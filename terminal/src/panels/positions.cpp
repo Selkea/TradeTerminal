@@ -1,11 +1,14 @@
 #include "panels/positions.h"
 
 #include "imgui.h"
+#include "ui_hints.h"
 
 namespace tt::ui {
 
 void PositionsPanel::draw(bool* open) {
-    if (!ImGui::Begin("Positions", open)) {
+    const bool visible = ImGui::Begin("Positions", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

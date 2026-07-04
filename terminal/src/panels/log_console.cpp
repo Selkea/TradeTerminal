@@ -1,5 +1,7 @@
 #include "panels/log_console.h"
 
+#include "ui_hints.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -47,7 +49,9 @@ void LogConsole::add(std::string line) {
 }
 
 void LogConsole::draw(const char* title, bool* open) {
-    if (!ImGui::Begin(title, open)) {
+    const bool visible = ImGui::Begin(title, open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

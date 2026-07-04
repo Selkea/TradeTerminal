@@ -2,6 +2,7 @@
 
 #include "imgui.h"
 #include "implot.h"
+#include "ui_hints.h"
 
 #include <algorithm>
 #include <cctype>
@@ -26,7 +27,9 @@ int max_range_idx(int interval_idx) {
 } // namespace
 
 void BacktestPanel::draw(bool* open, const std::string& strategy_name, const RunFn& run) {
-    if (!ImGui::Begin("Backtest", open)) {
+    const bool visible = ImGui::Begin("Backtest", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

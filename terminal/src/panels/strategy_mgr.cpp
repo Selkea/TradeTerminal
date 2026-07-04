@@ -1,6 +1,7 @@
 #include "panels/strategy_mgr.h"
 
 #include "imgui.h"
+#include "ui_hints.h"
 
 #include <filesystem>
 
@@ -85,7 +86,9 @@ std::map<std::string, double> StrategyManagerPanel::param_values() const {
 }
 
 void StrategyManagerPanel::draw(bool* open) {
-    if (!ImGui::Begin("Strategy", open)) {
+    const bool visible = ImGui::Begin("Strategy", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

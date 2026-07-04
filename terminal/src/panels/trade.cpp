@@ -1,6 +1,7 @@
 #include "panels/trade.h"
 
 #include "imgui.h"
+#include "ui_hints.h"
 
 #include <algorithm>
 #include <cctype>
@@ -9,7 +10,9 @@
 namespace tt::ui {
 
 void TradePanel::draw(bool* open, const std::string& strategy_name, const StartFn& start) {
-    if (!ImGui::Begin("Trade", open)) {
+    const bool visible = ImGui::Begin("Trade", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

@@ -4,6 +4,7 @@
 
 #include "imgui.h"
 #include "implot.h"
+#include "ui_hints.h"
 
 #include <algorithm>
 #include <cctype>
@@ -71,7 +72,9 @@ void ChartPanel::rebuild_plot_arrays(const SeriesStore::Series& s) {
 }
 
 void ChartPanel::draw(bool* open) {
-    if (!ImGui::Begin("Chart", open)) {
+    const bool visible = ImGui::Begin("Chart", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

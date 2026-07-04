@@ -1,6 +1,7 @@
 #include "panels/watchlist.h"
 
 #include "imgui.h"
+#include "ui_hints.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,7 +16,9 @@ void WatchlistPanel::resubscribe() {
 }
 
 void WatchlistPanel::draw(bool* open, const std::function<void(const std::string&)>& on_select) {
-    if (!ImGui::Begin("Watchlist", open)) {
+    const bool visible = ImGui::Begin("Watchlist", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }

@@ -1,7 +1,7 @@
 #include "app.h"
 #include "dev_paths.h"
 
-#include "imgui_internal.h"  // DockBuilder API (default first-run layout)
+#include "imgui_internal.h"  // DockBuilder API (default first-run layout) + private dock node flags
 #include "implot.h"
 
 #include <chrono>
@@ -123,7 +123,8 @@ App::~App() {
 }
 
 void App::draw() {
-    const ImGuiID dockspace_id = ImGui::DockSpaceOverViewport();
+    const ImGuiID dockspace_id =
+        ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_NoWindowMenuButton);
     if (!layout_checked_) {
         layout_checked_ = true;
         if (!had_ini_) setup_default_layout(dockspace_id);

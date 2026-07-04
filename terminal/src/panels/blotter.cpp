@@ -1,6 +1,7 @@
 #include "panels/blotter.h"
 
 #include "imgui.h"
+#include "ui_hints.h"
 
 #include <ctime>
 
@@ -19,7 +20,9 @@ const char* status_str(OrderStatus s) {
 } // namespace
 
 void BlotterPanel::draw(bool* open) {
-    if (!ImGui::Begin("Blotter", open)) {
+    const bool visible = ImGui::Begin("Blotter", open);
+    tab_drag_hint();
+    if (!visible) {
         ImGui::End();
         return;
     }
