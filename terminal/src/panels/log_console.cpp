@@ -1,11 +1,19 @@
 #include "panels/log_console.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 
 namespace tt::ui {
 
 void LogConsole::add(std::string line) {
+    // TT_LOG_STDOUT=1 mirrors the console to stdout (headless verification).
+    static const bool echo = std::getenv("TT_LOG_STDOUT") != nullptr;
+    if (echo) {
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+    }
     const auto now = std::chrono::system_clock::now();
     const std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
