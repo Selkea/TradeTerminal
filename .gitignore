@@ -1,0 +1,15 @@
+# Builds happen outside the tree (C:/dev/build/TradeTerminal), but ignore accidental local ones
+build/
+out/
+.cache/
+
+# Compiled artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+
+# ImGui runtime layout + logs live in %LOCALAPPDATA%; ignore local strays
+imgui.ini
+*.log

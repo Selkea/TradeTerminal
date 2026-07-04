@@ -1,0 +1,9 @@
+{
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true,
+    "cmake.cmakePath": "C:/msys64/ucrt64/bin/cmake.exe",
+    "C_Cpp.default.compileCommands": "C:/dev/build/TradeTerminal/ucrt64-debug/compile_commands.json",
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\msys64\\ucrt64\\bin;${env:PATH}"
+    }
+}
