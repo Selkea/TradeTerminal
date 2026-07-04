@@ -21,7 +21,7 @@ int max_range_idx(int interval_idx) {
 }
 } // namespace
 
-void BacktestPanel::draw(bool* open, const RunFn& run) {
+void BacktestPanel::draw(bool* open, const std::string& strategy_name, const RunFn& run) {
     if (!ImGui::Begin("Backtest", open)) {
         ImGui::End();
         return;
@@ -42,17 +42,6 @@ void BacktestPanel::draw(bool* open, const RunFn& run) {
     ImGui::SetNextItemWidth(60);
     ImGui::Combo("##btrng", &range_idx_, kRanges, IM_ARRAYSIZE(kRanges));
     range_idx_ = std::min(range_idx_, max_range_idx(interval_idx_));
-
-    ImGui::SetNextItemWidth(80);
-    ImGui::InputInt("fast", &fast_);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80);
-    ImGui::InputInt("slow", &slow_);
-    fast_ = std::clamp(fast_, 1, 500);
-    slow_ = std::clamp(slow_, fast_ + 1, 1000);
-
-    ImGui::SetNextItemWidth(80);
-    ImGui::InputDouble("qty", &qty_, 0, 0, "%.0f");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(100);
     ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
@@ -61,15 +50,11 @@ void BacktestPanel::draw(bool* open, const RunFn& run) {
     ImGui::BeginDisabled(busy);
     if (ImGui::Button(busy ? "Running..." : "Run backtest") && sym_[0] && run) {
         for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
-        run(sym_, kIntervals[interval_idx_], kRanges[range_idx_],
-            {{"fast", static_cast<double>(fast_)},
-             {"slow", static_cast<double>(slow_)},
-             {"qty", qty_}},
-            cash_);
+        run(sym_, kIntervals[interval_idx_], kRanges[range_idx_], cash_);
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("SMA crossover (built-in)");
+    ImGui::TextDisabled("%s", strategy_name.c_str());
 
     if (has_res_) {
         ImGui::Separator();

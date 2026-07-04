@@ -2,11 +2,13 @@
 
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
+#include "engine/strategy_host.h"
 #include "market_data.h"
 #include "net/ipc_client.h"
 #include "panels/backtest.h"
 #include "panels/chart.h"
 #include "panels/log_console.h"
+#include "panels/strategy_mgr.h"
 #include "panels/watchlist.h"
 
 #include "imgui.h"
@@ -42,8 +44,12 @@ private:
         std::string symbol, interval;
         std::map<std::string, double> params;
         double cash = 0.0;
+        IStrategy* strategy = nullptr;   // captured at click time
+        uint64_t strategy_gen = 0;       // host generation at click time
     };
     void start_pending_backtest(net::CandleBatch& batch);
+    void queue_backtest(const std::string& sym, const std::string& ivl,
+                        const std::string& rng, double cash);
 
     LogConsole log_;
     SeriesStore series_;
@@ -51,9 +57,11 @@ private:
     net::IpcClient ipc_;
     Engine engine_;
     SmaCrossover sma_;
+    StrategyHost host_;
     ChartPanel chart_;
     WatchlistPanel watchlist_;
     BacktestPanel backtest_;
+    StrategyManagerPanel strat_mgr_;
 
     std::mutex pending_bt_mu_;
     PendingBacktest pending_bt_;
@@ -64,6 +72,7 @@ private:
     bool show_chart_ = true;
     bool show_watchlist_ = true;
     bool show_backtest_ = true;
+    bool show_strategy_ = true;
     bool show_log_ = true;
     bool show_imgui_demo_ = false;
     bool show_implot_demo_ = false;
