@@ -24,3 +24,6 @@ target_compile_options(implot PRIVATE -w)
 
 add_library(doctest INTERFACE)
 target_include_directories(doctest INTERFACE doctest)
+
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

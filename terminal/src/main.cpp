@@ -1,4 +1,5 @@
 #include "app.h"
+#include "dev_paths.h"
 
 #include "engine/version.h"
 
@@ -69,7 +70,11 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    tt::ui::App app;
+    const char* py_env = std::getenv("TT_PYTHON");
+    std::string python_cmd = py_env ? py_env : "python";
+    std::string service_dir = (fs::path(TT_REPO_ROOT) / "dataservice").make_preferred().string();
+
+    tt::ui::App app(python_cmd, service_dir);
     app.set_had_ini(had_ini);
     app.log().add(std::string("TradeTerminal engine ") + tt::engine_version());
     app.log().add(std::string("ImGui ") + IMGUI_VERSION + " (docking) + ImPlot " + IMPLOT_VERSION);
