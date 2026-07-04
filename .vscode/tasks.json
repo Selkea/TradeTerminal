@@ -7,9 +7,45 @@
             "command": "build",
             "group": {
                 "kind": "build",
-                "isDefault": true
+                "isDefault": false
             },
-            "problemMatcher": ["$gcc"]
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "Build TradeTerminal (debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", "ucrt64-debug"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$gcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Run TradeTerminal",
+            "type": "shell",
+            "command": "Start-Process",
+            "args": [
+                "-FilePath",
+                "C:\\dev\\build\\TradeTerminal\\ucrt64-debug\\terminal\\tt_terminal.exe",
+                "-WorkingDirectory",
+                "C:\\dev\\build\\TradeTerminal\\ucrt64-debug\\terminal"
+            ],
+            "options": {
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": ["-NoProfile", "-Command"]
+                }
+            },
+            "dependsOn": ["Build TradeTerminal (debug)"],
+            "problemMatcher": [],
+            "detail": "Incremental build, then launch tt_terminal.exe (no debugger)."
         }
     ]
 }
