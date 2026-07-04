@@ -6,6 +6,33 @@ single-threaded engine core fed by lock-free SPSC rings, hot-compiled strategy
 DLL plugins, and a Python sidecar for market data (Yahoo Finance, cached in
 sqlite).
 
+## Workflow
+
+1. **Chart / Watchlist** — type a symbol, candles + delayed quotes appear
+   (Python sidecar auto-starts; killing it is fine, it respawns).
+2. **Strategy panel** — pick a `.cpp` from `strategies/`, hit **Build & Load**:
+   the terminal compiles it with g++ and hot-loads the DLL. Edit the file and
+   rebuild without restarting. Parameters declared by the strategy are editable.
+3. **Backtest panel** — symbol/interval/range/cash, Run: full-speed replay
+   (millions of events/sec) with modeled latency, slippage, and commissions.
+   Bit-identical reruns; equity curve, drawdown, Sharpe, tick→order latency
+   percentiles; Export CSV.
+4. **Trade panel** — start a live paper session on the delayed feed: the same
+   engine/exec-sim code path on a real-time clock. Manual orders, order
+   blotter with cancel, live positions/PnL, pre-trade risk checks, and a
+   **KILL SWITCH** (cancel all + flatten + halt).
+
+Session state (watchlist, chart, cash settings) persists to
+`%LOCALAPPDATA%\TradeTerminal\config.json`; logs rotate in
+`...\TradeTerminal\logs\`. Live-broker and pro-feed integration points are
+documented in `engine/include/engine/broker.h` and `feed.h`.
+
+Debug/verification hooks (env vars): `TT_LOG_STDOUT=1` mirrors the log console
+to stdout; `TT_AUTORUN_BACKTEST=1` runs an AAPL backtest at startup;
+`TT_SIM_TICKS=1` feeds a synthetic 2 Hz walk to live sessions (markets closed);
+`TT_AUTORUN_LIVE=1` runs a scripted live-session check; `TT_PYTHON`/`TT_GXX`
+override tool paths.
+
 ## Layout
 
 | Path | What |

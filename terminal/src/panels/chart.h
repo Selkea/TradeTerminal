@@ -16,6 +16,12 @@ public:
     void draw(bool* open);
     void show_symbol(const std::string& symbol);  // e.g. watchlist row clicked
 
+    // Session persistence.
+    std::string symbol() const { return sym_; }
+    int interval_idx() const { return interval_idx_; }
+    int range_idx() const { return range_idx_; }
+    void restore(const std::string& sym, int ivl_idx, int rng_idx);
+
 private:
     void request();
     void rebuild_plot_arrays(const SeriesStore::Series& s);

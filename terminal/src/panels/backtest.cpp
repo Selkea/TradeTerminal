@@ -5,6 +5,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 
 namespace tt::ui {
 
@@ -63,9 +67,39 @@ void BacktestPanel::draw(bool* open, const std::string& strategy_name, const Run
     ImGui::End();
 }
 
+void BacktestPanel::export_csv() {
+    const char* base = std::getenv("LOCALAPPDATA");
+    const auto dir = std::filesystem::path(base ? base : ".") / "TradeTerminal" / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto path = dir / ("backtest_" + res_.symbol + "_" +
+                             std::to_string(std::time(nullptr)) + ".csv");
+    std::ofstream f(path);
+    if (!f) return;
+    f << "# symbol," << res_.symbol << "\n# return," << res_.total_return
+      << "\n# final_equity," << res_.final_equity << "\n# max_drawdown," << res_.max_drawdown
+      << "\n# sharpe," << res_.sharpe << "\n# trades," << res_.trades
+      << "\n# win_rate," << res_.win_rate << "\n# tick_to_order_p50_ns," << res_.lat_p50
+      << "\n# tick_to_order_p99_ns," << res_.lat_p99 << "\n# tick_to_order_max_ns,"
+      << res_.lat_max << "\n";
+    f << "section,ts,side,qty,price,fee\n";
+    for (const TradeRow& t : res_.fills)
+        f << "fill," << t.ts_ns / 1'000'000'000 << ","
+          << (t.side == static_cast<uint8_t>(Side::Buy) ? "buy" : "sell") << "," << t.qty
+          << "," << t.price << "," << t.fee << "\n";
+    f << "section,ts,equity,,,\n";
+    for (size_t i = 0; i < res_.eq_ts.size(); ++i)
+        f << "equity," << static_cast<int64_t>(res_.eq_ts[i]) << "," << res_.eq_val[i]
+          << ",,,\n";
+    last_export_ = path.string();
+}
+
 void BacktestPanel::draw_results() {
     ImGui::Text("%s — %d fills, %llu events in %.1f ms", res_.symbol.c_str(), res_.trades,
                 static_cast<unsigned long long>(res_.events), res_.duration_ms);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Export CSV")) export_csv();
+    if (!last_export_.empty()) ImGui::TextDisabled("saved: %s", last_export_.c_str());
 
     if (ImGui::BeginTable("##stats", 4, ImGuiTableFlags_BordersInnerV)) {
         auto row = [](const char* k1, const std::string& v1,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "config.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
@@ -71,6 +72,9 @@ private:
 
     std::mutex pending_bt_mu_;
     PendingBacktest pending_bt_;
+
+    std::string config_path_;
+    AppConfig cfg_;
 
     bool had_ini_ = false;
     bool layout_checked_ = false;

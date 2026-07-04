@@ -4,6 +4,7 @@ configure_file(src/dev_paths.h.in ${CMAKE_CURRENT_BINARY_DIR}/dev_paths.h @ONLY)
 add_executable(tt_terminal
     src/main.cpp
     src/app.cpp
+    src/config.cpp
     src/candle_plot.cpp
     src/net/ipc_client.cpp
     src/panels/log_console.cpp
@@ -24,3 +25,8 @@ target_link_libraries(tt_terminal PRIVATE
     opengl32
     ws2_32
 )
+
+# Release builds are windowed (no console); debug keeps the console for logs.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()

@@ -4,8 +4,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 
 namespace tt::ui {
+
+void LogConsole::set_log_file(std::string path) {
+    std::lock_guard lock(mu_);
+    file_path_ = std::move(path);
+    std::error_code ec;
+    namespace fs = std::filesystem;
+    fs::create_directories(fs::path(file_path_).parent_path(), ec);
+    if (fs::exists(file_path_, ec) &&
+        fs::file_size(file_path_, ec) > static_cast<uintmax_t>(kRotateBytes)) {
+        fs::rename(file_path_, file_path_ + ".1", ec);  // simple 1-deep rotation
+    }
+}
 
 void LogConsole::add(std::string line) {
     // TT_LOG_STDOUT=1 mirrors the console to stdout (headless verification).
@@ -23,6 +36,13 @@ void LogConsole::add(std::string line) {
 
     std::lock_guard lock(mu_);
     lines_.push_back(stamp + std::move(line));
+    if (!file_path_.empty()) {
+        if (FILE* f = std::fopen(file_path_.c_str(), "a")) {
+            std::fputs(lines_.back().c_str(), f);
+            std::fputc('\n', f);
+            std::fclose(f);
+        }
+    }
     while (lines_.size() > kMaxLines) lines_.pop_front();
 }
 

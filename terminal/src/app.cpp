@@ -11,11 +11,11 @@
 namespace tt::ui {
 
 namespace {
-std::string strategies_out_dir() {
+std::filesystem::path data_dir() {
     const char* base = std::getenv("LOCALAPPDATA");
-    return (std::filesystem::path(base ? base : ".") / "TradeTerminal" / "strategies")
-        .string();
+    return std::filesystem::path(base ? base : ".") / "TradeTerminal";
 }
+std::string strategies_out_dir() { return (data_dir() / "strategies").string(); }
 std::string gxx_path() {
     const char* env = std::getenv("TT_GXX");
     return env ? env : TT_GXX_DEFAULT;
@@ -50,6 +50,16 @@ App::App(std::string python_cmd, std::string service_dir)
         start_pending_backtest(b);
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
     };
+
+    // Session persistence + file logging.
+    log_.set_log_file((data_dir() / "logs" / "terminal.log").string());
+    config_path_ = (data_dir() / "config.json").string();
+    cfg_ = AppConfig::load(config_path_);
+    watchlist_.set_symbols(cfg_.watchlist);
+    chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
+    backtest_.set_cash(cfg_.backtest_cash);
+    trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec);
+
     ipc_.start(std::move(cbs));
 }
 
@@ -100,7 +110,17 @@ void App::queue_backtest(const std::string& sym, const std::string& ivl,
     ipc_.request_candles(sym, ivl, rng);
 }
 
-App::~App() { ipc_.stop(); }
+App::~App() {
+    ipc_.stop();
+    cfg_.watchlist = watchlist_.symbols();
+    cfg_.chart_symbol = chart_.symbol();
+    cfg_.chart_interval_idx = chart_.interval_idx();
+    cfg_.chart_range_idx = chart_.range_idx();
+    cfg_.backtest_cash = backtest_.cash();
+    cfg_.trade_cash = trade_.cash();
+    cfg_.trade_bar_sec = trade_.bar_sec();
+    cfg_.save(config_path_);
+}
 
 void App::draw() {
     const ImGuiID dockspace_id = ImGui::DockSpaceOverViewport();

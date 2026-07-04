@@ -33,6 +33,13 @@ void ChartPanel::show_symbol(const std::string& symbol) {
     request();
 }
 
+void ChartPanel::restore(const std::string& sym, int ivl_idx, int rng_idx) {
+    std::snprintf(sym_, sizeof(sym_), "%s", sym.c_str());
+    interval_idx_ = std::clamp(ivl_idx, 0, static_cast<int>(IM_ARRAYSIZE(kIntervals)) - 1);
+    range_idx_ = std::clamp(rng_idx, 0, static_cast<int>(IM_ARRAYSIZE(kRanges)) - 1);
+    // No request here: the first connection-generation bump fires it.
+}
+
 void ChartPanel::request() {
     range_idx_ = std::min(range_idx_, max_range_idx(interval_idx_));
     for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));

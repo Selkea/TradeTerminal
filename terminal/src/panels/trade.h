@@ -17,6 +17,13 @@ public:
     explicit TradePanel(Engine& eng) : eng_(eng) {}
     void draw(bool* open, const std::string& strategy_name, const StartFn& start);
 
+    double cash() const { return cash_; }
+    int bar_sec() const { return bar_sec_; }
+    void restore(double cash, int bar_sec) {
+        cash_ = cash;
+        bar_sec_ = bar_sec;
+    }
+
 private:
     Engine& eng_;
     char sym_[16] = "AAPL";

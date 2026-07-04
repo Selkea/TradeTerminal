@@ -18,8 +18,12 @@ public:
     explicit BacktestPanel(Engine& eng) : eng_(eng) {}
     void draw(bool* open, const std::string& strategy_name, const RunFn& run);
 
+    double cash() const { return cash_; }
+    void set_cash(double c) { cash_ = c; }
+
 private:
     void draw_results();
+    void export_csv();
 
     Engine& eng_;
     char sym_[16] = "AAPL";
@@ -28,6 +32,7 @@ private:
     double cash_ = 100'000.0;
     BacktestResult res_;
     bool has_res_ = false;
+    std::string last_export_;
 };
 
 } // namespace tt::ui

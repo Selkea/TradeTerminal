@@ -17,6 +17,12 @@ public:
     // on_select fires when the user clicks a row (chart follows).
     void draw(bool* open, const std::function<void(const std::string&)>& on_select);
 
+    const std::vector<std::string>& symbols() const { return symbols_; }
+    void set_symbols(std::vector<std::string> v) {
+        symbols_ = std::move(v);
+        dirty_ = true;
+    }
+
     // Guarantee the symbol is subscribed (live sessions need its quotes).
     void ensure(const std::string& symbol) {
         if (std::find(symbols_.begin(), symbols_.end(), symbol) == symbols_.end()) {
