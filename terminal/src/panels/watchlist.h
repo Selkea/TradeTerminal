@@ -3,6 +3,7 @@
 #include "market_data.h"
 #include "net/ipc_client.h"
 
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <vector>
@@ -15,6 +16,14 @@ public:
 
     // on_select fires when the user clicks a row (chart follows).
     void draw(bool* open, const std::function<void(const std::string&)>& on_select);
+
+    // Guarantee the symbol is subscribed (live sessions need its quotes).
+    void ensure(const std::string& symbol) {
+        if (std::find(symbols_.begin(), symbols_.end(), symbol) == symbols_.end()) {
+            symbols_.push_back(symbol);
+            dirty_ = true;
+        }
+    }
 
 private:
     void resubscribe();

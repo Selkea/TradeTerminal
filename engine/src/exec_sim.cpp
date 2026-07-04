@@ -25,6 +25,14 @@ uint64_t ExecSim::submit(const OrderRequest& r, int64_t now_ns) {
     return id;
 }
 
+std::vector<uint64_t> ExecSim::cancel_all() {
+    std::vector<uint64_t> ids;
+    ids.reserve(pending_.size());
+    for (const PendingOrder& o : pending_) ids.push_back(o.id);
+    pending_.clear();
+    return ids;
+}
+
 bool ExecSim::cancel(uint64_t order_id) {
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
         if (it->id == order_id) {

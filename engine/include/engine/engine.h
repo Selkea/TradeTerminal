@@ -54,6 +54,44 @@ struct BacktestResult {
     uint64_t events = 0;
 };
 
+// ---------------------------------------------------------------- live mode
+
+struct RiskLimits {
+    double max_order_qty = 1'000;
+    double max_position_qty = 5'000;
+    double price_band_pct = 0.20;   // limit orders within ±20% of last trade
+};
+
+struct LiveConfig {
+    std::string symbol;
+    double initial_cash = 100'000.0;
+    ExecParams exec{};
+    std::map<std::string, double> params;
+    RiskLimits risk{};
+    int bar_seconds = 60;           // tick->bar aggregation for on_bar
+};
+
+enum class OrderStatus : uint8_t { Working = 0, Filled, Cancelled, Rejected };
+
+struct OrderRecord {
+    uint64_t id = 0;
+    int64_t ts_ns = 0;
+    uint8_t side = 0, type = 0;
+    OrderStatus status = OrderStatus::Working;
+    double qty = 0, limit_price = 0, fill_price = 0, fee = 0;
+    bool manual = false;
+};
+
+struct LiveSnapshot {
+    bool running = false, halted = false;
+    std::string symbol;
+    double cash = 0, equity = 0, last_price = 0;
+    Position position{};
+    std::vector<OrderRecord> orders;   // newest last, capped
+    uint64_t ticks = 0, dropped_ticks = 0;
+    int64_t last_tick_ts_ms = 0;
+};
+
 class Engine {
 public:
     Engine();
@@ -69,9 +107,29 @@ public:
     // Engine/strategy log lines, drained by the UI each frame.
     bool pop_log(std::string& out);
 
+    // ---- live paper trading ----
+    bool start_live(LiveConfig cfg, IStrategy* strategy);
+    void stop_live();                       // graceful: on_stop, joins the thread
+    bool live_running() const { return live_running_.load(std::memory_order_relaxed); }
+    std::string live_symbol() const;
+    // IPC thread: feed a delayed quote into the live engine.
+    void push_live_tick(int64_t ts_ms, double price, double day_volume);
+    // UI thread: async commands consumed by the engine thread.
+    void request_cancel(uint64_t order_id);
+    void submit_manual(bool buy, double qty);
+    void kill_switch();                     // cancel all + flatten + halt strategy
+    LiveSnapshot live_snapshot() const;
+
 private:
     friend class EngineCtx;
+    struct LiveCmd {
+        enum : uint8_t { Stop = 1, Cancel, Kill, Manual } type = Stop;
+        uint8_t buy = 0;
+        uint64_t order_id = 0;
+        double qty = 0;
+    };
     void run(BacktestConfig cfg, IStrategy* strategy);
+    void run_live(LiveConfig cfg, IStrategy* strategy);
     void push_log(std::string line);
 
     // Heap-allocated: the 4 MiB buffer must never land on a caller's stack.
@@ -86,6 +144,15 @@ private:
 
     std::mutex log_mu_;
     std::deque<std::string> logs_;
+
+    // ---- live state ----
+    using CmdRing = SpscRing<LiveCmd, 1 << 12>;
+    std::unique_ptr<CmdRing> cmd_ring_ = std::make_unique<CmdRing>();
+    std::thread live_thread_;
+    std::atomic<bool> live_running_{false};
+    std::atomic<uint64_t> dropped_ticks_{0};
+    mutable std::mutex snap_mu_;
+    LiveSnapshot snap_;
 };
 
 } // namespace tt

@@ -6,9 +6,12 @@
 #include "market_data.h"
 #include "net/ipc_client.h"
 #include "panels/backtest.h"
+#include "panels/blotter.h"
 #include "panels/chart.h"
 #include "panels/log_console.h"
+#include "panels/positions.h"
 #include "panels/strategy_mgr.h"
+#include "panels/trade.h"
 #include "panels/watchlist.h"
 
 #include "imgui.h"
@@ -62,6 +65,9 @@ private:
     WatchlistPanel watchlist_;
     BacktestPanel backtest_;
     StrategyManagerPanel strat_mgr_;
+    TradePanel trade_;
+    BlotterPanel blotter_;
+    PositionsPanel positions_;
 
     std::mutex pending_bt_mu_;
     PendingBacktest pending_bt_;
@@ -73,9 +79,16 @@ private:
     bool show_watchlist_ = true;
     bool show_backtest_ = true;
     bool show_strategy_ = true;
+    bool show_trade_ = true;
+    bool show_blotter_ = true;
+    bool show_positions_ = true;
     bool show_log_ = true;
     bool show_imgui_demo_ = false;
     bool show_implot_demo_ = false;
+    int autorun_live_stage_ = 0;
+    double sim_tick_next_s_ = 0.0;
+    double sim_tick_px_ = 0.0;
+    unsigned sim_tick_rng_ = 0x5eed;
 };
 
 } // namespace tt::ui

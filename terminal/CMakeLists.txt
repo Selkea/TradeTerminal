@@ -11,6 +11,9 @@ add_executable(tt_terminal
     src/panels/watchlist.cpp
     src/panels/backtest.cpp
     src/panels/strategy_mgr.cpp
+    src/panels/trade.cpp
+    src/panels/blotter.cpp
+    src/panels/positions.cpp
 )
 target_include_directories(tt_terminal PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(tt_terminal PRIVATE

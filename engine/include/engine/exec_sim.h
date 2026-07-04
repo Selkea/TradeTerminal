@@ -40,6 +40,9 @@ public:
     void on_price(uint32_t symbol_id, double price, int64_t now_ns,
                   std::vector<Fill>& out);
 
+    // Cancels everything; returns the cancelled ids (kill switch).
+    std::vector<uint64_t> cancel_all();
+
     size_t open_orders() const { return pending_.size(); }
 
 private:

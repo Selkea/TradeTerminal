@@ -4,6 +4,7 @@
 #include "imgui_internal.h"  // DockBuilder API (default first-run layout)
 #include "implot.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 
@@ -27,10 +28,17 @@ App::App(std::string python_cmd, std::string service_dir)
       chart_(ipc_, series_),
       watchlist_(ipc_, quotes_),
       backtest_(engine_),
-      strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies") {
+      strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
+      trade_(engine_),
+      blotter_(engine_),
+      positions_(engine_) {
     net::IpcClient::Callbacks cbs;
     cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
-    cbs.on_tick = [this](const std::string& sym, const Quote& q) { quotes_.set(sym, q); };
+    cbs.on_tick = [this](const std::string& sym, const Quote& q) {
+        quotes_.set(sym, q);
+        if (engine_.live_running() && sym == engine_.live_symbol())
+            engine_.push_live_tick(q.ts_ms, q.price, q.day_volume);
+    };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
         log_.add("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
         std::lock_guard lock(pending_bt_mu_);
@@ -125,7 +133,68 @@ void App::draw() {
                            queue_backtest(sym, ivl, rng, cash);
                        });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
+    if (show_trade_)
+        trade_.draw(&show_trade_, strat_mgr_.active_name(),
+                    [this](const std::string& sym, double cash, int bar_sec) {
+                        LiveConfig cfg;
+                        cfg.symbol = sym;
+                        cfg.initial_cash = cash;
+                        cfg.params = strat_mgr_.param_values();
+                        cfg.bar_seconds = bar_sec;
+                        if (engine_.start_live(std::move(cfg),
+                                               strat_mgr_.active_strategy(sma_))) {
+                            watchlist_.ensure(sym);   // quote subscription feeds the engine
+                            log_.add("live: session queued for " + sym + " (" +
+                                     strat_mgr_.active_name() + ")");
+                        } else {
+                            log_.add("live: cannot start (engine busy)");
+                        }
+                    });
+    if (show_blotter_) blotter_.draw(&show_blotter_);
+    if (show_positions_) positions_.draw(&show_positions_);
     if (show_log_) log_.draw("Log Console", &show_log_);
+
+    // TT_SIM_TICKS=1: synthesize a 2 Hz random walk for the live session —
+    // demo/verification when the market is closed.
+    if (engine_.live_running() && std::getenv("TT_SIM_TICKS")) {
+        const double now = ImGui::GetTime();
+        if (now >= sim_tick_next_s_) {
+            sim_tick_next_s_ = now + 0.5;
+            if (sim_tick_px_ <= 0.0) sim_tick_px_ = 100.0;
+            sim_tick_rng_ = sim_tick_rng_ * 1664525u + 1013904223u;
+            sim_tick_px_ += (static_cast<double>(sim_tick_rng_ >> 8 & 0xffff) / 65535.0 - 0.5);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            engine_.push_live_tick(ms, sim_tick_px_, 0.0);
+        }
+    }
+
+    // TT_AUTORUN_LIVE=1: start a session, manual buy, kill switch — headless
+    // verification of the whole live path.
+    if (std::getenv("TT_AUTORUN_LIVE")) {
+        const LiveSnapshot s = engine_.live_snapshot();
+        if (autorun_live_stage_ == 0) {
+            autorun_live_stage_ = 1;
+            LiveConfig cfg;
+            cfg.symbol = "SIMTEST";
+            cfg.params = strat_mgr_.param_values();
+            cfg.bar_seconds = 2;
+            engine_.start_live(std::move(cfg), strat_mgr_.active_strategy(sma_));
+            log_.add("autorun-live: session started");
+        } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {
+            autorun_live_stage_ = 2;
+            engine_.submit_manual(true, 10);
+            log_.add("autorun-live: manual BUY 10 submitted");
+        } else if (autorun_live_stage_ == 2 && s.position.qty > 0) {
+            autorun_live_stage_ = 3;
+            log_.add("autorun-live: position open, firing kill switch");
+            engine_.kill_switch();
+        } else if (autorun_live_stage_ == 3 && s.halted && s.position.qty == 0) {
+            autorun_live_stage_ = 4;
+            log_.add("autorun-live: FLAT after kill switch — live path verified");
+        }
+    }
     if (show_imgui_demo_) ImGui::ShowDemoWindow(&show_imgui_demo_);
     if (show_implot_demo_) ImPlot::ShowDemoWindow(&show_implot_demo_);
 }
@@ -137,6 +206,9 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
         ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
         ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
+        ImGui::MenuItem("Trade", nullptr, &show_trade_);
+        ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
+        ImGui::MenuItem("Positions", nullptr, &show_positions_);
         ImGui::MenuItem("Log Console", nullptr, &show_log_);
         ImGui::EndMenu();
     }
@@ -173,7 +245,10 @@ void App::setup_default_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Chart", center);
     ImGui::DockBuilderDockWindow("Backtest", right);
     ImGui::DockBuilderDockWindow("Strategy", right);
+    ImGui::DockBuilderDockWindow("Trade", right);
     ImGui::DockBuilderDockWindow("Log Console", bottom);
+    ImGui::DockBuilderDockWindow("Blotter", bottom);
+    ImGui::DockBuilderDockWindow("Positions", bottom);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
