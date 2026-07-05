@@ -86,6 +86,9 @@ App::App(std::string python_cmd, std::string service_dir)
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
     if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
 
+    if (!journal_.open((data_dir() / "journal.db").string()))
+        log_.add("journal: could not open journal.db — history disabled");
+
 #ifdef TT_DEBUG
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
 #endif
@@ -388,6 +391,32 @@ void App::draw() {
         log_.add("autorun: queued 4x4 fast/slow sweep");
     }
 
+    // Journal: session rows are keyed off the live_running transition (works
+    // for every start path — Trade panel, autorun, future ones), and fills
+    // are drained afterwards so the session row always exists first.
+    const bool live_now = engine_.live_running();
+    if (!prev_live_running_ && live_now) {
+        journal_syms_ = engine_.live_symbols();
+        std::string jsyms;
+        for (const std::string& sym : journal_syms_)
+            jsyms += (jsyms.empty() ? "" : ",") + sym;
+        journal_session_ = journal_.begin_session(
+            jsyms, alpaca_ ? "alpaca" : "sim", engine_.live_snapshot().cash);
+    } else if (prev_live_running_ && !live_now && journal_session_) {
+        const LiveSnapshot s = engine_.live_snapshot();
+        journal_.end_session(journal_session_, s.equity, s.halted);
+        journal_session_ = 0;
+    }
+    prev_live_running_ = live_now;
+    Engine::FillRecord fr;
+    while (engine_.pop_fill(fr)) {
+        const std::string sym = fr.symbol_id >= 1 && fr.symbol_id <= journal_syms_.size()
+                                    ? journal_syms_[fr.symbol_id - 1]
+                                    : "?";
+        journal_.add_fill(journal_session_, fr.ts_ns, sym, fr.side == 1, fr.qty,
+                          fr.price, fr.fee, fr.order_id);
+    }
+
     pump_sweep();   // before the panels: sweep results must not be stolen
 
     draw_menu_bar();
@@ -482,6 +511,7 @@ void App::draw() {
                                 fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
                                     fc.pin_core = std::atoi(pin);
+                                fc.bar_seconds = opts.bar_seconds;
                                 alpaca_feed_ = std::make_unique<AlpacaFeed>(
                                     std::move(fc), [this](const EngineEvent& ev) {
                                         return engine_.push_feed_event(ev);
@@ -522,6 +552,7 @@ void App::draw() {
                     });
     if (show_blotter_) blotter_.draw(&show_blotter_);
     if (show_positions_) positions_.draw(&show_positions_);
+    if (show_journal_) journal_panel_.draw(&show_journal_);
     if (show_log_) log_.draw("Log Console", &show_log_);
 
 #ifdef TT_DEBUG
@@ -736,6 +767,7 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Trade", nullptr, &show_trade_);
         ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
         ImGui::MenuItem("Positions", nullptr, &show_positions_);
+        ImGui::MenuItem("Journal", nullptr, &show_journal_);
         ImGui::MenuItem("Log Console", nullptr, &show_log_);
         ImGui::Separator();
         bool alerts_on = !alerts_.muted();

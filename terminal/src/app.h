@@ -8,11 +8,13 @@
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
+#include "journal.h"
 #include "market_data.h"
 #include "net/ipc_client.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/chart.h"
+#include "panels/journal_panel.h"
 #include "panels/log_console.h"
 #include "panels/positions.h"
 #include "panels/strategy_mgr.h"
@@ -98,6 +100,13 @@ private:
     PositionsPanel positions_;
     SweepPanel sweep_panel_;
 
+    // ---- trade journal (UI thread only) ----
+    TradeJournal journal_;
+    JournalPanel journal_panel_{journal_};
+    int64_t journal_session_ = 0;          // 0 = no open session row
+    std::vector<std::string> journal_syms_;
+    bool prev_live_running_ = false;
+
     // Sweep runner. The IPC thread only stashes fetched candles under
     // pending_bt_mu_; everything else runs on the UI thread.
     struct SweepSetup {
@@ -147,6 +156,7 @@ private:
     bool show_trade_ = true;
     bool show_blotter_ = true;
     bool show_positions_ = true;
+    bool show_journal_ = false;
     bool show_log_ = true;
     bool show_imgui_demo_ = false;
     bool show_implot_demo_ = false;

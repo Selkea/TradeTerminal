@@ -36,6 +36,10 @@ struct AlpacaFeedConfig {
     bool busy_poll = false;
     // >= 0: pin the feed I/O thread to this core (keep it off the engine's).
     int pin_core = -1;
+    // Session bar size: after a reconnect, the gap is backfilled with REST
+    // bars at this granularity (60/300/900/3600 s supported; others skip).
+    int bar_seconds = 60;
+    std::string data_rest_url = "https://data.alpaca.markets";
 };
 
 // One parsed market-data message (exposed for unit tests). The data stream
@@ -56,6 +60,13 @@ struct AlpacaFeedMsg {
 size_t alpaca_parse_feed_msgs(std::string_view json_text,
                               const std::vector<std::string>& symbols,
                               std::vector<AlpacaFeedMsg>& out);
+
+// One row of GET /v2/stocks/{sym}/bars (exposed for unit tests).
+struct AlpacaRestBar {
+    int64_t ts_ns = 0;
+    double open = 0, high = 0, low = 0, close = 0, volume = 0;
+};
+bool alpaca_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out);
 
 class AlpacaFeed final : public IFeedHandler {
 public:

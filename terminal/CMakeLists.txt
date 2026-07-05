@@ -8,6 +8,8 @@ add_executable(tt_terminal
     src/alerts.cpp
     src/app.cpp
     src/config.cpp
+    src/journal.cpp
+    src/panels/journal_panel.cpp
     src/candle_plot.cpp
     src/net/ipc_client.cpp
     src/panels/log_console.cpp
@@ -41,6 +43,7 @@ target_link_libraries(tt_terminal PRIVATE
     crypt32     # DPAPI (account_store)
     winmm       # timeBeginPeriod (1 ms timer granularity)
     CURL::libcurl   # alert webhook POSTs
+    sqlite3     # trade journal (MSYS2 package)
 )
 if(WIN32)
     target_link_libraries(tt_terminal PRIVATE dwmapi)

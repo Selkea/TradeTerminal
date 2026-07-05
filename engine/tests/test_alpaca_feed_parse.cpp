@@ -53,6 +53,25 @@ TEST_CASE("errors carry the message and code") {
     CHECK(out[0].error == "connection limit exceeded (code 406)");
 }
 
+TEST_CASE("REST bars parse for gap backfill") {
+    std::vector<tt::AlpacaRestBar> bars;
+    REQUIRE(tt::alpaca_parse_rest_bars(
+        R"({"bars":[{"t":"2026-07-02T14:30:00Z","o":100.1,"h":101,"l":99.9,"c":100.5,"v":1200},)"
+        R"({"t":"2026-07-02T14:31:00Z","o":100.5,"h":100.8,"l":100.2,"c":100.7,"v":800}],)"
+        R"("symbol":"AAPL","next_page_token":null})",
+        bars));
+    REQUIRE(bars.size() == 2);
+    CHECK(bars[0].ts_ns == 1783002600'000'000'000LL);   // 14:30:00Z
+    CHECK(bars[0].open == doctest::Approx(100.1));
+    CHECK(bars[1].close == doctest::Approx(100.7));
+    CHECK(bars[1].volume == doctest::Approx(800));
+
+    bars.clear();
+    CHECK_FALSE(tt::alpaca_parse_rest_bars("junk", bars));
+    CHECK(tt::alpaca_parse_rest_bars(R"({"bars":[]})", bars));
+    CHECK(bars.empty());
+}
+
 TEST_CASE("unknown symbols get id 0; unknown types and junk are skipped") {
     std::vector<AlpacaFeedMsg> out;
     REQUIRE(alpaca_parse_feed_msgs(

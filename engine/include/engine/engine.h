@@ -158,6 +158,16 @@ public:
     void stop_live();                       // graceful: on_stop, joins the thread
     bool live_running() const { return live_running_.load(std::memory_order_relaxed); }
     std::vector<std::string> live_symbols() const;
+    // Exact per-fill records for the journal, drained by the UI each frame
+    // (same pattern as pop_log). Live sessions only.
+    struct FillRecord {
+        int64_t ts_ns = 0;
+        uint64_t order_id = 0;
+        uint32_t symbol_id = 0;
+        uint8_t side = 0;   // tt::Side
+        double qty = 0, price = 0, fee = 0;
+    };
+    bool pop_fill(FillRecord& out);
     // IPC thread: feed a delayed quote into the live engine (dropped if the
     // symbol isn't part of the running session).
     void push_live_tick(const std::string& symbol, int64_t ts_ms, double price,
@@ -203,6 +213,10 @@ private:
 
     std::mutex log_mu_;
     std::deque<std::string> logs_;
+
+    std::mutex fill_mu_;
+    std::deque<FillRecord> fill_feed_;
+    void push_fill(const FillRecord& f);
 
     // ---- live state ----
     using CmdRing = SpscRing<LiveCmd, 1 << 12>;

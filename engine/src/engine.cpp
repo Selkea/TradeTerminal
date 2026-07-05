@@ -194,6 +194,20 @@ bool Engine::pop_log(std::string& out) {
     return true;
 }
 
+void Engine::push_fill(const FillRecord& f) {
+    std::lock_guard lock(fill_mu_);
+    fill_feed_.push_back(f);
+    while (fill_feed_.size() > 1000) fill_feed_.pop_front();
+}
+
+bool Engine::pop_fill(FillRecord& out) {
+    std::lock_guard lock(fill_mu_);
+    if (fill_feed_.empty()) return false;
+    out = fill_feed_.front();
+    fill_feed_.pop_front();
+    return true;
+}
+
 bool Engine::take_result(BacktestResult& out) {
     if (!has_result_.exchange(false)) return false;
     std::lock_guard lock(result_mu_);
@@ -395,8 +409,18 @@ void Engine::run_replay(ReplayConfig cfg, IStrategy* strategy) {
     fills.reserve(16);
     uint64_t events = 0;
     for (const EngineEvent& ev : cfg.log.events) {
-        if (ev.type != static_cast<uint16_t>(EvType::Tick)) continue;
         if (ev.symbol_id == 0 || ev.symbol_id > n_sym) continue;
+        if (ev.type == static_cast<uint16_t>(EvType::Bar)) {
+            // Captured backfill bar: replay it to the strategy exactly as
+            // the live loop delivered it (no fills, no marks).
+            ++events;
+            clock.set(ev.ts_event_ns);
+            const Bar b{ev.ts_event_ns, ev.u.bar.open, ev.u.bar.high,
+                        ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
+            strategy->on_bar(ctx, ev.symbol_id, b);
+            continue;
+        }
+        if (ev.type != static_cast<uint16_t>(EvType::Tick)) continue;
         ++events;
         clock.set(ev.ts_event_ns);
         // Captured ingest timestamps are meaningless at replay time; leaving
@@ -657,6 +681,8 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                       static_cast<unsigned long long>(f.order_id),
                       f.side == Side::Buy ? "BUY" : "SELL", f.qty, f.price);
         push_log(buf);
+        push_fill(FillRecord{f.ts_ns, f.order_id, f.symbol_id,
+                             static_cast<uint8_t>(f.side), f.qty, f.price, f.fee});
         if (!halted) strategy->on_fill(ctx, f);
     };
 
@@ -843,6 +869,20 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
             capture.write(ev);
             const int64_t now = rt.now_ns();
             last_md_ns = now;
+
+            if (ev.type == static_cast<uint16_t>(EvType::Bar)) {
+                // Backfilled bar (feed outage recovery): keep the strategy's
+                // indicators continuous, but never fill or mark positions
+                // against stale prices.
+                if (!halted && ev.symbol_id >= 1 && ev.symbol_id <= n_sym) {
+                    ctx.set_current_event_tsc(0);
+                    const Bar b{ev.ts_event_ns, ev.u.bar.open, ev.u.bar.high,
+                                ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
+                    strategy->on_bar(ctx, ev.symbol_id, b);
+                }
+                continue;
+            }
+
             const uint32_t sid = ev.symbol_id;
             ctx.set_current_event_tsc(ev.ts_ingest_tsc);
             const double price = ev.u.tick.price;
