@@ -79,6 +79,17 @@ App::App(std::string python_cmd, std::string service_dir)
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
 #endif
 
+    // TT_MOBILE=1: start the read-only phone dashboard at launch (same as
+    // View -> Mobile status page).
+    if (std::getenv("TT_MOBILE")) {
+        status_server_ = std::make_unique<StatusServer>(engine_);
+        if (status_server_->start())
+            log_.add("mobile: read-only dashboard at " + status_server_->url() +
+                     "  (same Wi-Fi; token in URL)");
+        else
+            status_server_.reset();
+    }
+
     ipc_.start(std::move(cbs));
 }
 
@@ -619,6 +630,26 @@ void App::draw_menu_bar() {
     if (!ImGui::BeginMainMenuBar()) return;
     draw_account_menu();
     if (ImGui::BeginMenu("View")) {
+        bool mobile = status_server_ && status_server_->running();
+        if (ImGui::MenuItem("Mobile status page", nullptr, &mobile)) {
+            if (mobile) {
+                status_server_ = std::make_unique<StatusServer>(engine_);
+                if (status_server_->start())
+                    log_.add("mobile: read-only dashboard at " + status_server_->url() +
+                             "  (same Wi-Fi; token in URL)");
+                else {
+                    log_.add("mobile: could not bind port " +
+                             std::to_string(status_server_->port()));
+                    status_server_.reset();
+                }
+            } else {
+                status_server_.reset();
+                log_.add("mobile: dashboard stopped");
+            }
+        }
+        ImGui::SetItemTooltip("Serve a read-only status page for your phone "
+                              "(LAN only, token-protected)");
+        ImGui::Separator();
         ImGui::MenuItem("Chart", nullptr, &show_chart_);
         ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
         ImGui::MenuItem("Backtest", nullptr, &show_backtest_);

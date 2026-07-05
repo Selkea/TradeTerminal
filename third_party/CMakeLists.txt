@@ -32,3 +32,7 @@ target_include_directories(nlohmann_json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(simdjson STATIC simdjson/simdjson.cpp)
 target_include_directories(simdjson PUBLIC simdjson)
 target_compile_options(simdjson PRIVATE -w)
+
+# Embedded HTTP server for the read-only mobile status page.
+add_library(httplib INTERFACE)
+target_include_directories(httplib INTERFACE httplib)

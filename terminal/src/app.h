@@ -9,6 +9,7 @@
 #include "engine/strategy_host.h"
 #include "market_data.h"
 #include "net/ipc_client.h"
+#include "net/status_server.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/chart.h"
@@ -84,6 +85,8 @@ private:
     // ring, so it must be destroyed (thread joined) before the engine.
     std::unique_ptr<AlpacaFeed> alpaca_feed_;
     std::atomic<bool> rt_feed_active_{false};   // IPC thread: skip sidecar ticks
+    // Also after engine_: reads live_snapshot() from its server thread.
+    std::unique_ptr<StatusServer> status_server_;
     SmaCrossover sma_;
     StrategyHost host_;
     ChartPanel chart_;

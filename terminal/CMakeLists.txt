@@ -8,6 +8,7 @@ add_executable(tt_terminal
     src/config.cpp
     src/candle_plot.cpp
     src/net/ipc_client.cpp
+    src/net/status_server.cpp
     src/panels/log_console.cpp
     src/panels/chart.cpp
     src/panels/watchlist.cpp
@@ -31,6 +32,7 @@ target_compile_definitions(tt_terminal PRIVATE $<$<CONFIG:Debug>:TT_DEBUG>)
 target_link_libraries(tt_terminal PRIVATE
     tt_engine
     tt_alpaca
+    httplib
     imgui
     implot
     nlohmann_json
