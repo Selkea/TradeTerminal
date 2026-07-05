@@ -440,8 +440,14 @@ std::vector<std::string> Engine::live_symbols() const {
 }
 
 LiveSnapshot Engine::live_snapshot() const {
-    std::lock_guard lock(snap_mu_);
-    LiveSnapshot s = snap_;
+    LiveSnapshot s;
+    std::shared_ptr<const std::vector<OrderRecord>> ord;
+    {
+        std::lock_guard lock(snap_mu_);
+        s = snap_;          // scalars + small symbols vector; orders are empty
+        ord = snap_orders_;
+    }
+    if (ord) s.orders = *ord;   // immutable: safe to copy outside the lock
     s.dropped_ticks = dropped_ticks_.load(std::memory_order_relaxed);
     return s;
 }
@@ -505,6 +511,7 @@ bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
     {
         std::lock_guard lock(snap_mu_);
         snap_ = LiveSnapshot{};
+        snap_orders_.reset();
         snap_.running = true;
         snap_.cash = cfg.initial_cash;
         snap_.equity = cfg.initial_cash;
@@ -522,6 +529,8 @@ bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
 }
 
 void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
+    // The trading thread outranks everything else in this process.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     RealTimeClock rt;
     ExecSim exec(cfg.exec);
     Portfolio pf(cfg.initial_cash);
@@ -579,6 +588,13 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
             lat_p50 = lat.percentile_ns(0.50);
             lat_p99 = lat.percentile_ns(0.99);
         }
+        // String-heavy orders copy happens before taking the lock, and only
+        // when orders actually changed; under the lock it's a pointer swap.
+        std::shared_ptr<const std::vector<OrderRecord>> fresh;
+        if (orders_dirty) {
+            fresh = std::make_shared<const std::vector<OrderRecord>>(orders);
+            orders_dirty = false;
+        }
         std::lock_guard lock(snap_mu_);
         snap_.running = true;
         snap_.halted = halted;
@@ -588,10 +604,7 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
             snap_.symbols[i].last_price = last_price[i];
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
         }
-        if (orders_dirty) {
-            snap_.orders = orders;   // string-heavy copy: only when changed
-            orders_dirty = false;
-        }
+        if (fresh) snap_orders_ = std::move(fresh);
         snap_.ticks = ticks;
         snap_.last_tick_ts_ms = last_ts_ms;
         snap_.lat_p50 = lat_p50;
@@ -852,7 +865,14 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 last_pub_ns = rt.now_ns();
                 snap_dirty = false;
             }
-            if (idle < 5'000) {
+            if (cfg.busy_spin) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+                // Stay scheduler-friendly without ever timer-sleeping: yield
+                // once in a while so same-core threads aren't starved.
+                if ((idle & 0x3FFF) == 0) Sleep(0);
+            } else if (idle < 5'000) {
 #if defined(__x86_64__) || defined(_M_X64)
                 _mm_pause();
 #endif
@@ -860,20 +880,25 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 Sleep(0);
             } else {
                 Sleep(5);   // delayed-quote cadence: don't pin a core for nothing
-                // Stale-feed halt: holding a position blind is the one state
-                // a trading loop must never sit in quietly.
-                if (!halted && cfg.risk.stale_feed_sec > 0 && ticks > 0 &&
-                    rt.now_ns() - last_md_ns >
-                        static_cast<int64_t>(cfg.risk.stale_feed_sec) * 1'000'000'000) {
-                    bool open_pos = false;
-                    for (size_t i = 0; i < n_sym && !open_pos; ++i)
-                        open_pos = pf.position(static_cast<uint32_t>(i + 1)).qty != 0.0;
-                    if (open_pos) {
-                        kill_all("RISK HALT (feed stale " +
-                                 std::to_string(cfg.risk.stale_feed_sec) +
-                                 "s with open position)");
-                        publish();
-                    }
+            }
+            // Stale-feed halt: holding a position blind is the one state a
+            // trading loop must never sit in quietly. Spin mode checks once
+            // per ~16k iterations (µs apart) to keep the spin pure; sleep
+            // mode checks every 5 ms tier iteration as before.
+            const bool stale_due =
+                cfg.busy_spin ? (idle & 0x3FFF) == 0 : idle >= 20'000;
+            if (stale_due && !halted && cfg.risk.stale_feed_sec > 0 &&
+                ticks > 0 &&
+                rt.now_ns() - last_md_ns >
+                    static_cast<int64_t>(cfg.risk.stale_feed_sec) * 1'000'000'000) {
+                bool open_pos = false;
+                for (size_t i = 0; i < n_sym && !open_pos; ++i)
+                    open_pos = pf.position(static_cast<uint32_t>(i + 1)).qty != 0.0;
+                if (open_pos) {
+                    kill_all("RISK HALT (feed stale " +
+                             std::to_string(cfg.risk.stale_feed_sec) +
+                             "s with open position)");
+                    publish();
                 }
             }
         }

@@ -4,6 +4,10 @@
 #include "alpaca_ws.h"
 #include "engine/clock.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <nlohmann/json.hpp>
 #include <simdjson.h>
 
@@ -112,6 +116,11 @@ void AlpacaFeed::log(std::string line) {
 }
 
 void AlpacaFeed::io_loop() {
+#ifdef _WIN32
+    // Tick ingest latency = this thread's wakeup + parse time; outrank
+    // normal threads so a busy UI never delays market data.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     alpaca_ensure_curl_init();
 
     AlpacaWs ws;
@@ -216,7 +225,9 @@ void AlpacaFeed::io_loop() {
             next_connect_ms = alpaca_steady_ms() + 1000;
             log("stream lost, reconnecting");
         } else if (r == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            // Block on the socket: ticks are handled the moment bytes land,
+            // not on the next timer expiry. Timeout only bounds stop_ checks.
+            ws.wait_readable(200);
         }
     }
 }

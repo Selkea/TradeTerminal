@@ -555,7 +555,13 @@ void AlpacaBroker::io_loop() {
             }
         }
 
-        if (!worked) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (!worked) {
+            // Fills wake us the instant bytes land; the 1 ms cap bounds how
+            // long a queued engine command (submit/cancel) can sit — small
+            // next to the REST round-trip it precedes.
+            if (io.ws.open()) io.ws.wait_readable(1);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
     }
 }
 

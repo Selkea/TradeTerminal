@@ -352,6 +352,9 @@ void App::draw() {
                         cfg.params = strat_mgr_.param_values();
                         cfg.bar_seconds = opts.bar_seconds;
                         cfg.risk = opts.risk;
+                        // Real-time feed => spin the engine thread instead of
+                        // sleeping; ticks are handled in ns, not after Sleep(5).
+                        cfg.busy_spin = opts.alpaca_data;
                         if (opts.record) {
                             std::error_code ec;
                             std::filesystem::create_directories(sessions_dir(), ec);

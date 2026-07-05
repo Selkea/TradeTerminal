@@ -19,7 +19,9 @@ add_library(tt_alpaca STATIC
     src/alpaca_broker.cpp
     src/alpaca_feed.cpp
 )
-target_link_libraries(tt_alpaca PUBLIC tt_engine PRIVATE CURL::libcurl nlohmann_json simdjson)
+target_link_libraries(tt_alpaca
+    PUBLIC tt_engine ws2_32   # ws2_32: select() in the socket wait path
+    PRIVATE CURL::libcurl nlohmann_json simdjson)
 
 add_executable(tt_engine_tests
     tests/test_spsc_ring.cpp

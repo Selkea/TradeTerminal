@@ -84,6 +84,11 @@ struct LiveConfig {
     // Non-empty: append every consumed market-data event to this .ttk file
     // for deterministic replay later.
     std::string capture_path;
+    // True: never sleep while idle — the engine thread spins (_mm_pause) and
+    // handles the next tick within nanoseconds instead of up to 5 ms.
+    // Dedicates most of a core; set it when a real-time feed drives the
+    // session. False keeps the sleep tiers sized for delayed quotes.
+    bool busy_spin = false;
 };
 
 // Replay a captured .ttk session through ExecSim with the deterministic
@@ -203,7 +208,12 @@ private:
     std::atomic<bool> live_running_{false};
     std::atomic<uint64_t> dropped_ticks_{0};
     mutable std::mutex snap_mu_;
-    LiveSnapshot snap_;
+    LiveSnapshot snap_;   // orders kept out-of-band, see snap_orders_
+    // Orders are published as an immutable shared vector so the string-heavy
+    // copy happens OUTSIDE snap_mu_ on both sides: the engine swaps a pointer
+    // under the lock, readers copy from the immutable vector after unlocking.
+    // Readers can never stall the engine's publish for more than a few loads.
+    std::shared_ptr<const std::vector<OrderRecord>> snap_orders_;
     std::vector<std::string> live_symbol_table_;   // symbol name -> id (index+1)
 };
 

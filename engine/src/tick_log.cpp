@@ -1,5 +1,9 @@
 #include "engine/tick_log.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <chrono>
 #include <cstring>
 
@@ -48,6 +52,10 @@ bool TickLogWriter::open(const std::string& path, const std::vector<std::string>
 }
 
 void TickLogWriter::drain_loop() {
+#ifdef _WIN32
+    // Background disk work: never compete with the engine/feed threads.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     EngineEvent ev;
     for (;;) {
         bool worked = false;

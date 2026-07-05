@@ -65,6 +65,23 @@ struct AlpacaWs {
         return true;
     }
 
+    // Blocks until the socket is readable, the timeout passes, or the
+    // connection is unusable. Lets I/O threads wake the instant bytes
+    // arrive instead of sleeping on a timer (which adds up to the full
+    // sleep to every tick/fill that lands mid-sleep).
+    bool wait_readable(int timeout_ms) {
+        if (!ws) return false;
+        curl_socket_t s = CURL_SOCKET_BAD;
+        if (curl_easy_getinfo(ws, CURLINFO_ACTIVESOCKET, &s) != CURLE_OK ||
+            s == CURL_SOCKET_BAD)
+            return false;
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(s, &rd);
+        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        return select(0, &rd, nullptr, nullptr, &tv) > 0;
+    }
+
     // Drives recv; calls on_msg(std::string_view) for each complete message.
     // Returns 0 = idle, 1 = progressed, -1 = connection lost.
     template <typename Fn>
