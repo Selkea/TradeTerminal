@@ -65,6 +65,6 @@ TEST_CASE("two-thread stress: 4M items, checksum and order intact") {
 TEST_CASE("SDK event PODs keep their ABI size") {
     CHECK(sizeof(tt::Bar) == 48);
     CHECK(sizeof(tt::Tick) == 40);
-    CHECK(sizeof(tt::OrderRequest) == 24);
+    CHECK(sizeof(tt::OrderRequest) == 48);   // SDK v2: stop + bracket fields
     CHECK(sizeof(tt::Fill) == 48);
 }

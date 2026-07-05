@@ -27,3 +27,8 @@ target_include_directories(doctest INTERFACE doctest)
 
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# SIMD JSON parsing for the market-data hot path (amalgamated release build).
+add_library(simdjson STATIC simdjson/simdjson.cpp)
+target_include_directories(simdjson PUBLIC simdjson)
+target_compile_options(simdjson PRIVATE -w)

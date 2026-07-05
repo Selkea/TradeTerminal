@@ -16,10 +16,14 @@ public:
                                      const std::string&, double)>;
 
     explicit BacktestPanel(Engine& eng) : eng_(eng) {}
-    void draw(bool* open, const std::string& strategy_name, const RunFn& run);
+    // suppress_result: a parameter sweep owns the engine's results right now.
+    void draw(bool* open, const std::string& strategy_name, bool suppress_result,
+              const RunFn& run);
 
     double cash() const { return cash_; }
     void set_cash(double c) { cash_ = c; }
+    // Last finished result, or null (chart overlays fills for its symbol).
+    const BacktestResult* result() const { return has_res_ ? &res_ : nullptr; }
 
 private:
     void draw_results();

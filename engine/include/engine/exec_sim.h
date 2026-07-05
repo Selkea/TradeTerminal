@@ -2,6 +2,11 @@
 // Paper execution simulator. Orders wait modeled wire latency, then fill
 // against observed prices with slippage + commission. Only ever sees
 // now_ns() values — identical behavior in backtest replay and live paper.
+//
+// Brackets: a filled parent with take_profit/stop_loss spawns two exit
+// children (limit TP + stop SL, one-cancels-other). Children get their own
+// ids from the same sequence; their fills surface like any other fill, but
+// no OrderRecord exists for them engine-side (they were never submitted).
 
 #include "tt/events.h"
 
@@ -51,7 +56,9 @@ private:
         uint32_t symbol_id;
         Side side;
         OrdType type;
-        double qty, limit_price;
+        double qty, limit_price, stop_price;
+        double take_profit = 0, stop_loss = 0;   // bracket spec (parent only)
+        uint64_t oco_sibling = 0;                // cancelled when this fills
         int64_t effective_ns;   // now + modeled latency at submit
     };
 

@@ -9,11 +9,19 @@
 
 namespace tt::ui {
 
+// A fill to mark on the price plot (triangle up = buy, down = sell).
+struct FillMarker {
+    double ts_sec;
+    double price;
+    bool buy;
+};
+
 class ChartPanel {
 public:
     ChartPanel(net::IpcClient& ipc, SeriesStore& store) : ipc_(ipc), store_(store) {}
 
-    void draw(bool* open);
+    // fills: markers for the currently charted symbol (App matches symbols).
+    void draw(bool* open, const std::vector<FillMarker>& fills = {});
     void show_symbol(const std::string& symbol);  // e.g. watchlist row clicked
 
     // Session persistence.

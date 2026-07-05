@@ -56,7 +56,8 @@ TEST_CASE("exec sim: latency gates fills; limits fill on crossing prices") {
     ExecSim ex(p);
     std::vector<Fill> fills;
 
-    const uint64_t id = ex.submit(OrderRequest{1, Side::Buy, OrdType::Market, {}, 100, 0}, 0);
+    const uint64_t id =
+        ex.submit(OrderRequest{1, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0}, 0);
     CHECK(id != 0);
     ex.on_price(1, 50.0, 500'000, fills);        // before latency elapses
     CHECK(fills.empty());
@@ -65,7 +66,7 @@ TEST_CASE("exec sim: latency gates fills; limits fill on crossing prices") {
     CHECK(fills[0].price == doctest::Approx(51.0));
 
     fills.clear();
-    ex.submit(OrderRequest{1, Side::Buy, OrdType::Limit, {}, 100, 48.0}, 2'000'000);
+    ex.submit(OrderRequest{1, Side::Buy, OrdType::Limit, {}, 100, 48.0, 0, 0, 0}, 2'000'000);
     ex.on_price(1, 49.0, 4'000'000, fills);      // above limit: no fill
     CHECK(fills.empty());
     ex.on_price(1, 47.5, 5'000'000, fills);      // crossed: fills at market price
@@ -73,7 +74,8 @@ TEST_CASE("exec sim: latency gates fills; limits fill on crossing prices") {
     CHECK(fills[0].price == doctest::Approx(47.5));
 
     fills.clear();
-    const uint64_t c = ex.submit(OrderRequest{1, Side::Sell, OrdType::Limit, {}, 100, 60.0}, 0);
+    const uint64_t c =
+        ex.submit(OrderRequest{1, Side::Sell, OrdType::Limit, {}, 100, 60.0, 0, 0, 0}, 0);
     CHECK(ex.cancel(c));
     ex.on_price(1, 65.0, 10'000'000, fills);
     CHECK(fills.empty());                        // cancelled order never fills

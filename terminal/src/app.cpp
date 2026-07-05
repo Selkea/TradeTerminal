@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 
 namespace tt::ui {
 
@@ -16,11 +17,20 @@ std::filesystem::path data_dir() {
     return std::filesystem::path(base ? base : ".") / "TradeTerminal";
 }
 std::string strategies_out_dir() { return (data_dir() / "strategies").string(); }
+std::string sessions_dir() { return (data_dir() / "sessions").string(); }
 std::string gxx_path() {
     const char* env = std::getenv("TT_GXX");
     return env ? env : TT_GXX_DEFAULT;
 }
 } // namespace
+
+std::optional<Account> App::alpaca_creds() const {
+    if (auto a = accounts_.active()) return a;
+    const char* k = std::getenv("APCA_API_KEY_ID");
+    const char* s = std::getenv("APCA_API_SECRET_KEY");
+    if (k && *k && s && *s) return Account{"env", k, s};
+    return std::nullopt;
+}
 
 App::App(std::string python_cmd, std::string service_dir)
     : ipc_(std::move(python_cmd), std::move(service_dir)),
@@ -29,14 +39,18 @@ App::App(std::string python_cmd, std::string service_dir)
       watchlist_(ipc_, quotes_),
       backtest_(engine_),
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
-      trade_(engine_),
+      trade_(engine_, sessions_dir()),
       blotter_(engine_),
-      positions_(engine_) {
+      positions_(engine_),
+      sweep_panel_(engine_),
+      accounts_((data_dir() / "accounts.json").string()) {
     net::IpcClient::Callbacks cbs;
     cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
-        if (engine_.live_running())
+        // When the real-time feed owns the session, delayed sidecar quotes
+        // still update the watchlist but must not reach the engine.
+        if (engine_.live_running() && !rt_feed_active_.load(std::memory_order_relaxed))
             engine_.push_live_tick(sym, q.ts_ms, q.price, q.day_volume);
     };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
@@ -48,6 +62,7 @@ App::App(std::string python_cmd, std::string service_dir)
         log_.add("candles: " + b.symbol + " " + b.interval + " x" +
                  std::to_string(b.candles.size()) + (b.cached ? " (cache)" : ""));
         start_pending_backtest(b);
+        stash_pending_sweep(b);
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
     };
 
@@ -59,6 +74,10 @@ App::App(std::string python_cmd, std::string service_dir)
     chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
     backtest_.set_cash(cfg_.backtest_cash);
     trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec);
+
+#ifdef TT_DEBUG
+    sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
+#endif
 
     ipc_.start(std::move(cbs));
 }
@@ -110,8 +129,123 @@ void App::queue_backtest(const std::string& sym, const std::string& ivl,
     ipc_.request_candles(sym, ivl, rng);
 }
 
+// ------------------------------------------------------------------ sweep
+
+// UI thread: capture the request + strategy and fetch the data.
+void App::queue_sweep(const SweepPanel::Request& rq) {
+    if (!ipc_.connected()) {
+        log_.add("sweep: feed is down, cannot fetch data");
+        return;
+    }
+    if (sweep_.running || engine_.running()) {
+        log_.add("sweep: engine busy, try again");
+        return;
+    }
+    {
+        std::lock_guard lock(pending_bt_mu_);
+        sweep_setup_ = SweepSetup{};
+        sweep_setup_.waiting = true;
+        sweep_setup_.req = rq;
+        sweep_setup_.strategy = strat_mgr_.active_strategy(sma_);
+        sweep_setup_.strategy_gen = host_.generation();
+    }
+    ipc_.request_candles(rq.symbol, rq.interval, rq.range);
+}
+
+// IPC thread: if this batch is what the sweep is waiting for, stash the
+// bars; the UI thread picks them up in pump_sweep().
+void App::stash_pending_sweep(net::CandleBatch& batch) {
+    std::lock_guard lock(pending_bt_mu_);
+    if (!sweep_setup_.waiting || sweep_setup_.req.symbol != batch.symbol ||
+        sweep_setup_.req.interval != batch.interval)
+        return;
+    sweep_setup_.bars.clear();
+    sweep_setup_.bars.reserve(batch.candles.size());
+    for (const Candle& c : batch.candles)
+        sweep_setup_.bars.push_back(
+            Bar{c.ts * 1'000'000'000, c.open, c.high, c.low, c.close, c.volume});
+    sweep_setup_.waiting = false;
+    sweep_setup_.ready = true;
+}
+
+void App::start_sweep_cell() {
+    const int nx = static_cast<int>(sweep_.xs.size());
+    const int ix = sweep_.done % nx;
+    const int iy = sweep_.done / nx;
+    BacktestConfig cfg = sweep_base_;   // copies bars (a few MB at worst)
+    cfg.params[sweep_.px] = sweep_.xs[static_cast<size_t>(ix)];
+    if (!sweep_.py.empty()) cfg.params[sweep_.py] = sweep_.ys[static_cast<size_t>(iy)];
+    if (!engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
+        log_.add("sweep: engine busy, aborted");
+        sweep_.running = false;
+    }
+}
+
+// UI thread, before the panels draw (so a finished cell's result is consumed
+// here and never stolen by the Backtest panel).
+void App::pump_sweep() {
+    // Fetched candles arrived: set up the grid and start cell 0.
+    {
+        std::lock_guard lock(pending_bt_mu_);
+        if (sweep_setup_.ready) {
+            sweep_setup_.ready = false;
+            const SweepPanel::Request& rq = sweep_setup_.req;
+            if (sweep_setup_.bars.size() < 3) {
+                log_.add("sweep: not enough data for " + rq.symbol);
+            } else if (sweep_setup_.strategy_gen != host_.generation()) {
+                log_.add("sweep: strategy changed while fetching data, cancelled");
+            } else {
+                sweep_base_ = BacktestConfig{};
+                sweep_base_.symbol = rq.symbol;
+                sweep_base_.bars = std::move(sweep_setup_.bars);
+                sweep_base_.initial_cash = rq.cash;
+                sweep_base_.params = strat_mgr_.param_values();
+                sweep_strategy_ = sweep_setup_.strategy;
+                sweep_gen_ = sweep_setup_.strategy_gen;
+
+                sweep_ = SweepPanel::State{};
+                sweep_.running = true;
+                sweep_.px = rq.px;
+                sweep_.py = rq.py;
+                sweep_.metric = rq.metric;
+                for (int i = 0; i < rq.nx; ++i)
+                    sweep_.xs.push_back(rq.x0 + (rq.x1 - rq.x0) * i / (rq.nx - 1));
+                if (!rq.py.empty())
+                    for (int i = 0; i < rq.ny; ++i)
+                        sweep_.ys.push_back(rq.y0 + (rq.y1 - rq.y0) * i / (rq.ny - 1));
+                const int total = rq.nx * (rq.py.empty() ? 1 : rq.ny);
+                sweep_.total = total;
+                sweep_.vals.assign(static_cast<size_t>(total),
+                                   std::numeric_limits<double>::quiet_NaN());
+                sweep_.label = rq.symbol + " " + rq.interval + " " + rq.range + " — " +
+                               strat_mgr_.active_name();
+                start_sweep_cell();
+            }
+        }
+    }
+
+    if (!sweep_.running) return;
+    if (sweep_gen_ != host_.generation()) {
+        log_.add("sweep: strategy recompiled mid-sweep, aborted");
+        sweep_.running = false;
+        return;
+    }
+    BacktestResult r;
+    if (!engine_.take_result(r)) return;
+    sweep_.vals[static_cast<size_t>(sweep_.done)] = sweep_metric_of(r, sweep_.metric);
+    ++sweep_.done;
+    if (sweep_.done >= sweep_.total) {
+        sweep_.running = false;
+        log_.add("sweep: finished " + std::to_string(sweep_.total) + " backtests (" +
+                 sweep_.label + ")");
+        return;
+    }
+    start_sweep_cell();
+}
+
 App::~App() {
     ipc_.stop();
+    if (signin_.worker.joinable()) signin_.worker.join();
     cfg_.watchlist = watchlist_.symbols();
     cfg_.chart_symbol = chart_.symbol();
     cfg_.chart_interval_idx = chart_.interval_idx();
@@ -130,9 +264,20 @@ void App::draw() {
         if (!had_ini_) setup_default_layout(dockspace_id);
     }
 
-    // Surface engine/strategy log lines in the console.
+    // Surface engine/strategy/broker/feed log lines in the console.
     std::string line;
     while (engine_.pop_log(line)) log_.add(std::move(line));
+    if (alpaca_)
+        while (alpaca_->pop_log(line)) log_.add(std::move(line));
+    if (alpaca_feed_) {
+        while (alpaca_feed_->pop_log(line)) log_.add(std::move(line));
+        // Session over: stop streaming (frees the one allowed connection).
+        if (!engine_.live_running()) {
+            rt_feed_active_.store(false, std::memory_order_relaxed);
+            alpaca_feed_.reset();
+            log_.add("live: real-time feed stopped");
+        }
+    }
 
     // TT_AUTORUN_BACKTEST=1: fire one AAPL backtest as soon as the feed is up
     // (headless end-to-end verification of the UI -> data -> engine path).
@@ -142,28 +287,113 @@ void App::draw() {
         log_.add("autorun: queued AAPL 1d 2y backtest (" + strat_mgr_.active_name() + ")");
     }
 
+    // TT_AUTORUN_SWEEP=1: 4x4 fast/slow grid — headless verification of the
+    // sweep runner ("sweep: finished 16 backtests" on success).
+    if (!autorun_sweep_done_ && ipc_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
+        autorun_sweep_done_ = true;
+        SweepPanel::Request rq;
+        rq.symbol = "AAPL";
+        rq.interval = "1d";
+        rq.range = "1y";
+        rq.px = "fast";
+        rq.x0 = 5;  rq.x1 = 20;  rq.nx = 4;
+        rq.py = "slow";
+        rq.y0 = 30; rq.y1 = 120; rq.ny = 4;
+        queue_sweep(rq);
+        log_.add("autorun: queued 4x4 fast/slow sweep");
+    }
+
+    pump_sweep();   // before the panels: sweep results must not be stolen
+
     draw_menu_bar();
-    if (show_chart_) chart_.draw(&show_chart_);
+    draw_signin_modal();
+    if (show_chart_) {
+        // Overlay fills for the charted symbol: last backtest + live session.
+        std::vector<FillMarker> fills;
+        const std::string chart_sym = chart_.symbol();
+        if (const BacktestResult* r = backtest_.result(); r && r->symbol == chart_sym)
+            for (const TradeRow& t : r->fills)
+                fills.push_back({static_cast<double>(t.ts_ns) / 1e9, t.price,
+                                 t.side == static_cast<uint8_t>(Side::Buy)});
+        if (engine_.live_running()) {
+            const LiveSnapshot s = engine_.live_snapshot();
+            for (const OrderRecord& o : s.orders)
+                if (o.status == OrderStatus::Filled && o.symbol == chart_sym)
+                    fills.push_back({static_cast<double>(o.ts_ns) / 1e9, o.fill_price,
+                                     o.side == static_cast<uint8_t>(Side::Buy)});
+        }
+        chart_.draw(&show_chart_, fills);
+    }
     if (show_watchlist_)
         watchlist_.draw(&show_watchlist_,
                         [this](const std::string& sym) { chart_.show_symbol(sym); });
     if (show_backtest_)
-        backtest_.draw(&show_backtest_, strat_mgr_.active_name(),
+        backtest_.draw(&show_backtest_, strat_mgr_.active_name(), sweep_.running,
                        [this](const std::string& sym, const std::string& ivl,
                               const std::string& rng, double cash) {
                            queue_backtest(sym, ivl, rng, cash);
                        });
+    if (show_sweep_)
+        sweep_panel_.draw(&show_sweep_, strat_mgr_.active_name(),
+                          strat_mgr_.param_values(), sweep_,
+                          [this](const SweepPanel::Request& rq) { queue_sweep(rq); },
+                          [this] {
+                              sweep_.running = false;
+                              log_.add("sweep: cancelled");
+                          });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_trade_)
-        trade_.draw(&show_trade_, strat_mgr_.active_name(),
-                    [this](const std::vector<std::string>& syms, double cash, int bar_sec) {
+        trade_.draw(&show_trade_, strat_mgr_.active_name(), alpaca_creds().has_value(),
+                    [this](const TradePanel::StartOpts& opts) {
+                        const std::vector<std::string>& syms = opts.symbols;
                         LiveConfig cfg;
                         cfg.symbols = syms;
-                        cfg.initial_cash = cash;
+                        cfg.initial_cash = opts.cash;
                         cfg.params = strat_mgr_.param_values();
-                        cfg.bar_seconds = bar_sec;
+                        cfg.bar_seconds = opts.bar_seconds;
+                        cfg.risk = opts.risk;
+                        if (opts.record) {
+                            std::error_code ec;
+                            std::filesystem::create_directories(sessions_dir(), ec);
+                            char name[32];
+                            const std::time_t now = std::time(nullptr);
+                            std::tm tm{};
+                            localtime_s(&tm, &now);
+                            std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
+                            cfg.capture_path = sessions_dir() + "\\" + name;
+                        }
+                        // Paper endpoint only for now; going live is a deliberate
+                        // future step, not an env-var surprise.
+                        std::unique_ptr<AlpacaBroker> broker;
+                        const std::optional<Account> creds = alpaca_creds();
+                        if (opts.alpaca_orders && creds) {
+                            AlpacaConfig ac;
+                            ac.key_id = creds->key_id;
+                            ac.secret = creds->secret;
+                            ac.symbols = syms;
+                            broker = std::make_unique<AlpacaBroker>(std::move(ac));
+                            cfg.broker = broker.get();
+                            log_.add("live: using Alpaca account '" + creds->name + "'");
+                        }
                         if (engine_.start_live(std::move(cfg),
                                                strat_mgr_.active_strategy(sma_))) {
+                            // Previous session's thread was joined inside
+                            // start_live, so replacing the old broker is safe.
+                            alpaca_ = std::move(broker);
+                            alpaca_feed_.reset();   // previous session's feed, if any
+                            rt_feed_active_.store(false, std::memory_order_relaxed);
+                            if (opts.alpaca_data && creds) {
+                                AlpacaFeedConfig fc;
+                                fc.key_id = creds->key_id;
+                                fc.secret = creds->secret;
+                                fc.symbols = syms;
+                                alpaca_feed_ = std::make_unique<AlpacaFeed>(
+                                    std::move(fc), [this](const EngineEvent& ev) {
+                                        return engine_.push_feed_event(ev);
+                                    });
+                                alpaca_feed_->start();
+                                rt_feed_active_.store(true, std::memory_order_relaxed);
+                            }
                             for (const std::string& sym : syms)
                                 watchlist_.ensure(sym);  // quote subscription feeds the engine
                             std::string joined;
@@ -174,14 +404,35 @@ void App::draw() {
                         } else {
                             log_.add("live: cannot start (engine busy)");
                         }
+                    },
+                    [this](const std::string& path) {
+                        TickLog log;
+                        std::string err;
+                        if (!tick_log_read(path, log, err)) {
+                            log_.add("replay: " + err);
+                            return;
+                        }
+                        ReplayConfig cfg;
+                        cfg.name = "replay:" +
+                                   std::filesystem::path(path).filename().string();
+                        cfg.log = std::move(log);
+                        cfg.initial_cash = trade_.cash();
+                        cfg.params = strat_mgr_.param_values();
+                        if (engine_.start_replay(std::move(cfg),
+                                                 strat_mgr_.active_strategy(sma_)))
+                            log_.add("replay: running " + path + " (" +
+                                     strat_mgr_.active_name() + ")");
+                        else
+                            log_.add("replay: engine busy, try again");
                     });
     if (show_blotter_) blotter_.draw(&show_blotter_);
     if (show_positions_) positions_.draw(&show_positions_);
     if (show_log_) log_.draw("Log Console", &show_log_);
 
-    // TT_SIM_TICKS=1: synthesize a 2 Hz random walk for the live session —
-    // demo/verification when the market is closed.
-    if (engine_.live_running() && std::getenv("TT_SIM_TICKS")) {
+#ifdef TT_DEBUG
+    // Debug menu (or TT_SIM_TICKS=1): synthesize a 2 Hz random walk for the
+    // live session — demo/verification when the market is closed.
+    if (engine_.live_running() && sim_ticks_) {
         const double now = ImGui::GetTime();
         if (now >= sim_tick_next_s_) {
             sim_tick_next_s_ = now + 0.5;
@@ -195,6 +446,7 @@ void App::draw() {
                 engine_.push_live_tick(sym, ms, sim_tick_px_, 0.0);
         }
     }
+#endif
 
     // TT_AUTORUN_LIVE=1: start a session, manual buy, kill switch — headless
     // verification of the whole live path.
@@ -231,12 +483,146 @@ void App::draw() {
     if (show_implot_demo_) ImPlot::ShowDemoWindow(&show_implot_demo_);
 }
 
+void App::draw_account_menu() {
+    if (!ImGui::BeginMenu("Account")) return;
+    const std::string& active = accounts_.active_name();
+    if (active.empty())
+        ImGui::TextDisabled("Not signed in");
+    else
+        ImGui::TextDisabled("Signed in: %s", active.c_str());
+    ImGui::Separator();
+
+    if (ImGui::MenuItem("Sign In...")) signin_.request_open = true;
+
+    if (ImGui::BeginMenu("Switch", !accounts_.names().empty())) {
+        for (const std::string& name : accounts_.names())
+            if (ImGui::MenuItem(name.c_str(), nullptr, name == active) && name != active) {
+                if (accounts_.get(name)) {
+                    accounts_.set_active(name);
+                    log_.add("account: switched to '" + name + "'");
+                } else {
+                    log_.add("account: cannot decrypt '" + name +
+                             "' (saved by another Windows user?)");
+                }
+            }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::MenuItem("Sign Out", nullptr, false, !active.empty())) {
+        log_.add("account: signed out of '" + active + "'");
+        accounts_.sign_out();
+    }
+
+    ImGui::Separator();
+    if (ImGui::BeginMenu("Remove", !accounts_.names().empty())) {
+        ImGui::TextDisabled("Deletes the saved credentials");
+        for (const std::string& name : accounts_.names())
+            if (ImGui::MenuItem(name.c_str())) {
+                accounts_.remove(name);
+                log_.add("account: removed '" + name + "'");
+            }
+        ImGui::EndMenu();
+    }
+    ImGui::EndMenu();
+}
+
+void App::draw_signin_modal() {
+    if (signin_.request_open) {
+        signin_.request_open = false;
+        signin_.status.store(0);
+        {
+            std::lock_guard lock(signin_.mu);
+            signin_.detail.clear();
+        }
+        ImGui::OpenPopup("Sign In to Alpaca");
+    }
+    if (!ImGui::BeginPopupModal("Sign In to Alpaca", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    const int status = signin_.status.load();
+    if (status == 2) {   // worker verified the credentials — save and close
+        if (signin_.worker.joinable()) signin_.worker.join();
+        Account a{signin_.name[0] ? signin_.name : "default", signin_.key, signin_.secret};
+        accounts_.upsert(a, /*make_active=*/true);
+        std::string detail;
+        {
+            std::lock_guard lock(signin_.mu);
+            detail = signin_.detail;
+        }
+        log_.add("account: signed in as '" + a.name + "' (" + detail + ")");
+        signin_.status.store(0);
+        signin_.secret[0] = '\0';   // no plaintext left in the UI buffer
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    const bool busy = status == 1;
+    ImGui::BeginDisabled(busy);
+    ImGui::SetNextItemWidth(280);
+    ImGui::InputText("Name", signin_.name, sizeof signin_.name);
+    ImGui::SetItemTooltip("Label shown in the Account menu (e.g. \"paper\")");
+    ImGui::SetNextItemWidth(280);
+    ImGui::InputText("API key ID", signin_.key, sizeof signin_.key);
+    ImGui::SetNextItemWidth(280);
+    ImGui::InputText("API secret", signin_.secret, sizeof signin_.secret,
+                     ImGuiInputTextFlags_Password);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Stored encrypted (Windows DPAPI, this user only).");
+
+    if (busy) {
+        ImGui::TextDisabled("Verifying against the paper endpoint...");
+    } else if (status == 3) {
+        std::lock_guard lock(signin_.mu);
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.25f, 1), "Failed: %s",
+                           signin_.detail.c_str());
+    }
+
+    const bool have_input = signin_.key[0] && signin_.secret[0];
+    ImGui::BeginDisabled(busy || !have_input);
+    if (ImGui::Button("Verify & Sign In")) {
+        if (signin_.worker.joinable()) signin_.worker.join();
+        signin_.status.store(1);
+        const std::string key = signin_.key, secret = signin_.secret;
+        signin_.worker = std::thread([this, key, secret] {
+            std::string detail;
+            const bool ok =
+                alpaca_verify_account(AlpacaConfig{}.rest_url, key, secret, detail);
+            {
+                std::lock_guard lock(signin_.mu);
+                signin_.detail = std::move(detail);
+            }
+            signin_.status.store(ok ? 2 : 3);
+        });
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save without verifying")) {
+        Account a{signin_.name[0] ? signin_.name : "default", signin_.key, signin_.secret};
+        accounts_.upsert(a, /*make_active=*/true);
+        log_.add("account: saved '" + a.name + "' (not verified)");
+        signin_.secret[0] = '\0';
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(busy);   // let the worker finish; it writes signin_ state
+    if (ImGui::Button("Cancel")) {
+        signin_.secret[0] = '\0';
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
 void App::draw_menu_bar() {
     if (!ImGui::BeginMainMenuBar()) return;
+    draw_account_menu();
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Chart", nullptr, &show_chart_);
         ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
         ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
+        ImGui::MenuItem("Optimizer", nullptr, &show_sweep_);
         ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
         ImGui::MenuItem("Trade", nullptr, &show_trade_);
         ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
@@ -244,6 +630,14 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Log Console", nullptr, &show_log_);
         ImGui::EndMenu();
     }
+#ifdef TT_DEBUG
+    if (ImGui::BeginMenu("Debug")) {
+        ImGui::MenuItem("Simulate ticks", nullptr, &sim_ticks_);
+        ImGui::SetItemTooltip("Feed the live session a 2 Hz random walk — "
+                              "test strategies while the market is closed");
+        ImGui::EndMenu();
+    }
+#endif
     if (ImGui::BeginMenu("Help")) {
         ImGui::MenuItem("ImGui Demo", nullptr, &show_imgui_demo_);
         ImGui::MenuItem("ImPlot Demo", nullptr, &show_implot_demo_);

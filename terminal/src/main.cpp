@@ -10,6 +10,15 @@
 #include "implot.h"
 #include <GLFW/glfw3.h>
 
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#include <dwmapi.h>
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -58,6 +67,15 @@ int main() {
         icon_images[i].pixels = const_cast<unsigned char*>(src.pixels);
     }
     glfwSetWindowIcon(window, tt::ui::kAppIconCount, icon_images);
+
+#ifdef _WIN32
+    // Match the OS-drawn titlebar to the app's dark ImGui theme.
+    {
+        const BOOL dark = TRUE;
+        DwmSetWindowAttribute(glfwGetWin32Window(window), DWMWA_USE_IMMERSIVE_DARK_MODE,
+                              &dark, sizeof(dark));
+    }
+#endif
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

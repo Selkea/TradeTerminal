@@ -3,6 +3,7 @@ configure_file(src/dev_paths.h.in ${CMAKE_CURRENT_BINARY_DIR}/dev_paths.h @ONLY)
 
 add_executable(tt_terminal
     src/main.cpp
+    src/account_store.cpp
     src/app.cpp
     src/config.cpp
     src/candle_plot.cpp
@@ -12,6 +13,7 @@ add_executable(tt_terminal
     src/panels/watchlist.cpp
     src/panels/backtest.cpp
     src/panels/strategy_mgr.cpp
+    src/panels/sweep.cpp
     src/panels/trade.cpp
     src/panels/blotter.cpp
     src/panels/positions.cpp
@@ -24,14 +26,21 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico)
 endif()
 target_include_directories(tt_terminal PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+# Debug-only features (Debug menu, tick simulator) compile out of release.
+target_compile_definitions(tt_terminal PRIVATE $<$<CONFIG:Debug>:TT_DEBUG>)
 target_link_libraries(tt_terminal PRIVATE
     tt_engine
+    tt_alpaca
     imgui
     implot
     nlohmann_json
     opengl32
     ws2_32
+    crypt32     # DPAPI (account_store)
 )
+if(WIN32)
+    target_link_libraries(tt_terminal PRIVATE dwmapi)
+endif()
 
 # Release builds are windowed (no console); debug keeps the console for logs.
 if(CMAKE_BUILD_TYPE STREQUAL "Release")

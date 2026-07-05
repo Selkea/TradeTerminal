@@ -12,7 +12,9 @@
 
 #include "events.h"
 
-#define TT_SDK_VERSION 1u
+// v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
+// OrdType gained Stop. Old DLLs are rejected by the version check.
+#define TT_SDK_VERSION 2u
 
 namespace tt {
 

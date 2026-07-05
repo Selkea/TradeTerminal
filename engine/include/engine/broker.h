@@ -4,21 +4,28 @@
 // Today, execution is simulated: the engine calls ExecSim directly and fills
 // come back synchronously as prices arrive. To trade against a real broker
 // (Alpaca, IBKR, ...), implement this interface and route EngineCtx's
-// submit/cancel through it instead of ExecSim.
+// submit/cancel through it instead of ExecSim (LiveConfig::broker).
 //
 // Contract for implementers:
-//  - submit()/cancel() are called on the engine thread and must NOT block:
-//    hand the request to your own I/O thread (REST/websocket/FIX) and return.
-//  - Acknowledgements, fills, and rejects come back by pushing OrderEvents
-//    into the engine's md_ring (or a dedicated broker ring) — never by
-//    calling into the engine synchronously from your I/O thread.
+//  - submit()/cancel()/cancel_all()/flatten() are called on the engine
+//    thread and must NOT block: hand the request to your own I/O thread
+//    (REST/websocket/FIX) and return.
+//  - Acknowledgements, fills, and rejects come back as EngineEvents through
+//    poll_event(), which the engine drains every loop iteration. Produce
+//    them from your I/O thread into your own SPSC ring — never call into
+//    the engine synchronously.
+//      Fill        -> EvType::Fill   (u.fill + symbol_id + ts_event_ns)
+//      Cancelled   -> EvType::OrderCancel
+//      Rejected    -> EvType::OrderCancel with kEvFlagRejected set
 //  - Order ids: return your own monotonically increasing id immediately;
-//    map it to the broker's id internally.
+//    map it to the broker's id internally. Return 0 to reject client-side
+//    (not connected, queue full, ...).
 //  - The kill switch calls cancel_all() then flatten(); both must be safe to
 //    call repeatedly and while orders are in flight.
 //
-// PaperBroker (the ExecSim wrapper) is the reference implementation shape.
+// AlpacaBroker is the reference implementation.
 
+#include "engine/events.h"
 #include "tt/events.h"
 
 #include <cstdint>
@@ -32,6 +39,11 @@ public:
     virtual uint64_t submit(const OrderRequest& r, int64_t now_ns) = 0;
     virtual bool cancel(uint64_t order_id) = 0;
     virtual void cancel_all() = 0;
+    // Close every open position at market (kill switch, after cancel_all).
+    virtual void flatten() = 0;
+
+    // Engine thread: drain pending fills/cancels/rejects. False = none left.
+    virtual bool poll_event(EngineEvent& out) = 0;
 
     // True once the adapter is connected and accepting orders.
     virtual bool ready() const = 0;

@@ -12,6 +12,7 @@
 #include "engine/latency.h"
 #include "engine/portfolio.h"
 #include "engine/spsc_ring.h"
+#include "engine/tick_log.h"
 #include "tt/strategy_api.h"
 
 #include <atomic>
@@ -60,7 +61,15 @@ struct RiskLimits {
     double max_order_qty = 1'000;
     double max_position_qty = 5'000;
     double price_band_pct = 0.20;   // limit orders within ±20% of last trade
+
+    // Automated halts — the engine pulls the kill switch itself (cancel all,
+    // flatten, halt strategy). 0 = disabled.
+    double daily_max_loss = 0;      // $ of equity lost since session start
+    double max_drawdown_pct = 0;    // fraction lost from the session equity high
+    int stale_feed_sec = 0;         // no ticks this long with a position open
 };
+
+class IBrokerAdapter;
 
 struct LiveConfig {
     std::vector<std::string> symbols;
@@ -69,6 +78,22 @@ struct LiveConfig {
     std::map<std::string, double> params;
     RiskLimits risk{};
     int bar_seconds = 60;           // tick->bar aggregation for on_bar
+    // Optional real-broker routing (caller-owned, must outlive the session).
+    // Null = orders fill in ExecSim as before.
+    IBrokerAdapter* broker = nullptr;
+    // Non-empty: append every consumed market-data event to this .ttk file
+    // for deterministic replay later.
+    std::string capture_path;
+};
+
+// Replay a captured .ttk session through ExecSim with the deterministic
+// backtest clock: same ticks in, bit-identical run out.
+struct ReplayConfig {
+    std::string name;               // shown as the result's symbol column
+    TickLog log;
+    double initial_cash = 100'000.0;
+    ExecParams exec{};
+    std::map<std::string, double> params;
 };
 
 enum class OrderStatus : uint8_t { Working = 0, Filled, Cancelled, Rejected };
@@ -98,6 +123,9 @@ struct LiveSnapshot {
     std::vector<OrderRecord> orders;   // newest last, capped
     uint64_t ticks = 0, dropped_ticks = 0;
     int64_t last_tick_ts_ms = 0;       // most recent tick across any symbol
+    // Tick -> order submit latency for this session (strategy orders only).
+    int64_t lat_p50 = 0, lat_p99 = 0, lat_max = 0;
+    uint64_t lat_count = 0;
 };
 
 class Engine {
@@ -108,6 +136,8 @@ public:
     // Strategy is caller-owned and must outlive the run; on_init must fully
     // reset its state. Returns false if a backtest is already running.
     bool start_backtest(BacktestConfig cfg, IStrategy* strategy);
+    // Same contract and result plumbing as start_backtest.
+    bool start_replay(ReplayConfig cfg, IStrategy* strategy);
 
     bool running() const { return running_.load(std::memory_order_relaxed); }
     // True exactly once per finished run.
@@ -124,9 +154,16 @@ public:
     // symbol isn't part of the running session).
     void push_live_tick(const std::string& symbol, int64_t ts_ms, double price,
                         double day_volume);
+    // Real-time feed thread (exactly one producer): push a normalized
+    // EngineEvent into the live session. False = ring full, caller counts
+    // the drop. Separate ring from push_live_tick so both sources keep
+    // single-producer semantics.
+    bool push_feed_event(const EngineEvent& ev) { return feed_ring_->try_push(ev); }
     // UI thread: async commands consumed by the engine thread.
     void request_cancel(uint64_t order_id);
-    void submit_manual(uint32_t symbol_id, bool buy, double qty);
+    // take_profit/stop_loss > 0: attach bracket exit legs (OCO).
+    void submit_manual(uint32_t symbol_id, bool buy, double qty,
+                       double take_profit = 0, double stop_loss = 0);
     void kill_switch();                     // cancel all + flatten + halt strategy
     LiveSnapshot live_snapshot() const;
 
@@ -138,14 +175,17 @@ private:
         uint64_t order_id = 0;
         double qty = 0;
         uint32_t symbol_id = 0;
+        double take_profit = 0, stop_loss = 0;   // Manual bracket legs
     };
     void run(BacktestConfig cfg, IStrategy* strategy);
+    void run_replay(ReplayConfig cfg, IStrategy* strategy);
     void run_live(LiveConfig cfg, IStrategy* strategy);
     void push_log(std::string line);
 
     // Heap-allocated: the 4 MiB buffer must never land on a caller's stack.
     using MdRing = SpscRing<EngineEvent, 1 << 16>;
     std::unique_ptr<MdRing> md_ring_ = std::make_unique<MdRing>();
+    std::unique_ptr<MdRing> feed_ring_ = std::make_unique<MdRing>();   // real-time feed
     std::thread engine_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> has_result_{false};

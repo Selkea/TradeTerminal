@@ -23,6 +23,16 @@ public:
     void apply(const Fill& f);
     void mark(uint32_t symbol_id, double price);  // update last trade price
 
+    // Broker reconciliation at session start: adopt an existing position /
+    // the real account cash without booking a fill.
+    void seed_position(uint32_t symbol_id, double qty, double avg_price) {
+        Slot& s = slot(symbol_id);
+        s.qty = qty;
+        s.avg_price = avg_price;
+        if (s.last_price == 0.0) s.last_price = avg_price;
+    }
+    void set_cash(double cash) { cash_ = cash; }
+
     double cash() const { return cash_; }
     double equity() const;
     Position position(uint32_t symbol_id) const;

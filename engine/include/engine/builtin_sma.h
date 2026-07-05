@@ -45,10 +45,12 @@ public:
         if (prev_valid_) {
             const double pos = ctx.position(sym_).qty;
             if (prev_diff_ <= 0.0 && diff > 0.0 && pos <= 0.0) {
-                OrderRequest r{sym_, Side::Buy, OrdType::Market, {}, qty_, 0.0};
+                OrderRequest r{sym_, Side::Buy, OrdType::Market, {}, qty_, 0.0, 0.0,
+                               0.0, 0.0};
                 ctx.submit_order(r);
             } else if (prev_diff_ >= 0.0 && diff < 0.0 && pos > 0.0) {
-                OrderRequest r{sym_, Side::Sell, OrdType::Market, {}, pos, 0.0};
+                OrderRequest r{sym_, Side::Sell, OrdType::Market, {}, pos, 0.0, 0.0,
+                               0.0, 0.0};
                 ctx.submit_order(r);
             }
         }

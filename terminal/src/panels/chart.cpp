@@ -71,7 +71,7 @@ void ChartPanel::rebuild_plot_arrays(const SeriesStore::Series& s) {
     fit_next_ = true;
 }
 
-void ChartPanel::draw(bool* open) {
+void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills) {
     const bool visible = ImGui::Begin("Chart", open);
     tab_drag_hint();
     if (!visible) {
@@ -124,6 +124,28 @@ void ChartPanel::draw(bool* open) {
             if (n > 0)
                 PlotCandlestick(sym_, xs_.data(), opens_.data(), highs_.data(),
                                 lows_.data(), closes_.data(), n, width_sec_);
+            if (!fills.empty()) {
+                // Session/backtest fills on top of the candles.
+                std::vector<double> bx, by, sx, sy;
+                for (const FillMarker& f : fills) {
+                    (f.buy ? bx : sx).push_back(f.ts_sec);
+                    (f.buy ? by : sy).push_back(f.price);
+                }
+                if (!bx.empty()) {
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Up, 6.0f,
+                                               ImVec4(0.2f, 0.9f, 0.4f, 1.0f), 1.0f,
+                                               ImVec4(0.05f, 0.35f, 0.15f, 1.0f));
+                    ImPlot::PlotScatter("##buys", bx.data(), by.data(),
+                                        static_cast<int>(bx.size()));
+                }
+                if (!sx.empty()) {
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Down, 6.0f,
+                                               ImVec4(0.95f, 0.35f, 0.3f, 1.0f), 1.0f,
+                                               ImVec4(0.4f, 0.1f, 0.08f, 1.0f));
+                    ImPlot::PlotScatter("##sells", sx.data(), sy.data(),
+                                        static_cast<int>(sx.size()));
+                }
+            }
             ImPlot::EndPlot();
         }
         if (fit_next_) ImPlot::SetNextAxesToFit();

@@ -26,7 +26,8 @@ int max_range_idx(int interval_idx) {
 }
 } // namespace
 
-void BacktestPanel::draw(bool* open, const std::string& strategy_name, const RunFn& run) {
+void BacktestPanel::draw(bool* open, const std::string& strategy_name, bool suppress_result,
+                         const RunFn& run) {
     const bool visible = ImGui::Begin("Backtest", open);
     tab_drag_hint();
     if (!visible) {
@@ -35,7 +36,7 @@ void BacktestPanel::draw(bool* open, const std::string& strategy_name, const Run
     }
 
     BacktestResult r;
-    if (eng_.take_result(r)) {
+    if (!suppress_result && eng_.take_result(r)) {
         res_ = std::move(r);
         has_res_ = true;
     }

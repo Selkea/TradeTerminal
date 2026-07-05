@@ -9,7 +9,7 @@
 namespace tt {
 
 enum class Side : uint8_t { Buy = 1, Sell = 2 };
-enum class OrdType : uint8_t { Market = 1, Limit = 2 };
+enum class OrdType : uint8_t { Market = 1, Limit = 2, Stop = 3 };
 enum class OrdStatus : uint8_t { New, Accepted, Filled, PartFilled, Cancelled, Rejected };
 
 struct Bar {
@@ -30,9 +30,14 @@ struct OrderRequest {
     OrdType  type;
     uint8_t  _pad[2]{};
     double   qty;
-    double   limit_price;   // ignored for Market
+    double   limit_price;   // Limit only
+    double   stop_price;    // Stop only: trigger price
+    // Bracket exit legs, spawned when this order fills (0 = none). The two
+    // children are one-cancels-other.
+    double   take_profit;   // exit limit price
+    double   stop_loss;     // exit stop trigger
 };
-static_assert(sizeof(OrderRequest) == 24);
+static_assert(sizeof(OrderRequest) == 48);
 
 struct Fill {
     uint64_t order_id;
