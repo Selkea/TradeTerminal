@@ -1,4 +1,5 @@
 #include "app.h"
+#include "app_icon.h"
 #include "dev_paths.h"
 
 #include "engine/version.h"
@@ -47,6 +48,16 @@ int main() {
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);  // vsync — the UI thread is not the hot path
+
+    // Window/taskbar icon (GLFWimage.pixels wants non-const, hence the cast).
+    GLFWimage icon_images[tt::ui::kAppIconCount];
+    for (int i = 0; i < tt::ui::kAppIconCount; ++i) {
+        const tt::ui::AppIconImage& src = tt::ui::kAppIcons[i];
+        icon_images[i].width = src.width;
+        icon_images[i].height = src.height;
+        icon_images[i].pixels = const_cast<unsigned char*>(src.pixels);
+    }
+    glfwSetWindowIcon(window, tt::ui::kAppIconCount, icon_images);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

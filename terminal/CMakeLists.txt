@@ -16,6 +16,13 @@ add_executable(tt_terminal
     src/panels/blotter.cpp
     src/panels/positions.cpp
 )
+if(WIN32)
+    target_sources(tt_terminal PRIVATE resources/app.rc)
+    # windres doesn't emit a depfile, so ninja can't see that app.rc embeds
+    # app.ico -- without this, changing the icon silently relinks the old one.
+    set_source_files_properties(resources/app.rc PROPERTIES OBJECT_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico)
+endif()
 target_include_directories(tt_terminal PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(tt_terminal PRIVATE
     tt_engine
