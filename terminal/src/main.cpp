@@ -14,6 +14,7 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #include <dwmapi.h>
+#include <timeapi.h>   // timeBeginPeriod
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
@@ -57,6 +58,12 @@ int main() {
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);  // vsync — the UI thread is not the hot path
+
+    // Windows' default timer granularity is ~15.6 ms, which silently
+    // stretches every Sleep() and socket timeout in the process. 1 ms
+    // granularity keeps the engine's sleep tiers and the I/O threads'
+    // wait caps meaning what they say.
+    timeBeginPeriod(1);
 
     // Window/taskbar icon (GLFWimage.pixels wants non-const, hence the cast).
     GLFWimage icon_images[tt::ui::kAppIconCount];
@@ -138,5 +145,6 @@ int main() {
     ImGui::DestroyContext();
     glfwDestroyWindow(window);
     glfwTerminate();
+    timeEndPeriod(1);
     return 0;
 }

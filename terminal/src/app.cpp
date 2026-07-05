@@ -355,6 +355,10 @@ void App::draw() {
                         // Real-time feed => spin the engine thread instead of
                         // sleeping; ticks are handled in ns, not after Sleep(5).
                         cfg.busy_spin = opts.alpaca_data;
+                        // Optional core pinning (TT_PIN_ENGINE / TT_PIN_FEED =
+                        // core index): kills scheduler-migration jitter.
+                        if (const char* pin = std::getenv("TT_PIN_ENGINE"))
+                            cfg.pin_core = std::atoi(pin);
                         if (opts.record) {
                             std::error_code ec;
                             std::filesystem::create_directories(sessions_dir(), ec);
@@ -390,6 +394,9 @@ void App::draw() {
                                 fc.key_id = creds->key_id;
                                 fc.secret = creds->secret;
                                 fc.symbols = syms;
+                                fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
+                                if (const char* pin = std::getenv("TT_PIN_FEED"))
+                                    fc.pin_core = std::atoi(pin);
                                 alpaca_feed_ = std::make_unique<AlpacaFeed>(
                                     std::move(fc), [this](const EngineEvent& ev) {
                                         return engine_.push_feed_event(ev);

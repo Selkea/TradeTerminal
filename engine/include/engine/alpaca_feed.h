@@ -30,6 +30,12 @@ struct AlpacaFeedConfig {
     std::string secret;
     std::string stream_url = "wss://stream.data.alpaca.markets/v2/iex";
     std::vector<std::string> symbols;   // session symbol table: id = index + 1
+    // True: spin on the socket instead of blocking in select() — removes the
+    // ~10-50 µs kernel wakeup from tick ingest at the cost of a core. Worth
+    // it on SIP-rate data; overkill for IEX.
+    bool busy_poll = false;
+    // >= 0: pin the feed I/O thread to this core (keep it off the engine's).
+    int pin_core = -1;
 };
 
 // One parsed market-data message (exposed for unit tests). The data stream

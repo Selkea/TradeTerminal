@@ -120,6 +120,9 @@ void AlpacaFeed::io_loop() {
     // Tick ingest latency = this thread's wakeup + parse time; outrank
     // normal threads so a busy UI never delays market data.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    if (cfg_.pin_core >= 0 && cfg_.pin_core < 64)
+        if (SetThreadAffinityMask(GetCurrentThread(), 1ull << cfg_.pin_core))
+            log("feed thread pinned to core " + std::to_string(cfg_.pin_core));
 #endif
     alpaca_ensure_curl_init();
 
@@ -225,9 +228,17 @@ void AlpacaFeed::io_loop() {
             next_connect_ms = alpaca_steady_ms() + 1000;
             log("stream lost, reconnecting");
         } else if (r == 0) {
-            // Block on the socket: ticks are handled the moment bytes land,
-            // not on the next timer expiry. Timeout only bounds stop_ checks.
-            ws.wait_readable(200);
+            if (cfg_.busy_poll) {
+                // Spin: removes the kernel wakeup from tick ingest entirely.
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            } else {
+                // Block on the socket: ticks are handled the moment bytes
+                // land, not on the next timer expiry. Timeout only bounds
+                // stop_ checks.
+                ws.wait_readable(200);
+            }
         }
     }
 }

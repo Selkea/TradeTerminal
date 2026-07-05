@@ -89,6 +89,9 @@ struct LiveConfig {
     // Dedicates most of a core; set it when a real-time feed drives the
     // session. False keeps the sleep tiers sized for delayed quotes.
     bool busy_spin = false;
+    // >= 0: pin the engine thread to this core (avoids scheduler migrations
+    // and the cache refills they cost). Pick a core the feed isn't on.
+    int pin_core = -1;
 };
 
 // Replay a captured .ttk session through ExecSim with the deterministic

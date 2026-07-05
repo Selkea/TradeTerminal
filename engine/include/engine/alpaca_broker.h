@@ -124,6 +124,11 @@ private:
     std::mutex log_mu_;
     std::deque<std::string> logs_;
 
+    // Loopback UDP self-pipe: push_cmd() sends one byte so the I/O thread's
+    // select() wakes immediately for queued commands (µs, not the wait cap).
+    uintptr_t wake_tx_ = static_cast<uintptr_t>(-1);
+    uintptr_t wake_rx_ = static_cast<uintptr_t>(-1);
+
     std::thread io_thread_;   // last member: starts in ctor, joined in dtor
 };
 

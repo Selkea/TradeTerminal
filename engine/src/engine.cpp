@@ -531,6 +531,13 @@ bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
 void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
     // The trading thread outranks everything else in this process.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    if (cfg.pin_core >= 0 && cfg.pin_core < 64) {
+        if (SetThreadAffinityMask(GetCurrentThread(), 1ull << cfg.pin_core))
+            push_log("live: engine thread pinned to core " + std::to_string(cfg.pin_core));
+        else
+            push_log("live: could not pin engine thread to core " +
+                     std::to_string(cfg.pin_core));
+    }
     RealTimeClock rt;
     ExecSim exec(cfg.exec);
     Portfolio pf(cfg.initial_cash);

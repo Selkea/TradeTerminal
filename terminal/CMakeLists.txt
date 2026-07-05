@@ -37,6 +37,7 @@ target_link_libraries(tt_terminal PRIVATE
     opengl32
     ws2_32
     crypt32     # DPAPI (account_store)
+    winmm       # timeBeginPeriod (1 ms timer granularity)
 )
 if(WIN32)
     target_link_libraries(tt_terminal PRIVATE dwmapi)
