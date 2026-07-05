@@ -26,6 +26,12 @@ AppConfig AppConfig::load(const std::string& path) {
     c.backtest_cash = j.value("backtest_cash", c.backtest_cash);
     c.trade_cash = j.value("trade_cash", c.trade_cash);
     c.trade_bar_sec = j.value("trade_bar_sec", c.trade_bar_sec);
+    c.alert_webhook = j.value("alert_webhook", c.alert_webhook);
+    c.risk_max_order_qty = j.value("risk_max_order_qty", c.risk_max_order_qty);
+    c.risk_max_position_qty = j.value("risk_max_position_qty", c.risk_max_position_qty);
+    c.risk_daily_max_loss = j.value("risk_daily_max_loss", c.risk_daily_max_loss);
+    c.risk_max_drawdown_pct = j.value("risk_max_drawdown_pct", c.risk_max_drawdown_pct);
+    c.risk_stale_feed_sec = j.value("risk_stale_feed_sec", c.risk_stale_feed_sec);
     return c;
 }
 
@@ -38,6 +44,12 @@ void AppConfig::save(const std::string& path) const {
         {"backtest_cash", backtest_cash},
         {"trade_cash", trade_cash},
         {"trade_bar_sec", trade_bar_sec},
+        {"alert_webhook", alert_webhook},
+        {"risk_max_order_qty", risk_max_order_qty},
+        {"risk_max_position_qty", risk_max_position_qty},
+        {"risk_daily_max_loss", risk_daily_max_loss},
+        {"risk_max_drawdown_pct", risk_max_drawdown_pct},
+        {"risk_stale_feed_sec", risk_stale_feed_sec},
     };
     std::ofstream f(path);
     if (f) f << j.dump(2);

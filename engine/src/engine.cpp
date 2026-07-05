@@ -231,12 +231,17 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
 
     strategy->on_init(ctx);
 
+    // Local ring: a backtest may run concurrently with a live session (the
+    // Optimizer does this), and md_ring_ belongs to the live loop — two
+    // consumers on one SPSC ring steal each other's events.
+    const auto bt_ring = std::make_unique<MdRing>();
+
     // Feed thread: replays the series at full speed. Backpressure by
     // spinning — the backtest must be lossless.
-    std::thread feed([this, &cfg, dt] {
-        auto push = [this](EngineEvent& ev) {
+    std::thread feed([&bt_ring, &cfg, dt] {
+        auto push = [&bt_ring](EngineEvent& ev) {
             ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
-            while (!md_ring_->try_push(ev)) { /* spin: consumer is draining */ }
+            while (!bt_ring->try_push(ev)) { /* spin: consumer is draining */ }
         };
         for (const Bar& b : cfg.bars) {
             if (cfg.synth_ticks) {
@@ -275,7 +280,7 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
     EngineEvent ev;
     uint64_t events = 0;
     for (;;) {
-        if (!md_ring_->try_pop(ev)) {
+        if (!bt_ring->try_pop(ev)) {
 #if defined(__x86_64__) || defined(_M_X64)
             _mm_pause();
 #endif

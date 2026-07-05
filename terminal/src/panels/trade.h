@@ -37,6 +37,13 @@ public:
         cash_ = cash;
         bar_sec_ = bar_sec;
     }
+    // Risk limits persist across restarts (armed halts must stay armed).
+    const RiskLimits& risk() const { return risk_; }
+    double risk_dd_pct() const { return risk_dd_pct_; }
+    void restore_risk(const RiskLimits& r, double dd_pct) {
+        risk_ = r;
+        risk_dd_pct_ = dd_pct;
+    }
 
 private:
     void scan_replay_files();

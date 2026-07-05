@@ -1,9 +1,11 @@
 set(TT_REPO_ROOT ${CMAKE_SOURCE_DIR})
+find_package(CURL REQUIRED)   # alert webhook POSTs
 configure_file(src/dev_paths.h.in ${CMAKE_CURRENT_BINARY_DIR}/dev_paths.h @ONLY)
 
 add_executable(tt_terminal
     src/main.cpp
     src/account_store.cpp
+    src/alerts.cpp
     src/app.cpp
     src/config.cpp
     src/candle_plot.cpp
@@ -38,6 +40,7 @@ target_link_libraries(tt_terminal PRIVATE
     ws2_32
     crypt32     # DPAPI (account_store)
     winmm       # timeBeginPeriod (1 ms timer granularity)
+    CURL::libcurl   # alert webhook POSTs
 )
 if(WIN32)
     target_link_libraries(tt_terminal PRIVATE dwmapi)

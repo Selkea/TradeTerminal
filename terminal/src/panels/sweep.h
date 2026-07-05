@@ -22,6 +22,10 @@ public:
         double y0 = 0, y1 = 0;
         int nx = 1, ny = 1;
         int metric = 0;          // index into kSweepMetrics
+        // Walk-forward guard: optimize on the first (100-h)% of the data,
+        // then score the best cell on the held-out tail it never saw.
+        // 0 = off.
+        double holdout_pct = 0;
     };
 
     // Owned by App (which runs the cells); read by the panel every frame.
@@ -33,6 +37,9 @@ public:
         int done = 0, total = 0;
         int metric = 0;
         std::string label;            // "AAPL 1d 2y — SmaCrossover"
+        double holdout_pct = 0;       // >0: holdout run follows the grid
+        bool has_holdout = false;     // holdout_val is valid
+        double holdout_val = 0;       // best cell's metric on unseen data
     };
 
     using RunFn = std::function<void(const Request&)>;
@@ -55,6 +62,8 @@ private:
     double y0_ = 20, y1_ = 200;
     int nx_ = 10, ny_ = 10;
     int metric_ = 0;
+    double holdout_pct_ = 25.0;
+    bool use_holdout_ = true;
 };
 
 // Higher is better for every metric except max drawdown.

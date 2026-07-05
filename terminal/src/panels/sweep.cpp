@@ -107,6 +107,18 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
 
     ImGui::SetNextItemWidth(130);
     ImGui::Combo("metric", &metric_, kSweepMetrics, IM_ARRAYSIZE(kSweepMetrics));
+    ImGui::SameLine();
+    ImGui::Checkbox("holdout", &use_holdout_);
+    ImGui::SetItemTooltip("Optimize on the older data only, then score the best "
+                          "cell on the newest slice it never saw.\nIf the holdout "
+                          "number collapses vs the grid's best, the parameters are "
+                          "overfit.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!use_holdout_);
+    ImGui::SetNextItemWidth(60);
+    ImGui::InputDouble("%##holdout", &holdout_pct_, 0, 0, "%.0f");
+    ImGui::EndDisabled();
+    holdout_pct_ = std::clamp(holdout_pct_, 5.0, 50.0);
 
     const int total = nx_ * (has_y ? ny_ : 1);
     if (st.running) {
@@ -134,6 +146,7 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
                 rq.y0 = y0_; rq.y1 = y1_; rq.ny = ny_;
             }
             rq.metric = metric_;
+            rq.holdout_pct = use_holdout_ ? holdout_pct_ : 0.0;
             run(rq);
         }
         ImGui::EndDisabled();
@@ -172,6 +185,21 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
         ImGui::TextUnformatted(buf);
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", st.label.c_str());
+        if (st.has_holdout) {
+            const double train = st.vals[static_cast<size_t>(best)];
+            const bool collapsed = sweep_metric_minimize(st.metric)
+                                       ? st.holdout_val > train * 1.5
+                                       : st.holdout_val < train * 0.5;
+            ImGui::Text("holdout (last %.0f%%, unseen): %s %.4g", st.holdout_pct,
+                        kSweepMetrics[st.metric], st.holdout_val);
+            if (collapsed) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1),
+                                   "— much worse than in-sample: likely overfit");
+            }
+        } else if (st.holdout_pct > 0 && st.running) {
+            ImGui::TextDisabled("holdout run pending...");
+        }
     }
 
     const int nx = static_cast<int>(st.xs.size());

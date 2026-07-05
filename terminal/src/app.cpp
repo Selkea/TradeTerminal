@@ -74,6 +74,17 @@ App::App(std::string python_cmd, std::string service_dir)
     chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
     backtest_.set_cash(cfg_.backtest_cash);
     trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec);
+    {
+        RiskLimits r;
+        r.max_order_qty = cfg_.risk_max_order_qty;
+        r.max_position_qty = cfg_.risk_max_position_qty;
+        r.daily_max_loss = cfg_.risk_daily_max_loss;
+        r.stale_feed_sec = cfg_.risk_stale_feed_sec;
+        trade_.restore_risk(r, cfg_.risk_max_drawdown_pct);
+    }
+    const char* wh = std::getenv("TT_ALERT_WEBHOOK");
+    alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
+    if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
 
 #ifdef TT_DEBUG
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
@@ -203,7 +214,27 @@ void App::pump_sweep() {
                 sweep_strategy_ = sweep_setup_.strategy;
                 sweep_gen_ = sweep_setup_.strategy_gen;
 
+                // Walk-forward split: the newest slice is held out of the
+                // optimization entirely and scores the winner afterwards.
+                sweep_test_bars_.clear();
+                sweep_holdout_phase_ = false;
+                double holdout = rq.holdout_pct;
+                if (holdout > 0) {
+                    const size_t n = sweep_base_.bars.size();
+                    const size_t n_train =
+                        static_cast<size_t>(n * (1.0 - holdout / 100.0));
+                    if (n_train >= 3 && n - n_train >= 3) {
+                        sweep_test_bars_.assign(sweep_base_.bars.begin() + n_train,
+                                                sweep_base_.bars.end());
+                        sweep_base_.bars.resize(n_train);
+                    } else {
+                        holdout = 0;
+                        log_.add("sweep: too little data for a holdout, skipped");
+                    }
+                }
+
                 sweep_ = SweepPanel::State{};
+                sweep_.holdout_pct = holdout;
                 sweep_.running = true;
                 sweep_.px = rq.px;
                 sweep_.py = rq.py;
@@ -228,19 +259,57 @@ void App::pump_sweep() {
     if (sweep_gen_ != host_.generation()) {
         log_.add("sweep: strategy recompiled mid-sweep, aborted");
         sweep_.running = false;
+        sweep_holdout_phase_ = false;
         return;
     }
     BacktestResult r;
     if (!engine_.take_result(r)) return;
-    sweep_.vals[static_cast<size_t>(sweep_.done)] = sweep_metric_of(r, sweep_.metric);
-    ++sweep_.done;
-    if (sweep_.done >= sweep_.total) {
+
+    if (sweep_holdout_phase_) {   // the winner's run on unseen data
+        sweep_.has_holdout = true;
+        sweep_.holdout_val = sweep_metric_of(r, sweep_.metric);
+        sweep_holdout_phase_ = false;
         sweep_.running = false;
-        log_.add("sweep: finished " + std::to_string(sweep_.total) + " backtests (" +
-                 sweep_.label + ")");
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "sweep: holdout %s %.4g (last %.0f%%, unseen)",
+                      kSweepMetrics[sweep_.metric], sweep_.holdout_val,
+                      sweep_.holdout_pct);
+        log_.add(buf);
         return;
     }
-    start_sweep_cell();
+
+    sweep_.vals[static_cast<size_t>(sweep_.done)] = sweep_metric_of(r, sweep_.metric);
+    ++sweep_.done;
+    if (sweep_.done < sweep_.total) {
+        start_sweep_cell();
+        return;
+    }
+    log_.add("sweep: finished " + std::to_string(sweep_.total) + " backtests (" +
+             sweep_.label + ")");
+    if (sweep_.holdout_pct <= 0 || sweep_test_bars_.empty()) {
+        sweep_.running = false;
+        return;
+    }
+    // Score the best cell on the held-out tail it never saw.
+    int best = -1;
+    for (int i = 0; i < sweep_.total; ++i) {
+        if (best < 0) { best = i; continue; }
+        const double a = sweep_.vals[static_cast<size_t>(i)];
+        const double b = sweep_.vals[static_cast<size_t>(best)];
+        if (sweep_metric_minimize(sweep_.metric) ? a < b : a > b) best = i;
+    }
+    const int nx = static_cast<int>(sweep_.xs.size());
+    BacktestConfig cfg = sweep_base_;
+    cfg.bars = sweep_test_bars_;
+    cfg.params[sweep_.px] = sweep_.xs[static_cast<size_t>(best % nx)];
+    if (!sweep_.py.empty())
+        cfg.params[sweep_.py] = sweep_.ys[static_cast<size_t>(best / nx)];
+    if (engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
+        sweep_holdout_phase_ = true;
+    } else {
+        log_.add("sweep: holdout run could not start (engine busy)");
+        sweep_.running = false;
+    }
 }
 
 App::~App() {
@@ -253,6 +322,11 @@ App::~App() {
     cfg_.backtest_cash = backtest_.cash();
     cfg_.trade_cash = trade_.cash();
     cfg_.trade_bar_sec = trade_.bar_sec();
+    cfg_.risk_max_order_qty = trade_.risk().max_order_qty;
+    cfg_.risk_max_position_qty = trade_.risk().max_position_qty;
+    cfg_.risk_daily_max_loss = trade_.risk().daily_max_loss;
+    cfg_.risk_max_drawdown_pct = trade_.risk_dd_pct();
+    cfg_.risk_stale_feed_sec = trade_.risk().stale_feed_sec;
     cfg_.save(config_path_);
 }
 
@@ -264,13 +338,23 @@ void App::draw() {
         if (!had_ini_) setup_default_layout(dockspace_id);
     }
 
-    // Surface engine/strategy/broker/feed log lines in the console.
+    // Surface engine/strategy/broker/feed log lines in the console; scan
+    // them for alert-worthy events on the way through.
     std::string line;
-    while (engine_.pop_log(line)) log_.add(std::move(line));
+    while (engine_.pop_log(line)) {
+        alert_scan(line);
+        log_.add(std::move(line));
+    }
     if (alpaca_)
-        while (alpaca_->pop_log(line)) log_.add(std::move(line));
+        while (alpaca_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
     if (alpaca_feed_) {
-        while (alpaca_feed_->pop_log(line)) log_.add(std::move(line));
+        while (alpaca_feed_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
         // Session over: stop streaming (frees the one allowed connection).
         if (!engine_.live_running()) {
             rt_feed_active_.store(false, std::memory_order_relaxed);
@@ -299,6 +383,7 @@ void App::draw() {
         rq.x0 = 5;  rq.x1 = 20;  rq.nx = 4;
         rq.py = "slow";
         rq.y0 = 30; rq.y1 = 120; rq.ny = 4;
+        rq.holdout_pct = 25;   // exercises the walk-forward phase headlessly
         queue_sweep(rq);
         log_.add("autorun: queued 4x4 fast/slow sweep");
     }
@@ -536,6 +621,20 @@ void App::draw_account_menu() {
     ImGui::EndMenu();
 }
 
+// Route noteworthy engine/broker/feed log lines to the alert channel.
+// Critical = money is at risk right now; Warning = something needs a look;
+// Info = fills (webhook only, no beep — they can be frequent).
+void App::alert_scan(const std::string& l) {
+    auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
+    if (has("KILL SWITCH") || has("RISK HALT"))
+        alerts_.notify(AlertNotifier::Critical, l);
+    else if (has("rejected") || has("stream lost") || has("auth failed") ||
+             has("(drops!)"))
+        alerts_.notify(AlertNotifier::Warning, l);
+    else if (has("live: fill"))
+        alerts_.notify(AlertNotifier::Info, l);
+}
+
 void App::draw_signin_modal() {
     if (signin_.request_open) {
         signin_.request_open = false;
@@ -638,6 +737,15 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
         ImGui::MenuItem("Positions", nullptr, &show_positions_);
         ImGui::MenuItem("Log Console", nullptr, &show_log_);
+        ImGui::Separator();
+        bool alerts_on = !alerts_.muted();
+        if (ImGui::MenuItem("Alerts", nullptr, &alerts_on)) alerts_.set_muted(!alerts_on);
+        ImGui::SetItemTooltip(alerts_.has_webhook()
+                                  ? "Beep + webhook on halts, rejects, disconnects, fills"
+                                  : "Beeps on halts/rejects/disconnects. Set "
+                                    "\"alert_webhook\" in config.json (or "
+                                    "TT_ALERT_WEBHOOK) for phone push, e.g. an "
+                                    "ntfy.sh topic URL");
         ImGui::EndMenu();
     }
 #ifdef TT_DEBUG

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "account_store.h"
+#include "alerts.h"
 #include "config.h"
 #include "engine/alpaca_broker.h"
 #include "engine/alpaca_feed.h"
@@ -47,6 +48,7 @@ private:
     void draw_menu_bar();
     void draw_account_menu();
     void draw_signin_modal();
+    void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
     // Signed-in account, falling back to APCA_* env vars; nullopt = neither.
     std::optional<Account> alpaca_creds() const;
@@ -84,6 +86,7 @@ private:
     // ring, so it must be destroyed (thread joined) before the engine.
     std::unique_ptr<AlpacaFeed> alpaca_feed_;
     std::atomic<bool> rt_feed_active_{false};   // IPC thread: skip sidecar ticks
+    AlertNotifier alerts_;
     SmaCrossover sma_;
     StrategyHost host_;
     ChartPanel chart_;
@@ -106,7 +109,9 @@ private:
     };
     SweepSetup sweep_setup_;
     SweepPanel::State sweep_;
-    BacktestConfig sweep_base_;
+    BacktestConfig sweep_base_;          // train slice
+    std::vector<Bar> sweep_test_bars_;   // holdout slice (never optimized on)
+    bool sweep_holdout_phase_ = false;
     IStrategy* sweep_strategy_ = nullptr;
     uint64_t sweep_gen_ = 0;
 
