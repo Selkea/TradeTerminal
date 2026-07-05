@@ -21,8 +21,31 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, const StartF
 
     if (!s.running) {
         ImGui::TextDisabled("Paper trading — %s", strategy_name.c_str());
+
         ImGui::SetNextItemWidth(80);
-        ImGui::InputText("symbol", sym_, sizeof(sym_), ImGuiInputTextFlags_CharsUppercase);
+        const bool entered = ImGui::InputText("##add_sym", input_, sizeof(input_),
+                                              ImGuiInputTextFlags_EnterReturnsTrue |
+                                              ImGuiInputTextFlags_CharsUppercase);
+        ImGui::SameLine();
+        if ((ImGui::Button("Add") || entered) && input_[0]) {
+            std::string sym(input_);
+            std::transform(sym.begin(), sym.end(), sym.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (std::find(pending_symbols_.begin(), pending_symbols_.end(), sym) ==
+                pending_symbols_.end())
+                pending_symbols_.push_back(sym);
+            input_[0] = '\0';
+        }
+        int remove_at = -1;
+        for (size_t i = 0; i < pending_symbols_.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TextUnformatted(pending_symbols_[i].c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) remove_at = static_cast<int>(i);
+            ImGui::PopID();
+        }
+        if (remove_at >= 0) pending_symbols_.erase(pending_symbols_.begin() + remove_at);
+
         ImGui::SetNextItemWidth(100);
         ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
         ImGui::SetNextItemWidth(80);
@@ -30,17 +53,18 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, const StartF
         bar_sec_ = std::clamp(bar_sec_, 1, 3600);
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
-        if (ImGui::Button("Start paper trading") && sym_[0] && start) {
-            for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
-            start(sym_, cash_, bar_sec_);
-        }
+        if (ImGui::Button("Start paper trading") && !pending_symbols_.empty() && start)
+            start(pending_symbols_, cash_, bar_sec_);
         ImGui::EndDisabled();
         ImGui::End();
         return;
     }
 
     // ---- running session ----
-    ImGui::Text("%s", s.symbol.c_str());
+    std::string sym_list;
+    for (const SymbolState& sym : s.symbols)
+        sym_list += (sym_list.empty() ? "" : ", ") + sym.symbol;
+    ImGui::Text("%s", sym_list.c_str());
     ImGui::SameLine();
     if (s.halted)
         ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "HALTED");
@@ -54,18 +78,32 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, const StartF
         localtime_s(&tm, &t);
         std::snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
     }
-    ImGui::Text("last %.2f @ %s   ticks %llu%s", s.last_price, tbuf,
-                static_cast<unsigned long long>(s.ticks),
-                s.dropped_ticks ? " (drops!)" : "");
-    ImGui::Text("equity %.2f   cash %.2f   pos %.0f", s.equity, s.cash, s.position.qty);
+    ImGui::Text("ticks %llu%s   last tick @ %s", static_cast<unsigned long long>(s.ticks),
+                s.dropped_ticks ? " (drops!)" : "", tbuf);
+    ImGui::Text("equity %.2f   cash %.2f", s.equity, s.cash);
+    for (const SymbolState& sym : s.symbols)
+        ImGui::Text("  %s   last %.2f   pos %.0f", sym.symbol.c_str(), sym.last_price,
+                    sym.position.qty);
 
     ImGui::Separator();
+    if (selected_symbol_idx_ >= static_cast<int>(s.symbols.size())) selected_symbol_idx_ = 0;
+    if (s.symbols.size() > 1) {
+        ImGui::SetNextItemWidth(90);
+        if (ImGui::BeginCombo("##manual_sym", s.symbols[selected_symbol_idx_].symbol.c_str())) {
+            for (int i = 0; i < static_cast<int>(s.symbols.size()); ++i)
+                if (ImGui::Selectable(s.symbols[i].symbol.c_str(), i == selected_symbol_idx_))
+                    selected_symbol_idx_ = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+    }
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("##mqty", &manual_qty_, 0, 0, "%.0f");
     ImGui::SameLine();
-    if (ImGui::Button("Buy")) eng_.submit_manual(true, manual_qty_);
+    const uint32_t manual_sid = static_cast<uint32_t>(selected_symbol_idx_ + 1);
+    if (ImGui::Button("Buy")) eng_.submit_manual(manual_sid, true, manual_qty_);
     ImGui::SameLine();
-    if (ImGui::Button("Sell")) eng_.submit_manual(false, manual_qty_);
+    if (ImGui::Button("Sell")) eng_.submit_manual(manual_sid, false, manual_qty_);
 
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.15f, 0.15f, 1));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1));

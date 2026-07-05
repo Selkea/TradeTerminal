@@ -30,12 +30,12 @@ public:
     using OrderHook = std::function<void(const OrderRequest&, uint64_t id)>;
 
     EngineCtx(Engine& eng, const std::map<std::string, double>& params,
-              const std::string& symbol, NowFn now, ExecSim& exec, Portfolio& pf,
-              LatencyHistogram& lat, const RiskLimits* risk = nullptr,
+              const std::vector<std::string>& symbols, NowFn now, ExecSim& exec,
+              Portfolio& pf, LatencyHistogram& lat, const RiskLimits* risk = nullptr,
               OrderHook on_order = {})
         : eng_(eng), params_(params), now_(std::move(now)), exec_(exec), pf_(pf),
           lat_(lat), risk_(risk), on_order_(std::move(on_order)) {
-        symbols_.push_back(symbol);
+        symbols_ = symbols;
     }
 
     uint64_t submit_order(const OrderRequest& r) noexcept override {
@@ -77,7 +77,11 @@ public:
     }
 
     void set_current_event_tsc(int64_t tsc) { cur_event_tsc_ = tsc; }
-    void set_last_price(double p) { last_price_ = p; }
+    void set_last_price(uint32_t symbol_id, double p) {
+        if (symbol_id == 0) return;
+        if (last_price_.size() < symbol_id) last_price_.resize(symbol_id, 0.0);
+        last_price_[symbol_id - 1] = p;
+    }
 
 private:
     bool risk_ok(const OrderRequest& r) noexcept {
@@ -91,8 +95,10 @@ private:
             eng_.push_log("risk: resulting position exceeds limit, rejected");
             return false;
         }
-        if (r.type == OrdType::Limit && last_price_ > 0.0 &&
-            std::abs(r.limit_price - last_price_) / last_price_ > risk_->price_band_pct) {
+        const double last =
+            r.symbol_id > 0 && r.symbol_id <= last_price_.size() ? last_price_[r.symbol_id - 1] : 0.0;
+        if (r.type == OrdType::Limit && last > 0.0 &&
+            std::abs(r.limit_price - last) / last > risk_->price_band_pct) {
             eng_.push_log("risk: limit price outside band, rejected (fat finger?)");
             return false;
         }
@@ -109,7 +115,7 @@ private:
     OrderHook on_order_;
     std::vector<std::string> symbols_;
     int64_t cur_event_tsc_ = 0;
-    double last_price_ = 0.0;
+    std::vector<double> last_price_;
 };
 
 Engine::Engine() { tsc::calibrate(); }
@@ -156,7 +162,7 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
     ExecSim exec(cfg.exec);
     Portfolio pf(cfg.initial_cash);
     LatencyHistogram lat;
-    EngineCtx ctx(*this, cfg.params, cfg.symbol,
+    EngineCtx ctx(*this, cfg.params, std::vector<std::string>{cfg.symbol},
                   [&clock] { return clock.now_ns(); }, exec, pf, lat);
 
     BacktestResult res;
@@ -318,9 +324,9 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
 
 // ------------------------------------------------------------------- live
 
-std::string Engine::live_symbol() const {
+std::vector<std::string> Engine::live_symbols() const {
     std::lock_guard lock(snap_mu_);
-    return snap_.symbol;
+    return live_symbol_table_;
 }
 
 LiveSnapshot Engine::live_snapshot() const {
@@ -330,11 +336,20 @@ LiveSnapshot Engine::live_snapshot() const {
     return s;
 }
 
-void Engine::push_live_tick(int64_t ts_ms, double price, double day_volume) {
+void Engine::push_live_tick(const std::string& symbol, int64_t ts_ms, double price,
+                            double day_volume) {
     if (!live_running_.load(std::memory_order_relaxed)) return;
+    uint32_t symbol_id = 0;
+    {
+        std::lock_guard lock(snap_mu_);
+        for (size_t i = 0; i < live_symbol_table_.size(); ++i)
+            if (live_symbol_table_[i] == symbol) { symbol_id = static_cast<uint32_t>(i + 1); break; }
+    }
+    if (symbol_id == 0) return;  // not part of this live session
+
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::Tick);
-    ev.symbol_id = 1;
+    ev.symbol_id = symbol_id;
     ev.ts_event_ns = ts_ms * 1'000'000;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.tick.price = price;
@@ -346,20 +361,20 @@ void Engine::push_live_tick(int64_t ts_ms, double price, double day_volume) {
 }
 
 void Engine::request_cancel(uint64_t order_id) {
-    cmd_ring_->try_push(LiveCmd{LiveCmd::Cancel, 0, order_id, 0});
+    cmd_ring_->try_push(LiveCmd{LiveCmd::Cancel, 0, order_id, 0, 0});
 }
 
-void Engine::submit_manual(bool buy, double qty) {
-    cmd_ring_->try_push(LiveCmd{LiveCmd::Manual, static_cast<uint8_t>(buy), 0, qty});
+void Engine::submit_manual(uint32_t symbol_id, bool buy, double qty) {
+    cmd_ring_->try_push(LiveCmd{LiveCmd::Manual, static_cast<uint8_t>(buy), 0, qty, symbol_id});
 }
 
 void Engine::kill_switch() {
-    cmd_ring_->try_push(LiveCmd{LiveCmd::Kill, 0, 0, 0});
+    cmd_ring_->try_push(LiveCmd{LiveCmd::Kill, 0, 0, 0, 0});
 }
 
 void Engine::stop_live() {
     if (live_running_.load(std::memory_order_relaxed))
-        while (!cmd_ring_->try_push(LiveCmd{LiveCmd::Stop, 0, 0, 0})) Sleep(1);
+        while (!cmd_ring_->try_push(LiveCmd{LiveCmd::Stop, 0, 0, 0, 0})) Sleep(1);
     if (live_thread_.joinable()) live_thread_.join();
 }
 
@@ -378,9 +393,15 @@ bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
         std::lock_guard lock(snap_mu_);
         snap_ = LiveSnapshot{};
         snap_.running = true;
-        snap_.symbol = cfg.symbol;
         snap_.cash = cfg.initial_cash;
         snap_.equity = cfg.initial_cash;
+        for (size_t i = 0; i < cfg.symbols.size(); ++i) {
+            SymbolState st;
+            st.symbol = cfg.symbols[i];
+            st.position.symbol_id = static_cast<uint32_t>(i + 1);
+            snap_.symbols.push_back(std::move(st));
+        }
+        live_symbol_table_ = cfg.symbols;
     }
     live_thread_ = std::thread(
         [this, cfg = std::move(cfg), strategy]() mutable { run_live(std::move(cfg), strategy); });
@@ -396,10 +417,16 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
 
     std::vector<OrderRecord> orders;   // engine-thread master copy
     bool next_is_manual = false;
+    auto symbol_name = [&](uint32_t symbol_id) -> std::string {
+        return symbol_id > 0 && symbol_id <= cfg.symbols.size()
+                   ? cfg.symbols[symbol_id - 1] : std::string();
+    };
     auto record_order = [&](const OrderRequest& r, uint64_t id) {
         OrderRecord rec;
         rec.id = id;
         rec.ts_ns = rt.now_ns();
+        rec.symbol_id = r.symbol_id;
+        rec.symbol = symbol_name(r.symbol_id);
         rec.side = static_cast<uint8_t>(r.side);
         rec.type = static_cast<uint8_t>(r.type);
         rec.status = id ? OrderStatus::Working : OrderStatus::Rejected;
@@ -410,48 +437,56 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
         if (orders.size() > 200) orders.erase(orders.begin());
     };
 
-    EngineCtx ctx(*this, cfg.params, cfg.symbol, [&rt] { return rt.now_ns(); },
+    EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
                   exec, pf, lat, &cfg.risk, record_order);
 
+    const size_t n_sym = cfg.symbols.size();
     uint64_t ticks = 0;
-    double last_price = 0.0;
+    std::vector<double> last_price(n_sym, 0.0);
     int64_t last_ts_ms = 0;
 
     auto publish = [&] {
         std::lock_guard lock(snap_mu_);
         snap_.running = true;
         snap_.halted = halted;
-        snap_.symbol = cfg.symbol;
         snap_.cash = pf.cash();
         snap_.equity = pf.equity();
-        snap_.last_price = last_price;
-        snap_.position = pf.position(1);
+        for (size_t i = 0; i < n_sym; ++i) {
+            snap_.symbols[i].last_price = last_price[i];
+            snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
+        }
         snap_.orders = orders;
         snap_.ticks = ticks;
         snap_.last_tick_ts_ms = last_ts_ms;
     };
 
     strategy->on_init(ctx);
-    push_log("live: paper trading " + cfg.symbol + " started (bar " +
+    std::string symbol_list;
+    for (const std::string& s : cfg.symbols)
+        symbol_list += (symbol_list.empty() ? "" : ",") + s;
+    push_log("live: paper trading " + symbol_list + " started (bar " +
              std::to_string(cfg.bar_seconds) + "s)");
 
-    // Tick -> bar aggregation so bar-based strategies work on the live feed.
+    // Tick -> bar aggregation so bar-based strategies work on the live feed,
+    // one aggregator per symbol.
     const int64_t bar_ns = static_cast<int64_t>(cfg.bar_seconds) * 1'000'000'000;
-    Bar cur_bar{};
-    bool bar_open = false;
-    auto roll_bar = [&](int64_t ts, double px) {
-        if (bar_open && ts >= cur_bar.ts_ns + bar_ns) {
-            if (!halted) strategy->on_bar(ctx, 1, cur_bar);
-            bar_open = false;
+    struct BarAgg { Bar cur{}; bool open = false; };
+    std::vector<BarAgg> bar_agg(n_sym);
+    auto roll_bar = [&](uint32_t symbol_id, int64_t ts, double px) {
+        if (symbol_id == 0 || symbol_id > n_sym) return;
+        BarAgg& agg = bar_agg[symbol_id - 1];
+        if (agg.open && ts >= agg.cur.ts_ns + bar_ns) {
+            if (!halted) strategy->on_bar(ctx, symbol_id, agg.cur);
+            agg.open = false;
         }
-        if (!bar_open) {
-            bar_open = true;
-            cur_bar = Bar{ts / bar_ns * bar_ns, px, px, px, px, 0.0};
+        if (!agg.open) {
+            agg.open = true;
+            agg.cur = Bar{ts / bar_ns * bar_ns, px, px, px, px, 0.0};
             return;
         }
-        cur_bar.high = std::max(cur_bar.high, px);
-        cur_bar.low = std::min(cur_bar.low, px);
-        cur_bar.close = px;
+        agg.cur.high = std::max(agg.cur.high, px);
+        agg.cur.low = std::min(agg.cur.low, px);
+        agg.cur.close = px;
     };
 
     std::vector<Fill> fills;
@@ -479,10 +514,12 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 for (uint64_t id : exec.cancel_all())
                     for (auto& o : orders)
                         if (o.id == id) o.status = OrderStatus::Cancelled;
-                const double pos = pf.position(1).qty;
-                if (pos != 0.0) {
+                for (size_t i = 0; i < n_sym; ++i) {
+                    const uint32_t sid = static_cast<uint32_t>(i + 1);
+                    const double pos = pf.position(sid).qty;
+                    if (pos == 0.0) continue;
                     // Flatten bypasses risk checks — closing must always work.
-                    OrderRequest r{1, pos > 0 ? Side::Sell : Side::Buy,
+                    OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy,
                                    OrdType::Market, {}, std::abs(pos), 0.0};
                     next_is_manual = true;
                     record_order(r, exec.submit(r, rt.now_ns()));
@@ -492,18 +529,20 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 break;
             }
             case LiveCmd::Manual: {
-                if (last_price <= 0.0) {
+                const uint32_t sid = c.symbol_id;
+                if (sid == 0 || sid > n_sym || last_price[sid - 1] <= 0.0) {
                     push_log("live: manual order rejected (no market data yet)");
                     break;
                 }
-                OrderRequest r{1, c.buy ? Side::Buy : Side::Sell, OrdType::Market, {},
+                OrderRequest r{sid, c.buy ? Side::Buy : Side::Sell, OrdType::Market, {},
                                c.qty, 0.0};
                 next_is_manual = true;
                 const uint64_t id = ctx.submit_order(r);
                 next_is_manual = false;
                 push_log(id ? "live: manual " + std::string(c.buy ? "BUY " : "SELL ") +
                                   std::to_string(static_cast<long long>(c.qty)) +
-                                  " submitted (#" + std::to_string(id) + ")"
+                                  " " + symbol_name(sid) + " submitted (#" +
+                                  std::to_string(id) + ")"
                             : "live: manual order rejected");
                 break;
             }
@@ -516,14 +555,15 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
             idle = 0;
             ++ticks;
             const int64_t now = rt.now_ns();
+            const uint32_t sid = ev.symbol_id;
             ctx.set_current_event_tsc(ev.ts_ingest_tsc);
             const double price = ev.u.tick.price;
-            last_price = price;
+            if (sid > 0 && sid <= n_sym) last_price[sid - 1] = price;
             last_ts_ms = ev.ts_event_ns / 1'000'000;
-            ctx.set_last_price(price);
+            ctx.set_last_price(sid, price);
 
             fills.clear();
-            exec.on_price(1, price, now, fills);
+            exec.on_price(sid, price, now, fills);
             for (const Fill& f : fills) {
                 pf.apply(f);
                 for (auto& o : orders)
@@ -539,13 +579,13 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 push_log(buf);
                 if (!halted) strategy->on_fill(ctx, f);
             }
-            pf.mark(1, price);
+            pf.mark(sid, price);
 
             if (!halted) {
                 Tick t{ev.ts_event_ns, price, ev.u.tick.size, ev.u.tick.bid, ev.u.tick.ask};
-                strategy->on_tick(ctx, 1, t);
+                strategy->on_tick(ctx, sid, t);
             }
-            roll_bar(ev.ts_event_ns, price);
+            roll_bar(sid, ev.ts_event_ns, price);
             publish();
         } else {
             ++idle;

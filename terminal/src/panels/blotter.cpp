@@ -33,12 +33,13 @@ void BlotterPanel::draw(bool* open) {
         return;
     }
 
-    if (ImGui::BeginTable("##orders", 8,
+    if (ImGui::BeginTable("##orders", 9,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40);
         ImGui::TableSetupColumn("Time");
+        ImGui::TableSetupColumn("Symbol");
         ImGui::TableSetupColumn("Side");
         ImGui::TableSetupColumn("Qty");
         ImGui::TableSetupColumn("Type");
@@ -57,6 +58,8 @@ void BlotterPanel::draw(bool* open) {
             std::tm tm{};
             localtime_s(&tm, &t);
             ImGui::Text("%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(o.symbol.c_str());
             ImGui::TableNextColumn();
             const bool buy = o.side == static_cast<uint8_t>(Side::Buy);
             ImGui::TextColored(buy ? ImVec4(0.25f, 0.85f, 0.45f, 1)

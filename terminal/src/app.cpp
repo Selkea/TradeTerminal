@@ -36,8 +36,8 @@ App::App(std::string python_cmd, std::string service_dir)
     cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
-        if (engine_.live_running() && sym == engine_.live_symbol())
-            engine_.push_live_tick(q.ts_ms, q.price, q.day_volume);
+        if (engine_.live_running())
+            engine_.push_live_tick(sym, q.ts_ms, q.price, q.day_volume);
     };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
         log_.add("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
@@ -156,16 +156,20 @@ void App::draw() {
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_trade_)
         trade_.draw(&show_trade_, strat_mgr_.active_name(),
-                    [this](const std::string& sym, double cash, int bar_sec) {
+                    [this](const std::vector<std::string>& syms, double cash, int bar_sec) {
                         LiveConfig cfg;
-                        cfg.symbol = sym;
+                        cfg.symbols = syms;
                         cfg.initial_cash = cash;
                         cfg.params = strat_mgr_.param_values();
                         cfg.bar_seconds = bar_sec;
                         if (engine_.start_live(std::move(cfg),
                                                strat_mgr_.active_strategy(sma_))) {
-                            watchlist_.ensure(sym);   // quote subscription feeds the engine
-                            log_.add("live: session queued for " + sym + " (" +
+                            for (const std::string& sym : syms)
+                                watchlist_.ensure(sym);  // quote subscription feeds the engine
+                            std::string joined;
+                            for (const std::string& sym : syms)
+                                joined += (joined.empty() ? "" : ",") + sym;
+                            log_.add("live: session queued for " + joined + " (" +
                                      strat_mgr_.active_name() + ")");
                         } else {
                             log_.add("live: cannot start (engine busy)");
@@ -187,7 +191,8 @@ void App::draw() {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
-            engine_.push_live_tick(ms, sim_tick_px_, 0.0);
+            for (const std::string& sym : engine_.live_symbols())
+                engine_.push_live_tick(sym, ms, sim_tick_px_, 0.0);
         }
     }
 
@@ -198,22 +203,28 @@ void App::draw() {
         if (autorun_live_stage_ == 0) {
             autorun_live_stage_ = 1;
             LiveConfig cfg;
-            cfg.symbol = "SIMTEST";
+            cfg.symbols = {"SIMTEST", "SIMTEST2"};   // proves multi-symbol routing headlessly
             cfg.params = strat_mgr_.param_values();
             cfg.bar_seconds = 2;
             engine_.start_live(std::move(cfg), strat_mgr_.active_strategy(sma_));
             log_.add("autorun-live: session started");
         } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {
             autorun_live_stage_ = 2;
-            engine_.submit_manual(true, 10);
-            log_.add("autorun-live: manual BUY 10 submitted");
-        } else if (autorun_live_stage_ == 2 && s.position.qty > 0) {
+            engine_.submit_manual(1, true, 10);
+            log_.add("autorun-live: manual BUY 10 SIMTEST submitted");
+        } else if (autorun_live_stage_ == 2 && !s.symbols.empty() &&
+                  s.symbols[0].position.qty > 0) {
             autorun_live_stage_ = 3;
             log_.add("autorun-live: position open, firing kill switch");
             engine_.kill_switch();
-        } else if (autorun_live_stage_ == 3 && s.halted && s.position.qty == 0) {
-            autorun_live_stage_ = 4;
-            log_.add("autorun-live: FLAT after kill switch — live path verified");
+        } else if (autorun_live_stage_ == 3 && s.halted) {
+            bool all_flat = true;
+            for (const SymbolState& sym : s.symbols)
+                if (sym.position.qty != 0) all_flat = false;
+            if (all_flat) {
+                autorun_live_stage_ = 4;
+                log_.add("autorun-live: FLAT after kill switch — live path verified");
+            }
         }
     }
     if (show_imgui_demo_) ImGui::ShowDemoWindow(&show_imgui_demo_);

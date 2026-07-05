@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace tt::ui {
 
@@ -11,8 +12,8 @@ namespace tt::ui {
 // switch, session status.
 class TradePanel {
 public:
-    // symbol, initial cash, bar aggregation seconds
-    using StartFn = std::function<void(const std::string&, double, int)>;
+    // symbols, initial cash, bar aggregation seconds
+    using StartFn = std::function<void(const std::vector<std::string>&, double, int)>;
 
     explicit TradePanel(Engine& eng) : eng_(eng) {}
     void draw(bool* open, const std::string& strategy_name, const StartFn& start);
@@ -26,10 +27,12 @@ public:
 
 private:
     Engine& eng_;
-    char sym_[16] = "AAPL";
+    char input_[16] = "";
+    std::vector<std::string> pending_symbols_ = {"AAPL"};
     double cash_ = 100'000.0;
     int bar_sec_ = 60;
     double manual_qty_ = 10.0;
+    int selected_symbol_idx_ = 0;
 };
 
 } // namespace tt::ui
