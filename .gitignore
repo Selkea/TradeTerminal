@@ -13,3 +13,6 @@ out/
 # ImGui runtime layout + logs live in %LOCALAPPDATA%; ignore local strays
 imgui.ini
 *.log
+
+# IBKR Client Portal Gateway lives in tools/ (binary distribution + runtime logs; never committed)
+tools/clientportal.gw/

@@ -27,6 +27,17 @@ std::string gxx_path() {
     const char* env = std::getenv("TT_GXX");
     return env ? env : TT_GXX_DEFAULT;
 }
+// Launch command for the Client Portal Gateway: config wins, otherwise the
+// conventional in-repo location (tools/clientportal.gw) is auto-detected.
+std::string gateway_cmd(const std::string& configured) {
+    if (!configured.empty()) return configured;
+    const std::filesystem::path gw =
+        std::filesystem::path(TT_REPO_ROOT) / "tools" / "clientportal.gw";
+    std::error_code ec;
+    if (std::filesystem::exists(gw / "bin" / "run.bat", ec))
+        return "cd /d \"" + gw.string() + "\" && bin\\run.bat root\\conf.yaml";
+    return {};
+}
 } // namespace
 
 std::string App::polygon_key() const {
@@ -779,17 +790,17 @@ void App::draw_signin_modal() {
             ShellExecuteA(nullptr, "open", gw_.login_url().c_str(), nullptr, nullptr,
                           SW_SHOWNORMAL);
         }
-        if (!cfg_.ibkr_gateway_cmd.empty()) {
+        const std::string gw_cmd = gateway_cmd(cfg_.ibkr_gateway_cmd);
+        if (!gw_cmd.empty()) {
             ImGui::SameLine();
             if (ImGui::Button("Launch gateway")) {
-                ShellExecuteA(nullptr, "open", "cmd.exe",
-                              ("/c " + cfg_.ibkr_gateway_cmd).c_str(), nullptr,
-                              SW_SHOWMINNOACTIVE);
+                ShellExecuteA(nullptr, "open", "cmd.exe", ("/c " + gw_cmd).c_str(),
+                              nullptr, SW_SHOWMINNOACTIVE);
                 log_.add("account: launching Client Portal Gateway");
             }
         } else {
-            ImGui::TextDisabled("Tip: set \"ibkr_gateway_cmd\" in config.json (e.g. "
-                                "the gateway's run.bat) for a Launch button here.");
+            ImGui::TextDisabled("Tip: extract the gateway to tools\\clientportal.gw "
+                                "(see tools/README.md) for a Launch button here.");
         }
         ImGui::SameLine();
         if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
