@@ -1,10 +1,14 @@
 // SMA crossover (long/flat) — the example TradeTerminal strategy.
 //
 // Edit this file, click Build in the Strategy Manager, and run a backtest —
-// no terminal restart needed. See strategies/README.md for the SDK rules.
+// no terminal restart needed. See strategies/README.md for the SDK rules and
+// for the patterns this file demonstrates: signals guarded by in-flight
+// order ids (market orders fill on the NEXT price event, so a signal must
+// not re-fire while its order is pending), and on_fill routed by order id.
 
 #include "tt/strategy_api.h"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -31,6 +35,7 @@ public:
         sum_fast_ = sum_slow_ = prev_diff_ = 0.0;
         prev_valid_ = false;
         sym_ = 0;
+        entry_id_ = exit_id_ = 0;
         char buf[96];
         std::snprintf(buf, sizeof(buf), "SMA(dll): fast=%d slow=%d qty=%.0f",
                       fast_, slow_, qty_);
@@ -50,12 +55,18 @@ public:
         if (n < static_cast<size_t>(slow_)) return;
 
         const double diff = sum_fast_ / fast_ - sum_slow_ / slow_;
-        if (prev_valid_) {
+        if (prev_valid_ && entry_id_ == 0 && exit_id_ == 0) {
             const double pos = ctx.position(sym_).qty;
             if (prev_diff_ <= 0.0 && diff > 0.0 && pos <= 0.0) {
-                ctx.submit_order({sym_, Side::Buy, OrdType::Market, {}, qty_, 0.0});
+                // Never buy more than the cash can carry.
+                const double qty =
+                    std::min(qty_, std::floor(ctx.cash() * 0.95 / bar.close));
+                if (qty >= 1.0)
+                    entry_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Market,
+                                                  {}, qty, 0.0, 0.0, 0.0, 0.0});
             } else if (prev_diff_ >= 0.0 && diff < 0.0 && pos > 0.0) {
-                ctx.submit_order({sym_, Side::Sell, OrdType::Market, {}, pos, 0.0});
+                exit_id_ = ctx.submit_order({sym_, Side::Sell, OrdType::Market,
+                                             {}, pos, 0.0, 0.0, 0.0, 0.0});
             }
         }
         prev_diff_ = diff;
@@ -65,6 +76,8 @@ public:
     void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
 
     void on_fill(IStrategyContext& ctx, const Fill& f) noexcept override {
+        if (f.order_id == entry_id_) entry_id_ = 0;
+        else if (f.order_id == exit_id_) exit_id_ = 0;
         char buf[96];
         std::snprintf(buf, sizeof(buf), "fill: %s %.0f @ %.2f",
                       f.side == Side::Buy ? "BUY" : "SELL", f.qty, f.price);
@@ -84,6 +97,7 @@ private:
     double sum_fast_ = 0, sum_slow_ = 0, prev_diff_ = 0;
     bool prev_valid_ = false;
     uint32_t sym_ = 0;
+    uint64_t entry_id_ = 0, exit_id_ = 0;
 };
 
 TT_STRATEGY(SmaCrossoverStrategy, "SMA Crossover", kParams)
