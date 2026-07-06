@@ -191,6 +191,7 @@ struct IbkrBroker::Io {
         // machine, so peer verification is deliberately off.
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(rest, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
         curl_easy_setopt(rest, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(rest, CURLOPT_TIMEOUT_MS, 10000L);
         curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
@@ -213,15 +214,22 @@ struct IbkrBroker::Io {
     // Session + account + conid resolution; true once orders can flow.
     bool ensure_ready() {
         if (!session) {
-            const Response r = call("GET", "/iserver/accounts", "");
+            Response r = call("GET", "/iserver/accounts", "");
+            if (!r.ok() && r.status != 0) {
+                // Post-login 401 quirk: kick the brokerage session, retry.
+                call("POST", "/iserver/auth/status", "");
+                call("POST", "/tickle", "");
+                r = call("GET", "/iserver/accounts", "");
+            }
             if (!r.ok()) {
                 const int64_t now = net_steady_ms();
                 if (now - last_login_nag_ms > 30'000) {
                     last_login_nag_ms = now;
-                    b.log(r.status == 401 || r.status == 0
-                              ? "no gateway session — log in via browser at the "
-                                "Client Portal Gateway (default https://localhost:5000)"
-                              : "gateway error " + std::to_string(r.status));
+                    b.log(r.status == 0
+                              ? "cannot reach the Client Portal Gateway at " +
+                                    b.cfg_.gateway_url
+                              : "gateway probe HTTP " + std::to_string(r.status) +
+                                    " — log in via Account menu > Sign In > IBKR");
                 }
                 return false;
             }

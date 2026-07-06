@@ -152,6 +152,7 @@ void GatewayData::worker() {
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(h, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 15000L);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
@@ -169,6 +170,7 @@ void GatewayData::worker() {
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(h, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
@@ -190,7 +192,16 @@ void GatewayData::worker() {
         if (now - last_session_ms > 3000) {
             last_session_ms = now;
             const bool was = connected_.load(std::memory_order_relaxed);
-            const bool ok = get("/iserver/accounts", body) / 100 == 2;
+            long status = get("/iserver/accounts", body);
+            if (status / 100 != 2 && status != 0) {
+                // CP Gateway quirk: after the browser login, /iserver/*
+                // endpoints can 401 until something kicks the brokerage
+                // session alive. Kick, then retry once.
+                post("/iserver/auth/status");
+                post("/tickle");
+                status = get("/iserver/accounts", body);
+            }
+            const bool ok = status / 100 == 2;
             if (ok && !was) {
                 std::string acct = ibkr_parse_first_account(body);
                 {
@@ -209,7 +220,13 @@ void GatewayData::worker() {
                 }
                 if (now - last_nag_ms > 30'000) {
                     last_nag_ms = now;
-                    log("gateway: no session — Account menu > Sign In > IBKR to log in");
+                    if (status == 0)
+                        log("gateway: cannot reach " + gateway_url_ +
+                            " — is the CLIENT PORTAL gateway running? (IB Gateway/TWS "
+                            "is a different product and won't work)");
+                    else
+                        log("gateway: probe got HTTP " + std::to_string(status) +
+                            " — log in via Account menu > Sign In > IBKR");
                 }
             }
         }

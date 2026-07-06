@@ -108,8 +108,10 @@ int main() {
 
     // All market data + brokerage flows through the IBKR Client Portal
     // Gateway on this machine (log in via Account > Sign In > IBKR).
+    // 127.0.0.1, not localhost: the gateway's Jetty often binds IPv4 only,
+    // and localhost can resolve to ::1 first (connection refused).
     const char* gw_env = std::getenv("TT_IBKR_GATEWAY");
-    std::string gateway_url = gw_env && *gw_env ? gw_env : "https://localhost:5000/v1/api";
+    std::string gateway_url = gw_env && *gw_env ? gw_env : "https://127.0.0.1:5000/v1/api";
 
     tt::ui::App app(gateway_url);
     app.set_had_ini(had_ini);

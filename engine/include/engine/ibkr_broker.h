@@ -34,9 +34,10 @@
 namespace tt {
 
 struct IbkrConfig {
-    // Client Portal Gateway base URL. Loopback by default; its self-signed
+    // Client Portal Gateway base URL. Loopback by default (127.0.0.1, not
+    // localhost — the gateway's Jetty often binds IPv4 only); its self-signed
     // TLS cert is accepted only because the hop never leaves the machine.
-    std::string gateway_url = "https://localhost:5000/v1/api";
+    std::string gateway_url = "https://127.0.0.1:5000/v1/api";
     std::vector<std::string> symbols;   // session symbol table: id = index + 1
 };
 

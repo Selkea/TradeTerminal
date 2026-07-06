@@ -141,6 +141,7 @@ void IbkrFeed::io_loop() {
         curl_easy_setopt(rest, CURLOPT_URL, url.c_str());
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYPEER, 0L);   // loopback gateway
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(rest, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
         curl_easy_setopt(rest, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(rest, CURLOPT_TIMEOUT_MS, 10000L);
         curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
@@ -161,12 +162,20 @@ void IbkrFeed::io_loop() {
     std::string body;
 
     auto resolve = [&]() -> bool {
-        if (call("GET", "/iserver/accounts", body) / 100 != 2) {
+        long status = call("GET", "/iserver/accounts", body);
+        if (status / 100 != 2 && status != 0) {
+            // Post-login 401 quirk: kick the brokerage session, retry.
+            call("POST", "/iserver/auth/status", body);
+            call("POST", "/tickle", body);
+            status = call("GET", "/iserver/accounts", body);
+        }
+        if (status / 100 != 2) {
             const int64_t now = net_steady_ms();
             if (now - last_nag_ms > 30'000) {
                 last_nag_ms = now;
-                log("no gateway session — log in via browser (default "
-                    "https://localhost:5000)");
+                log(status == 0 ? "cannot reach the gateway at " + cfg_.gateway_url
+                                : "gateway probe HTTP " + std::to_string(status) +
+                                      " — log in via Account menu > Sign In > IBKR");
             }
             return false;
         }

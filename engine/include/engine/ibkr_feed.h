@@ -30,8 +30,9 @@
 namespace tt {
 
 struct IbkrFeedConfig {
-    std::string gateway_url = "https://localhost:5000/v1/api";
-    std::string ws_url = "wss://localhost:5000/v1/api/ws";
+    // 127.0.0.1, not localhost: the gateway's Jetty often binds IPv4 only.
+    std::string gateway_url = "https://127.0.0.1:5000/v1/api";
+    std::string ws_url = "wss://127.0.0.1:5000/v1/api/ws";
     std::vector<std::string> symbols;   // session symbol table: id = index + 1
     int bar_seconds = 60;               // gap backfill granularity
     int pin_core = -1;
