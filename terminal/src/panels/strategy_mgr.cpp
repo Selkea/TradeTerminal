@@ -102,7 +102,9 @@ void StrategyManagerPanel::draw(bool* open) {
             src.swap(pending_src_);
         }
         if (!dll.empty()) {
-            if (eng_.running()) {
+            // "Idle" must include live sessions: the live thread calls into
+            // the currently loaded DLL, and load() starts by unloading it.
+            if (eng_.running() || eng_.live_running()) {
                 std::lock_guard lock(pending_mu_);   // put it back, retry next frame
                 pending_dll_ = std::move(dll);
                 pending_src_ = std::move(src);
@@ -139,7 +141,8 @@ void StrategyManagerPanel::draw(bool* open) {
     }
     ImGui::SameLine();
 
-    const bool can_build = !building_ && selected_ >= 0 && !eng_.running();
+    const bool can_build = !building_ && selected_ >= 0 && !eng_.running() &&
+                           !eng_.live_running();
     ImGui::BeginDisabled(!can_build);
     if (ImGui::Button(building_ ? "Building..." : "Build & Load"))
         start_build((fs::path(dir_) / files_[selected_]).string());
@@ -147,7 +150,7 @@ void StrategyManagerPanel::draw(bool* open) {
 
     if (host_.current()) {
         ImGui::SameLine();
-        ImGui::BeginDisabled(eng_.running());
+        ImGui::BeginDisabled(eng_.running() || eng_.live_running());
         if (ImGui::Button("Unload")) {
             host_.unload();
             use_builtin_params();

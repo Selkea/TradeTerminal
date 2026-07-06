@@ -84,6 +84,11 @@ private:
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<IbkrBroker> ibkr_;
+    // Same reasoning: engine threads (live and backtest) call into the
+    // built-in strategy and the loaded strategy DLL, so both must outlive
+    // the engine.
+    SmaCrossover sma_;
+    StrategyHost host_;
     Engine engine_;
     // Declared after engine_ on purpose: the feed pushes into the engine's
     // ring, so it must be destroyed (thread joined) before the engine.
@@ -91,8 +96,6 @@ private:
     std::unique_ptr<IbkrFeed> ibkr_feed_;
     std::atomic<bool> rt_feed_active_{false};   // worker thread: skip snapshot ticks
     AlertNotifier alerts_;
-    SmaCrossover sma_;
-    StrategyHost host_;
     ChartPanel chart_;
     WatchlistPanel watchlist_;
     BacktestPanel backtest_;
