@@ -11,7 +11,7 @@ port 5000 when run from a path under OneDrive or containing `+` characters.
 Keep the repo on a clean local path (no `+`, not inside OneDrive) and the
 gateway works from here in `tools\clientportal.gw`. TradeTerminal
 auto-detects two locations for the Sign In > IBKR "Launch gateway" button:
-`C:\ibkr\clientportal.gw` first (the VPS/bootstrap default), then
+`C:\ibkr\clientportal.gw` first (always a clean path), then
 `tools\clientportal.gw`. config.json `ibkr_gateway_cmd` overrides both.
 
 Setup:
@@ -20,6 +20,6 @@ Setup:
 2. Extract so that `tools\clientportal.gw\bin\run.bat` exists.
 3. Requires Java 8u192+ on PATH (`winget install EclipseAdoptium.Temurin.21.JRE`).
 
-The `scripts/vps_bootstrap.ps1` script performs all three steps automatically
-(installing to `C:\ibkr\clientportal.gw`, since a VPS checkout may also sit on
-a `+`/OneDrive path).
+The `scripts/vps_bootstrap.ps1` script performs all three steps automatically,
+installing here into `tools\clientportal.gw` (its default `-RepoDir` of
+`C:\dev\TradeTerminal` is a clean path; keep any override clean too).

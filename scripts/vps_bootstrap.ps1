@@ -69,10 +69,11 @@ if (Get-Command java -ErrorAction SilentlyContinue) {
     }
 }
 
-# NOT inside the repo: the gateway's web server fails to bind port 5000 from
-# OneDrive paths or paths containing '+'. C:\ibkr is short, local, and clean.
-Step "Client Portal Gateway (C:\ibkr\clientportal.gw)"
-$gwDir = "C:\ibkr\clientportal.gw"
+# Into the repo's tools\ dir. Caveat: the gateway's web server fails to bind
+# port 5000 from OneDrive paths or paths containing '+' — the default
+# C:\dev\TradeTerminal is clean; keep -RepoDir clean too.
+Step "Client Portal Gateway (tools\clientportal.gw)"
+$gwDir = Join-Path $RepoDir "tools\clientportal.gw"
 if (Test-Path (Join-Path $gwDir "bin\run.bat")) {
     Write-Host "  already present"
 } else {

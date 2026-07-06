@@ -805,7 +805,7 @@ void App::draw_signin_modal() {
                 log_.add("account: launching Client Portal Gateway");
             }
         } else {
-            ImGui::TextDisabled("Tip: extract the gateway to C:\\ibkr\\clientportal.gw "
+            ImGui::TextDisabled("Tip: extract the gateway to tools\\clientportal.gw "
                                 "(see tools/README.md) for a Launch button here.");
         }
         ImGui::SameLine();
