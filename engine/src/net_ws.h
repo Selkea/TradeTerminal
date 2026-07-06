@@ -44,6 +44,8 @@ struct WsClient {
         if (!ws) return false;
         curl_easy_setopt(ws, CURLOPT_URL, url.c_str());
         curl_easy_setopt(ws, CURLOPT_CONNECT_ONLY, 2L);   // websocket, no callbacks
+        // IBKR's backend 403s any request without a User-Agent.
+        curl_easy_setopt(ws, CURLOPT_USERAGENT, "TradeTerminal/1.0");
         if (insecure) {
             curl_easy_setopt(ws, CURLOPT_SSL_VERIFYPEER, 0L);
             curl_easy_setopt(ws, CURLOPT_SSL_VERIFYHOST, 0L);

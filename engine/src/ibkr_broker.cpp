@@ -51,7 +51,7 @@ bool ibkr_parse_order_response(std::string_view json_text, IbkrOrderResp& out) {
     if (j.is_discarded()) return false;
     // Error shape: {"error":"..."} — surface as message.
     if (j.is_object()) {
-        out.message = j.value("error", "");
+        out.message = str_field(j, "error");
         return !out.message.empty();
     }
     if (!j.is_array() || j.empty() || !j[0].is_object()) return false;
@@ -71,7 +71,7 @@ bool ibkr_parse_order_response(std::string_view json_text, IbkrOrderResp& out) {
 std::string ibkr_parse_first_account(std::string_view json_text) {
     const json j = json::parse(json_text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return {};
-    const std::string sel = j.value("selectedAccount", "");
+    const std::string sel = str_field(j, "selectedAccount");
     if (!sel.empty()) return sel;
     const auto it = j.find("accounts");
     if (it != j.end() && it->is_array() && !it->empty() && (*it)[0].is_string())
@@ -96,10 +96,17 @@ int64_t ibkr_parse_conid(std::string_view json_text, const std::string& symbol) 
             }
         }
         if (conid == 0) continue;
-        const bool sym_match = r.value("symbol", "") == symbol;
-        if (sym_match && fallback == 0) fallback = conid;
-        // Prefer the row explicitly typed as a US stock.
-        if (sym_match && r.value("secType", "") == "STK") return conid;
+        // NOTE r.value() would throw on "symbol": null, which IBKR sends
+        // on index/CFD rows — every string field here must use str_field.
+        if (str_field(r, "symbol") != symbol) continue;
+        if (fallback == 0) fallback = conid;
+        // Prefer the row explicitly typed as a US stock. Old gateway builds
+        // put secType on the row; current ones nest it under "sections".
+        if (str_field(r, "secType") == "STK") return conid;
+        const auto secs = r.find("sections");
+        if (secs == r.end() || !secs->is_array()) continue;
+        for (const json& sec : *secs)
+            if (sec.is_object() && str_field(sec, "secType") == "STK") return conid;
     }
     return fallback;
 }
@@ -113,7 +120,7 @@ bool ibkr_parse_orders(std::string_view json_text, std::vector<IbkrOrderStatus>&
         if (!r.is_object()) continue;
         IbkrOrderStatus s;
         s.order_id = str_field(r, "orderId");
-        s.status = r.value("status", "");
+        s.status = str_field(r, "status");
         if (!s.order_id.empty()) out.push_back(std::move(s));
     }
     return true;
@@ -126,9 +133,9 @@ bool ibkr_parse_trades(std::string_view json_text, std::vector<IbkrTrade>& out) 
         if (!r.is_object()) continue;
         IbkrTrade t;
         t.execution_id = str_field(r, "execution_id");
-        t.order_ref = r.value("order_ref", "");
-        t.symbol = r.value("symbol", "");
-        t.buy = r.value("side", "B") != "S";
+        t.order_ref = str_field(r, "order_ref");
+        t.symbol = str_field(r, "symbol");
+        t.buy = str_field(r, "side") != "S";
         t.qty = num_field(r, "size");
         t.price = num_field(r, "price");
         t.commission = num_field(r, "commission");
@@ -187,6 +194,8 @@ struct IbkrBroker::Io {
         curl_easy_reset(rest);
         const std::string url = b.cfg_.gateway_url + path;
         curl_easy_setopt(rest, CURLOPT_URL, url.c_str());
+        // IBKR's backend 403s any request without a User-Agent.
+        curl_easy_setopt(rest, CURLOPT_USERAGENT, "TradeTerminal/1.0");
         // Loopback gateway with a self-signed cert: the hop never leaves the
         // machine, so peer verification is deliberately off.
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -202,6 +211,10 @@ struct IbkrBroker::Io {
             hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
             curl_easy_setopt(rest, CURLOPT_HTTPHEADER, hdrs);
             curl_easy_setopt(rest, CURLOPT_POSTFIELDS, body.c_str());
+        } else if (std::string_view(method) == "POST") {
+            // Empty POST must still carry Content-Length: 0 — the gateway
+            // answers 411 without it and the session kick never lands.
+            curl_easy_setopt(rest, CURLOPT_POSTFIELDS, "");
         }
         res.rc = curl_easy_perform(rest);
         if (res.rc == CURLE_OK)

@@ -125,6 +125,8 @@ int64_t GatewayData::conid_for(const std::string& symbol) {
     curl_easy_reset(h);
     const std::string url = gateway_url_ + "/iserver/secdef/search?symbol=" + symbol;
     curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    // IBKR's backend 403s any request without a User-Agent.
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "TradeTerminal/1.0");
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);   // loopback gateway
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
@@ -150,6 +152,8 @@ void GatewayData::worker() {
         curl_easy_reset(h);
         const std::string url = gateway_url_ + path;
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        // IBKR's backend 403s any request without a User-Agent.
+        curl_easy_setopt(h, CURLOPT_USERAGENT, "TradeTerminal/1.0");
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(h, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
@@ -168,6 +172,7 @@ void GatewayData::worker() {
         curl_easy_reset(h);
         const std::string url = gateway_url_ + path;
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_USERAGENT, "TradeTerminal/1.0");
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(h, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
@@ -175,7 +180,9 @@ void GatewayData::worker() {
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
-        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+        // Empty POST must still carry Content-Length: 0 — the gateway
+        // answers 411 without it and the session kick never lands.
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, "");
         long status = 0;
         if (curl_easy_perform(h) == CURLE_OK)
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);

@@ -53,6 +53,18 @@ TEST_CASE("conid: prefers the STK row matching the symbol") {
     CHECK(ibkr_parse_conid("junk", "AAPL") == 0);
 }
 
+TEST_CASE("conid: live gateway shape — null symbol rows, secType in sections") {
+    // Real /iserver/secdef/search rows: string conids, "symbol":null on
+    // index/CFD rows (used to throw type_error 302), secType only under
+    // "sections". The STK-sectioned row must win over the WAR-only one.
+    const char* body = R"([
+      {"conid":"77777","symbol":null,"sections":[{"secType":"CFD"}]},
+      {"conid":"11111","symbol":"AAPL","sections":[{"secType":"WAR"}]},
+      {"conid":"265598","symbol":"AAPL",
+       "sections":[{"secType":"STK"},{"secType":"OPT"}]}])";
+    CHECK(ibkr_parse_conid(body, "AAPL") == 265598);
+}
+
 TEST_CASE("orders list parses id + status") {
     std::vector<IbkrOrderStatus> rows;
     REQUIRE(ibkr_parse_orders(

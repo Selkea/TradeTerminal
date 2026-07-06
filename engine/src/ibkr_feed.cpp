@@ -139,6 +139,8 @@ void IbkrFeed::io_loop() {
         curl_easy_reset(rest);
         const std::string url = cfg_.gateway_url + path;
         curl_easy_setopt(rest, CURLOPT_URL, url.c_str());
+        // IBKR's backend 403s any request without a User-Agent.
+        curl_easy_setopt(rest, CURLOPT_USERAGENT, "TradeTerminal/1.0");
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYPEER, 0L);   // loopback gateway
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(rest, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
@@ -147,6 +149,10 @@ void IbkrFeed::io_loop() {
         curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
         curl_easy_setopt(rest, CURLOPT_WRITEDATA, &body_out);
         curl_easy_setopt(rest, CURLOPT_CUSTOMREQUEST, method);
+        // Empty POST must still carry Content-Length: 0 — the gateway
+        // answers 411 without it and the session kick never lands.
+        if (std::string_view(method) == "POST")
+            curl_easy_setopt(rest, CURLOPT_POSTFIELDS, "");
         long status = 0;
         if (curl_easy_perform(rest) == CURLE_OK)
             curl_easy_getinfo(rest, CURLINFO_RESPONSE_CODE, &status);
