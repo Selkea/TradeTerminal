@@ -20,9 +20,8 @@ void TradePanel::scan_replay_files() {
     replay_idx_ = 0;
 }
 
-void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_available,
-                      bool polygon_available, const StartFn& start,
-                      const ReplayFn& replay) {
+void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon_available,
+                      const StartFn& start, const ReplayFn& replay) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -65,32 +64,22 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
         ImGui::InputInt("bar sec", &bar_sec_);
         bar_sec_ = std::clamp(bar_sec_, 1, 3600);
 
-        static constexpr const char* kBrokers[] = {"Simulator", "Alpaca (paper)",
-                                                   "IBKR (gateway)"};
+        static constexpr const char* kBrokers[] = {"Simulator", "IBKR (gateway)"};
         ImGui::SetNextItemWidth(140);
         ImGui::Combo("broker", &broker_idx_, kBrokers, IM_ARRAYSIZE(kBrokers));
         ImGui::SetItemTooltip("Simulator: local fills (ExecSim).\n"
-                              "Alpaca: paper API (needs Account-menu sign-in).\n"
-                              "IBKR: Client Portal Gateway on this machine — log in "
-                              "via browser at https://localhost:5000 first.");
-        if (broker_idx_ == 1 && !alpaca_available) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
-        }
-        static constexpr const char* kData[] = {"Delayed (Yahoo)", "Alpaca IEX",
-                                                "Polygon", "IBKR (gateway)"};
+                              "IBKR: Client Portal Gateway on this machine — "
+                              "Account menu > Sign In > IBKR to connect.");
+        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon"};
         ImGui::SetNextItemWidth(140);
         ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
-        ImGui::SetItemTooltip("Delayed: free ~10 s quotes via the Python sidecar.\n"
-                              "Alpaca IEX: real-time, needs Alpaca sign-in.\n"
-                              "Polygon: real-time, needs a Polygon key (Account menu "
-                              "or POLYGON_API_KEY).\n"
-                              "IBKR: ~250 ms conflated top-of-book via the local "
-                              "gateway session — no extra data bill.");
-        if ((data_idx_ == 1 && !alpaca_available) ||
-            (data_idx_ == 2 && !polygon_available)) {
+        ImGui::SetItemTooltip("IBKR: ~250 ms conflated top-of-book via the gateway "
+                              "session — no extra data bill.\n"
+                              "Polygon: full tick stream, needs a Polygon key "
+                              "(Account menu or POLYGON_API_KEY).");
+        if (data_idx_ == 1 && !polygon_available) {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "needs a Polygon key");
         }
         ImGui::Checkbox("Record ticks for replay", &record_ticks_);
         ImGui::SetItemTooltip("Capture every tick to a .ttk file — replay the exact "
@@ -120,15 +109,14 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
         if (ImGui::Button("Start paper trading") && !pending_symbols_.empty() && start) {
             session_broker_ = broker_idx_;
-            if (broker_idx_ == 1 && !alpaca_available) session_broker_ = 0;
             StartOpts opts;
             opts.symbols = pending_symbols_;
             opts.cash = cash_;
             opts.bar_seconds = bar_sec_;
             opts.broker = static_cast<Broker>(session_broker_);
             int data = data_idx_;
-            if ((data == 1 && !alpaca_available) || (data == 2 && !polygon_available))
-                data = 0;   // no credentials: fall back to delayed quotes
+            if (data == 1 && !polygon_available)
+                data = 0;   // no Polygon key: fall back to gateway data
             opts.data = static_cast<DataFeed>(data);
             opts.record = record_ticks_;
             opts.risk = risk_;
@@ -179,8 +167,6 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
     if (s.halted)
         ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "HALTED");
     else if (session_broker_ == 1)
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (alpaca paper)");
-    else if (session_broker_ == 2)
         ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr)");
     else
         ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "LIVE (paper)");

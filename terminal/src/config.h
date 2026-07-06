@@ -19,6 +19,9 @@ struct AppConfig {
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;
+    // Command that starts the IBKR Client Portal Gateway (e.g. its run.bat
+    // with the conf path); enables the Launch button in Sign In. Empty = off.
+    std::string ibkr_gateway_cmd;
     // Risk limits survive restarts — a halt threshold you set once should
     // still be armed tomorrow.
     double risk_max_order_qty = 1'000;

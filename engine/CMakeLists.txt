@@ -12,17 +12,16 @@ target_include_directories(tt_engine PUBLIC
     ${CMAKE_SOURCE_DIR}/sdk/include
 )
 
-# Broker/feed adapters (Alpaca + IBKR) — their own lib so tt_engine (and the
-# engine tests) stay free of libcurl and networking.
+# Broker/feed adapters (IBKR + Polygon) — their own lib so tt_engine (and
+# the engine tests) stay free of libcurl and networking.
 find_package(CURL REQUIRED)
-add_library(tt_alpaca STATIC
-    src/alpaca_broker.cpp
-    src/alpaca_feed.cpp
+add_library(tt_net STATIC
+    src/net_common.cpp
     src/ibkr_broker.cpp
     src/ibkr_feed.cpp
     src/polygon_feed.cpp
 )
-target_link_libraries(tt_alpaca
+target_link_libraries(tt_net
     PUBLIC tt_engine ws2_32   # ws2_32: select() in the socket wait path
     PRIVATE CURL::libcurl nlohmann_json simdjson)
 
@@ -40,18 +39,10 @@ target_compile_definitions(tt_engine_tests PRIVATE
 )
 add_test(NAME engine_tests COMMAND tt_engine_tests)
 
-add_executable(tt_alpaca_tests tests/test_alpaca_parse.cpp)
-target_link_libraries(tt_alpaca_tests PRIVATE tt_alpaca doctest)
-add_test(NAME alpaca_tests COMMAND tt_alpaca_tests)
-
-add_executable(tt_alpaca_feed_tests tests/test_alpaca_feed_parse.cpp)
-target_link_libraries(tt_alpaca_feed_tests PRIVATE tt_alpaca doctest)
-add_test(NAME alpaca_feed_tests COMMAND tt_alpaca_feed_tests)
-
 add_executable(tt_ibkr_tests tests/test_ibkr_parse.cpp)
-target_link_libraries(tt_ibkr_tests PRIVATE tt_alpaca doctest)
+target_link_libraries(tt_ibkr_tests PRIVATE tt_net doctest)
 add_test(NAME ibkr_tests COMMAND tt_ibkr_tests)
 
 add_executable(tt_polygon_tests tests/test_polygon_parse.cpp)
-target_link_libraries(tt_polygon_tests PRIVATE tt_alpaca doctest)
+target_link_libraries(tt_polygon_tests PRIVATE tt_net doctest)
 add_test(NAME polygon_tests COMMAND tt_polygon_tests)

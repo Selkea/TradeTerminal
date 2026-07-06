@@ -3,8 +3,6 @@
 #include "account_store.h"
 #include "alerts.h"
 #include "config.h"
-#include "engine/alpaca_broker.h"
-#include "engine/alpaca_feed.h"
 #include "engine/ibkr_broker.h"
 #include "engine/ibkr_feed.h"
 #include "engine/polygon_feed.h"
@@ -13,7 +11,7 @@
 #include "engine/strategy_host.h"
 #include "journal.h"
 #include "market_data.h"
-#include "net/ipc_client.h"
+#include "net/gateway_data.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/chart.h"
@@ -39,7 +37,7 @@ namespace tt::ui {
 // frame of UI inside the dockspace.
 class App {
 public:
-    App(std::string python_cmd, std::string service_dir);
+    explicit App(std::string gateway_url);
     ~App();
 
     void draw();
@@ -55,8 +53,6 @@ private:
     void draw_signin_modal();
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
-    // Signed-in account, falling back to APCA_* env vars; nullopt = neither.
-    std::optional<Account> alpaca_creds() const;
     // Signed-in Polygon key, falling back to POLYGON_API_KEY; "" = none.
     std::string polygon_key() const;
 
@@ -83,19 +79,17 @@ private:
     LogConsole log_;
     SeriesStore series_;
     QuoteBook quotes_;
-    net::IpcClient ipc_;
+    net::GatewayData gw_;
     // Declared before engine_ on purpose: the engine's live thread holds a
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
-    std::unique_ptr<AlpacaBroker> alpaca_;
     std::unique_ptr<IbkrBroker> ibkr_;
     Engine engine_;
     // Declared after engine_ on purpose: the feed pushes into the engine's
     // ring, so it must be destroyed (thread joined) before the engine.
-    std::unique_ptr<AlpacaFeed> alpaca_feed_;
     std::unique_ptr<PolygonFeed> polygon_feed_;
     std::unique_ptr<IbkrFeed> ibkr_feed_;
-    std::atomic<bool> rt_feed_active_{false};   // IPC thread: skip sidecar ticks
+    std::atomic<bool> rt_feed_active_{false};   // worker thread: skip snapshot ticks
     AlertNotifier alerts_;
     SmaCrossover sma_;
     StrategyHost host_;

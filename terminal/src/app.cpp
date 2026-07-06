@@ -4,6 +4,11 @@
 #include "imgui_internal.h"  // DockBuilder API (default first-run layout) + private dock node flags
 #include "implot.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>   // ShellExecuteA (gateway login page / launch)
+#endif
+
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -24,25 +29,17 @@ std::string gxx_path() {
 }
 } // namespace
 
-std::optional<Account> App::alpaca_creds() const {
-    if (auto a = accounts_.active("alpaca")) return a;
-    const char* k = std::getenv("APCA_API_KEY_ID");
-    const char* s = std::getenv("APCA_API_SECRET_KEY");
-    if (k && *k && s && *s) return Account{"env", "alpaca", k, s};
-    return std::nullopt;
-}
-
 std::string App::polygon_key() const {
     if (auto a = accounts_.active("polygon")) return a->key_id;
     const char* k = std::getenv("POLYGON_API_KEY");
     return k && *k ? k : "";
 }
 
-App::App(std::string python_cmd, std::string service_dir)
-    : ipc_(std::move(python_cmd), std::move(service_dir)),
+App::App(std::string gateway_url)
+    : gw_(std::move(gateway_url)),
       host_(gxx_path(), std::string(TT_REPO_ROOT) + "/sdk/include", strategies_out_dir()),
-      chart_(ipc_, series_),
-      watchlist_(ipc_, quotes_),
+      chart_(gw_, series_),
+      watchlist_(gw_, quotes_),
       backtest_(engine_),
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
       trade_(engine_, sessions_dir()),
@@ -50,7 +47,7 @@ App::App(std::string python_cmd, std::string service_dir)
       positions_(engine_),
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
-    net::IpcClient::Callbacks cbs;
+    net::GatewayData::Callbacks cbs;
     cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
@@ -99,7 +96,7 @@ App::App(std::string python_cmd, std::string service_dir)
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
 #endif
 
-    ipc_.start(std::move(cbs));
+    gw_.start(std::move(cbs));
 }
 
 // IPC thread: if this candle batch is the one a queued backtest is waiting
@@ -137,7 +134,7 @@ void App::start_pending_backtest(net::CandleBatch& batch) {
 // UI thread: capture the active strategy + params and fetch the data.
 void App::queue_backtest(const std::string& sym, const std::string& ivl,
                          const std::string& rng, double cash) {
-    if (!ipc_.connected()) {
+    if (!gw_.connected()) {
         log_.add("backtest: feed is down, cannot fetch data");
         return;
     }
@@ -146,14 +143,14 @@ void App::queue_backtest(const std::string& sym, const std::string& ivl,
         pending_bt_ = {true, sym, ivl, strat_mgr_.param_values(), cash,
                        strat_mgr_.active_strategy(sma_), host_.generation()};
     }
-    ipc_.request_candles(sym, ivl, rng);
+    gw_.request_candles(sym, ivl, rng);
 }
 
 // ------------------------------------------------------------------ sweep
 
 // UI thread: capture the request + strategy and fetch the data.
 void App::queue_sweep(const SweepPanel::Request& rq) {
-    if (!ipc_.connected()) {
+    if (!gw_.connected()) {
         log_.add("sweep: feed is down, cannot fetch data");
         return;
     }
@@ -169,7 +166,7 @@ void App::queue_sweep(const SweepPanel::Request& rq) {
         sweep_setup_.strategy = strat_mgr_.active_strategy(sma_);
         sweep_setup_.strategy_gen = host_.generation();
     }
-    ipc_.request_candles(rq.symbol, rq.interval, rq.range);
+    gw_.request_candles(rq.symbol, rq.interval, rq.range);
 }
 
 // IPC thread: if this batch is what the sweep is waiting for, stash the
@@ -322,7 +319,7 @@ void App::pump_sweep() {
 }
 
 App::~App() {
-    ipc_.stop();
+    gw_.stop();
     if (signin_.worker.joinable()) signin_.worker.join();
     cfg_.watchlist = watchlist_.symbols();
     cfg_.chart_symbol = chart_.symbol();
@@ -354,11 +351,6 @@ void App::draw() {
         alert_scan(line);
         log_.add(std::move(line));
     }
-    if (alpaca_)
-        while (alpaca_->pop_log(line)) {
-            alert_scan(line);
-            log_.add(std::move(line));
-        }
     if (ibkr_)
         while (ibkr_->pop_log(line)) {
             alert_scan(line);
@@ -374,15 +366,9 @@ void App::draw() {
             alert_scan(line);
             log_.add(std::move(line));
         }
-    if (alpaca_feed_)
-        while (alpaca_feed_->pop_log(line)) {
-            alert_scan(line);
-            log_.add(std::move(line));
-        }
     // Session over: stop streaming (frees the vendor connection slot).
-    if ((alpaca_feed_ || polygon_feed_ || ibkr_feed_) && !engine_.live_running()) {
+    if ((polygon_feed_ || ibkr_feed_) && !engine_.live_running()) {
         rt_feed_active_.store(false, std::memory_order_relaxed);
-        alpaca_feed_.reset();
         polygon_feed_.reset();
         ibkr_feed_.reset();
         log_.add("live: real-time feed stopped");
@@ -390,7 +376,7 @@ void App::draw() {
 
     // TT_AUTORUN_BACKTEST=1: fire one AAPL backtest as soon as the feed is up
     // (headless end-to-end verification of the UI -> data -> engine path).
-    if (!autorun_bt_done_ && ipc_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
+    if (!autorun_bt_done_ && gw_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
         autorun_bt_done_ = true;
         queue_backtest("AAPL", "1d", "2y", 100'000.0);
         log_.add("autorun: queued AAPL 1d 2y backtest (" + strat_mgr_.active_name() + ")");
@@ -398,7 +384,7 @@ void App::draw() {
 
     // TT_AUTORUN_SWEEP=1: 4x4 fast/slow grid — headless verification of the
     // sweep runner ("sweep: finished 16 backtests" on success).
-    if (!autorun_sweep_done_ && ipc_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
+    if (!autorun_sweep_done_ && gw_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
         autorun_sweep_done_ = true;
         SweepPanel::Request rq;
         rq.symbol = "AAPL";
@@ -423,8 +409,7 @@ void App::draw() {
         for (const std::string& sym : journal_syms_)
             jsyms += (jsyms.empty() ? "" : ",") + sym;
         journal_session_ = journal_.begin_session(
-            jsyms, alpaca_ ? "alpaca" : (ibkr_ ? "ibkr" : "sim"),
-            engine_.live_snapshot().cash);
+            jsyms, ibkr_ ? "ibkr" : "sim", engine_.live_snapshot().cash);
     } else if (prev_live_running_ && !live_now && journal_session_) {
         const LiveSnapshot s = engine_.live_snapshot();
         journal_.end_session(journal_session_, s.equity, s.halted);
@@ -480,8 +465,7 @@ void App::draw() {
                           });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_trade_)
-        trade_.draw(&show_trade_, strat_mgr_.active_name(), alpaca_creds().has_value(),
-                    !polygon_key().empty(),
+        trade_.draw(&show_trade_, strat_mgr_.active_name(), !polygon_key().empty(),
                     [this](const TradePanel::StartOpts& opts) {
                         const std::vector<std::string>& syms = opts.symbols;
                         LiveConfig cfg;
@@ -490,9 +474,9 @@ void App::draw() {
                         cfg.params = strat_mgr_.param_values();
                         cfg.bar_seconds = opts.bar_seconds;
                         cfg.risk = opts.risk;
-                        // Real-time feed => spin the engine thread instead of
-                        // sleeping; ticks are handled in ns, not after Sleep(5).
-                        cfg.busy_spin = opts.data != TradePanel::DataFeed::Delayed;
+                        // Every data source is real-time now => spin the engine
+                        // thread; ticks are handled in ns, not after Sleep(5).
+                        cfg.busy_spin = true;
                         // Optional core pinning (TT_PIN_ENGINE / TT_PIN_FEED =
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
@@ -507,20 +491,8 @@ void App::draw() {
                             std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
                             cfg.capture_path = sessions_dir() + "\\" + name;
                         }
-                        // Paper endpoints only for now; going live is a deliberate
-                        // future step, not an env-var surprise.
-                        std::unique_ptr<AlpacaBroker> broker;
                         std::unique_ptr<IbkrBroker> ibkr_broker;
-                        const std::optional<Account> creds = alpaca_creds();
-                        if (opts.broker == TradePanel::Broker::Alpaca && creds) {
-                            AlpacaConfig ac;
-                            ac.key_id = creds->key_id;
-                            ac.secret = creds->secret;
-                            ac.symbols = syms;
-                            broker = std::make_unique<AlpacaBroker>(std::move(ac));
-                            cfg.broker = broker.get();
-                            log_.add("live: using Alpaca account '" + creds->name + "'");
-                        } else if (opts.broker == TradePanel::Broker::Ibkr) {
+                        if (opts.broker == TradePanel::Broker::Ibkr) {
                             IbkrConfig ic;
                             if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
                                 ic.gateway_url = gw;
@@ -532,31 +504,16 @@ void App::draw() {
                         if (engine_.start_live(std::move(cfg),
                                                strat_mgr_.active_strategy(sma_))) {
                             // Previous session's thread was joined inside
-                            // start_live, so replacing the old brokers is safe.
-                            alpaca_ = std::move(broker);
+                            // start_live, so replacing the old broker is safe.
                             ibkr_ = std::move(ibkr_broker);
-                            alpaca_feed_.reset();   // previous session's feeds
-                            polygon_feed_.reset();
+                            polygon_feed_.reset();   // previous session's feeds
                             ibkr_feed_.reset();
                             rt_feed_active_.store(false, std::memory_order_relaxed);
                             const auto sink = [this](const EngineEvent& ev) {
                                 return engine_.push_feed_event(ev);
                             };
-                            if (opts.data == TradePanel::DataFeed::AlpacaIex && creds) {
-                                AlpacaFeedConfig fc;
-                                fc.key_id = creds->key_id;
-                                fc.secret = creds->secret;
-                                fc.symbols = syms;
-                                fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
-                                if (const char* pin = std::getenv("TT_PIN_FEED"))
-                                    fc.pin_core = std::atoi(pin);
-                                fc.bar_seconds = opts.bar_seconds;
-                                alpaca_feed_ =
-                                    std::make_unique<AlpacaFeed>(std::move(fc), sink);
-                                alpaca_feed_->start();
-                                rt_feed_active_.store(true, std::memory_order_relaxed);
-                            } else if (opts.data == TradePanel::DataFeed::Polygon &&
-                                       !polygon_key().empty()) {
+                            if (opts.data == TradePanel::DataFeed::Polygon &&
+                                !polygon_key().empty()) {
                                 PolygonFeedConfig pc;
                                 pc.api_key = polygon_key();
                                 // e.g. wss://delayed.polygon.io/stocks to test the
@@ -683,11 +640,18 @@ void App::draw() {
 
 void App::draw_account_menu() {
     if (!ImGui::BeginMenu("Account")) return;
-    for (const char* prov : {"alpaca", "polygon"}) {
-        const std::string act = accounts_.active_name(prov);
-        ImGui::TextDisabled("%s: %s", prov, act.empty() ? "(not signed in)" : act.c_str());
+    if (gw_.connected()) {
+        const std::string acct = gw_.account();
+        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "ibkr: session active%s",
+                           acct.empty() ? "" : ("  (" + acct + ")").c_str());
+    } else {
+        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "ibkr: no gateway session");
     }
-    ImGui::TextDisabled("ibkr: gateway browser login");
+    {
+        const std::string act = accounts_.active_name("polygon");
+        ImGui::TextDisabled("polygon: %s",
+                            act.empty() ? "(not signed in)" : act.c_str());
+    }
     ImGui::Separator();
 
     if (ImGui::MenuItem("Sign In...")) signin_.request_open = true;
@@ -709,15 +673,11 @@ void App::draw_account_menu() {
         ImGui::EndMenu();
     }
 
-    const bool any_active =
-        accounts_.signed_in("alpaca") || accounts_.signed_in("polygon");
-    if (ImGui::BeginMenu("Sign Out", any_active)) {
-        for (const char* prov : {"alpaca", "polygon"}) {
-            const std::string act = accounts_.active_name(prov);
-            if (!act.empty() && ImGui::MenuItem((std::string(prov) + ": " + act).c_str())) {
-                accounts_.sign_out(prov);
-                log_.add(std::string("account: signed out of ") + prov);
-            }
+    if (ImGui::BeginMenu("Sign Out", accounts_.signed_in("polygon"))) {
+        const std::string act = accounts_.active_name("polygon");
+        if (!act.empty() && ImGui::MenuItem(("polygon: " + act).c_str())) {
+            accounts_.sign_out("polygon");
+            log_.add("account: signed out of polygon");
         }
         ImGui::EndMenu();
     }
@@ -759,20 +719,17 @@ void App::draw_signin_modal() {
             std::lock_guard lock(signin_.mu);
             signin_.detail.clear();
         }
-        ImGui::OpenPopup("Sign In to Alpaca");
+        ImGui::OpenPopup("Sign In");
     }
-    if (!ImGui::BeginPopupModal("Sign In to Alpaca", nullptr,
-                                ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal("Sign In", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
 
-    const bool is_alpaca = signin_.provider == 0;
-    const bool is_polygon = signin_.provider == 1;
     auto make_account = [&] {
         Account a;
         a.name = signin_.name[0] ? signin_.name : "default";
-        a.provider = is_polygon ? "polygon" : "alpaca";
+        a.provider = "polygon";
         a.key_id = signin_.key;
-        a.secret = is_polygon ? "" : signin_.secret;
+        a.secret = "";
         return a;
     };
 
@@ -797,31 +754,54 @@ void App::draw_signin_modal() {
 
     const bool busy = status == 1;
     ImGui::BeginDisabled(busy);
-    static constexpr const char* kProviders[] = {"Alpaca", "Polygon", "IBKR"};
+    static constexpr const char* kProviders[] = {"IBKR (gateway)", "Polygon"};
     ImGui::SetNextItemWidth(280);
     ImGui::Combo("Provider", &signin_.provider, kProviders, IM_ARRAYSIZE(kProviders));
-    if (signin_.provider == 2) {
+    if (signin_.provider == 0) {
         ImGui::EndDisabled();
-        // Nothing to store: the gateway holds the brokerage session itself.
-        ImGui::TextWrapped("IBKR credentials are never stored here. Run the Client "
-                           "Portal Gateway and log in via your browser (default "
-                           "https://localhost:5000); the IBKR broker connects to "
-                           "that session automatically.");
+        // Nothing is stored: the Client Portal Gateway holds the brokerage
+        // session itself, so sign-in means logging into the gateway.
+        if (gw_.connected()) {
+            const std::string acct = gw_.account();
+            ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1),
+                               "Gateway session active%s",
+                               acct.empty() ? "" : ("  (" + acct + ")").c_str());
+            ImGui::TextWrapped("Orders, market data, charts, and backtests are all "
+                               "flowing through this session.");
+        } else {
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "No gateway session");
+            ImGui::TextWrapped("1. Start the Client Portal Gateway (IBKR's small "
+                               "Java app).\n2. Log in with your IBKR credentials on "
+                               "its login page.\n3. This dialog turns green within a "
+                               "few seconds — nothing is stored in TradeTerminal.");
+        }
+        if (ImGui::Button("Open gateway login page")) {
+            ShellExecuteA(nullptr, "open", gw_.login_url().c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
+        }
+        if (!cfg_.ibkr_gateway_cmd.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Launch gateway")) {
+                ShellExecuteA(nullptr, "open", "cmd.exe",
+                              ("/c " + cfg_.ibkr_gateway_cmd).c_str(), nullptr,
+                              SW_SHOWMINNOACTIVE);
+                log_.add("account: launching Client Portal Gateway");
+            }
+        } else {
+            ImGui::TextDisabled("Tip: set \"ibkr_gateway_cmd\" in config.json (e.g. "
+                                "the gateway's run.bat) for a Launch button here.");
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         return;
     }
     ImGui::SetNextItemWidth(280);
     ImGui::InputText("Name", signin_.name, sizeof signin_.name);
-    ImGui::SetItemTooltip("Label shown in the Account menu (e.g. \"paper\")");
+    ImGui::SetItemTooltip("Label shown in the Account menu (e.g. \"data\")");
     ImGui::SetNextItemWidth(280);
-    ImGui::InputText(is_polygon ? "API key" : "API key ID", signin_.key,
-                     sizeof signin_.key, is_polygon ? ImGuiInputTextFlags_Password : 0);
-    if (is_alpaca) {
-        ImGui::SetNextItemWidth(280);
-        ImGui::InputText("API secret", signin_.secret, sizeof signin_.secret,
-                         ImGuiInputTextFlags_Password);
-    }
+    ImGui::InputText("API key", signin_.key, sizeof signin_.key,
+                     ImGuiInputTextFlags_Password);
     ImGui::EndDisabled();
     ImGui::TextDisabled("Stored encrypted (Windows DPAPI, this user only).");
 
@@ -833,19 +813,15 @@ void App::draw_signin_modal() {
                            signin_.detail.c_str());
     }
 
-    const bool have_input = signin_.key[0] && (is_polygon || signin_.secret[0]);
+    const bool have_input = signin_.key[0] != '\0';
     ImGui::BeginDisabled(busy || !have_input);
     if (ImGui::Button("Verify & Sign In")) {
         if (signin_.worker.joinable()) signin_.worker.join();
         signin_.status.store(1);
-        const std::string key = signin_.key, secret = signin_.secret;
-        const bool polygon = is_polygon;
-        signin_.worker = std::thread([this, key, secret, polygon] {
+        const std::string key = signin_.key;
+        signin_.worker = std::thread([this, key] {
             std::string detail;
-            const bool ok =
-                polygon
-                    ? polygon_verify_key(PolygonFeedConfig{}.rest_url, key, detail)
-                    : alpaca_verify_account(AlpacaConfig{}.rest_url, key, secret, detail);
+            const bool ok = polygon_verify_key(PolygonFeedConfig{}.rest_url, key, detail);
             {
                 std::lock_guard lock(signin_.mu);
                 signin_.detail = std::move(detail);
@@ -911,9 +887,9 @@ void App::draw_menu_bar() {
         ImGui::EndMenu();
     }
 
-    // Right-aligned feed health indicator.
-    const bool up = ipc_.connected();
-    const char* label = up ? "FEED UP" : "FEED DOWN";
+    // Right-aligned gateway session indicator.
+    const bool up = gw_.connected();
+    const char* label = up ? "GATEWAY UP" : "GATEWAY DOWN";
     const float w = ImGui::CalcTextSize(label).x + 16.0f;
     ImGui::SameLine(ImGui::GetWindowWidth() - w);
     ImGui::TextColored(up ? ImVec4(0.25f, 0.85f, 0.45f, 1.0f)

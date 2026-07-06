@@ -1,6 +1,6 @@
 #pragma once
 // Polygon.io real-time market data -> engine ticks. Same IFeedHandler shape
-// as AlpacaFeed: one I/O thread owns the websocket, trades become
+// as the other feeds: one I/O thread owns the websocket, trades become
 // EngineEvent Ticks (quotes cached and attached as bid/ask), reconnects
 // backfill the gap with REST aggregate bars.
 //
@@ -9,11 +9,11 @@
 // socket, so the parsing rides the same simdjson hot path. Databento is the
 // later alternative if its binary DBN protocol's headroom is ever needed.
 //
-// Message kinds are normalized into AlpacaFeedMsg — the two vendors' events
+// Message kinds are normalized into FeedMsg — the two vendors' events
 // map 1:1 (trade/quote/connected/authenticated/subscription/error), and
-// sharing the struct keeps AlpacaFeed's handshake/stream logic pattern.
+// sharing the struct keeps every feed's handshake/stream loop identical.
 
-#include "engine/alpaca_feed.h"   // AlpacaFeedMsg, AlpacaRestBar
+#include "engine/feed_msg.h"   // FeedMsg, RestBar
 #include "engine/events.h"
 #include "engine/feed.h"
 
@@ -44,10 +44,10 @@ struct PolygonFeedConfig {
 //   {"ev":"T",...} trade   {"ev":"Q",...} quote   {"ev":"status",...} control
 size_t polygon_parse_feed_msgs(std::string_view json_text,
                                const std::vector<std::string>& symbols,
-                               std::vector<AlpacaFeedMsg>& out);
+                               std::vector<FeedMsg>& out);
 
 // GET /v2/aggs/... response ("results":[{t,o,h,l,c,v}...]) -> bars.
-bool polygon_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out);
+bool polygon_parse_rest_bars(std::string_view json_text, std::vector<RestBar>& out);
 
 // Synchronous API-key check (blocks up to ~10 s — worker thread only).
 // True = key valid; detail carries a summary or the error.

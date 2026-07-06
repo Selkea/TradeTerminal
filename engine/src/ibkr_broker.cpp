@@ -1,7 +1,7 @@
 #include "engine/ibkr_broker.h"
 
-#include "alpaca_util.h"
-#include "alpaca_ws.h"
+#include "net_util.h"
+#include "net_ws.h"
 #include "engine/clock.h"
 
 #include <curl/curl.h>
@@ -18,7 +18,7 @@ namespace tt {
 namespace {
 
 using nlohmann::json;
-using tt::alpaca::num_field;
+using tt::net_util::num_field;
 
 // cOID suffix "tt-<session_ms>-<local_id>" -> local_id, else 0.
 uint64_t coid_suffix(const std::string& coid) {
@@ -193,7 +193,7 @@ struct IbkrBroker::Io {
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(rest, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(rest, CURLOPT_TIMEOUT_MS, 10000L);
-        curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+        curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
         curl_easy_setopt(rest, CURLOPT_WRITEDATA, &res.body);
         curl_easy_setopt(rest, CURLOPT_CUSTOMREQUEST, method);
         curl_slist* hdrs = nullptr;
@@ -215,7 +215,7 @@ struct IbkrBroker::Io {
         if (!session) {
             const Response r = call("GET", "/iserver/accounts", "");
             if (!r.ok()) {
-                const int64_t now = alpaca_steady_ms();
+                const int64_t now = net_steady_ms();
                 if (now - last_login_nag_ms > 30'000) {
                     last_login_nag_ms = now;
                     b.log(r.status == 401 || r.status == 0
@@ -245,7 +245,7 @@ struct IbkrBroker::Io {
     }
 
     void tickle() {
-        const int64_t now = alpaca_steady_ms();
+        const int64_t now = net_steady_ms();
         if (now - last_tickle_ms < 60'000) return;
         last_tickle_ms = now;
         call("POST", "/tickle", "");
@@ -384,7 +384,7 @@ struct IbkrBroker::Io {
     }
 
     void poll() {
-        const int64_t now = alpaca_steady_ms();
+        const int64_t now = net_steady_ms();
         if (now - last_poll_ms < 1000) return;
         last_poll_ms = now;
 
@@ -449,8 +449,8 @@ IbkrBroker::IbkrBroker(IbkrConfig cfg) : cfg_(std::move(cfg)) {
         std::to_string(
             duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()) +
         "-";
-    alpaca_ensure_curl_init();
-    alpaca_make_wake_pipe(wake_tx_, wake_rx_);
+    net_ensure_curl_init();
+    net_make_wake_pipe(wake_tx_, wake_rx_);
     io_thread_ = std::thread([this] { io_loop(); });
 }
 

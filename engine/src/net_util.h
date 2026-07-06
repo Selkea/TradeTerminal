@@ -1,5 +1,5 @@
 #pragma once
-// Internal to tt_alpaca: JSON/number/timestamp helpers shared by the broker
+// Internal to tt_net: JSON/number/timestamp helpers shared by the broker
 // and market-data translation units.
 
 #include <nlohmann/json.hpp>
@@ -10,9 +10,9 @@
 #include <string>
 #include <string_view>
 
-namespace tt::alpaca {
+namespace tt::net_util {
 
-// Alpaca sends numbers as JSON strings on the trading stream and as JSON
+// Some vendors send numbers as JSON strings and others as JSON
 // numbers on the data stream — accept both.
 inline double num(const nlohmann::json& v) {
     if (v.is_number()) return v.get<double>();
@@ -76,4 +76,4 @@ inline size_t curl_write_to_string(char* p, size_t sz, size_t nm, void* ud) {
     return sz * nm;
 }
 
-} // namespace tt::alpaca
+} // namespace tt::net_util

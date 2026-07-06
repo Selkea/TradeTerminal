@@ -116,7 +116,7 @@ TEST_CASE("smd market updates: partial fields, string values, conid from topic")
 }
 
 TEST_CASE("history bars parse for gap backfill") {
-    std::vector<tt::AlpacaRestBar> bars;
+    std::vector<tt::RestBar> bars;
     REQUIRE(tt::ibkr_parse_history_bars(
         R"({"symbol":"AAPL","data":[{"t":1783002600000,"o":100.1,"h":101,"l":99.9,"c":100.5,"v":120}],"points":1})",
         bars));

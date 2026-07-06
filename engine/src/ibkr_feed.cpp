@@ -1,7 +1,7 @@
 #include "engine/ibkr_feed.h"
 
-#include "alpaca_util.h"
-#include "alpaca_ws.h"
+#include "net_util.h"
+#include "net_ws.h"
 #include "engine/clock.h"
 #include "engine/ibkr_broker.h"   // ibkr_parse_conid, ibkr_parse_first_account
 
@@ -19,7 +19,7 @@
 namespace tt {
 
 using nlohmann::json;
-using tt::alpaca::num_field;
+using tt::net_util::num_field;
 
 std::string ibkr_parse_session_token(std::string_view json_text) {
     const json j = json::parse(json_text, nullptr, false);
@@ -73,14 +73,14 @@ bool ibkr_parse_md_msg(std::string_view json_text, IbkrMdUpdate& out) {
     return u.has_last || u.has_bid || u.has_ask;
 }
 
-bool ibkr_parse_history_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out) {
+bool ibkr_parse_history_bars(std::string_view json_text, std::vector<RestBar>& out) {
     const json j = json::parse(json_text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return false;
     const auto data = j.find("data");
     if (data == j.end() || !data->is_array()) return false;
     for (const json& b : *data) {
         if (!b.is_object()) continue;
-        AlpacaRestBar r;
+        RestBar r;
         r.ts_ns = static_cast<int64_t>(num_field(b, "t")) * 1'000'000;   // ms
         r.open = num_field(b, "o");
         r.high = num_field(b, "h");
@@ -130,7 +130,7 @@ void IbkrFeed::io_loop() {
     if (cfg_.pin_core >= 0 && cfg_.pin_core < 64)
         SetThreadAffinityMask(GetCurrentThread(), 1ull << cfg_.pin_core);
 #endif
-    alpaca_ensure_curl_init();
+    net_ensure_curl_init();
 
     CURL* rest = curl_easy_init();
     auto call = [&](const char* method, const std::string& path, std::string& body_out) {
@@ -143,7 +143,7 @@ void IbkrFeed::io_loop() {
         curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(rest, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(rest, CURLOPT_TIMEOUT_MS, 10000L);
-        curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+        curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
         curl_easy_setopt(rest, CURLOPT_WRITEDATA, &body_out);
         curl_easy_setopt(rest, CURLOPT_CUSTOMREQUEST, method);
         long status = 0;
@@ -152,7 +152,7 @@ void IbkrFeed::io_loop() {
         return status;
     };
 
-    AlpacaWs ws;
+    WsClient ws;
     std::vector<int64_t> conids(cfg_.symbols.size(), 0);
     struct Cache { double bid = 0, ask = 0, last = 0; };
     std::vector<Cache> cache(cfg_.symbols.size());
@@ -162,7 +162,7 @@ void IbkrFeed::io_loop() {
 
     auto resolve = [&]() -> bool {
         if (call("GET", "/iserver/accounts", body) / 100 != 2) {
-            const int64_t now = alpaca_steady_ms();
+            const int64_t now = net_steady_ms();
             if (now - last_nag_ms > 30'000) {
                 last_nag_ms = now;
                 log("no gateway session — log in via browser (default "
@@ -204,10 +204,10 @@ void IbkrFeed::io_loop() {
                     100 !=
                 2)
                 continue;
-            std::vector<AlpacaRestBar> bars;
+            std::vector<RestBar> bars;
             if (!ibkr_parse_history_bars(body, bars)) continue;
             size_t pushed = 0;
-            for (const AlpacaRestBar& b : bars) {
+            for (const RestBar& b : bars) {
                 if (b.ts_ns <= from_ns) continue;
                 EngineEvent ev{};
                 ev.type = static_cast<uint16_t>(EvType::Bar);
@@ -284,7 +284,7 @@ void IbkrFeed::io_loop() {
     int64_t next_connect_ms = 0;
     while (!stop_.load(std::memory_order_relaxed)) {
         if (!ws.open()) {
-            if (alpaca_steady_ms() < next_connect_ms) {
+            if (net_steady_ms() < next_connect_ms) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
@@ -295,13 +295,13 @@ void IbkrFeed::io_loop() {
                 if (last_event_ns > 0) backfill(last_event_ns);
             } else {
                 ws.close();
-                next_connect_ms = alpaca_steady_ms() + backoff_s * 1000;
+                next_connect_ms = net_steady_ms() + backoff_s * 1000;
                 backoff_s = std::min(backoff_s * 2, 30);
             }
             continue;
         }
         // The gateway drops idle websockets: it expects a "tic" heartbeat.
-        const int64_t now = alpaca_steady_ms();
+        const int64_t now = net_steady_ms();
         if (now - last_tic_ms > 45'000) {
             last_tic_ms = now;
             ws.send_text("tic");
@@ -311,7 +311,7 @@ void IbkrFeed::io_loop() {
         if (r < 0) {
             connected_.store(false, std::memory_order_release);
             ws.close();
-            next_connect_ms = alpaca_steady_ms() + 1000;
+            next_connect_ms = net_steady_ms() + 1000;
             log("stream lost, reconnecting");
         } else if (r == 0) {
             ws.wait_readable(200);

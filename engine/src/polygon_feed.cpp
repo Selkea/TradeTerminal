@@ -1,7 +1,7 @@
 #include "engine/polygon_feed.h"
 
-#include "alpaca_util.h"
-#include "alpaca_ws.h"
+#include "net_util.h"
+#include "net_ws.h"
 #include "engine/clock.h"
 
 #ifdef _WIN32
@@ -24,7 +24,7 @@ using nlohmann::json;
 // per websocket frame ahead of the ts_ingest_tsc stamp.
 size_t polygon_parse_feed_msgs(std::string_view json_text,
                                const std::vector<std::string>& symbols,
-                               std::vector<AlpacaFeedMsg>& out) {
+                               std::vector<FeedMsg>& out) {
     namespace od = simdjson::ondemand;
     thread_local od::parser parser;
     thread_local std::string padded;
@@ -37,7 +37,7 @@ size_t polygon_parse_feed_msgs(std::string_view json_text,
         for (od::value elem : doc.get_array()) {
             od::object obj = elem.get_object();
             const std::string_view ev = obj["ev"].get_string();
-            AlpacaFeedMsg m;
+            FeedMsg m;
             if (ev == "T" || ev == "Q") {
                 const std::string_view sym = obj["sym"].get_string();
                 for (size_t i = 0; i < symbols.size(); ++i)
@@ -46,14 +46,14 @@ size_t polygon_parse_feed_msgs(std::string_view json_text,
                         break;
                     }
                 if (ev == "T") {
-                    m.kind = AlpacaFeedMsg::Trade;
+                    m.kind = FeedMsg::Trade;
                     m.price = double(obj["p"].get_double());
                     double sz = 0;
                     if (obj["s"].get_double().get(sz) != simdjson::SUCCESS)
                         sz = 0;   // odd lots may omit size
                     m.size = sz;
                 } else {
-                    m.kind = AlpacaFeedMsg::Quote;
+                    m.kind = FeedMsg::Quote;
                     m.bid = double(obj["bp"].get_double());
                     m.ask = double(obj["ap"].get_double());
                 }
@@ -62,11 +62,11 @@ size_t polygon_parse_feed_msgs(std::string_view json_text,
                 m.ts_ns = ts_ms * 1'000'000;
             } else if (ev == "status") {
                 const std::string_view status = obj["status"].get_string();
-                if (status == "connected") m.kind = AlpacaFeedMsg::Connected;
-                else if (status == "auth_success") m.kind = AlpacaFeedMsg::Authenticated;
-                else if (status == "success") m.kind = AlpacaFeedMsg::Subscription;
+                if (status == "connected") m.kind = FeedMsg::Connected;
+                else if (status == "auth_success") m.kind = FeedMsg::Authenticated;
+                else if (status == "success") m.kind = FeedMsg::Subscription;
                 else if (status == "auth_failed" || status == "error") {
-                    m.kind = AlpacaFeedMsg::Error;
+                    m.kind = FeedMsg::Error;
                     std::string_view msg = "unknown error";
                     if (obj["message"].get_string().get(msg) != simdjson::SUCCESS)
                         msg = "unknown error";
@@ -87,20 +87,20 @@ size_t polygon_parse_feed_msgs(std::string_view json_text,
 }
 
 // Non-hot path (reconnect recovery).
-bool polygon_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out) {
+bool polygon_parse_rest_bars(std::string_view json_text, std::vector<RestBar>& out) {
     const json j = json::parse(json_text, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return false;
     const auto results = j.find("results");
     if (results == j.end() || !results->is_array()) return j.value("resultsCount", -1) == 0;
     for (const json& b : *results) {
         if (!b.is_object()) continue;
-        AlpacaRestBar r;
-        r.ts_ns = static_cast<int64_t>(alpaca::num_field(b, "t")) * 1'000'000;   // ms
-        r.open = alpaca::num_field(b, "o");
-        r.high = alpaca::num_field(b, "h");
-        r.low = alpaca::num_field(b, "l");
-        r.close = alpaca::num_field(b, "c");
-        r.volume = alpaca::num_field(b, "v");
+        RestBar r;
+        r.ts_ns = static_cast<int64_t>(net_util::num_field(b, "t")) * 1'000'000;   // ms
+        r.open = net_util::num_field(b, "o");
+        r.high = net_util::num_field(b, "h");
+        r.low = net_util::num_field(b, "l");
+        r.close = net_util::num_field(b, "c");
+        r.volume = net_util::num_field(b, "v");
         if (r.ts_ns > 0 && r.close > 0) out.push_back(r);
     }
     return true;
@@ -108,7 +108,7 @@ bool polygon_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestB
 
 bool polygon_verify_key(const std::string& rest_url, const std::string& api_key,
                         std::string& detail) {
-    alpaca_ensure_curl_init();
+    net_ensure_curl_init();
     CURL* h = curl_easy_init();
     if (!h) {
         detail = "curl init failed";
@@ -123,7 +123,7 @@ bool polygon_verify_key(const std::string& rest_url, const std::string& api_key,
     curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
     const CURLcode rc = curl_easy_perform(h);
     long status = 0;
@@ -186,10 +186,10 @@ void PolygonFeed::io_loop() {
         if (SetThreadAffinityMask(GetCurrentThread(), 1ull << cfg_.pin_core))
             log("feed thread pinned to core " + std::to_string(cfg_.pin_core));
 #endif
-    alpaca_ensure_curl_init();
+    net_ensure_curl_init();
 
-    AlpacaWs ws;
-    std::vector<AlpacaFeedMsg> msgs;
+    WsClient ws;
+    std::vector<FeedMsg> msgs;
     struct BidAsk { double bid = 0.0, ask = 0.0; };
     std::vector<BidAsk> quotes(cfg_.symbols.size());
     int64_t last_trade_ns = 0;
@@ -222,20 +222,20 @@ void PolygonFeed::io_loop() {
             curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
             curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
-            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, net_util::curl_write_to_string);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
             const CURLcode rc = curl_easy_perform(h);
             long status = 0;
             if (rc == CURLE_OK) curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
             curl_easy_cleanup(h);
-            std::vector<AlpacaRestBar> bars;
+            std::vector<RestBar> bars;
             if (rc != CURLE_OK || status / 100 != 2 ||
                 !polygon_parse_rest_bars(body, bars)) {
                 log("gap backfill failed for " + cfg_.symbols[i]);
                 continue;
             }
             size_t pushed = 0;
-            for (const AlpacaRestBar& bar : bars) {
+            for (const RestBar& bar : bars) {
                 if (bar.ts_ns <= from_ns) continue;
                 EngineEvent ev{};
                 ev.type = static_cast<uint16_t>(EvType::Bar);
@@ -257,13 +257,13 @@ void PolygonFeed::io_loop() {
         curl_slist_free_all(hdrs);
     };
 
-    auto wait_for = [&](AlpacaFeedMsg::Kind kind, std::string& err) {
+    auto wait_for = [&](FeedMsg::Kind kind, std::string& err) {
         return ws.wait(5000, stop_, [&](std::string_view text) {
             msgs.clear();
             polygon_parse_feed_msgs(text, cfg_.symbols, msgs);
-            for (const AlpacaFeedMsg& m : msgs) {
+            for (const FeedMsg& m : msgs) {
                 if (m.kind == kind) return true;
-                if (m.kind == AlpacaFeedMsg::Error) {
+                if (m.kind == FeedMsg::Error) {
                     err = m.error;
                     return true;
                 }
@@ -278,13 +278,13 @@ void PolygonFeed::io_loop() {
             log("connect failed");
             return false;
         }
-        if (!wait_for(AlpacaFeedMsg::Connected, err) || !err.empty()) {
+        if (!wait_for(FeedMsg::Connected, err) || !err.empty()) {
             log("no welcome from stream" + (err.empty() ? "" : ": " + err));
             return false;
         }
         const json auth{{"action", "auth"}, {"params", cfg_.api_key}};
         if (!ws.send_text(auth.dump()) ||
-            !wait_for(AlpacaFeedMsg::Authenticated, err) || !err.empty()) {
+            !wait_for(FeedMsg::Authenticated, err) || !err.empty()) {
             log("auth failed (check POLYGON_API_KEY)" + (err.empty() ? "" : ": " + err));
             return false;
         }
@@ -293,7 +293,7 @@ void PolygonFeed::io_loop() {
             params += (params.empty() ? "" : ",") + ("T." + s) + ",Q." + s;
         const json sub{{"action", "subscribe"}, {"params", params}};
         if (!ws.send_text(sub.dump()) ||
-            !wait_for(AlpacaFeedMsg::Subscription, err) || !err.empty()) {
+            !wait_for(FeedMsg::Subscription, err) || !err.empty()) {
             log("subscribe failed" + (err.empty() ? "" : ": " + err));
             return false;
         }
@@ -303,10 +303,10 @@ void PolygonFeed::io_loop() {
     auto on_msg = [&](std::string_view text) {
         msgs.clear();
         polygon_parse_feed_msgs(text, cfg_.symbols, msgs);
-        for (const AlpacaFeedMsg& m : msgs) {
-            if (m.kind == AlpacaFeedMsg::Quote && m.symbol_id) {
+        for (const FeedMsg& m : msgs) {
+            if (m.kind == FeedMsg::Quote && m.symbol_id) {
                 quotes[m.symbol_id - 1] = {m.bid, m.ask};
-            } else if (m.kind == AlpacaFeedMsg::Trade && m.symbol_id && m.price > 0.0) {
+            } else if (m.kind == FeedMsg::Trade && m.symbol_id && m.price > 0.0) {
                 if (m.ts_ns > last_trade_ns) last_trade_ns = m.ts_ns;
                 EngineEvent ev{};
                 ev.type = static_cast<uint16_t>(EvType::Tick);
@@ -318,7 +318,7 @@ void PolygonFeed::io_loop() {
                 ev.u.tick.bid = quotes[m.symbol_id - 1].bid;
                 ev.u.tick.ask = quotes[m.symbol_id - 1].ask;
                 if (!sink_(ev)) dropped_.fetch_add(1, std::memory_order_relaxed);
-            } else if (m.kind == AlpacaFeedMsg::Error) {
+            } else if (m.kind == FeedMsg::Error) {
                 log("stream error: " + m.error);
             }
         }
@@ -328,7 +328,7 @@ void PolygonFeed::io_loop() {
     int64_t next_connect_ms = 0;
     while (!stop_.load(std::memory_order_relaxed)) {
         if (!ws.open()) {
-            if (alpaca_steady_ms() < next_connect_ms) {
+            if (net_steady_ms() < next_connect_ms) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
@@ -342,7 +342,7 @@ void PolygonFeed::io_loop() {
                 if (last_trade_ns > 0) backfill(last_trade_ns);
             } else {
                 ws.close();
-                next_connect_ms = alpaca_steady_ms() + backoff_s * 1000;
+                next_connect_ms = net_steady_ms() + backoff_s * 1000;
                 backoff_s = std::min(backoff_s * 2, 30);
             }
             continue;
@@ -351,7 +351,7 @@ void PolygonFeed::io_loop() {
         if (r < 0) {
             connected_.store(false, std::memory_order_release);
             ws.close();
-            next_connect_ms = alpaca_steady_ms() + 1000;
+            next_connect_ms = net_steady_ms() + 1000;
             log("stream lost, reconnecting");
         } else if (r == 0) {
             if (cfg_.busy_poll) {

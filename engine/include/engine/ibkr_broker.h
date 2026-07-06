@@ -6,12 +6,12 @@
 // periodic /tickle calls.
 //
 // Chosen over the TWS socket protocol for v1 because it reuses the proven
-// REST/JSON plumbing (curl + parsers, AlpacaBroker's exact thread shape)
+// REST/JSON plumbing (curl + parsers)
 // and every response parser is unit-testable offline. The TWS-socket / FIX
 // route is the later upgrade if unattended operation or lower order-path
 // latency demands it.
 //
-// Threading contract identical to AlpacaBroker: engine-thread calls enqueue
+// Threading contract: engine-thread calls enqueue
 // commands (SPSC ring + wake pipe) and return immediately; one I/O thread
 // owns all networking; fills/cancels/rejects come back via poll_event().
 // Order status is polled (~1 s) and executions come from

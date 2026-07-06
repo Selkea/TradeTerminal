@@ -12,15 +12,15 @@ namespace tt::ui {
 // switch, session status, and replay of captured sessions.
 class TradePanel {
 public:
-    enum class Broker : int { Sim = 0, Alpaca = 1, Ibkr = 2 };
-    enum class DataFeed : int { Delayed = 0, AlpacaIex = 1, Polygon = 2, Ibkr = 3 };
+    enum class Broker : int { Sim = 0, Ibkr = 1 };
+    enum class DataFeed : int { Ibkr = 0, Polygon = 1 };
 
     struct StartOpts {
         std::vector<std::string> symbols;
         double cash = 100'000.0;
         int bar_seconds = 60;
-        Broker broker = Broker::Sim;         // where orders route
-        DataFeed data = DataFeed::Delayed;   // where ticks come from
+        Broker broker = Broker::Sim;      // where orders route
+        DataFeed data = DataFeed::Ibkr;   // where ticks come from
         bool record = true;                  // capture ticks to a .ttk session file
         RiskLimits risk{};
     };
@@ -29,10 +29,10 @@ public:
 
     TradePanel(Engine& eng, std::string sessions_dir)
         : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
-    // *_available: credentials exist right now (signed-in account or env
-    // vars) — evaluated per frame because sign-in/out happens at runtime.
-    void draw(bool* open, const std::string& strategy_name, bool alpaca_available,
-              bool polygon_available, const StartFn& start, const ReplayFn& replay);
+    // polygon_available: a Polygon key exists right now (signed in or env
+    // var) — evaluated per frame because sign-in/out happens at runtime.
+    void draw(bool* open, const std::string& strategy_name, bool polygon_available,
+              const StartFn& start, const ReplayFn& replay);
 
     double cash() const { return cash_; }
     int bar_sec() const { return bar_sec_; }

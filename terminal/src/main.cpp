@@ -106,11 +106,12 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    const char* py_env = std::getenv("TT_PYTHON");
-    std::string python_cmd = py_env ? py_env : "python";
-    std::string service_dir = (fs::path(TT_REPO_ROOT) / "dataservice").make_preferred().string();
+    // All market data + brokerage flows through the IBKR Client Portal
+    // Gateway on this machine (log in via Account > Sign In > IBKR).
+    const char* gw_env = std::getenv("TT_IBKR_GATEWAY");
+    std::string gateway_url = gw_env && *gw_env ? gw_env : "https://localhost:5000/v1/api";
 
-    tt::ui::App app(python_cmd, service_dir);
+    tt::ui::App app(gateway_url);
     app.set_had_ini(had_ini);
     app.log().add(std::string("TradeTerminal engine ") + tt::engine_version());
     app.log().add(std::string("ImGui ") + IMGUI_VERSION + " (docking) + ImPlot " + IMPLOT_VERSION);

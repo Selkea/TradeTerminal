@@ -14,16 +14,16 @@
 
 namespace tt {
 
-inline int64_t alpaca_steady_ms() {
+inline int64_t net_steady_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-struct AlpacaWs {
+struct WsClient {
     CURL* ws = nullptr;
     std::string frame;   // fragment reassembly buffer
 
-    ~AlpacaWs() { close(); }
+    ~WsClient() { close(); }
 
     bool open() const { return ws != nullptr; }
 
@@ -120,9 +120,9 @@ struct AlpacaWs {
     // False also when the connection drops.
     template <typename Pred>
     bool wait(int timeout_ms, const std::atomic<bool>& stop, Pred&& pred) {
-        const int64_t deadline = alpaca_steady_ms() + timeout_ms;
+        const int64_t deadline = net_steady_ms() + timeout_ms;
         bool matched = false;
-        while (!matched && alpaca_steady_ms() < deadline &&
+        while (!matched && net_steady_ms() < deadline &&
                !stop.load(std::memory_order_relaxed)) {
             const int r = poll([&](std::string_view msg) {
                 if (pred(msg)) matched = true;
@@ -134,12 +134,12 @@ struct AlpacaWs {
     }
 };
 
-void alpaca_ensure_curl_init();   // process-wide curl_global_init, idempotent
+void net_ensure_curl_init();   // process-wide curl_global_init, idempotent
 
 // Loopback UDP pair used as a select()-compatible wakeup pipe: the engine
 // thread sends one byte so a broker I/O thread's select() wakes immediately
-// for queued commands. Call alpaca_ensure_curl_init() first (WSAStartup).
-inline bool alpaca_make_wake_pipe(uintptr_t& tx, uintptr_t& rx) {
+// for queued commands. Call net_ensure_curl_init() first (WSAStartup).
+inline bool net_make_wake_pipe(uintptr_t& tx, uintptr_t& rx) {
     const SOCKET r = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (r == INVALID_SOCKET) return false;
     sockaddr_in a{};

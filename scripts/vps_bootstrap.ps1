@@ -24,8 +24,8 @@ $ErrorActionPreference = "Stop"
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
 # --- 1. toolchain ------------------------------------------------------------
-Step "Installing Git, Python, MSYS2 (winget)"
-$pkgs = @("Git.Git", "Python.Python.3.12", "MSYS2.MSYS2")
+Step "Installing Git, MSYS2 (winget)"
+$pkgs = @("Git.Git", "MSYS2.MSYS2")
 foreach ($p in $pkgs) {
     winget install --id $p -e --silent --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) { Write-Host "  ($p may already be installed - continuing)" }
@@ -56,10 +56,9 @@ if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 & C:\msys64\ucrt64\bin\cmake.exe --build --preset ucrt64-release
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-Step "Python sidecar dependencies"
-if (Test-Path "$RepoDir\dataservice\requirements.txt") {
-    python -m pip install --quiet -r "$RepoDir\dataservice\requirements.txt"
-}
+# Market data + orders flow through the IBKR Client Portal Gateway (Java).
+# Download it from IBKR, then set "ibkr_gateway_cmd" in
+# %LOCALAPPDATA%\TradeTerminal\config.json for the in-app Launch button.
 
 # --- 3. trading-box tuning ----------------------------------------------------
 Step "Power plan: High performance (no core parking / frequency scaling)"

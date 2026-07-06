@@ -13,7 +13,7 @@
 // socket, trades become Tick events with cached bid/ask attached, drops are
 // counted, reconnects backfill via /iserver/marketdata/history.
 
-#include "engine/alpaca_feed.h"   // AlpacaRestBar (shared backfill shape)
+#include "engine/feed_msg.h"   // RestBar (shared backfill shape)
 #include "engine/events.h"
 #include "engine/feed.h"
 
@@ -57,7 +57,7 @@ struct IbkrMdUpdate {
 bool ibkr_parse_md_msg(std::string_view json_text, IbkrMdUpdate& out);
 
 // GET /iserver/marketdata/history response ("data":[{t,o,h,l,c,v}...]).
-bool ibkr_parse_history_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out);
+bool ibkr_parse_history_bars(std::string_view json_text, std::vector<RestBar>& out);
 
 // ----------------------------------------------------------------------------
 
