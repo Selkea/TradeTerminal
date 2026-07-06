@@ -1,0 +1,576 @@
+#include "engine/ibkr_broker.h"
+
+#include "alpaca_util.h"
+#include "alpaca_ws.h"
+#include "engine/clock.h"
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <cstdio>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace tt {
+
+namespace {
+
+using nlohmann::json;
+using tt::alpaca::num_field;
+
+// cOID suffix "tt-<session_ms>-<local_id>" -> local_id, else 0.
+uint64_t coid_suffix(const std::string& coid) {
+    if (coid.rfind("tt-", 0) != 0) return 0;
+    const size_t dash = coid.find_last_of('-');
+    if (dash < 3 || dash + 1 >= coid.size()) return 0;
+    uint64_t id = 0;
+    for (size_t i = dash + 1; i < coid.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(coid[i]))) return 0;
+        id = id * 10 + static_cast<uint64_t>(coid[i] - '0');
+    }
+    return id;
+}
+
+std::string str_field(const json& j, const char* key) {
+    const auto it = j.find(key);
+    if (it == j.end()) return {};
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number_integer()) return std::to_string(it->get<int64_t>());
+    if (it->is_number()) return std::to_string(it->get<double>());
+    return {};
+}
+
+} // namespace
+
+// ---- parsers ---------------------------------------------------------------
+
+bool ibkr_parse_order_response(std::string_view json_text, IbkrOrderResp& out) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded()) return false;
+    // Error shape: {"error":"..."} — surface as message.
+    if (j.is_object()) {
+        out.message = j.value("error", "");
+        return !out.message.empty();
+    }
+    if (!j.is_array() || j.empty() || !j[0].is_object()) return false;
+    const json& r = j[0];
+    out.order_id = str_field(r, "order_id");
+    out.reply_id = str_field(r, "id");
+    if (r.contains("message")) {
+        if (r["message"].is_array() && !r["message"].empty() && r["message"][0].is_string())
+            out.message = r["message"][0].get<std::string>();
+        else if (r["message"].is_string())
+            out.message = r["message"].get<std::string>();
+    }
+    if (out.message.empty()) out.message = str_field(r, "order_status");
+    return !out.order_id.empty() || !out.reply_id.empty();
+}
+
+std::string ibkr_parse_first_account(std::string_view json_text) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return {};
+    const std::string sel = j.value("selectedAccount", "");
+    if (!sel.empty()) return sel;
+    const auto it = j.find("accounts");
+    if (it != j.end() && it->is_array() && !it->empty() && (*it)[0].is_string())
+        return (*it)[0].get<std::string>();
+    return {};
+}
+
+int64_t ibkr_parse_conid(std::string_view json_text, const std::string& symbol) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_array()) return 0;
+    int64_t fallback = 0;
+    for (const json& r : j) {
+        if (!r.is_object()) continue;
+        int64_t conid = 0;
+        const auto c = r.find("conid");
+        if (c != r.end()) {
+            if (c->is_number_integer()) conid = c->get<int64_t>();
+            else if (c->is_string()) {
+                try {
+                    conid = std::stoll(c->get<std::string>());
+                } catch (...) {}
+            }
+        }
+        if (conid == 0) continue;
+        const bool sym_match = r.value("symbol", "") == symbol;
+        if (sym_match && fallback == 0) fallback = conid;
+        // Prefer the row explicitly typed as a US stock.
+        if (sym_match && r.value("secType", "") == "STK") return conid;
+    }
+    return fallback;
+}
+
+bool ibkr_parse_orders(std::string_view json_text, std::vector<IbkrOrderStatus>& out) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return false;
+    const auto it = j.find("orders");
+    if (it == j.end() || !it->is_array()) return false;
+    for (const json& r : *it) {
+        if (!r.is_object()) continue;
+        IbkrOrderStatus s;
+        s.order_id = str_field(r, "orderId");
+        s.status = r.value("status", "");
+        if (!s.order_id.empty()) out.push_back(std::move(s));
+    }
+    return true;
+}
+
+bool ibkr_parse_trades(std::string_view json_text, std::vector<IbkrTrade>& out) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_array()) return false;
+    for (const json& r : j) {
+        if (!r.is_object()) continue;
+        IbkrTrade t;
+        t.execution_id = str_field(r, "execution_id");
+        t.order_ref = r.value("order_ref", "");
+        t.symbol = r.value("symbol", "");
+        t.buy = r.value("side", "B") != "S";
+        t.qty = num_field(r, "size");
+        t.price = num_field(r, "price");
+        t.commission = num_field(r, "commission");
+        t.ts_ms = static_cast<int64_t>(num_field(r, "trade_time_r"));
+        if (!t.execution_id.empty() && t.qty > 0) out.push_back(std::move(t));
+    }
+    return true;
+}
+
+bool ibkr_parse_positions(std::string_view json_text, std::vector<IbkrPosition>& out) {
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_array()) return false;
+    for (const json& r : j) {
+        if (!r.is_object()) continue;
+        IbkrPosition p;
+        const auto c = r.find("conid");
+        if (c != r.end() && c->is_number()) p.conid = c->get<int64_t>();
+        p.qty = num_field(r, "position");
+        if (p.conid != 0 && p.qty != 0.0) out.push_back(p);
+    }
+    return true;
+}
+
+// ---- I/O thread -------------------------------------------------------------
+
+struct IbkrBroker::Io {
+    IbkrBroker& b;
+    CURL* rest = nullptr;
+    bool session = false;
+    std::string account;
+    std::vector<int64_t> conids;             // per symbol_id-1; 0 = unresolved
+    std::unordered_map<uint64_t, std::string> ibkr_by_local;
+    std::unordered_map<std::string, uint64_t> local_by_ibkr;
+    std::unordered_map<uint64_t, std::string> last_status;   // local -> status
+    std::unordered_set<std::string> seen_execs;
+    int64_t last_tickle_ms = 0, last_poll_ms = 0, last_login_nag_ms = 0;
+
+    explicit Io(IbkrBroker& broker) : b(broker) {
+        rest = curl_easy_init();
+        conids.assign(b.cfg_.symbols.size(), 0);
+    }
+    ~Io() {
+        if (rest) curl_easy_cleanup(rest);
+    }
+
+    struct Response {
+        CURLcode rc = CURLE_FAILED_INIT;
+        long status = 0;
+        std::string body;
+        bool ok() const { return rc == CURLE_OK && status / 100 == 2; }
+    };
+
+    Response call(const char* method, const std::string& path, const std::string& body) {
+        Response res;
+        if (!rest) return res;
+        curl_easy_reset(rest);
+        const std::string url = b.cfg_.gateway_url + path;
+        curl_easy_setopt(rest, CURLOPT_URL, url.c_str());
+        // Loopback gateway with a self-signed cert: the hop never leaves the
+        // machine, so peer verification is deliberately off.
+        curl_easy_setopt(rest, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(rest, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(rest, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+        curl_easy_setopt(rest, CURLOPT_TIMEOUT_MS, 10000L);
+        curl_easy_setopt(rest, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+        curl_easy_setopt(rest, CURLOPT_WRITEDATA, &res.body);
+        curl_easy_setopt(rest, CURLOPT_CUSTOMREQUEST, method);
+        curl_slist* hdrs = nullptr;
+        if (!body.empty()) {
+            hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+            curl_easy_setopt(rest, CURLOPT_HTTPHEADER, hdrs);
+            curl_easy_setopt(rest, CURLOPT_POSTFIELDS, body.c_str());
+        }
+        res.rc = curl_easy_perform(rest);
+        if (res.rc == CURLE_OK)
+            curl_easy_getinfo(rest, CURLINFO_RESPONSE_CODE, &res.status);
+        if (hdrs) curl_slist_free_all(hdrs);
+        if (res.status == 401) session = false;   // gateway session expired
+        return res;
+    }
+
+    // Session + account + conid resolution; true once orders can flow.
+    bool ensure_ready() {
+        if (!session) {
+            const Response r = call("GET", "/iserver/accounts", "");
+            if (!r.ok()) {
+                const int64_t now = alpaca_steady_ms();
+                if (now - last_login_nag_ms > 30'000) {
+                    last_login_nag_ms = now;
+                    b.log(r.status == 401 || r.status == 0
+                              ? "no gateway session — log in via browser at the "
+                                "Client Portal Gateway (default https://localhost:5000)"
+                              : "gateway error " + std::to_string(r.status));
+                }
+                return false;
+            }
+            account = ibkr_parse_first_account(r.body);
+            if (account.empty()) return false;
+            session = true;
+            b.log("session OK, account " + account);
+        }
+        bool all = true;
+        for (size_t i = 0; i < b.cfg_.symbols.size(); ++i) {
+            if (conids[i] != 0) continue;
+            const Response r =
+                call("GET", "/iserver/secdef/search?symbol=" + b.cfg_.symbols[i], "");
+            if (r.ok()) conids[i] = ibkr_parse_conid(r.body, b.cfg_.symbols[i]);
+            if (conids[i] == 0) {
+                all = false;
+                b.log("cannot resolve conid for " + b.cfg_.symbols[i]);
+            }
+        }
+        return all;
+    }
+
+    void tickle() {
+        const int64_t now = alpaca_steady_ms();
+        if (now - last_tickle_ms < 60'000) return;
+        last_tickle_ms = now;
+        call("POST", "/tickle", "");
+    }
+
+    json order_json(uint64_t local_id, const OrderRequest& r) {
+        json o{{"cOID", b.client_prefix_ + std::to_string(local_id)},
+               {"conid", conids[r.symbol_id - 1]},
+               {"side", r.side == Side::Buy ? "BUY" : "SELL"},
+               {"quantity", r.qty},
+               {"tif", "DAY"}};
+        switch (r.type) {
+        case OrdType::Limit:
+            o["orderType"] = "LMT";
+            o["price"] = r.limit_price;
+            break;
+        case OrdType::Stop:
+            o["orderType"] = "STP";
+            o["price"] = r.stop_price;
+            break;
+        default:
+            o["orderType"] = "MKT";
+        }
+        return o;
+    }
+
+    void handle_submit(const Cmd& c) {
+        json orders = json::array();
+        orders.push_back(order_json(c.local_id, c.req));
+        const std::string parent_coid = b.client_prefix_ + std::to_string(c.local_id);
+        // Bracket legs: children referencing the parent cOID, own local ids
+        // so their fills route back like any other order.
+        auto add_leg = [&](OrdType type, double px) {
+            OrderRequest leg{};
+            leg.symbol_id = c.req.symbol_id;
+            leg.side = c.req.side == Side::Buy ? Side::Sell : Side::Buy;
+            leg.type = type;
+            leg.qty = c.req.qty;
+            if (type == OrdType::Limit) leg.limit_price = px;
+            else leg.stop_price = px;
+            const uint64_t leg_local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+            json lo = order_json(leg_local, leg);
+            lo["parentId"] = parent_coid;
+            orders.push_back(std::move(lo));
+            return leg_local;
+        };
+        uint64_t tp_local = 0, sl_local = 0;
+        if (c.req.take_profit > 0.0) tp_local = add_leg(OrdType::Limit, c.req.take_profit);
+        if (c.req.stop_loss > 0.0) sl_local = add_leg(OrdType::Stop, c.req.stop_loss);
+
+        Response r = call("POST", "/iserver/account/" + account + "/orders",
+                          json{{"orders", orders}}.dump());
+        // The gateway may answer with confirmation questions (price caps,
+        // size checks); confirm up to 3 rounds — risk checks live in the
+        // engine, not in dialog boxes.
+        for (int round = 0; round < 3; ++round) {
+            IbkrOrderResp resp;
+            if (!r.ok() || !ibkr_parse_order_response(r.body, resp)) {
+                b.log("order #" + std::to_string(c.local_id) + " rejected: " +
+                      (r.rc != CURLE_OK ? curl_easy_strerror(r.rc)
+                                        : r.body.substr(0, 200)));
+                b.push_reject(c.local_id);
+                return;
+            }
+            if (!resp.order_id.empty()) {
+                ibkr_by_local[c.local_id] = resp.order_id;
+                local_by_ibkr[resp.order_id] = c.local_id;
+                if (tp_local || sl_local)
+                    b.log("order #" + std::to_string(c.local_id) + " bracket legs: #" +
+                          std::to_string(tp_local) + (sl_local ? ", #" +
+                          std::to_string(sl_local) : ""));
+                return;
+            }
+            b.log("order #" + std::to_string(c.local_id) + " gateway question: " +
+                  resp.message + " — confirming");
+            r = call("POST", "/iserver/reply/" + resp.reply_id, R"({"confirmed":true})");
+        }
+        b.log("order #" + std::to_string(c.local_id) + " stuck in confirmation loop");
+        b.push_reject(c.local_id);
+    }
+
+    void handle_cmd(const Cmd& c) {
+        switch (c.type) {
+        case Cmd::Submit:
+            handle_submit(c);
+            break;
+        case Cmd::Cancel: {
+            const auto it = ibkr_by_local.find(c.local_id);
+            if (it == ibkr_by_local.end()) {
+                b.log("cancel #" + std::to_string(c.local_id) + ": no broker id yet");
+                return;
+            }
+            call("DELETE", "/iserver/account/" + account + "/order/" + it->second, "");
+            break;
+        }
+        case Cmd::CancelAll: {
+            const Response r = call("GET", "/iserver/account/orders", "");
+            std::vector<IbkrOrderStatus> rows;
+            if (r.ok() && ibkr_parse_orders(r.body, rows)) {
+                int n = 0;
+                for (const IbkrOrderStatus& o : rows) {
+                    if (!local_by_ibkr.count(o.order_id)) continue;
+                    if (o.status == "Filled" || o.status == "Cancelled") continue;
+                    call("DELETE", "/iserver/account/" + account + "/order/" + o.order_id,
+                         "");
+                    ++n;
+                }
+                b.log("cancel-all: " + std::to_string(n) + " working orders");
+            }
+            break;
+        }
+        case Cmd::Flatten: {
+            const Response r = call("GET", "/portfolio/" + account + "/positions/0", "");
+            std::vector<IbkrPosition> pos;
+            if (!r.ok() || !ibkr_parse_positions(r.body, pos)) {
+                b.log("flatten: positions fetch failed");
+                return;
+            }
+            for (const IbkrPosition& p : pos) {
+                for (size_t i = 0; i < conids.size(); ++i) {
+                    if (conids[i] != p.conid) continue;
+                    Cmd close{};
+                    close.type = Cmd::Submit;
+                    close.local_id = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+                    close.req.symbol_id = static_cast<uint32_t>(i + 1);
+                    close.req.side = p.qty > 0 ? Side::Sell : Side::Buy;
+                    close.req.type = OrdType::Market;
+                    close.req.qty = p.qty > 0 ? p.qty : -p.qty;
+                    handle_submit(close);
+                }
+            }
+            b.log("flatten requested (close all session positions)");
+            break;
+        }
+        }
+    }
+
+    void poll() {
+        const int64_t now = alpaca_steady_ms();
+        if (now - last_poll_ms < 1000) return;
+        last_poll_ms = now;
+
+        // Order status: cancels and rejects (fills come from trades below).
+        Response r = call("GET", "/iserver/account/orders", "");
+        std::vector<IbkrOrderStatus> rows;
+        if (r.ok() && ibkr_parse_orders(r.body, rows)) {
+            for (const IbkrOrderStatus& o : rows) {
+                const auto it = local_by_ibkr.find(o.order_id);
+                if (it == local_by_ibkr.end()) continue;
+                std::string& prev = last_status[it->second];
+                if (prev == o.status) continue;
+                prev = o.status;
+                if (o.status == "Cancelled" || o.status == "Inactive") {
+                    EngineEvent ev{};
+                    ev.type = static_cast<uint16_t>(EvType::OrderCancel);
+                    ev.flags = o.status == "Inactive" ? kEvFlagRejected : 0;
+                    ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+                    ev.u.order.order_id = it->second;
+                    b.push_ev(ev);
+                }
+            }
+        }
+
+        // Executions, deduped by execution id.
+        r = call("GET", "/iserver/account/trades", "");
+        std::vector<IbkrTrade> trades;
+        if (r.ok() && ibkr_parse_trades(r.body, trades)) {
+            for (const IbkrTrade& t : trades) {
+                if (!seen_execs.insert(t.execution_id).second) continue;
+                const uint64_t local = coid_suffix(t.order_ref);
+                if (!local) continue;   // pre-session or manual TWS order
+                uint32_t sid = 0;
+                for (size_t i = 0; i < b.cfg_.symbols.size(); ++i)
+                    if (b.cfg_.symbols[i] == t.symbol) {
+                        sid = static_cast<uint32_t>(i + 1);
+                        break;
+                    }
+                if (!sid) continue;
+                EngineEvent ev{};
+                ev.type = static_cast<uint16_t>(EvType::Fill);
+                ev.symbol_id = sid;
+                ev.ts_event_ns = t.ts_ms * 1'000'000;
+                ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+                ev.u.fill.order_id = local;
+                ev.u.fill.price = t.price;
+                ev.u.fill.qty = t.qty;
+                ev.u.fill.fee = t.commission;
+                ev.u.fill.side = static_cast<uint8_t>(t.buy ? Side::Buy : Side::Sell);
+                b.push_ev(ev);
+            }
+        }
+    }
+};
+
+// ---- adapter ----------------------------------------------------------------
+
+IbkrBroker::IbkrBroker(IbkrConfig cfg) : cfg_(std::move(cfg)) {
+    using namespace std::chrono;
+    client_prefix_ =
+        "tt-" +
+        std::to_string(
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()) +
+        "-";
+    alpaca_ensure_curl_init();
+    alpaca_make_wake_pipe(wake_tx_, wake_rx_);
+    io_thread_ = std::thread([this] { io_loop(); });
+}
+
+IbkrBroker::~IbkrBroker() {
+    stop_.store(true, std::memory_order_release);
+    if (wake_tx_ != static_cast<uintptr_t>(-1))
+        ::send(static_cast<SOCKET>(wake_tx_), "x", 1, 0);
+    if (io_thread_.joinable()) io_thread_.join();
+    if (wake_tx_ != static_cast<uintptr_t>(-1)) ::closesocket(static_cast<SOCKET>(wake_tx_));
+    if (wake_rx_ != static_cast<uintptr_t>(-1)) ::closesocket(static_cast<SOCKET>(wake_rx_));
+}
+
+uint64_t IbkrBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
+    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size()) return 0;
+    if (!ready()) {
+        log("order rejected: gateway session not ready");
+        return 0;
+    }
+    const uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    Cmd c;
+    c.type = Cmd::Submit;
+    c.local_id = id;
+    c.req = r;
+    return push_cmd(c) ? id : 0;
+}
+
+bool IbkrBroker::cancel(uint64_t order_id) {
+    Cmd c;
+    c.type = Cmd::Cancel;
+    c.local_id = order_id;
+    return push_cmd(c);
+}
+
+void IbkrBroker::cancel_all() {
+    Cmd c;
+    c.type = Cmd::CancelAll;
+    push_cmd(c);
+}
+
+void IbkrBroker::flatten() {
+    Cmd c;
+    c.type = Cmd::Flatten;
+    push_cmd(c);
+}
+
+bool IbkrBroker::push_cmd(const Cmd& c) {
+    if (cmd_ring_->try_push(c)) {
+        if (wake_tx_ != static_cast<uintptr_t>(-1))
+            ::send(static_cast<SOCKET>(wake_tx_), "x", 1, 0);
+        return true;
+    }
+    log("command dropped: queue full");
+    return false;
+}
+
+void IbkrBroker::push_ev(const EngineEvent& ev) {
+    if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
+}
+
+void IbkrBroker::push_reject(uint64_t local_id) {
+    EngineEvent ev{};
+    ev.type = static_cast<uint16_t>(EvType::OrderCancel);
+    ev.flags = kEvFlagRejected;
+    ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+    ev.u.order.order_id = local_id;
+    push_ev(ev);
+}
+
+void IbkrBroker::log(std::string line) {
+    std::lock_guard lock(log_mu_);
+    logs_.push_back("ibkr: " + std::move(line));
+    while (logs_.size() > 500) logs_.pop_front();
+}
+
+bool IbkrBroker::pop_log(std::string& out) {
+    std::lock_guard lock(log_mu_);
+    if (logs_.empty()) return false;
+    out = std::move(logs_.front());
+    logs_.pop_front();
+    return true;
+}
+
+void IbkrBroker::io_loop() {
+    Io io(*this);
+    log("connecting to Client Portal Gateway at " + cfg_.gateway_url);
+
+    while (!stop_.load(std::memory_order_relaxed)) {
+        const bool was_ready = ready_.load(std::memory_order_relaxed);
+        const bool now_ready = io.ensure_ready();
+        ready_.store(now_ready, std::memory_order_release);
+        if (now_ready && !was_ready) log("ready — orders can flow");
+
+        Cmd c;
+        bool worked = false;
+        while (cmd_ring_->try_pop(c)) {
+            worked = true;
+            if (now_ready) io.handle_cmd(c);
+            else if (c.type == Cmd::Submit) push_reject(c.local_id);
+        }
+        if (now_ready) {
+            io.tickle();
+            io.poll();
+        }
+        if (!worked) {
+            // Sleep on the wake pipe: a queued command interrupts instantly;
+            // the timeout paces the 1 s status/trade polling.
+            fd_set rd;
+            FD_ZERO(&rd);
+            const SOCKET wake = static_cast<SOCKET>(wake_rx_);
+            if (wake_rx_ != static_cast<uintptr_t>(-1)) {
+                FD_SET(wake, &rd);
+                timeval tv{0, now_ready ? 200'000 : 1'000'000};
+                ::select(0, &rd, nullptr, nullptr, &tv);
+                char buf[64];
+                while (::recv(wake, buf, sizeof buf, 0) > 0) {}
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+    }
+}
+
+} // namespace tt

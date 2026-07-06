@@ -48,33 +48,6 @@ std::string fmt_num(double v) {
 
 constexpr auto write_cb = tt::alpaca::curl_write_to_string;
 
-// Loopback UDP pair used as a select()-compatible wakeup pipe.
-bool make_wake_pipe(uintptr_t& tx, uintptr_t& rx) {
-    const SOCKET r = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (r == INVALID_SOCKET) return false;
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int len = sizeof a;
-    if (::bind(r, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 ||
-        ::getsockname(r, reinterpret_cast<sockaddr*>(&a), &len) != 0) {
-        ::closesocket(r);
-        return false;
-    }
-    const SOCKET t = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (t == INVALID_SOCKET) {
-        ::closesocket(r);
-        return false;
-    }
-    ::connect(t, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    u_long nb = 1;
-    ::ioctlsocket(r, FIONBIO, &nb);
-    ::ioctlsocket(t, FIONBIO, &nb);
-    tx = static_cast<uintptr_t>(t);
-    rx = static_cast<uintptr_t>(r);
-    return true;
-}
-
 } // namespace
 
 void alpaca_ensure_curl_init() {
@@ -463,7 +436,7 @@ AlpacaBroker::AlpacaBroker(AlpacaConfig cfg) : cfg_(std::move(cfg)) {
             duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()) +
         "-";
     alpaca_ensure_curl_init();   // WSAStartup before any socket use
-    make_wake_pipe(wake_tx_, wake_rx_);
+    alpaca_make_wake_pipe(wake_tx_, wake_rx_);
     io_thread_ = std::thread([this] { io_loop(); });
 }
 

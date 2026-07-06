@@ -12,12 +12,13 @@ target_include_directories(tt_engine PUBLIC
     ${CMAKE_SOURCE_DIR}/sdk/include
 )
 
-# Alpaca broker adapter — its own lib so tt_engine (and the engine tests)
-# stay free of libcurl and networking.
+# Broker/feed adapters (Alpaca + IBKR) — their own lib so tt_engine (and the
+# engine tests) stay free of libcurl and networking.
 find_package(CURL REQUIRED)
 add_library(tt_alpaca STATIC
     src/alpaca_broker.cpp
     src/alpaca_feed.cpp
+    src/ibkr_broker.cpp
 )
 target_link_libraries(tt_alpaca
     PUBLIC tt_engine ws2_32   # ws2_32: select() in the socket wait path
@@ -44,3 +45,7 @@ add_test(NAME alpaca_tests COMMAND tt_alpaca_tests)
 add_executable(tt_alpaca_feed_tests tests/test_alpaca_feed_parse.cpp)
 target_link_libraries(tt_alpaca_feed_tests PRIVATE tt_alpaca doctest)
 add_test(NAME alpaca_feed_tests COMMAND tt_alpaca_feed_tests)
+
+add_executable(tt_ibkr_tests tests/test_ibkr_parse.cpp)
+target_link_libraries(tt_ibkr_tests PRIVATE tt_alpaca doctest)
+add_test(NAME ibkr_tests COMMAND tt_ibkr_tests)

@@ -67,9 +67,10 @@ size_t alpaca_parse_feed_msgs(std::string_view json_text,
                 m.kind = AlpacaFeedMsg::Subscription;
             } else if (type == "error") {
                 std::string_view msg = "unknown error";
-                obj["msg"].get_string().get(msg);
                 int64_t code = 0;
-                obj["code"].get_int64().get(code);
+                // Best-effort: a missing field keeps the defaults.
+                (void)obj["msg"].get_string().get(msg);
+                (void)obj["code"].get_int64().get(code);
                 m.kind = AlpacaFeedMsg::Error;
                 m.error = std::string(msg) + " (code " + std::to_string(code) + ")";
             } else {

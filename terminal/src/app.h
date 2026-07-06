@@ -5,6 +5,7 @@
 #include "config.h"
 #include "engine/alpaca_broker.h"
 #include "engine/alpaca_feed.h"
+#include "engine/ibkr_broker.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
@@ -83,6 +84,7 @@ private:
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<AlpacaBroker> alpaca_;
+    std::unique_ptr<IbkrBroker> ibkr_;
     Engine engine_;
     // Declared after engine_ on purpose: the feed pushes into the engine's
     // ring, so it must be destroyed (thread joined) before the engine.

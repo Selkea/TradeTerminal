@@ -64,20 +64,25 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
         ImGui::InputInt("bar sec", &bar_sec_);
         bar_sec_ = std::clamp(bar_sec_, 1, 3600);
 
+        static constexpr const char* kBrokers[] = {"Simulator", "Alpaca (paper)",
+                                                   "IBKR (gateway)"};
+        ImGui::SetNextItemWidth(140);
+        ImGui::Combo("broker", &broker_idx_, kBrokers, IM_ARRAYSIZE(kBrokers));
+        ImGui::SetItemTooltip("Simulator: local fills (ExecSim).\n"
+                              "Alpaca: paper API (needs Account-menu sign-in).\n"
+                              "IBKR: Client Portal Gateway on this machine — log in "
+                              "via browser at https://localhost:5000 first.");
+        if (broker_idx_ == 1 && !alpaca_available) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
+        }
         ImGui::BeginDisabled(!alpaca_available);
-        ImGui::Checkbox("Route orders to Alpaca (paper)", &use_alpaca_);
-        ImGui::SetItemTooltip(alpaca_available
-                                  ? "Orders go to the Alpaca paper API; fills come back "
-                                    "from its trade-updates stream.\nOff = local fill "
-                                    "simulator."
-                                  : "Sign in via the Account menu (or set "
-                                    "APCA_API_KEY_ID / APCA_API_SECRET_KEY)");
         ImGui::Checkbox("Real-time data (Alpaca IEX)", &use_alpaca_data_);
         ImGui::SetItemTooltip(alpaca_available
                                   ? "Stream live IEX trades for this session's symbols "
                                     "instead of delayed quotes.\nNote: one connection per "
                                     "account on the free tier."
-                                  : "Sign in via the Account menu (or set "
+                                  : "Needs Alpaca credentials (Account menu or "
                                     "APCA_API_KEY_ID / APCA_API_SECRET_KEY)");
         ImGui::EndDisabled();
         ImGui::Checkbox("Record ticks for replay", &record_ticks_);
@@ -107,12 +112,13 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
         if (ImGui::Button("Start paper trading") && !pending_symbols_.empty() && start) {
-            session_alpaca_ = use_alpaca_ && alpaca_available;
+            session_broker_ = broker_idx_;
+            if (broker_idx_ == 1 && !alpaca_available) session_broker_ = 0;
             StartOpts opts;
             opts.symbols = pending_symbols_;
             opts.cash = cash_;
             opts.bar_seconds = bar_sec_;
-            opts.alpaca_orders = session_alpaca_;
+            opts.broker = static_cast<Broker>(session_broker_);
             opts.alpaca_data = use_alpaca_data_ && alpaca_available;
             opts.record = record_ticks_;
             opts.risk = risk_;
@@ -162,8 +168,10 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
     ImGui::SameLine();
     if (s.halted)
         ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "HALTED");
-    else if (session_alpaca_)
+    else if (session_broker_ == 1)
         ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (alpaca paper)");
+    else if (session_broker_ == 2)
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr)");
     else
         ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "LIVE (paper)");
 

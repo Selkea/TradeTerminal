@@ -12,13 +12,15 @@ namespace tt::ui {
 // switch, session status, and replay of captured sessions.
 class TradePanel {
 public:
+    enum class Broker : int { Sim = 0, Alpaca = 1, Ibkr = 2 };
+
     struct StartOpts {
         std::vector<std::string> symbols;
         double cash = 100'000.0;
         int bar_seconds = 60;
-        bool alpaca_orders = false;   // route orders to the Alpaca paper API
-        bool alpaca_data = false;     // real-time IEX ticks instead of delayed quotes
-        bool record = true;           // capture ticks to a .ttk session file
+        Broker broker = Broker::Sim;   // where orders route
+        bool alpaca_data = false;      // real-time IEX ticks instead of delayed quotes
+        bool record = true;            // capture ticks to a .ttk session file
         RiskLimits risk{};
     };
     using StartFn = std::function<void(const StartOpts&)>;
@@ -50,10 +52,10 @@ private:
 
     Engine& eng_;
     std::string sessions_dir_;
-    bool use_alpaca_ = false;        // route orders; deliberately not persisted
+    int broker_idx_ = 0;             // Broker enum; deliberately not persisted
     bool use_alpaca_data_ = false;   // real-time IEX data for the session
     bool record_ticks_ = true;
-    bool session_alpaca_ = false;    // what the running session was started with
+    int session_broker_ = 0;         // what the running session was started with
     char input_[16] = "";
     std::vector<std::string> pending_symbols_ = {"AAPL"};
     double cash_ = 100'000.0;

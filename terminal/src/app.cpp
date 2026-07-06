@@ -353,6 +353,11 @@ void App::draw() {
             alert_scan(line);
             log_.add(std::move(line));
         }
+    if (ibkr_)
+        while (ibkr_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
     if (alpaca_feed_) {
         while (alpaca_feed_->pop_log(line)) {
             alert_scan(line);
@@ -401,7 +406,8 @@ void App::draw() {
         for (const std::string& sym : journal_syms_)
             jsyms += (jsyms.empty() ? "" : ",") + sym;
         journal_session_ = journal_.begin_session(
-            jsyms, alpaca_ ? "alpaca" : "sim", engine_.live_snapshot().cash);
+            jsyms, alpaca_ ? "alpaca" : (ibkr_ ? "ibkr" : "sim"),
+            engine_.live_snapshot().cash);
     } else if (prev_live_running_ && !live_now && journal_session_) {
         const LiveSnapshot s = engine_.live_snapshot();
         journal_.end_session(journal_session_, s.equity, s.halted);
@@ -483,11 +489,12 @@ void App::draw() {
                             std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
                             cfg.capture_path = sessions_dir() + "\\" + name;
                         }
-                        // Paper endpoint only for now; going live is a deliberate
+                        // Paper endpoints only for now; going live is a deliberate
                         // future step, not an env-var surprise.
                         std::unique_ptr<AlpacaBroker> broker;
+                        std::unique_ptr<IbkrBroker> ibkr_broker;
                         const std::optional<Account> creds = alpaca_creds();
-                        if (opts.alpaca_orders && creds) {
+                        if (opts.broker == TradePanel::Broker::Alpaca && creds) {
                             AlpacaConfig ac;
                             ac.key_id = creds->key_id;
                             ac.secret = creds->secret;
@@ -495,12 +502,21 @@ void App::draw() {
                             broker = std::make_unique<AlpacaBroker>(std::move(ac));
                             cfg.broker = broker.get();
                             log_.add("live: using Alpaca account '" + creds->name + "'");
+                        } else if (opts.broker == TradePanel::Broker::Ibkr) {
+                            IbkrConfig ic;
+                            if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
+                                ic.gateway_url = gw;
+                            ic.symbols = syms;
+                            ibkr_broker = std::make_unique<IbkrBroker>(std::move(ic));
+                            cfg.broker = ibkr_broker.get();
+                            log_.add("live: routing orders to IBKR gateway");
                         }
                         if (engine_.start_live(std::move(cfg),
                                                strat_mgr_.active_strategy(sma_))) {
                             // Previous session's thread was joined inside
-                            // start_live, so replacing the old broker is safe.
+                            // start_live, so replacing the old brokers is safe.
                             alpaca_ = std::move(broker);
+                            ibkr_ = std::move(ibkr_broker);
                             alpaca_feed_.reset();   // previous session's feed, if any
                             rt_feed_active_.store(false, std::memory_order_relaxed);
                             if (opts.alpaca_data && creds) {
