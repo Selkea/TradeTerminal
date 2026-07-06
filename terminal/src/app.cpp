@@ -28,14 +28,20 @@ std::string gxx_path() {
     return env ? env : TT_GXX_DEFAULT;
 }
 // Launch command for the Client Portal Gateway: config wins, otherwise the
-// conventional in-repo location (tools/clientportal.gw) is auto-detected.
+// first standard location containing bin\run.bat is auto-detected. NOTE the
+// gateway's embedded web server fails to bind port 5000 from paths under
+// OneDrive or containing '+', so C:\ibkr is preferred over the repo's
+// tools\ dir (which is fine only for a checkout on a clean local path).
 std::string gateway_cmd(const std::string& configured) {
     if (!configured.empty()) return configured;
-    const std::filesystem::path gw =
-        std::filesystem::path(TT_REPO_ROOT) / "tools" / "clientportal.gw";
     std::error_code ec;
-    if (std::filesystem::exists(gw / "bin" / "run.bat", ec))
-        return "cd /d \"" + gw.string() + "\" && bin\\run.bat root\\conf.yaml";
+    for (std::filesystem::path gw :
+         {std::filesystem::path("C:/ibkr/clientportal.gw"),
+          std::filesystem::path(TT_REPO_ROOT) / "tools" / "clientportal.gw"}) {
+        if (std::filesystem::exists(gw / "bin" / "run.bat", ec))
+            return "cd /d \"" + gw.make_preferred().string() +
+                   "\" && bin\\run.bat root\\conf.yaml";
+    }
     return {};
 }
 } // namespace
@@ -799,7 +805,7 @@ void App::draw_signin_modal() {
                 log_.add("account: launching Client Portal Gateway");
             }
         } else {
-            ImGui::TextDisabled("Tip: extract the gateway to tools\\clientportal.gw "
+            ImGui::TextDisabled("Tip: extract the gateway to C:\\ibkr\\clientportal.gw "
                                 "(see tools/README.md) for a Launch button here.");
         }
         ImGui::SameLine();
