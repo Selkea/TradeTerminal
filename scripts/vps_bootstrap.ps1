@@ -56,9 +56,44 @@ if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 & C:\msys64\ucrt64\bin\cmake.exe --build --preset ucrt64-release
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-# Market data + orders flow through the IBKR Client Portal Gateway (Java).
-# Download it from IBKR, then set "ibkr_gateway_cmd" in
-# %LOCALAPPDATA%\TradeTerminal\config.json for the in-app Launch button.
+# --- 2b. IBKR Client Portal Gateway (all market data + orders flow here) ------
+Step "Java runtime (gateway requirement)"
+if (Get-Command java -ErrorAction SilentlyContinue) {
+    Write-Host "  java present: $((Get-Command java).Source)"
+} else {
+    winget install --id EclipseAdoptium.Temurin.21.JRE -e --silent --accept-package-agreements --accept-source-agreements
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
+        Write-Host "  WARNING: java still not on PATH - open a fresh terminal or install Temurin manually" -ForegroundColor Yellow
+    }
+}
+
+Step "Client Portal Gateway (tools\clientportal.gw)"
+$gwDir = Join-Path $RepoDir "tools\clientportal.gw"
+if (Test-Path (Join-Path $gwDir "bin\run.bat")) {
+    Write-Host "  already present"
+} else {
+    $zip = Join-Path $env:TEMP "clientportal.gw.zip"
+    curl.exe -sL -o $zip https://download2.interactivebrokers.com/portal/clientportal.gw.zip
+    Expand-Archive -Path $zip -DestinationPath $gwDir -Force
+    Remove-Item $zip
+    # Some zips wrap everything in a single top-level folder - flatten it.
+    if (-not (Test-Path (Join-Path $gwDir "bin\run.bat"))) {
+        $inner = Get-ChildItem $gwDir -Directory | Where-Object {
+            Test-Path (Join-Path $_.FullName "bin\run.bat")
+        } | Select-Object -First 1
+        if ($inner) {
+            Get-ChildItem $inner.FullName | Move-Item -Destination $gwDir
+            Remove-Item $inner.FullName -Recurse -Force
+        }
+    }
+    if (Test-Path (Join-Path $gwDir "bin\run.bat")) {
+        Write-Host "  installed - TradeTerminal's Sign In dialog will auto-detect it"
+    } else {
+        Write-Host "  WARNING: extraction layout unexpected - see tools\README.md" -ForegroundColor Yellow
+    }
+}
 
 # --- 3. trading-box tuning ----------------------------------------------------
 Step "Power plan: High performance (no core parking / frequency scaling)"
@@ -87,8 +122,10 @@ Write-Host @"
 Next steps (manual):
   1. Launch: C:\dev\build\TradeTerminal\ucrt64-release\terminal\tt_terminal.exe
      (allow the Windows Firewall prompts on private networks only)
-  2. Set Windows Update active hours to cover the trading day.
-  3. When leaving RDP, CLOSE the window (disconnect) - do not sign out.
-  4. For remote monitoring, install Tailscale; do NOT open dashboard/RDP
+  2. Account menu > Sign In > IBKR > Launch gateway, then Open login page
+     and log in with your IBKR paper credentials (browser, on this machine).
+  3. Set Windows Update active hours to cover the trading day.
+  4. When leaving RDP, CLOSE the window (disconnect) - do not sign out.
+  5. For remote monitoring, install Tailscale; do NOT open dashboard/RDP
      ports to the public internet.
 "@
