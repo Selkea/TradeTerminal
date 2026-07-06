@@ -552,6 +552,10 @@ void App::draw() {
                                        !polygon_key().empty()) {
                                 PolygonFeedConfig pc;
                                 pc.api_key = polygon_key();
+                                // e.g. wss://delayed.polygon.io/stocks to test the
+                                // adapter on the $29 delayed tier (same protocol).
+                                if (const char* ws = std::getenv("TT_POLYGON_WS"))
+                                    pc.stream_url = ws;
                                 pc.symbols = syms;
                                 pc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
