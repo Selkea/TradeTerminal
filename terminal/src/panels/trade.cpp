@@ -21,7 +21,8 @@ void TradePanel::scan_replay_files() {
 }
 
 void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_available,
-                      const StartFn& start, const ReplayFn& replay) {
+                      bool polygon_available, const StartFn& start,
+                      const ReplayFn& replay) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -76,15 +77,19 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
         }
-        ImGui::BeginDisabled(!alpaca_available);
-        ImGui::Checkbox("Real-time data (Alpaca IEX)", &use_alpaca_data_);
-        ImGui::SetItemTooltip(alpaca_available
-                                  ? "Stream live IEX trades for this session's symbols "
-                                    "instead of delayed quotes.\nNote: one connection per "
-                                    "account on the free tier."
-                                  : "Needs Alpaca credentials (Account menu or "
-                                    "APCA_API_KEY_ID / APCA_API_SECRET_KEY)");
-        ImGui::EndDisabled();
+        static constexpr const char* kData[] = {"Delayed (Yahoo)", "Alpaca IEX",
+                                                "Polygon"};
+        ImGui::SetNextItemWidth(140);
+        ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
+        ImGui::SetItemTooltip("Delayed: free ~10 s quotes via the Python sidecar.\n"
+                              "Alpaca IEX: real-time, needs Alpaca sign-in.\n"
+                              "Polygon: real-time, needs a Polygon key (Account menu "
+                              "or POLYGON_API_KEY).");
+        if ((data_idx_ == 1 && !alpaca_available) ||
+            (data_idx_ == 2 && !polygon_available)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
+        }
         ImGui::Checkbox("Record ticks for replay", &record_ticks_);
         ImGui::SetItemTooltip("Capture every tick to a .ttk file — replay the exact "
                               "session later, deterministically");
@@ -119,7 +124,10 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
             opts.cash = cash_;
             opts.bar_seconds = bar_sec_;
             opts.broker = static_cast<Broker>(session_broker_);
-            opts.alpaca_data = use_alpaca_data_ && alpaca_available;
+            int data = data_idx_;
+            if ((data == 1 && !alpaca_available) || (data == 2 && !polygon_available))
+                data = 0;   // no credentials: fall back to delayed quotes
+            opts.data = static_cast<DataFeed>(data);
             opts.record = record_ticks_;
             opts.risk = risk_;
             opts.risk.max_drawdown_pct = risk_dd_pct_ / 100.0;

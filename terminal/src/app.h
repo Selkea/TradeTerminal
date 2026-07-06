@@ -6,6 +6,7 @@
 #include "engine/alpaca_broker.h"
 #include "engine/alpaca_feed.h"
 #include "engine/ibkr_broker.h"
+#include "engine/polygon_feed.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
@@ -55,6 +56,8 @@ private:
     void setup_default_layout(ImGuiID dockspace_id);
     // Signed-in account, falling back to APCA_* env vars; nullopt = neither.
     std::optional<Account> alpaca_creds() const;
+    // Signed-in Polygon key, falling back to POLYGON_API_KEY; "" = none.
+    std::string polygon_key() const;
 
     // Set on the UI thread when Run is clicked; consumed on the IPC thread
     // when the matching candle response arrives.
@@ -89,6 +92,7 @@ private:
     // Declared after engine_ on purpose: the feed pushes into the engine's
     // ring, so it must be destroyed (thread joined) before the engine.
     std::unique_ptr<AlpacaFeed> alpaca_feed_;
+    std::unique_ptr<PolygonFeed> polygon_feed_;
     std::atomic<bool> rt_feed_active_{false};   // IPC thread: skip sidecar ticks
     AlertNotifier alerts_;
     SmaCrossover sma_;
@@ -133,6 +137,7 @@ private:
     AccountStore accounts_;
     struct SignIn {
         bool request_open = false;        // menu clicked; OpenPopup next frame
+        int provider = 0;                 // 0 alpaca, 1 polygon, 2 ibkr (info only)
         char name[32] = "paper";
         char key[96] = "";
         char secret[128] = "";

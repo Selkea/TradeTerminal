@@ -19,6 +19,7 @@ add_library(tt_alpaca STATIC
     src/alpaca_broker.cpp
     src/alpaca_feed.cpp
     src/ibkr_broker.cpp
+    src/polygon_feed.cpp
 )
 target_link_libraries(tt_alpaca
     PUBLIC tt_engine ws2_32   # ws2_32: select() in the socket wait path
@@ -49,3 +50,7 @@ add_test(NAME alpaca_feed_tests COMMAND tt_alpaca_feed_tests)
 add_executable(tt_ibkr_tests tests/test_ibkr_parse.cpp)
 target_link_libraries(tt_ibkr_tests PRIVATE tt_alpaca doctest)
 add_test(NAME ibkr_tests COMMAND tt_ibkr_tests)
+
+add_executable(tt_polygon_tests tests/test_polygon_parse.cpp)
+target_link_libraries(tt_polygon_tests PRIVATE tt_alpaca doctest)
+add_test(NAME polygon_tests COMMAND tt_polygon_tests)

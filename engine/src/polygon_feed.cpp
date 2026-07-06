@@ -1,4 +1,4 @@
-#include "engine/alpaca_feed.h"
+#include "engine/polygon_feed.h"
 
 #include "alpaca_util.h"
 #include "alpaca_ws.h"
@@ -8,26 +8,24 @@
 #include <windows.h>
 #endif
 
+#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <simdjson.h>
 
 #include <algorithm>
 #include <chrono>
-#include <ctime>
 #include <thread>
 
 namespace tt {
 
-using nlohmann::json;   // handshake message *building* only — off the hot path
+using nlohmann::json;
 
-// simdjson on-demand: no DOM, no allocation per message — this runs on the
-// feed thread for every websocket frame, ahead of the ts_ingest_tsc stamp.
-size_t alpaca_parse_feed_msgs(std::string_view json_text,
-                              const std::vector<std::string>& symbols,
-                              std::vector<AlpacaFeedMsg>& out) {
+// simdjson on-demand, same discipline as the Alpaca feed parser: this runs
+// per websocket frame ahead of the ts_ingest_tsc stamp.
+size_t polygon_parse_feed_msgs(std::string_view json_text,
+                               const std::vector<std::string>& symbols,
+                               std::vector<AlpacaFeedMsg>& out) {
     namespace od = simdjson::ondemand;
-    // Reused per thread: the parser keeps its scratch buffers, and the padded
-    // copy grows once to the high-water mark instead of allocating per call.
     thread_local od::parser parser;
     thread_local std::string padded;
     padded.assign(json_text);
@@ -38,45 +36,46 @@ size_t alpaca_parse_feed_msgs(std::string_view json_text,
         od::document doc = parser.iterate(padded.data(), padded.size(), padded.capacity());
         for (od::value elem : doc.get_array()) {
             od::object obj = elem.get_object();
-            const std::string_view type = obj["T"].get_string();
+            const std::string_view ev = obj["ev"].get_string();
             AlpacaFeedMsg m;
-            if (type == "t" || type == "q") {
-                const std::string_view sym = obj["S"].get_string();
+            if (ev == "T" || ev == "Q") {
+                const std::string_view sym = obj["sym"].get_string();
                 for (size_t i = 0; i < symbols.size(); ++i)
                     if (symbols[i] == sym) {
                         m.symbol_id = static_cast<uint32_t>(i + 1);
                         break;
                     }
-                if (type == "t") {
+                if (ev == "T") {
                     m.kind = AlpacaFeedMsg::Trade;
                     m.price = double(obj["p"].get_double());
-                    m.size = double(obj["s"].get_double());
+                    double sz = 0;
+                    if (obj["s"].get_double().get(sz) != simdjson::SUCCESS)
+                        sz = 0;   // odd lots may omit size
+                    m.size = sz;
                 } else {
                     m.kind = AlpacaFeedMsg::Quote;
                     m.bid = double(obj["bp"].get_double());
                     m.ask = double(obj["ap"].get_double());
                 }
-                std::string_view ts;
-                if (obj["t"].get_string().get(ts) == simdjson::SUCCESS)
-                    m.ts_ns = alpaca::rfc3339_ns(ts);
-            } else if (type == "success") {
-                const std::string_view msg = obj["msg"].get_string();
-                if (msg == "connected") m.kind = AlpacaFeedMsg::Connected;
-                else if (msg == "authenticated") m.kind = AlpacaFeedMsg::Authenticated;
-                else continue;
-            } else if (type == "subscription") {
-                m.kind = AlpacaFeedMsg::Subscription;
-            } else if (type == "error") {
-                std::string_view msg = "unknown error";
-                int64_t code = 0;
-                // Best-effort: a missing field keeps the defaults.
-                if (obj["msg"].get_string().get(msg) != simdjson::SUCCESS)
-                    msg = "unknown error";
-                if (obj["code"].get_int64().get(code) != simdjson::SUCCESS) code = 0;
-                m.kind = AlpacaFeedMsg::Error;
-                m.error = std::string(msg) + " (code " + std::to_string(code) + ")";
+                int64_t ts_ms = 0;   // SIP timestamp, Unix ms
+                if (obj["t"].get_int64().get(ts_ms) != simdjson::SUCCESS) ts_ms = 0;
+                m.ts_ns = ts_ms * 1'000'000;
+            } else if (ev == "status") {
+                const std::string_view status = obj["status"].get_string();
+                if (status == "connected") m.kind = AlpacaFeedMsg::Connected;
+                else if (status == "auth_success") m.kind = AlpacaFeedMsg::Authenticated;
+                else if (status == "success") m.kind = AlpacaFeedMsg::Subscription;
+                else if (status == "auth_failed" || status == "error") {
+                    m.kind = AlpacaFeedMsg::Error;
+                    std::string_view msg = "unknown error";
+                    if (obj["message"].get_string().get(msg) != simdjson::SUCCESS)
+                        msg = "unknown error";
+                    m.error = std::string(msg);
+                } else {
+                    continue;
+                }
             } else {
-                continue;   // bars, statuses, LULDs, ... nothing we route yet
+                continue;   // aggregates (A/AM), LULDs, ... nothing we route
             }
             out.push_back(std::move(m));
             ++appended;
@@ -87,16 +86,16 @@ size_t alpaca_parse_feed_msgs(std::string_view json_text,
     return appended;
 }
 
-// Non-hot path (reconnect recovery): nlohmann is fine here.
-bool alpaca_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out) {
+// Non-hot path (reconnect recovery).
+bool polygon_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBar>& out) {
     const json j = json::parse(json_text, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return false;
-    const auto bars = j.find("bars");
-    if (bars == j.end() || !bars->is_array()) return false;
-    for (const json& b : *bars) {
+    const auto results = j.find("results");
+    if (results == j.end() || !results->is_array()) return j.value("resultsCount", -1) == 0;
+    for (const json& b : *results) {
         if (!b.is_object()) continue;
         AlpacaRestBar r;
-        r.ts_ns = alpaca::rfc3339_ns(b.value("t", ""));
+        r.ts_ns = static_cast<int64_t>(alpaca::num_field(b, "t")) * 1'000'000;   // ms
         r.open = alpaca::num_field(b, "o");
         r.high = alpaca::num_field(b, "h");
         r.low = alpaca::num_field(b, "l");
@@ -107,25 +106,66 @@ bool alpaca_parse_rest_bars(std::string_view json_text, std::vector<AlpacaRestBa
     return true;
 }
 
-AlpacaFeed::AlpacaFeed(AlpacaFeedConfig cfg, Sink sink)
+bool polygon_verify_key(const std::string& rest_url, const std::string& api_key,
+                        std::string& detail) {
+    alpaca_ensure_curl_init();
+    CURL* h = curl_easy_init();
+    if (!h) {
+        detail = "curl init failed";
+        return false;
+    }
+    curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + api_key).c_str());
+    std::string body;
+    const std::string url = rest_url + "/v3/reference/tickers?limit=1";
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, alpaca::curl_write_to_string);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+    const CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    if (rc == CURLE_OK) curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+
+    if (rc != CURLE_OK) {
+        detail = curl_easy_strerror(rc);
+        return false;
+    }
+    if (status == 401 || status == 403) {
+        detail = "invalid API key";
+        return false;
+    }
+    if (status / 100 != 2) {
+        detail = "HTTP " + std::to_string(status);
+        return false;
+    }
+    detail = "key OK";
+    return true;
+}
+
+PolygonFeed::PolygonFeed(PolygonFeedConfig cfg, Sink sink)
     : cfg_(std::move(cfg)), sink_(std::move(sink)) {}
 
-AlpacaFeed::~AlpacaFeed() { stop(); }
+PolygonFeed::~PolygonFeed() { stop(); }
 
-bool AlpacaFeed::start() {
-    if (io_thread_.joinable()) return false;   // already started
+bool PolygonFeed::start() {
+    if (io_thread_.joinable()) return false;
     stop_.store(false, std::memory_order_relaxed);
     io_thread_ = std::thread([this] { io_loop(); });
     return true;
 }
 
-void AlpacaFeed::stop() {
+void PolygonFeed::stop() {
     stop_.store(true, std::memory_order_release);
     if (io_thread_.joinable()) io_thread_.join();
     connected_.store(false, std::memory_order_release);
 }
 
-bool AlpacaFeed::pop_log(std::string& out) {
+bool PolygonFeed::pop_log(std::string& out) {
     std::lock_guard lock(log_mu_);
     if (logs_.empty()) return false;
     out = std::move(logs_.front());
@@ -133,39 +173,14 @@ bool AlpacaFeed::pop_log(std::string& out) {
     return true;
 }
 
-void AlpacaFeed::log(std::string line) {
+void PolygonFeed::log(std::string line) {
     std::lock_guard lock(log_mu_);
-    logs_.push_back("alpaca-feed: " + std::move(line));
+    logs_.push_back("polygon: " + std::move(line));
     while (logs_.size() > 500) logs_.pop_front();
 }
 
-namespace {
-
-const char* timeframe_for(int bar_seconds) {
-    switch (bar_seconds) {
-    case 60: return "1Min";
-    case 300: return "5Min";
-    case 900: return "15Min";
-    case 3600: return "1Hour";
-    default: return nullptr;
-    }
-}
-
-std::string rfc3339_utc(int64_t ns) {
-    const std::time_t t = static_cast<std::time_t>(ns / 1'000'000'000);
-    std::tm tm{};
-    gmtime_s(&tm, &t);
-    char buf[24];
-    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
-}
-
-} // namespace
-
-void AlpacaFeed::io_loop() {
+void PolygonFeed::io_loop() {
 #ifdef _WIN32
-    // Tick ingest latency = this thread's wakeup + parse time; outrank
-    // normal threads so a busy UI never delays market data.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (cfg_.pin_core >= 0 && cfg_.pin_core < 64)
         if (SetThreadAffinityMask(GetCurrentThread(), 1ull << cfg_.pin_core))
@@ -175,33 +190,32 @@ void AlpacaFeed::io_loop() {
 
     AlpacaWs ws;
     std::vector<AlpacaFeedMsg> msgs;
-    // Latest quote per symbol, attached to the next trade tick.
     struct BidAsk { double bid = 0.0, ask = 0.0; };
     std::vector<BidAsk> quotes(cfg_.symbols.size());
-    int64_t last_trade_ns = 0;   // newest trade seen — backfill anchor
+    int64_t last_trade_ns = 0;
 
-    // After an outage, fetch the bars the stream missed so bar-based
-    // strategies resume with continuous indicators instead of a blind gap.
     auto backfill = [&](int64_t from_ns) {
-        const char* tf = timeframe_for(cfg_.bar_seconds);
-        if (!tf) {
+        // Polygon aggs support arbitrary minute multiples.
+        if (cfg_.bar_seconds % 60 != 0) {
             log("gap backfill skipped: unsupported bar size " +
                 std::to_string(cfg_.bar_seconds) + "s");
             return;
         }
-        const size_t slash = cfg_.stream_url.find_last_of('/');
-        const std::string feed_tier =
-            slash == std::string::npos ? "iex" : cfg_.stream_url.substr(slash + 1);
+        const int mult = cfg_.bar_seconds / 60;
+        const int64_t from_ms = from_ns / 1'000'000;
+        const int64_t to_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
         curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, ("APCA-API-KEY-ID: " + cfg_.key_id).c_str());
-        hdrs = curl_slist_append(hdrs, ("APCA-API-SECRET-KEY: " + cfg_.secret).c_str());
+        hdrs = curl_slist_append(hdrs, ("Authorization: Bearer " + cfg_.api_key).c_str());
         for (size_t i = 0; i < cfg_.symbols.size(); ++i) {
             CURL* h = curl_easy_init();
             if (!h) break;
-            const std::string url = cfg_.data_rest_url + "/v2/stocks/" +
-                                    cfg_.symbols[i] + "/bars?timeframe=" + tf +
-                                    "&start=" + rfc3339_utc(from_ns) +
-                                    "&limit=1000&adjustment=raw&feed=" + feed_tier;
+            const std::string url = cfg_.rest_url + "/v2/aggs/ticker/" + cfg_.symbols[i] +
+                                    "/range/" + std::to_string(mult) + "/minute/" +
+                                    std::to_string(from_ms) + "/" + std::to_string(to_ms) +
+                                    "?adjusted=true&sort=asc&limit=5000";
             std::string body;
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
             curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
@@ -216,7 +230,7 @@ void AlpacaFeed::io_loop() {
             curl_easy_cleanup(h);
             std::vector<AlpacaRestBar> bars;
             if (rc != CURLE_OK || status / 100 != 2 ||
-                !alpaca_parse_rest_bars(body, bars)) {
+                !polygon_parse_rest_bars(body, bars)) {
                 log("gap backfill failed for " + cfg_.symbols[i]);
                 continue;
             }
@@ -243,12 +257,10 @@ void AlpacaFeed::io_loop() {
         curl_slist_free_all(hdrs);
     };
 
-    // During the handshake waits, data may already stream; kept minimal —
-    // anything non-matching is discarded (a few ticks at connect is fine).
     auto wait_for = [&](AlpacaFeedMsg::Kind kind, std::string& err) {
         return ws.wait(5000, stop_, [&](std::string_view text) {
             msgs.clear();
-            alpaca_parse_feed_msgs(text, cfg_.symbols, msgs);
+            polygon_parse_feed_msgs(text, cfg_.symbols, msgs);
             for (const AlpacaFeedMsg& m : msgs) {
                 if (m.kind == kind) return true;
                 if (m.kind == AlpacaFeedMsg::Error) {
@@ -267,18 +279,19 @@ void AlpacaFeed::io_loop() {
             return false;
         }
         if (!wait_for(AlpacaFeedMsg::Connected, err) || !err.empty()) {
-            log("no welcome from data stream" + (err.empty() ? "" : ": " + err));
+            log("no welcome from stream" + (err.empty() ? "" : ": " + err));
             return false;
         }
-        const json auth{{"action", "auth"}, {"key", cfg_.key_id}, {"secret", cfg_.secret}};
+        const json auth{{"action", "auth"}, {"params", cfg_.api_key}};
         if (!ws.send_text(auth.dump()) ||
             !wait_for(AlpacaFeedMsg::Authenticated, err) || !err.empty()) {
-            log("auth failed" + (err.empty() ? "" : ": " + err));
+            log("auth failed (check POLYGON_API_KEY)" + (err.empty() ? "" : ": " + err));
             return false;
         }
-        const json sub{{"action", "subscribe"},
-                       {"trades", cfg_.symbols},
-                       {"quotes", cfg_.symbols}};
+        std::string params;
+        for (const std::string& s : cfg_.symbols)
+            params += (params.empty() ? "" : ",") + ("T." + s) + ",Q." + s;
+        const json sub{{"action", "subscribe"}, {"params", params}};
         if (!ws.send_text(sub.dump()) ||
             !wait_for(AlpacaFeedMsg::Subscription, err) || !err.empty()) {
             log("subscribe failed" + (err.empty() ? "" : ": " + err));
@@ -289,7 +302,7 @@ void AlpacaFeed::io_loop() {
 
     auto on_msg = [&](std::string_view text) {
         msgs.clear();
-        alpaca_parse_feed_msgs(text, cfg_.symbols, msgs);
+        polygon_parse_feed_msgs(text, cfg_.symbols, msgs);
         for (const AlpacaFeedMsg& m : msgs) {
             if (m.kind == AlpacaFeedMsg::Quote && m.symbol_id) {
                 quotes[m.symbol_id - 1] = {m.bid, m.ask};
@@ -325,8 +338,7 @@ void AlpacaFeed::io_loop() {
                 std::string joined;
                 for (const std::string& s : cfg_.symbols)
                     joined += (joined.empty() ? "" : ",") + s;
-                log("streaming " + joined + " (IEX)");
-                // Reconnect (not first connect): recover what the outage ate.
+                log("streaming " + joined);
                 if (last_trade_ns > 0) backfill(last_trade_ns);
             } else {
                 ws.close();
@@ -343,14 +355,10 @@ void AlpacaFeed::io_loop() {
             log("stream lost, reconnecting");
         } else if (r == 0) {
             if (cfg_.busy_poll) {
-                // Spin: removes the kernel wakeup from tick ingest entirely.
 #if defined(__x86_64__) || defined(_M_X64)
                 _mm_pause();
 #endif
             } else {
-                // Block on the socket: ticks are handled the moment bytes
-                // land, not on the next timer expiry. Timeout only bounds
-                // stop_ checks.
                 ws.wait_readable(200);
             }
         }

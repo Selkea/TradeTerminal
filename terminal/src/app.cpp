@@ -25,11 +25,17 @@ std::string gxx_path() {
 } // namespace
 
 std::optional<Account> App::alpaca_creds() const {
-    if (auto a = accounts_.active()) return a;
+    if (auto a = accounts_.active("alpaca")) return a;
     const char* k = std::getenv("APCA_API_KEY_ID");
     const char* s = std::getenv("APCA_API_SECRET_KEY");
-    if (k && *k && s && *s) return Account{"env", k, s};
+    if (k && *k && s && *s) return Account{"env", "alpaca", k, s};
     return std::nullopt;
+}
+
+std::string App::polygon_key() const {
+    if (auto a = accounts_.active("polygon")) return a->key_id;
+    const char* k = std::getenv("POLYGON_API_KEY");
+    return k && *k ? k : "";
 }
 
 App::App(std::string python_cmd, std::string service_dir)
@@ -358,17 +364,22 @@ void App::draw() {
             alert_scan(line);
             log_.add(std::move(line));
         }
-    if (alpaca_feed_) {
+    if (polygon_feed_)
+        while (polygon_feed_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
+    if (alpaca_feed_)
         while (alpaca_feed_->pop_log(line)) {
             alert_scan(line);
             log_.add(std::move(line));
         }
-        // Session over: stop streaming (frees the one allowed connection).
-        if (!engine_.live_running()) {
-            rt_feed_active_.store(false, std::memory_order_relaxed);
-            alpaca_feed_.reset();
-            log_.add("live: real-time feed stopped");
-        }
+    // Session over: stop streaming (frees the vendor connection slot).
+    if ((alpaca_feed_ || polygon_feed_) && !engine_.live_running()) {
+        rt_feed_active_.store(false, std::memory_order_relaxed);
+        alpaca_feed_.reset();
+        polygon_feed_.reset();
+        log_.add("live: real-time feed stopped");
     }
 
     // TT_AUTORUN_BACKTEST=1: fire one AAPL backtest as soon as the feed is up
@@ -464,6 +475,7 @@ void App::draw() {
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_trade_)
         trade_.draw(&show_trade_, strat_mgr_.active_name(), alpaca_creds().has_value(),
+                    !polygon_key().empty(),
                     [this](const TradePanel::StartOpts& opts) {
                         const std::vector<std::string>& syms = opts.symbols;
                         LiveConfig cfg;
@@ -474,7 +486,7 @@ void App::draw() {
                         cfg.risk = opts.risk;
                         // Real-time feed => spin the engine thread instead of
                         // sleeping; ticks are handled in ns, not after Sleep(5).
-                        cfg.busy_spin = opts.alpaca_data;
+                        cfg.busy_spin = opts.data != TradePanel::DataFeed::Delayed;
                         // Optional core pinning (TT_PIN_ENGINE / TT_PIN_FEED =
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
@@ -517,9 +529,13 @@ void App::draw() {
                             // start_live, so replacing the old brokers is safe.
                             alpaca_ = std::move(broker);
                             ibkr_ = std::move(ibkr_broker);
-                            alpaca_feed_.reset();   // previous session's feed, if any
+                            alpaca_feed_.reset();   // previous session's feeds
+                            polygon_feed_.reset();
                             rt_feed_active_.store(false, std::memory_order_relaxed);
-                            if (opts.alpaca_data && creds) {
+                            const auto sink = [this](const EngineEvent& ev) {
+                                return engine_.push_feed_event(ev);
+                            };
+                            if (opts.data == TradePanel::DataFeed::AlpacaIex && creds) {
                                 AlpacaFeedConfig fc;
                                 fc.key_id = creds->key_id;
                                 fc.secret = creds->secret;
@@ -528,11 +544,22 @@ void App::draw() {
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
                                     fc.pin_core = std::atoi(pin);
                                 fc.bar_seconds = opts.bar_seconds;
-                                alpaca_feed_ = std::make_unique<AlpacaFeed>(
-                                    std::move(fc), [this](const EngineEvent& ev) {
-                                        return engine_.push_feed_event(ev);
-                                    });
+                                alpaca_feed_ =
+                                    std::make_unique<AlpacaFeed>(std::move(fc), sink);
                                 alpaca_feed_->start();
+                                rt_feed_active_.store(true, std::memory_order_relaxed);
+                            } else if (opts.data == TradePanel::DataFeed::Polygon &&
+                                       !polygon_key().empty()) {
+                                PolygonFeedConfig pc;
+                                pc.api_key = polygon_key();
+                                pc.symbols = syms;
+                                pc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
+                                if (const char* pin = std::getenv("TT_PIN_FEED"))
+                                    pc.pin_core = std::atoi(pin);
+                                pc.bar_seconds = opts.bar_seconds;
+                                polygon_feed_ =
+                                    std::make_unique<PolygonFeed>(std::move(pc), sink);
+                                polygon_feed_->start();
                                 rt_feed_active_.store(true, std::memory_order_relaxed);
                             }
                             for (const std::string& sym : syms)
@@ -627,42 +654,55 @@ void App::draw() {
 
 void App::draw_account_menu() {
     if (!ImGui::BeginMenu("Account")) return;
-    const std::string& active = accounts_.active_name();
-    if (active.empty())
-        ImGui::TextDisabled("Not signed in");
-    else
-        ImGui::TextDisabled("Signed in: %s", active.c_str());
+    for (const char* prov : {"alpaca", "polygon"}) {
+        const std::string act = accounts_.active_name(prov);
+        ImGui::TextDisabled("%s: %s", prov, act.empty() ? "(not signed in)" : act.c_str());
+    }
+    ImGui::TextDisabled("ibkr: gateway browser login");
     ImGui::Separator();
 
     if (ImGui::MenuItem("Sign In...")) signin_.request_open = true;
 
-    if (ImGui::BeginMenu("Switch", !accounts_.names().empty())) {
-        for (const std::string& name : accounts_.names())
-            if (ImGui::MenuItem(name.c_str(), nullptr, name == active) && name != active) {
-                if (accounts_.get(name)) {
-                    accounts_.set_active(name);
-                    log_.add("account: switched to '" + name + "'");
+    if (ImGui::BeginMenu("Switch", !accounts_.list().empty())) {
+        for (const auto& e : accounts_.list()) {
+            const bool is_active = accounts_.active_name(e.provider) == e.name;
+            const std::string label = e.name + "  (" + e.provider + ")";
+            if (ImGui::MenuItem(label.c_str(), nullptr, is_active) && !is_active) {
+                if (accounts_.get(e.name)) {
+                    accounts_.set_active(e.name);
+                    log_.add("account: switched " + e.provider + " to '" + e.name + "'");
                 } else {
-                    log_.add("account: cannot decrypt '" + name +
+                    log_.add("account: cannot decrypt '" + e.name +
                              "' (saved by another Windows user?)");
                 }
             }
+        }
         ImGui::EndMenu();
     }
 
-    if (ImGui::MenuItem("Sign Out", nullptr, false, !active.empty())) {
-        log_.add("account: signed out of '" + active + "'");
-        accounts_.sign_out();
+    const bool any_active =
+        accounts_.signed_in("alpaca") || accounts_.signed_in("polygon");
+    if (ImGui::BeginMenu("Sign Out", any_active)) {
+        for (const char* prov : {"alpaca", "polygon"}) {
+            const std::string act = accounts_.active_name(prov);
+            if (!act.empty() && ImGui::MenuItem((std::string(prov) + ": " + act).c_str())) {
+                accounts_.sign_out(prov);
+                log_.add(std::string("account: signed out of ") + prov);
+            }
+        }
+        ImGui::EndMenu();
     }
 
     ImGui::Separator();
-    if (ImGui::BeginMenu("Remove", !accounts_.names().empty())) {
+    if (ImGui::BeginMenu("Remove", !accounts_.list().empty())) {
         ImGui::TextDisabled("Deletes the saved credentials");
-        for (const std::string& name : accounts_.names())
-            if (ImGui::MenuItem(name.c_str())) {
-                accounts_.remove(name);
-                log_.add("account: removed '" + name + "'");
+        for (const auto& e : accounts_.list()) {
+            const std::string label = e.name + "  (" + e.provider + ")";
+            if (ImGui::MenuItem(label.c_str())) {
+                accounts_.remove(e.name);
+                log_.add("account: removed '" + e.name + "'");
             }
+        }
         ImGui::EndMenu();
     }
     ImGui::EndMenu();
@@ -696,17 +736,29 @@ void App::draw_signin_modal() {
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
 
+    const bool is_alpaca = signin_.provider == 0;
+    const bool is_polygon = signin_.provider == 1;
+    auto make_account = [&] {
+        Account a;
+        a.name = signin_.name[0] ? signin_.name : "default";
+        a.provider = is_polygon ? "polygon" : "alpaca";
+        a.key_id = signin_.key;
+        a.secret = is_polygon ? "" : signin_.secret;
+        return a;
+    };
+
     const int status = signin_.status.load();
     if (status == 2) {   // worker verified the credentials — save and close
         if (signin_.worker.joinable()) signin_.worker.join();
-        Account a{signin_.name[0] ? signin_.name : "default", signin_.key, signin_.secret};
+        const Account a = make_account();
         accounts_.upsert(a, /*make_active=*/true);
         std::string detail;
         {
             std::lock_guard lock(signin_.mu);
             detail = signin_.detail;
         }
-        log_.add("account: signed in as '" + a.name + "' (" + detail + ")");
+        log_.add("account: signed in to " + a.provider + " as '" + a.name + "' (" +
+                 detail + ")");
         signin_.status.store(0);
         signin_.secret[0] = '\0';   // no plaintext left in the UI buffer
         ImGui::CloseCurrentPopup();
@@ -716,35 +768,55 @@ void App::draw_signin_modal() {
 
     const bool busy = status == 1;
     ImGui::BeginDisabled(busy);
+    static constexpr const char* kProviders[] = {"Alpaca", "Polygon", "IBKR"};
+    ImGui::SetNextItemWidth(280);
+    ImGui::Combo("Provider", &signin_.provider, kProviders, IM_ARRAYSIZE(kProviders));
+    if (signin_.provider == 2) {
+        ImGui::EndDisabled();
+        // Nothing to store: the gateway holds the brokerage session itself.
+        ImGui::TextWrapped("IBKR credentials are never stored here. Run the Client "
+                           "Portal Gateway and log in via your browser (default "
+                           "https://localhost:5000); the IBKR broker connects to "
+                           "that session automatically.");
+        if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
     ImGui::SetNextItemWidth(280);
     ImGui::InputText("Name", signin_.name, sizeof signin_.name);
     ImGui::SetItemTooltip("Label shown in the Account menu (e.g. \"paper\")");
     ImGui::SetNextItemWidth(280);
-    ImGui::InputText("API key ID", signin_.key, sizeof signin_.key);
-    ImGui::SetNextItemWidth(280);
-    ImGui::InputText("API secret", signin_.secret, sizeof signin_.secret,
-                     ImGuiInputTextFlags_Password);
+    ImGui::InputText(is_polygon ? "API key" : "API key ID", signin_.key,
+                     sizeof signin_.key, is_polygon ? ImGuiInputTextFlags_Password : 0);
+    if (is_alpaca) {
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("API secret", signin_.secret, sizeof signin_.secret,
+                         ImGuiInputTextFlags_Password);
+    }
     ImGui::EndDisabled();
     ImGui::TextDisabled("Stored encrypted (Windows DPAPI, this user only).");
 
     if (busy) {
-        ImGui::TextDisabled("Verifying against the paper endpoint...");
+        ImGui::TextDisabled("Verifying...");
     } else if (status == 3) {
         std::lock_guard lock(signin_.mu);
         ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.25f, 1), "Failed: %s",
                            signin_.detail.c_str());
     }
 
-    const bool have_input = signin_.key[0] && signin_.secret[0];
+    const bool have_input = signin_.key[0] && (is_polygon || signin_.secret[0]);
     ImGui::BeginDisabled(busy || !have_input);
     if (ImGui::Button("Verify & Sign In")) {
         if (signin_.worker.joinable()) signin_.worker.join();
         signin_.status.store(1);
         const std::string key = signin_.key, secret = signin_.secret;
-        signin_.worker = std::thread([this, key, secret] {
+        const bool polygon = is_polygon;
+        signin_.worker = std::thread([this, key, secret, polygon] {
             std::string detail;
             const bool ok =
-                alpaca_verify_account(AlpacaConfig{}.rest_url, key, secret, detail);
+                polygon
+                    ? polygon_verify_key(PolygonFeedConfig{}.rest_url, key, detail)
+                    : alpaca_verify_account(AlpacaConfig{}.rest_url, key, secret, detail);
             {
                 std::lock_guard lock(signin_.mu);
                 signin_.detail = std::move(detail);
@@ -754,9 +826,9 @@ void App::draw_signin_modal() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Save without verifying")) {
-        Account a{signin_.name[0] ? signin_.name : "default", signin_.key, signin_.secret};
+        const Account a = make_account();
         accounts_.upsert(a, /*make_active=*/true);
-        log_.add("account: saved '" + a.name + "' (not verified)");
+        log_.add("account: saved " + a.provider + " '" + a.name + "' (not verified)");
         signin_.secret[0] = '\0';
         ImGui::CloseCurrentPopup();
     }

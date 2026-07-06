@@ -13,14 +13,15 @@ namespace tt::ui {
 class TradePanel {
 public:
     enum class Broker : int { Sim = 0, Alpaca = 1, Ibkr = 2 };
+    enum class DataFeed : int { Delayed = 0, AlpacaIex = 1, Polygon = 2 };
 
     struct StartOpts {
         std::vector<std::string> symbols;
         double cash = 100'000.0;
         int bar_seconds = 60;
-        Broker broker = Broker::Sim;   // where orders route
-        bool alpaca_data = false;      // real-time IEX ticks instead of delayed quotes
-        bool record = true;            // capture ticks to a .ttk session file
+        Broker broker = Broker::Sim;         // where orders route
+        DataFeed data = DataFeed::Delayed;   // where ticks come from
+        bool record = true;                  // capture ticks to a .ttk session file
         RiskLimits risk{};
     };
     using StartFn = std::function<void(const StartOpts&)>;
@@ -28,10 +29,10 @@ public:
 
     TradePanel(Engine& eng, std::string sessions_dir)
         : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
-    // alpaca_available: credentials exist right now (signed-in account or env
+    // *_available: credentials exist right now (signed-in account or env
     // vars) — evaluated per frame because sign-in/out happens at runtime.
     void draw(bool* open, const std::string& strategy_name, bool alpaca_available,
-              const StartFn& start, const ReplayFn& replay);
+              bool polygon_available, const StartFn& start, const ReplayFn& replay);
 
     double cash() const { return cash_; }
     int bar_sec() const { return bar_sec_; }
@@ -53,7 +54,7 @@ private:
     Engine& eng_;
     std::string sessions_dir_;
     int broker_idx_ = 0;             // Broker enum; deliberately not persisted
-    bool use_alpaca_data_ = false;   // real-time IEX data for the session
+    int data_idx_ = 0;               // DataFeed enum
     bool record_ticks_ = true;
     int session_broker_ = 0;         // what the running session was started with
     char input_[16] = "";
