@@ -6,6 +6,7 @@
 #include "engine/alpaca_broker.h"
 #include "engine/alpaca_feed.h"
 #include "engine/ibkr_broker.h"
+#include "engine/ibkr_feed.h"
 #include "engine/polygon_feed.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
@@ -93,6 +94,7 @@ private:
     // ring, so it must be destroyed (thread joined) before the engine.
     std::unique_ptr<AlpacaFeed> alpaca_feed_;
     std::unique_ptr<PolygonFeed> polygon_feed_;
+    std::unique_ptr<IbkrFeed> ibkr_feed_;
     std::atomic<bool> rt_feed_active_{false};   // IPC thread: skip sidecar ticks
     AlertNotifier alerts_;
     SmaCrossover sma_;

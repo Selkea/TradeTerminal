@@ -34,13 +34,24 @@ struct AlpacaWs {
     }
 
     // TLS connect only — protocol handshakes are the caller's business.
-    bool connect(const std::string& url) {
+    // cookie: sent with the upgrade request (IBKR gateway wants its session
+    // as "api=<token>"). insecure: skip peer verification — only ever for a
+    // loopback gateway with a self-signed cert.
+    bool connect(const std::string& url, const std::string& cookie = {},
+                 bool insecure = false) {
         close();
         ws = curl_easy_init();
         if (!ws) return false;
         curl_easy_setopt(ws, CURLOPT_URL, url.c_str());
         curl_easy_setopt(ws, CURLOPT_CONNECT_ONLY, 2L);   // websocket, no callbacks
-        curl_easy_setopt(ws, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+        if (insecure) {
+            curl_easy_setopt(ws, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(ws, CURLOPT_SSL_VERIFYHOST, 0L);
+        } else {
+            curl_easy_setopt(ws, CURLOPT_SSL_OPTIONS,
+                             static_cast<long>(CURLSSLOPT_NATIVE_CA));
+        }
+        if (!cookie.empty()) curl_easy_setopt(ws, CURLOPT_COOKIE, cookie.c_str());
         curl_easy_setopt(ws, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
         if (curl_easy_perform(ws) != CURLE_OK) {
             close();

@@ -369,16 +369,22 @@ void App::draw() {
             alert_scan(line);
             log_.add(std::move(line));
         }
+    if (ibkr_feed_)
+        while (ibkr_feed_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
     if (alpaca_feed_)
         while (alpaca_feed_->pop_log(line)) {
             alert_scan(line);
             log_.add(std::move(line));
         }
     // Session over: stop streaming (frees the vendor connection slot).
-    if ((alpaca_feed_ || polygon_feed_) && !engine_.live_running()) {
+    if ((alpaca_feed_ || polygon_feed_ || ibkr_feed_) && !engine_.live_running()) {
         rt_feed_active_.store(false, std::memory_order_relaxed);
         alpaca_feed_.reset();
         polygon_feed_.reset();
+        ibkr_feed_.reset();
         log_.add("live: real-time feed stopped");
     }
 
@@ -531,6 +537,7 @@ void App::draw() {
                             ibkr_ = std::move(ibkr_broker);
                             alpaca_feed_.reset();   // previous session's feeds
                             polygon_feed_.reset();
+                            ibkr_feed_.reset();
                             rt_feed_active_.store(false, std::memory_order_relaxed);
                             const auto sink = [this](const EngineEvent& ev) {
                                 return engine_.push_feed_event(ev);
@@ -564,6 +571,24 @@ void App::draw() {
                                 polygon_feed_ =
                                     std::make_unique<PolygonFeed>(std::move(pc), sink);
                                 polygon_feed_->start();
+                                rt_feed_active_.store(true, std::memory_order_relaxed);
+                            } else if (opts.data == TradePanel::DataFeed::Ibkr) {
+                                IbkrFeedConfig fc;
+                                if (const char* gw = std::getenv("TT_IBKR_GATEWAY")) {
+                                    fc.gateway_url = gw;
+                                    // wss://host/v1/api/ws mirrors the REST base.
+                                    std::string ws = fc.gateway_url;
+                                    if (ws.rfind("https://", 0) == 0)
+                                        ws.replace(0, 8, "wss://");
+                                    fc.ws_url = ws + "/ws";
+                                }
+                                fc.symbols = syms;
+                                fc.bar_seconds = opts.bar_seconds;
+                                if (const char* pin = std::getenv("TT_PIN_FEED"))
+                                    fc.pin_core = std::atoi(pin);
+                                ibkr_feed_ =
+                                    std::make_unique<IbkrFeed>(std::move(fc), sink);
+                                ibkr_feed_->start();
                                 rt_feed_active_.store(true, std::memory_order_relaxed);
                             }
                             for (const std::string& sym : syms)

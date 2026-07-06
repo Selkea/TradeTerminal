@@ -78,13 +78,15 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool alpaca_
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "sign in first");
         }
         static constexpr const char* kData[] = {"Delayed (Yahoo)", "Alpaca IEX",
-                                                "Polygon"};
+                                                "Polygon", "IBKR (gateway)"};
         ImGui::SetNextItemWidth(140);
         ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
         ImGui::SetItemTooltip("Delayed: free ~10 s quotes via the Python sidecar.\n"
                               "Alpaca IEX: real-time, needs Alpaca sign-in.\n"
                               "Polygon: real-time, needs a Polygon key (Account menu "
-                              "or POLYGON_API_KEY).");
+                              "or POLYGON_API_KEY).\n"
+                              "IBKR: ~250 ms conflated top-of-book via the local "
+                              "gateway session — no extra data bill.");
         if ((data_idx_ == 1 && !alpaca_available) ||
             (data_idx_ == 2 && !polygon_available)) {
             ImGui::SameLine();

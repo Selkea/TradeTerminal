@@ -19,6 +19,7 @@ add_library(tt_alpaca STATIC
     src/alpaca_broker.cpp
     src/alpaca_feed.cpp
     src/ibkr_broker.cpp
+    src/ibkr_feed.cpp
     src/polygon_feed.cpp
 )
 target_link_libraries(tt_alpaca

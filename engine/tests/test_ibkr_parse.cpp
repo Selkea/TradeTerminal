@@ -3,6 +3,7 @@
 #include "doctest.h"
 
 #include "engine/ibkr_broker.h"
+#include "engine/ibkr_feed.h"
 
 #include <string>
 #include <vector>
@@ -75,6 +76,54 @@ TEST_CASE("trades parse with dedupe key, ref, and side") {
     CHECK(out[0].qty == doctest::Approx(10));
     CHECK(out[0].price == doctest::Approx(213.45));
     CHECK(out[0].ts_ms == 1783002601500LL);
+}
+
+TEST_CASE("gateway session token parses from /tickle") {
+    CHECK(tt::ibkr_parse_session_token(
+              R"({"session":"abc123def","ssoExpires":420000,"iserver":{}})") ==
+          "abc123def");
+    CHECK(tt::ibkr_parse_session_token(R"({})").empty());
+    CHECK(tt::ibkr_parse_session_token("junk").empty());
+}
+
+TEST_CASE("smd market updates: partial fields, string values, conid from topic") {
+    tt::IbkrMdUpdate u;
+    REQUIRE(tt::ibkr_parse_md_msg(
+        R"({"topic":"smd+265598","conid":265598,"_updated":1783002601500,)"
+        R"("31":"213.45","84":"213.44","86":"213.46","7059":"100"})",
+        u));
+    CHECK(u.kind == tt::IbkrMdUpdate::Market);
+    CHECK(u.conid == 265598);
+    CHECK(u.has_last);
+    CHECK(u.last == doctest::Approx(213.45));
+    CHECK(u.bid == doctest::Approx(213.44));
+    CHECK(u.ask == doctest::Approx(213.46));
+    CHECK(u.size == doctest::Approx(100));
+    CHECK(u.ts_ms == 1783002601500LL);
+
+    // Quote-only delta: no last price present.
+    u = {};
+    REQUIRE(tt::ibkr_parse_md_msg(R"({"topic":"smd+8314","84":"501.20"})", u));
+    CHECK(u.conid == 8314);   // recovered from the topic
+    CHECK_FALSE(u.has_last);
+    CHECK(u.has_bid);
+
+    // System noise is ignored; auth loss is surfaced.
+    u = {};
+    CHECK_FALSE(tt::ibkr_parse_md_msg(R"({"topic":"system","hb":1783002601500})", u));
+    REQUIRE(tt::ibkr_parse_md_msg(R"({"topic":"sts","args":{"authenticated":false}})", u));
+    CHECK(u.kind == tt::IbkrMdUpdate::AuthLost);
+}
+
+TEST_CASE("history bars parse for gap backfill") {
+    std::vector<tt::AlpacaRestBar> bars;
+    REQUIRE(tt::ibkr_parse_history_bars(
+        R"({"symbol":"AAPL","data":[{"t":1783002600000,"o":100.1,"h":101,"l":99.9,"c":100.5,"v":120}],"points":1})",
+        bars));
+    REQUIRE(bars.size() == 1);
+    CHECK(bars[0].ts_ns == 1783002600000'000'000LL);
+    CHECK(bars[0].close == doctest::Approx(100.5));
+    CHECK_FALSE(tt::ibkr_parse_history_bars("junk", bars));
 }
 
 TEST_CASE("positions parse conid + signed qty") {

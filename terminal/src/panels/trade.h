@@ -13,7 +13,7 @@ namespace tt::ui {
 class TradePanel {
 public:
     enum class Broker : int { Sim = 0, Alpaca = 1, Ibkr = 2 };
-    enum class DataFeed : int { Delayed = 0, AlpacaIex = 1, Polygon = 2 };
+    enum class DataFeed : int { Delayed = 0, AlpacaIex = 1, Polygon = 2, Ibkr = 3 };
 
     struct StartOpts {
         std::vector<std::string> symbols;
