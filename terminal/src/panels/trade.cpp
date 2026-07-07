@@ -88,14 +88,15 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         int remove_at = -1;
         if (!pending_.empty() &&
             ImGui::BeginTabBar("##symtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                                ImGuiTabBarFlags_Reorderable |
-                                                ImGuiTabBarFlags_TabListPopupButton)) {
+                                                ImGuiTabBarFlags_Reorderable)) {
             for (size_t i = 0; i < pending_.size(); ++i) {
                 SymRow& r = pending_[i];
                 bool open = true;
                 // Tab id = symbol (unique, stable across add/remove); the tab's
-                // close button removes it.
-                if (ImGui::BeginTabItem(r.symbol.c_str(), &open)) {
+                // close button removes it. want_tab_ selects it from the button.
+                const ImGuiTabItemFlags sel =
+                    want_tab_ == static_cast<int>(i) ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem(r.symbol.c_str(), &open, sel)) {
                     ImGui::PushID(r.symbol.c_str());
                     // Capital: sub-account picker when the login has them, else the
                     // shared account/pool.
@@ -181,6 +182,28 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::EndTabItem();
                 }
                 if (!open) remove_at = static_cast<int>(i);
+            }
+            want_tab_ = -1;   // consumed by the SetSelected above
+            // Custom tab-list button: a down-triangle pinned to the right of the
+            // strip (like a docked panel's) that pops a menu of the symbols.
+            if (ImGui::TabItemButton("  ##symtablist", ImGuiTabItemFlags_Leading |
+                                                           ImGuiTabItemFlags_NoTooltip))
+                ImGui::OpenPopup("##symtablist");
+            {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+                const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
+                const float rr = ImGui::GetFontSize() * 0.26f;
+                const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
+                                      ImVec2(cx + rr, cy - rr * 0.5f),
+                                      ImVec2(cx, cy + rr * 0.7f), col);
+            }
+            if (ImGui::BeginPopup("##symtablist")) {
+                for (size_t i = 0; i < pending_.size(); ++i)
+                    if (ImGui::Selectable(pending_[i].symbol.c_str()))
+                        want_tab_ = static_cast<int>(i);
+                ImGui::EndPopup();
             }
             ImGui::EndTabBar();
         }

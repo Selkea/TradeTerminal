@@ -91,9 +91,9 @@ void StrategyManagerPanel::start_build(const std::string& src, bool make_active)
 // longer needs the engine idle — replacing a module retires the old one, and
 // its DLL lives until the last running instance is destroyed.
 void StrategyManagerPanel::pump() {
-    if (!want_load_.empty() && !building_.load()) {
-        const std::string want = want_load_;
-        want_load_.clear();
+    if (!load_queue_.empty() && !building_.load()) {
+        const std::string want = load_queue_.front();
+        load_queue_.pop_front();
         if (!loaded_fresh(want))
             start_build((fs::path(dir_) / want).string(), /*make_active=*/false);
     }
@@ -192,15 +192,15 @@ bool StrategyManagerPanel::loaded_fresh(const std::string& key) const {
 
 void StrategyManagerPanel::request_load(const std::string& key) {
     if (key.empty() || loaded_fresh(key)) return;
-    if (building_.load()) {
-        want_load_ = key;
-        return;
-    }
-    start_build((fs::path(dir_) / key).string(), /*make_active=*/false);
+    // Queue it (deduped); pump() builds queued strategies one at a time, so a
+    // batch (e.g. restoring last session's strategies) all get built.
+    for (const std::string& q : load_queue_)
+        if (q == key) return;
+    load_queue_.push_back(key);
 }
 
 bool StrategyManagerPanel::load_pending() const {
-    if (building_.load() || !want_load_.empty()) return true;
+    if (building_.load() || !load_queue_.empty()) return true;
     std::lock_guard lock(pending_mu_);
     return !pending_dll_.empty();
 }
@@ -261,19 +261,50 @@ void StrategyManagerPanel::draw(bool* open) {
 
     // ---- one tab per strategy: built-in + each loaded module ----
     if (ImGui::BeginTabBar("##strat_tabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                               ImGuiTabBarFlags_Reorderable |
-                                               ImGuiTabBarFlags_TabListPopupButton)) {
-        if (ImGui::BeginTabItem("SMA (built-in)###builtin")) {
+                                               ImGuiTabBarFlags_Reorderable)) {
+        const std::vector<StrategyHost::ModuleView> mods = host_.modules();
+        const ImGuiTabItemFlags bsel =
+            want_tab_set_ && want_tab_.empty() ? ImGuiTabItemFlags_SetSelected : 0;
+        if (ImGui::BeginTabItem("SMA (built-in)###builtin", nullptr, bsel)) {
             draw_strategy_tab("", nullptr);
             ImGui::EndTabItem();
         }
-        const std::vector<StrategyHost::ModuleView> mods = host_.modules();
         for (const auto& m : mods) {
             const std::string label = m.name + "###" + m.key;   // stable id = key
-            if (ImGui::BeginTabItem(label.c_str())) {
+            const ImGuiTabItemFlags msel =
+                want_tab_set_ && want_tab_ == m.key ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(label.c_str(), nullptr, msel)) {
                 draw_strategy_tab(m.key, &m);
                 ImGui::EndTabItem();
             }
+        }
+        want_tab_set_ = false;   // consumed
+        // Custom tab-list button: a down-triangle at the right of the strip,
+        // popping a menu of the strategies.
+        if (ImGui::TabItemButton("  ##stratlist", ImGuiTabItemFlags_Leading |
+                                                      ImGuiTabItemFlags_NoTooltip))
+            ImGui::OpenPopup("##stratlist");
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
+            const float rr = ImGui::GetFontSize() * 0.26f;
+            const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+            dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
+                                  ImVec2(cx + rr, cy - rr * 0.5f),
+                                  ImVec2(cx, cy + rr * 0.7f), col);
+        }
+        if (ImGui::BeginPopup("##stratlist")) {
+            if (ImGui::Selectable("SMA Crossover (built-in)")) {
+                want_tab_.clear();
+                want_tab_set_ = true;
+            }
+            for (const auto& m : mods)
+                if (ImGui::Selectable(m.name.c_str())) {
+                    want_tab_ = m.key;
+                    want_tab_set_ = true;
+                }
+            ImGui::EndPopup();
         }
         ImGui::EndTabBar();
     }

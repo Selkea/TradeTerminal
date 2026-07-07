@@ -89,10 +89,12 @@ private:
 
     std::vector<std::string> files_;   // .cpp basenames
     int build_sel_ = 0;                // index into files_ for the Build picker
+    std::string want_tab_;             // tab-list button: key to select ("" built-in)
+    bool want_tab_set_ = false;
     double next_refresh_s_ = 0.0;
 
     std::string active_key_;           // "" = built-in SMA
-    std::string want_load_;            // deferred request_load while building
+    std::deque<std::string> load_queue_;   // pending request_loads, built one at a time
 
     std::thread build_thread_;
     std::atomic<bool> building_{false};

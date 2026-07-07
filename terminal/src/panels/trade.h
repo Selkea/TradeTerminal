@@ -91,6 +91,7 @@ private:
     Engine& eng_;
     int data_idx_ = 0;               // DataFeed enum (persisted)
     int session_broker_ = 0;         // what the running session was started with
+    int want_tab_ = -1;              // tab-list button: symbol index to select
     char input_[16] = "";
     // One tab per pending symbol: its bar size, capture flag, sub-account (when
     // the login has them), and its own risk limits.
