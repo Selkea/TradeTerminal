@@ -376,10 +376,10 @@ void App::queue_sweep(const SweepPanel::Request& rq) {
         log_.add("sweep: engine busy, try again");
         return;
     }
-    const std::string key = strat_mgr_.active_key();
+    const std::string key = rq.strat_key;
     IStrategy* inst = acquire_strategy(key);
     if (!inst) {
-        log_.add("sweep: strategy '" + key + "' is not loaded");
+        log_.add("sweep: strategy '" + strat_mgr_.display_name(key) + "' is not loaded");
         return;
     }
     leases_.push_back({inst, key, StrategyLease::Sweep});
@@ -741,8 +741,10 @@ void App::draw() {
                          }
                      });
     if (show_sweep_)
-        sweep_panel_.draw(&show_sweep_, strat_mgr_.active_name(),
-                          strat_mgr_.param_values(strat_mgr_.active_key()), sweep_,
+        sweep_panel_.draw(&show_sweep_, strat_mgr_.loaded_keys(),
+                          [this](const std::string& k) { return strat_mgr_.display_name(k); },
+                          [this](const std::string& k) { return strat_mgr_.param_values(k); },
+                          sweep_,
                           [this](const SweepPanel::Request& rq) { queue_sweep(rq); },
                           [this] {
                               sweep_.running = false;

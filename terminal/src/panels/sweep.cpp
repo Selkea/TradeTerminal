@@ -41,8 +41,8 @@ int param_combo(const char* id, const std::vector<std::string>& names, int idx,
 }
 } // namespace
 
-void SweepPanel::draw(bool* open, const std::string& strategy_name,
-                      const std::map<std::string, double>& params, const State& st,
+void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
+                      const NameFn& name, const ParamsFn& params_of, const State& st,
                       const RunFn& run, const CancelFn& cancel) {
     const bool visible = ImGui::Begin("Optimizer", open);
     tab_drag_hint();
@@ -51,13 +51,29 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
         return;
     }
 
+    // Strategy to sweep (loaded modules only; build via the Strategy panel).
+    if (!strat_key_.empty() &&
+        std::find(strat_keys.begin(), strat_keys.end(), strat_key_) == strat_keys.end())
+        strat_key_.clear();   // picked module was unloaded: fall back to built-in
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::BeginCombo("strategy", name(strat_key_).c_str())) {
+        if (ImGui::Selectable(name("").c_str(), strat_key_.empty())) strat_key_.clear();
+        for (const std::string& k : strat_keys) {
+            const std::string lbl = name(k) + "###" + k;
+            if (ImGui::Selectable(lbl.c_str(), k == strat_key_)) strat_key_ = k;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip("Strategy the grid sweeps (loaded strategies only — build "
+                          "via the Strategy panel)");
+
+    const std::map<std::string, double> params = params_of(strat_key_);
     std::vector<std::string> names;
     names.reserve(params.size());
     for (const auto& [k, v] : params) names.push_back(k);
 
     if (names.empty()) {
-        ImGui::TextDisabled("Active strategy (%s) exposes no parameters.",
-                            strategy_name.c_str());
+        ImGui::TextDisabled("%s exposes no parameters.", name(strat_key_).c_str());
         ImGui::End();
         return;
     }
@@ -135,6 +151,7 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
         if (ImGui::Button(label) && run) {
             for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
             Request rq;
+            rq.strat_key = strat_key_;
             rq.symbol = sym_;
             rq.interval = kIntervals[interval_idx_];
             rq.range = kRanges[range_idx_];
@@ -151,9 +168,6 @@ void SweepPanel::draw(bool* open, const std::string& strategy_name,
         }
         ImGui::EndDisabled();
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", strategy_name.c_str());
-
     // ---- results ----
     if (st.total == 0 || st.vals.empty()) {
         ImGui::End();

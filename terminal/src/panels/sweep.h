@@ -9,12 +9,13 @@
 
 namespace tt::ui {
 
-// Grid-search optimizer: runs the active strategy across a 1-D or 2-D
+// Grid-search optimizer: runs a chosen strategy across a 1-D or 2-D
 // parameter grid (serial backtests — the engine is fast and deterministic)
 // and renders the metric surface as a heatmap.
 class SweepPanel {
 public:
     struct Request {
+        std::string strat_key;   // strategy to sweep ("" = built-in SMA)
         std::string symbol, interval, range;
         double cash = 100'000.0;
         std::string px, py;      // parameter names; py empty = 1-D sweep
@@ -44,14 +45,21 @@ public:
 
     using RunFn = std::function<void(const Request&)>;
     using CancelFn = std::function<void()>;
+    // Resolve a strategy key to its display name / current param values.
+    using NameFn = std::function<std::string(const std::string& key)>;
+    using ParamsFn =
+        std::function<std::map<std::string, double>(const std::string& key)>;
 
     explicit SweepPanel(Engine& eng) : eng_(eng) {}
-    void draw(bool* open, const std::string& strategy_name,
-              const std::map<std::string, double>& params, const State& st,
-              const RunFn& run, const CancelFn& cancel);
+    // strat_keys: selectable strategies (loaded modules; built-in added in the
+    // UI). The swept parameter names come from the picked strategy's params.
+    void draw(bool* open, const std::vector<std::string>& strat_keys, const NameFn& name,
+              const ParamsFn& params_of, const State& st, const RunFn& run,
+              const CancelFn& cancel);
 
 private:
     Engine& eng_;
+    std::string strat_key_;   // "" = built-in SMA
     char sym_[16] = "AAPL";
     int interval_idx_ = 2;   // 1d
     int range_idx_ = 3;      // 2y
