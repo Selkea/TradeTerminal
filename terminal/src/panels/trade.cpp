@@ -10,10 +10,9 @@
 
 namespace tt::ui {
 
-void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon_available,
-                      bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
-                      const StartFn& start) {
-    (void)strategy_name;
+void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
+                      bool polygon_available, bool finnhub_available, bool ibkr_ready,
+                      const AccountInfo& account, const StartFn& start) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -79,8 +78,8 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             const bool dup = std::any_of(pending_.begin(), pending_.end(),
                                          [&](const SymRow& r) { return r.symbol == sym; });
             if (!dup)
-                pending_.push_back(
-                    {sym, def_bar_sec_, def_record_, 0, def_risk_, def_risk_dd_pct_});
+                pending_.push_back({sym, def_bar_sec_, def_record_, 0, def_risk_,
+                                    def_risk_dd_pct_, def_strat_key_});
             input_[0] = '\0';
         }
 
@@ -125,6 +124,21 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
                     ImGui::Checkbox("Record", &r.record);
                     ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file "
                                           "for replay");
+                    // Strategy for this symbol (built-in SMA or a loaded source).
+                    constexpr const char* kBuiltin = "SMA Crossover (built-in)";
+                    ImGui::SetNextItemWidth(220);
+                    if (ImGui::BeginCombo("strategy", r.strat_key.empty()
+                                                          ? kBuiltin
+                                                          : r.strat_key.c_str())) {
+                        if (ImGui::Selectable(kBuiltin, r.strat_key.empty()))
+                            r.strat_key.clear();
+                        for (const std::string& src : strat_sources)
+                            if (ImGui::Selectable(src.c_str(), src == r.strat_key))
+                                r.strat_key = src;
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SetItemTooltip("Strategy this symbol trades; params come from "
+                                          "the Strategy panel");
                     ImGui::SetNextItemWidth(100);
                     ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
                     r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
@@ -165,6 +179,7 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             def_record_ = pending_.back().record;
             def_risk_ = pending_.back().risk;
             def_risk_dd_pct_ = pending_.back().risk_dd_pct;
+            def_strat_key_ = pending_.back().strat_key;
         }
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
@@ -186,7 +201,8 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
                         ? account.subaccounts[r.account_idx] : std::string();
                 RiskLimits rk = r.risk;
                 rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
-                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, rk});
+                opts.symbols.push_back(
+                    {r.symbol, r.bar_sec, r.record, acct, r.strat_key, rk});
             }
             start(opts);
         }

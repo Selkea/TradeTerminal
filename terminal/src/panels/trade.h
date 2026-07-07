@@ -21,7 +21,8 @@ public:
         std::string symbol;
         int bar_seconds = 60;
         bool record = true;
-        std::string account;   // IBKR sub-account id; "" = shared account/pool
+        std::string account;      // IBKR sub-account id; "" = shared account/pool
+        std::string strat_key;    // strategy source basename; "" = built-in SMA
         RiskLimits risk{};
     };
     struct StartOpts {
@@ -42,13 +43,13 @@ public:
     };
 
     explicit TradePanel(Engine& eng) : eng_(eng) {}
-    // polygon_available / finnhub_available: a key for that vendor exists right
-    // now (signed in or env var) — evaluated per frame because sign-in/out
-    // happens at runtime. ibkr_ready: the IBKR gateway is connected, so orders
+    // strat_sources: available strategy source basenames ("" built-in is added
+    // in the UI). polygon_available / finnhub_available: a key for that vendor
+    // exists right now. ibkr_ready: the IBKR gateway is connected, so orders
     // route to it; otherwise the local fill simulator is used.
-    void draw(bool* open, const std::string& strategy_name, bool polygon_available,
-              bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
-              const StartFn& start);
+    void draw(bool* open, const std::vector<std::string>& strat_sources,
+              bool polygon_available, bool finnhub_available, bool ibkr_ready,
+              const AccountInfo& account, const StartFn& start);
 
     // Persisted: the shared cash pool + per-symbol defaults for new cards.
     double cash() const { return session_cash_; }
@@ -83,14 +84,16 @@ private:
         int account_idx = 0;        // index into AccountInfo.subaccounts
         RiskLimits risk{};
         double risk_dd_pct = 0.0;   // UI percent; converted to fraction at start
+        std::string strat_key;      // strategy source basename; "" = built-in SMA
     };
-    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0}};
+    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0, ""}};
     // Shared-pool cash (simulator / single account) + per-symbol defaults.
     double session_cash_ = 100'000.0;
     int def_bar_sec_ = 60;
     bool def_record_ = true;
     RiskLimits def_risk_{};
     double def_risk_dd_pct_ = 0.0;   // UI shows percent; RiskLimits stores fraction
+    std::string def_strat_key_;      // strategy seeded into the next added symbol
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
     int selected_symbol_idx_ = 0;

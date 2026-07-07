@@ -76,6 +76,9 @@ struct LiveConfig {
     double initial_cash = 100'000.0;
     ExecParams exec{};
     std::map<std::string, double> params;
+    // Optional per-symbol strategy params (parallel to symbols). ctx.param()
+    // resolves against the current symbol's map; empty = use `params`.
+    std::vector<std::map<std::string, double>> symbol_params;
     RiskLimits risk{};              // session-level: equity + stale-feed halts
     // Optional per-symbol order-level risk (parallel to symbols; empty = use
     // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
@@ -98,6 +101,10 @@ struct LiveConfig {
     // >= 0: pin the engine thread to this core (avoids scheduler migrations
     // and the cache refills they cost). Pick a core the feed isn't on.
     int pin_core = -1;
+    // Per-symbol strategy watchdog: if a strategy's on_tick/on_bar callback runs
+    // longer than this many ms, that symbol is halted + flattened so one slow or
+    // runaway strategy can't keep degrading the shared engine thread. 0 = off.
+    int watchdog_ms = 0;
 };
 
 // Replay a captured .ttk session through ExecSim with the deterministic
@@ -164,7 +171,10 @@ public:
     bool pop_log(std::string& out);
 
     // ---- live paper trading ----
-    bool start_live(LiveConfig cfg, IStrategy* strategy);
+    // One strategy instance per symbol (parallel to cfg.symbols); each is
+    // caller-owned and must outlive the run. A symbol's events route only to
+    // its own instance. All instances share one portfolio/cash (design v1).
+    bool start_live(LiveConfig cfg, std::vector<IStrategy*> strategies);
     void stop_live();                       // graceful: on_stop, joins the thread
     bool live_running() const { return live_running_.load(std::memory_order_relaxed); }
     std::vector<std::string> live_symbols() const;
@@ -207,7 +217,7 @@ private:
     };
     void run(BacktestConfig cfg, IStrategy* strategy);
     void run_replay(ReplayConfig cfg, IStrategy* strategy);
-    void run_live(LiveConfig cfg, IStrategy* strategy);
+    void run_live(LiveConfig cfg, std::vector<IStrategy*> strategies);
     void push_log(std::string line);
 
     // Heap-allocated: the 4 MiB buffer must never land on a caller's stack.

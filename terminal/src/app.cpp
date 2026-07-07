@@ -738,7 +738,7 @@ void App::draw() {
                           });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_trade_)
-        trade_.draw(&show_trade_, strat_mgr_.active_name(), !polygon_key().empty(),
+        trade_.draw(&show_trade_, strat_mgr_.sources(), !polygon_key().empty(),
                     !finnhub_key().empty(), gw_.connected(),
                     [&] {
                         TradePanel::AccountInfo a;
@@ -799,6 +799,11 @@ void App::draw() {
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
                             cfg.pin_core = std::atoi(pin);
+                        // Per-strategy callback watchdog (huge headroom over the
+                        // µs a normal callback takes; catches runaways only).
+                        cfg.watchdog_ms = 250;
+                        if (const char* w = std::getenv("TT_WATCHDOG_MS"))
+                            cfg.watchdog_ms = std::atoi(w);
                         if (any_record) {
                             std::error_code ec;
                             std::filesystem::create_directories(sessions_dir(), ec);
@@ -823,14 +828,43 @@ void App::draw() {
                                          ? "live: IBKR account is READ-ONLY — orders blocked"
                                          : "live: routing orders to IBKR gateway");
                         }
-                        const std::string strat_key = strat_mgr_.active_key();
-                        IStrategy* strat = acquire_strategy(strat_key);
-                        if (!strat) {
-                            log_.add("live: strategy '" + strat_key + "' is not loaded");
+                        // Each symbol needs its strategy built + loaded first.
+                        std::string unbuilt;
+                        for (const auto& so : opts.symbols)
+                            if (!so.strat_key.empty() &&
+                                !strat_mgr_.loaded_fresh(so.strat_key)) {
+                                strat_mgr_.request_load(so.strat_key);
+                                unbuilt += (unbuilt.empty() ? "" : ", ") + so.strat_key;
+                            }
+                        if (!unbuilt.empty()) {
+                            log_.add("live: building strategies (" + unbuilt +
+                                     ") — click Start Trading again");
                             return;
                         }
-                        if (engine_.start_live(std::move(cfg), strat)) {
-                            leases_.push_back({strat, strat_key, StrategyLease::Live});
+                        // One strategy instance + param set per symbol.
+                        std::vector<IStrategy*> strategies;
+                        std::vector<StrategyLease> new_leases;
+                        bool acq_ok = true;
+                        for (const auto& so : opts.symbols) {
+                            IStrategy* inst = acquire_strategy(so.strat_key);
+                            if (!inst) {
+                                log_.add("live: strategy '" +
+                                         strat_mgr_.display_name(so.strat_key) +
+                                         "' failed to load");
+                                acq_ok = false;
+                                break;
+                            }
+                            strategies.push_back(inst);
+                            cfg.symbol_params.push_back(
+                                strat_mgr_.param_values(so.strat_key));
+                            new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
+                        }
+                        if (!acq_ok) {
+                            for (const auto& l : new_leases) release_strategy(l);
+                            return;
+                        }
+                        if (engine_.start_live(std::move(cfg), std::move(strategies))) {
+                            for (const auto& l : new_leases) leases_.push_back(l);
                             // Previous session's thread was joined inside
                             // start_live, so replacing the old broker is safe.
                             ibkr_ = std::move(ibkr_broker);
@@ -900,7 +934,7 @@ void App::draw() {
                             log_.add("live: session queued for " + joined + " (" +
                                      strat_mgr_.active_name() + ")");
                         } else {
-                            release_strategy({strat, strat_key, StrategyLease::Live});
+                            for (const auto& l : new_leases) release_strategy(l);
                             log_.add("live: cannot start (engine busy)");
                         }
                     });
@@ -939,7 +973,9 @@ void App::draw() {
             cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
             cfg.bar_seconds = 2;
             if (IStrategy* strat = acquire_strategy(strat_mgr_.active_key())) {
-                if (engine_.start_live(std::move(cfg), strat))
+                // Both SIMTEST symbols run the same one strategy instance here.
+                if (engine_.start_live(std::move(cfg),
+                                       std::vector<IStrategy*>{strat, strat}))
                     leases_.push_back(
                         {strat, strat_mgr_.active_key(), StrategyLease::Live});
                 else
@@ -1135,7 +1171,7 @@ void App::draw_data_menu() {
 // Info = fills (webhook only, no beep — they can be frequent).
 void App::alert_scan(const std::string& l) {
     auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
-    if (has("KILL SWITCH") || has("RISK HALT"))
+    if (has("KILL SWITCH") || has("RISK HALT") || has("WATCHDOG"))
         alerts_.notify(AlertNotifier::Critical, l);
     else if (has("rejected") || has("stream lost") || has("auth failed") ||
              has("(drops!)"))

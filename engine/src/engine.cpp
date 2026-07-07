@@ -87,10 +87,12 @@ public:
               const std::vector<std::string>& symbols, NowFn now, ExecSim& exec,
               Portfolio& pf, LatencyHistogram& lat, const RiskLimits* risk = nullptr,
               OrderHook on_order = {}, IBrokerAdapter* broker = nullptr,
-              const std::vector<RiskLimits>* symbol_risk = nullptr)
+              const std::vector<RiskLimits>* symbol_risk = nullptr,
+              const std::vector<std::map<std::string, double>>* symbol_params = nullptr)
         : eng_(eng), params_(params), now_(std::move(now)), exec_(exec), pf_(pf),
           lat_(lat), risk_(risk), symbol_risk_(symbol_risk),
-          on_order_(std::move(on_order)), broker_(broker) {
+          symbol_params_(symbol_params), on_order_(std::move(on_order)),
+          broker_(broker) {
         symbols_ = symbols;
     }
 
@@ -123,6 +125,13 @@ public:
         return static_cast<uint32_t>(symbols_.size());
     }
     double param(const char* name, double fallback) const noexcept override {
+        // Per-symbol strategies each get their own params, keyed by the symbol
+        // whose callback is currently running.
+        if (symbol_params_ && cur_symbol_ >= 1 && cur_symbol_ <= symbol_params_->size()) {
+            const auto& m = (*symbol_params_)[cur_symbol_ - 1];
+            auto it = m.find(name);
+            return it != m.end() ? it->second : fallback;
+        }
         auto it = params_.find(name);
         return it != params_.end() ? it->second : fallback;
     }
@@ -133,6 +142,8 @@ public:
     }
 
     void set_current_event_tsc(int64_t tsc) { cur_event_tsc_ = tsc; }
+    // The symbol whose strategy callback is running now (per-symbol params).
+    void set_current_symbol(uint32_t symbol_id) { cur_symbol_ = symbol_id; }
     void set_last_price(uint32_t symbol_id, double p) {
         if (symbol_id == 0) return;
         if (last_price_.size() < symbol_id) last_price_.resize(symbol_id, 0.0);
@@ -174,6 +185,8 @@ private:
     LatencyHistogram& lat_;
     const RiskLimits* risk_;
     const std::vector<RiskLimits>* symbol_risk_ = nullptr;
+    const std::vector<std::map<std::string, double>>* symbol_params_ = nullptr;
+    uint32_t cur_symbol_ = 0;
     OrderHook on_order_;
     IBrokerAdapter* broker_;
     std::vector<std::string> symbols_;
@@ -536,7 +549,7 @@ void Engine::stop_live() {
     if (live_thread_.joinable()) live_thread_.join();
 }
 
-bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
+bool Engine::start_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     if (running_.load(std::memory_order_relaxed)) return false;
     if (live_running_.exchange(true)) return false;
     if (live_thread_.joinable()) live_thread_.join();
@@ -564,11 +577,13 @@ bool Engine::start_live(LiveConfig cfg, IStrategy* strategy) {
         live_symbol_table_ = cfg.symbols;
     }
     live_thread_ = std::thread(
-        [this, cfg = std::move(cfg), strategy]() mutable { run_live(std::move(cfg), strategy); });
+        [this, cfg = std::move(cfg), strategies = std::move(strategies)]() mutable {
+            run_live(std::move(cfg), std::move(strategies));
+        });
     return true;
 }
 
-void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
+void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // The trading thread outranks everything else in this process.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (cfg.pin_core >= 0 && cfg.pin_core < 64) {
@@ -610,7 +625,12 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
 
     IBrokerAdapter* const broker = cfg.broker;
     EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
-                  exec, pf, lat, &cfg.risk, record_order, broker, &cfg.symbol_risk);
+                  exec, pf, lat, &cfg.risk, record_order, broker, &cfg.symbol_risk,
+                  &cfg.symbol_params);
+    // Route an event's symbol to the strategy instance that owns it.
+    auto strat_for = [&](uint32_t sid) -> IStrategy* {
+        return sid >= 1 && sid <= strategies.size() ? strategies[sid - 1] : nullptr;
+    };
 
     TickLogWriter capture;
     if (!cfg.capture_path.empty()) {
@@ -694,7 +714,11 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
         push_log(buf);
         push_fill(FillRecord{f.ts_ns, f.order_id, f.symbol_id,
                              static_cast<uint8_t>(f.side), f.qty, f.price, f.fee});
-        if (!halted) strategy->on_fill(ctx, f);
+        if (!halted)
+            if (IStrategy* s = strat_for(f.symbol_id)) {
+                ctx.set_current_symbol(f.symbol_id);
+                s->on_fill(ctx, f);
+            }
     };
 
     // Kill-switch behavior, shared by the manual command and automated risk
@@ -743,13 +767,61 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
     };
     int64_t last_md_ns = rt.now_ns();
 
-    strategy->on_init(ctx);
+    // True only for the first symbol pointing at a given instance, so shared
+    // instances get on_init/on_stop exactly once.
+    auto first_use = [&](size_t i) {
+        for (size_t j = 0; j < i; ++j)
+            if (strategies[j] == strategies[i]) return false;
+        return true;
+    };
+    // Each symbol's strategy instance gets its own on_init.
+    for (size_t i = 0; i < strategies.size(); ++i)
+        if (strategies[i] && first_use(i)) {
+            ctx.set_current_symbol(static_cast<uint32_t>(i + 1));
+            strategies[i]->on_init(ctx);
+        }
     std::string symbol_list;
     for (const std::string& s : cfg.symbols)
         symbol_list += (symbol_list.empty() ? "" : ",") + s;
     push_log(std::string("live: ") + (broker ? "BROKER trading " : "paper trading ") +
              symbol_list + " started (bar " + std::to_string(cfg.bar_seconds) + "s)" +
              (broker && !broker->ready() ? " — waiting for broker connection" : ""));
+
+    // Per-symbol strategy watchdog: if a callback overruns the budget, halt that
+    // symbol (stop dispatching to it) and flatten its position — one slow or
+    // runaway strategy must not keep degrading the shared engine thread. Note:
+    // this catches callbacks that *return* slowly; a true infinite loop can't be
+    // unwound from this thread (nothing safely can).
+    const int64_t watchdog_ns = static_cast<int64_t>(cfg.watchdog_ms) * 1'000'000;
+    std::vector<char> strat_halted(n_sym, 0);
+    auto halt_symbol = [&](uint32_t sid, int64_t dur_ns) {
+        if (sid < 1 || sid > n_sym || strat_halted[sid - 1]) return;
+        strat_halted[sid - 1] = 1;
+        const double pos = pf.position(sid).qty;
+        if (pos != 0.0) {
+            OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy, OrdType::Market,
+                           {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
+            next_is_manual = true;   // bypass risk: closing must always work
+            record_order(r, broker ? broker->submit(r, rt.now_ns())
+                                    : exec.submit(r, rt.now_ns()));
+            next_is_manual = false;
+        }
+        char buf[176];
+        std::snprintf(buf, sizeof buf,
+                      "live: WATCHDOG halt — %s strategy callback ran %lld ms "
+                      "(budget %d ms); halted + flattened",
+                      cfg.symbols[sid - 1].c_str(),
+                      static_cast<long long>(dur_ns / 1'000'000), cfg.watchdog_ms);
+        push_log(buf);
+    };
+    // Time a strategy callback; halt the symbol if it overruns. No-op when off.
+    auto guarded = [&](uint32_t sid, auto&& fn) {
+        if (watchdog_ns <= 0) { fn(); return; }
+        const uint64_t t0 = rdtsc();
+        fn();
+        const int64_t d = tsc::to_ns(static_cast<int64_t>(rdtsc() - t0));
+        if (d > watchdog_ns) halt_symbol(sid, d);
+    };
 
     // Tick -> bar aggregation so bar-based strategies work on the live feed,
     // one aggregator per symbol, each at its own bar size (falls back to the
@@ -767,7 +839,11 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
         const int64_t bn = bar_ns[symbol_id - 1];
         BarAgg& agg = bar_agg[symbol_id - 1];
         if (agg.open && ts >= agg.cur.ts_ns + bn) {
-            if (!halted) strategy->on_bar(ctx, symbol_id, agg.cur);
+            if (!halted && !strat_halted[symbol_id - 1])
+                if (IStrategy* s = strat_for(symbol_id)) {
+                    ctx.set_current_symbol(symbol_id);
+                    guarded(symbol_id, [&] { s->on_bar(ctx, symbol_id, agg.cur); });
+                }
             agg.open = false;
         }
         if (!agg.open) {
@@ -892,11 +968,15 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
                 // Backfilled bar (feed outage recovery): keep the strategy's
                 // indicators continuous, but never fill or mark positions
                 // against stale prices.
-                if (!halted && ev.symbol_id >= 1 && ev.symbol_id <= n_sym) {
+                if (!halted && ev.symbol_id >= 1 && ev.symbol_id <= n_sym &&
+                    !strat_halted[ev.symbol_id - 1]) {
                     ctx.set_current_event_tsc(0);
                     const Bar b{ev.ts_event_ns, ev.u.bar.open, ev.u.bar.high,
                                 ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
-                    strategy->on_bar(ctx, ev.symbol_id, b);
+                    if (IStrategy* s = strat_for(ev.symbol_id)) {
+                        ctx.set_current_symbol(ev.symbol_id);
+                        guarded(ev.symbol_id, [&] { s->on_bar(ctx, ev.symbol_id, b); });
+                    }
                 }
                 continue;
             }
@@ -915,10 +995,13 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
             }
             pf.mark(sid, price);
 
-            if (!halted) {
-                Tick t{ev.ts_event_ns, price, ev.u.tick.size, ev.u.tick.bid, ev.u.tick.ask};
-                strategy->on_tick(ctx, sid, t);
-            }
+            if (!halted && sid >= 1 && sid <= n_sym && !strat_halted[sid - 1])
+                if (IStrategy* s = strat_for(sid)) {
+                    Tick t{ev.ts_event_ns, price, ev.u.tick.size, ev.u.tick.bid,
+                           ev.u.tick.ask};
+                    ctx.set_current_symbol(sid);
+                    guarded(sid, [&] { s->on_tick(ctx, sid, t); });
+                }
             roll_bar(sid, ev.ts_event_ns, price);
             check_risk();
             if (halted) publish();          // a risk halt must surface instantly
@@ -986,7 +1069,11 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
         capture.close();
     }
 
-    strategy->on_stop(ctx);
+    for (size_t i = 0; i < strategies.size(); ++i)
+        if (strategies[i] && first_use(i)) {
+            ctx.set_current_symbol(static_cast<uint32_t>(i + 1));
+            strategies[i]->on_stop(ctx);
+        }
     {
         std::lock_guard lock(snap_mu_);
         snap_.running = false;
