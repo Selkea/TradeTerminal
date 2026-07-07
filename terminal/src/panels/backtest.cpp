@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -26,8 +27,25 @@ int max_range_idx(int interval_idx) {
 }
 } // namespace
 
-void BacktestPanel::draw(bool* open, const std::string& strategy_name, bool suppress_result,
-                         const RunFn& run) {
+void BacktestPanel::set_symbol(const std::string& sym) {
+    std::snprintf(sym_, sizeof(sym_), "%s", sym.c_str());
+}
+
+void BacktestPanel::scan_replay_files() {
+    replay_files_.clear();
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(sessions_dir_, ec))
+        if (e.is_regular_file() && e.path().extension() == ".ttk")
+            replay_files_.push_back(e.path().filename().string());
+    std::sort(replay_files_.rbegin(), replay_files_.rend());   // newest first
+    replay_idx_ = 0;
+}
+
+void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
+                         const std::string& active_key,
+                         const std::function<bool(const std::string&)>& loaded_fresh,
+                         bool activating, bool suppress_result, const RunFn& run,
+                         const ReplayFn& replay) {
     const bool visible = ImGui::Begin("Backtest", open);
     tab_drag_hint();
     if (!visible) {
@@ -54,15 +72,66 @@ void BacktestPanel::draw(bool* open, const std::string& strategy_name, bool supp
     ImGui::SetNextItemWidth(100);
     ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
 
-    const bool busy = eng_.running();
+    // Strategy dropdown: Run builds + loads the pick if it isn't active yet.
+    if (!strat_init_) {
+        strat_sel_ = active_key;
+        strat_init_ = true;
+    }
+    constexpr const char* kBuiltin = "SMA Crossover (built-in)";
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::BeginCombo("##btstrat",
+                          strat_sel_.empty() ? kBuiltin : strat_sel_.c_str())) {
+        if (ImGui::Selectable(kBuiltin, strat_sel_.empty())) strat_sel_.clear();
+        for (const std::string& s : sources)
+            if (ImGui::Selectable(s.c_str(), s == strat_sel_)) strat_sel_ = s;
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip("Strategy for the next run; params are edited in "
+                          "the Strategy panel");
+    ImGui::SameLine();
+
+    const bool busy = eng_.running() || activating;
     ImGui::BeginDisabled(busy);
-    if (ImGui::Button(busy ? "Running..." : "Run backtest") && sym_[0] && run) {
+    if (ImGui::Button(activating ? "Building..."
+                                 : (busy ? "Running..." : "Run backtest")) &&
+        sym_[0] && run) {
         for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
-        run(sym_, kIntervals[interval_idx_], kRanges[range_idx_], cash_);
+        run(strat_sel_, sym_, kIntervals[interval_idx_], kRanges[range_idx_], cash_);
     }
     ImGui::EndDisabled();
+    if (!activating && loaded_fresh && !loaded_fresh(strat_sel_)) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(builds on Run)");
+    }
+
+    // ---- session replay: re-run a captured .ttk session through the strategy ----
+    ImGui::Separator();
+    ImGui::TextDisabled("Session replay");
+    if (!replay_scanned_) {
+        scan_replay_files();
+        replay_scanned_ = true;
+    }
+    if (replay_files_.empty()) {
+        ImGui::TextDisabled("(no .ttk files yet — record a session in the Trade panel)");
+    } else {
+        if (replay_idx_ >= static_cast<int>(replay_files_.size())) replay_idx_ = 0;
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::BeginCombo("##replay_file", replay_files_[replay_idx_].c_str())) {
+            for (int i = 0; i < static_cast<int>(replay_files_.size()); ++i)
+                if (ImGui::Selectable(replay_files_[i].c_str(), i == replay_idx_))
+                    replay_idx_ = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(eng_.running());
+        if (ImGui::Button("Replay") && replay)
+            replay(sessions_dir_ + "\\" + replay_files_[replay_idx_]);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Re-run these captured ticks through the current strategy "
+                              "+ fill simulator");
+    }
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", strategy_name.c_str());
+    if (ImGui::SmallButton("refresh")) scan_replay_files();
 
     if (has_res_) {
         ImGui::Separator();

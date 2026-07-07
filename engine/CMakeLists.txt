@@ -20,6 +20,7 @@ add_library(tt_net STATIC
     src/ibkr_broker.cpp
     src/ibkr_feed.cpp
     src/polygon_feed.cpp
+    src/finnhub_feed.cpp
 )
 target_link_libraries(tt_net
     PUBLIC tt_engine ws2_32   # ws2_32: select() in the socket wait path
@@ -46,3 +47,7 @@ add_test(NAME ibkr_tests COMMAND tt_ibkr_tests)
 add_executable(tt_polygon_tests tests/test_polygon_parse.cpp)
 target_link_libraries(tt_polygon_tests PRIVATE tt_net doctest)
 add_test(NAME polygon_tests COMMAND tt_polygon_tests)
+
+add_executable(tt_finnhub_tests tests/test_finnhub_parse.cpp)
+target_link_libraries(tt_finnhub_tests PRIVATE tt_net doctest)
+add_test(NAME finnhub_tests COMMAND tt_finnhub_tests)

@@ -209,18 +209,40 @@ void GatewayData::worker() {
                 status = get("/iserver/accounts", body);
             }
             const bool ok = status / 100 == 2;
-            if (ok && !was) {
+            if (ok) {
+                // Re-parse every poll (not just on connect) so a mid-session
+                // account switch updates the displayed id + paper/live kind.
                 std::string acct = ibkr_parse_first_account(body);
+                AccountKind kind = AccountKind::Unknown;
+                {
+                    const json j = json::parse(body, nullptr, false);
+                    if (!j.is_discarded() && j.contains("isPaper") &&
+                        j["isPaper"].is_boolean())
+                        kind = j["isPaper"].get<bool>() ? AccountKind::Paper
+                                                        : AccountKind::Live;
+                }
+                account_kind_.store(kind, std::memory_order_release);
+                bool changed = false;
                 {
                     std::lock_guard lock(mu_);
-                    account_ = acct;
+                    if (!acct.empty() && acct != account_) {
+                        account_ = acct;
+                        changed = true;
+                    }
                 }
-                connected_.store(true, std::memory_order_release);
-                conn_gen_.fetch_add(1, std::memory_order_relaxed);
-                log("gateway: session active" + (acct.empty() ? "" : " (" + acct + ")"));
-            } else if (!ok) {
+                if (!was) {
+                    connected_.store(true, std::memory_order_release);
+                    conn_gen_.fetch_add(1, std::memory_order_relaxed);
+                    log("gateway: session active" +
+                        (acct.empty() ? "" : " (" + acct + ")"));
+                } else if (changed) {
+                    conn_gen_.fetch_add(1, std::memory_order_relaxed);
+                    log("gateway: account changed to " + acct);
+                }
+            } else {
                 if (was) log("gateway: session lost");
                 connected_.store(false, std::memory_order_release);
+                account_kind_.store(AccountKind::Unknown, std::memory_order_release);
                 {
                     std::lock_guard lock(mu_);
                     account_.clear();

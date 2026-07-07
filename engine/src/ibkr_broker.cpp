@@ -486,6 +486,10 @@ IbkrBroker::~IbkrBroker() {
 
 uint64_t IbkrBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
     if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size()) return 0;
+    if (cfg_.read_only) {
+        log("order blocked: account is READ-ONLY (trading disabled)");
+        return 0;
+    }
     if (!ready()) {
         log("order rejected: gateway session not ready");
         return 0;

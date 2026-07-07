@@ -10,18 +10,8 @@
 
 namespace tt::ui {
 
-void TradePanel::scan_replay_files() {
-    replay_files_.clear();
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(sessions_dir_, ec))
-        if (e.is_regular_file() && e.path().extension() == ".ttk")
-            replay_files_.push_back(e.path().filename().string());
-    std::sort(replay_files_.rbegin(), replay_files_.rend());   // newest first
-    replay_idx_ = 0;
-}
-
 void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon_available,
-                      const StartFn& start, const ReplayFn& replay) {
+                      bool finnhub_available, bool ibkr_ready, const StartFn& start) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -64,24 +54,29 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
         ImGui::InputInt("bar sec", &bar_sec_);
         bar_sec_ = std::clamp(bar_sec_, 1, 3600);
 
-        static constexpr const char* kBrokers[] = {"Simulator", "IBKR (gateway)"};
-        ImGui::SetNextItemWidth(140);
-        ImGui::Combo("broker", &broker_idx_, kBrokers, IM_ARRAYSIZE(kBrokers));
-        ImGui::SetItemTooltip("Simulator: local fills (ExecSim).\n"
-                              "IBKR: Client Portal Gateway on this machine — "
-                              "Account menu > Sign In > IBKR to connect.");
-        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon"};
+        // Broker follows the signed-in account: IBKR gateway when it's connected,
+        // otherwise the local fill simulator. No manual pick.
+        if (ibkr_ready)
+            ImGui::TextDisabled("broker: IBKR gateway");
+        else
+            ImGui::TextDisabled("broker: Simulator (sign in to route to IBKR)");
+        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon", "Finnhub"};
         ImGui::SetNextItemWidth(140);
         ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
         ImGui::SetItemTooltip("IBKR: ~250 ms conflated top-of-book via the gateway "
                               "session — no extra data bill.\n"
                               "Polygon: full tick stream, needs a Polygon key "
-                              "(Account menu or POLYGON_API_KEY).");
+                              "(Account menu or POLYGON_API_KEY).\n"
+                              "Finnhub: real-time US trade prints via websocket, "
+                              "free key (Account menu or FINNHUB_API_KEY).");
         if (data_idx_ == 1 && !polygon_available) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "needs a Polygon key");
+        } else if (data_idx_ == 2 && !finnhub_available) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "needs a Finnhub key");
         }
-        ImGui::Checkbox("Record ticks for replay", &record_ticks_);
+        ImGui::Checkbox("Record", &record_ticks_);
         ImGui::SetItemTooltip("Capture every tick to a .ttk file — replay the exact "
                               "session later, deterministically");
 
@@ -108,7 +103,7 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
         if (ImGui::Button("Start paper trading") && !pending_symbols_.empty() && start) {
-            session_broker_ = broker_idx_;
+            session_broker_ = ibkr_ready ? 1 : 0;   // IBKR if signed in, else Simulator
             StartOpts opts;
             opts.symbols = pending_symbols_;
             opts.cash = cash_;
@@ -117,6 +112,8 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             int data = data_idx_;
             if (data == 1 && !polygon_available)
                 data = 0;   // no Polygon key: fall back to gateway data
+            if (data == 2 && !finnhub_available)
+                data = 0;   // no Finnhub key: fall back to gateway data
             opts.data = static_cast<DataFeed>(data);
             opts.record = record_ticks_;
             opts.risk = risk_;
@@ -124,35 +121,6 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             start(opts);
         }
         ImGui::EndDisabled();
-
-        // ---- replay a captured session ----
-        ImGui::Separator();
-        ImGui::TextDisabled("Session replay");
-        if (!replay_scanned_) {
-            scan_replay_files();
-            replay_scanned_ = true;
-        }
-        if (replay_files_.empty()) {
-            ImGui::TextDisabled("(no .ttk files yet — record a session first)");
-        } else {
-            if (replay_idx_ >= static_cast<int>(replay_files_.size())) replay_idx_ = 0;
-            ImGui::SetNextItemWidth(220);
-            if (ImGui::BeginCombo("##replay_file", replay_files_[replay_idx_].c_str())) {
-                for (int i = 0; i < static_cast<int>(replay_files_.size()); ++i)
-                    if (ImGui::Selectable(replay_files_[i].c_str(), i == replay_idx_))
-                        replay_idx_ = i;
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine();
-            ImGui::BeginDisabled(eng_.running());
-            if (ImGui::Button("Replay") && replay)
-                replay(sessions_dir_ + "\\" + replay_files_[replay_idx_]);
-            ImGui::EndDisabled();
-            ImGui::SetItemTooltip("Re-run these ticks through the current strategy + "
-                                  "fill simulator; results land in the Backtest panel");
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("refresh")) scan_replay_files();
 
         ImGui::End();
         return;

@@ -16,6 +16,8 @@ struct AppConfig {
     double backtest_cash = 100'000.0;
     double trade_cash = 100'000.0;
     int trade_bar_sec = 60;
+    int trade_data_idx = 0;      // last data-feed pick (DataFeed enum)
+    bool trade_record = true;    // last "Record" toggle
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;

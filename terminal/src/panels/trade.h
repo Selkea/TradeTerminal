@@ -9,11 +9,11 @@
 namespace tt::ui {
 
 // Live paper-trading controls: start/stop a session, manual orders, kill
-// switch, session status, and replay of captured sessions.
+// switch, and session status. (Session replay lives in the Backtest panel.)
 class TradePanel {
 public:
     enum class Broker : int { Sim = 0, Ibkr = 1 };
-    enum class DataFeed : int { Ibkr = 0, Polygon = 1 };
+    enum class DataFeed : int { Ibkr = 0, Polygon = 1, Finnhub = 2 };
 
     struct StartOpts {
         std::vector<std::string> symbols;
@@ -25,20 +25,24 @@ public:
         RiskLimits risk{};
     };
     using StartFn = std::function<void(const StartOpts&)>;
-    using ReplayFn = std::function<void(const std::string& path)>;
 
-    TradePanel(Engine& eng, std::string sessions_dir)
-        : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
-    // polygon_available: a Polygon key exists right now (signed in or env
-    // var) — evaluated per frame because sign-in/out happens at runtime.
+    explicit TradePanel(Engine& eng) : eng_(eng) {}
+    // polygon_available / finnhub_available: a key for that vendor exists right
+    // now (signed in or env var) — evaluated per frame because sign-in/out
+    // happens at runtime. ibkr_ready: the IBKR gateway is connected, so orders
+    // route to it; otherwise the local fill simulator is used.
     void draw(bool* open, const std::string& strategy_name, bool polygon_available,
-              const StartFn& start, const ReplayFn& replay);
+              bool finnhub_available, bool ibkr_ready, const StartFn& start);
 
     double cash() const { return cash_; }
     int bar_sec() const { return bar_sec_; }
-    void restore(double cash, int bar_sec) {
+    int data_idx() const { return data_idx_; }
+    bool record() const { return record_ticks_; }
+    void restore(double cash, int bar_sec, int data_idx, bool record) {
         cash_ = cash;
         bar_sec_ = bar_sec;
+        data_idx_ = (data_idx >= 0 && data_idx <= 2) ? data_idx : 0;  // Ibkr/Poly/Finn
+        record_ticks_ = record;
     }
     // Risk limits persist across restarts (armed halts must stay armed).
     const RiskLimits& risk() const { return risk_; }
@@ -49,13 +53,9 @@ public:
     }
 
 private:
-    void scan_replay_files();
-
     Engine& eng_;
-    std::string sessions_dir_;
-    int broker_idx_ = 0;             // Broker enum; deliberately not persisted
-    int data_idx_ = 0;               // DataFeed enum
-    bool record_ticks_ = true;
+    int data_idx_ = 0;               // DataFeed enum (persisted)
+    bool record_ticks_ = true;       // persisted
     int session_broker_ = 0;         // what the running session was started with
     char input_[16] = "";
     std::vector<std::string> pending_symbols_ = {"AAPL"};
@@ -66,9 +66,6 @@ private:
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
     int selected_symbol_idx_ = 0;
-    std::vector<std::string> replay_files_;   // basenames, newest first
-    int replay_idx_ = 0;
-    bool replay_scanned_ = false;
 };
 
 } // namespace tt::ui

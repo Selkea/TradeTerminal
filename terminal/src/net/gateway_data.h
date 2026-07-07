@@ -55,6 +55,13 @@ public:
     std::string account() const;
     std::string login_url() const;
 
+    // Whether the live session is a paper or a real-money account (from the
+    // gateway's isPaper flag); Unknown until a session is established.
+    enum class AccountKind { Unknown, Paper, Live };
+    AccountKind account_kind() const {
+        return account_kind_.load(std::memory_order_acquire);
+    }
+
     // Thread-safe; return the request id used (0 if not running).
     uint32_t request_candles(const std::string& symbol, const std::string& interval,
                              const std::string& range);
@@ -79,6 +86,8 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> conn_gen_{0};
     std::atomic<uint32_t> next_id_{1};
+
+    std::atomic<AccountKind> account_kind_{AccountKind::Unknown};
 
     mutable std::mutex mu_;   // guards account_, reqs_, subs_
     std::string account_;

@@ -39,6 +39,11 @@ struct IbkrConfig {
     // TLS cert is accepted only because the hop never leaves the machine.
     std::string gateway_url = "https://127.0.0.1:5000/v1/api";
     std::vector<std::string> symbols;   // session symbol table: id = index + 1
+    // When true, submit() refuses every order (no order ever reaches the
+    // gateway). Set for accounts flagged read-only — a live login used only for
+    // viewing/testing. Cancels/flatten are still allowed so positions can be
+    // closed. Belt-and-suspenders alongside IBKR's server-side Read-Only API.
+    bool read_only = false;
 };
 
 // ---- response parsers (exposed for unit tests) ----------------------------

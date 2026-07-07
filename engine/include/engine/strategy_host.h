@@ -4,13 +4,30 @@
 // Windows locks a loaded DLL's file, so each build gets a fresh versioned
 // name (<stem>.<millis>.dll) in the output dir — g++ never has to overwrite
 // a file that's mapped. Old versions are swept (best-effort) at startup and
-// after unload. Load order: tt_sdk_version is checked before anything else;
-// a mismatched DLL is refused, never called.
+// when modules are released. Load order: tt_sdk_version is checked before
+// anything else; a mismatched DLL is refused, never called.
+//
+// Multiple modules stay loaded side by side, keyed by source basename, and
+// every run (backtest, sweep, live, replay) gets its OWN instance from the
+// module's factory via create_instance(). Modules are refcounted by their
+// outstanding instances: unloading or replacing a module merely retires it,
+// and the DLL is freed only when its last instance is destroyed — so a live
+// session keeps trading version N while version N+1 loads beside it, and a
+// backtest can run strategy B while strategy A trades live.
+//
+// Threading: compile() only touches the filesystem and may run on a worker
+// thread; everything else must be called from a single thread (the UI
+// thread). Engine threads never touch the host — they only call the
+// IStrategy* they were handed, and the owner of that instance keeps it alive
+// until the run's thread is done with it.
 
 #include "tt/strategy_api.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -18,13 +35,16 @@ namespace tt {
 
 class StrategyHost {
 public:
-    struct Loaded {
-        IStrategy* instance = nullptr;   // DLL-owned; freed via destroy()
-        std::string name;                // display name from StrategyInfo
-        std::string dll_path;
-        std::string src_path;
-        struct Param { std::string name; double def, min, max; };
-        std::vector<Param> params;       // copied out of DLL memory at load
+    struct Param {
+        std::string name;
+        double def, min, max;
+    };
+    struct ModuleView {
+        std::string key;                // source basename ("sma_crossover.cpp")
+        std::string name;               // display name from StrategyInfo
+        std::string dll_path, src_path;
+        std::vector<Param> params;
+        int instances = 0;              // outstanding create_instance() handles
     };
 
     StrategyHost(std::string gxx_path, std::string sdk_include_dir,
@@ -37,28 +57,49 @@ public:
                  const std::function<void(std::string)>& on_output,
                  std::string& dll_out);
 
-    // Refuses SDK version mismatches and missing exports. Any previously
-    // loaded strategy is unloaded first (caller must ensure the engine is
-    // idle — enforce with Engine::running()).
+    // Loads dll_path as the module for src_path's basename. An existing
+    // module under that key is retired: its instances keep working and its
+    // DLL is freed when the last one is destroyed.
     bool load(const std::string& dll_path, const std::string& src_path,
               std::string& err);
-    void unload();
+    // Retires the module (same deferred-free semantics as replacement).
+    void unload(const std::string& key);
 
-    const Loaded* current() const { return loaded_.instance ? &loaded_ : nullptr; }
+    bool has(const std::string& key) const { return modules_.count(key) != 0; }
+    // Source file modified since this module was built?
+    bool stale(const std::string& key) const;
+    bool info(const std::string& key, ModuleView& out) const;
+    std::vector<ModuleView> modules() const;   // for the Strategy panel list
 
-    // Bumped on every load/unload; lets queued work detect strategy swaps.
-    uint64_t generation() const { return generation_; }
+    // Fresh instance from the module's factory; nullptr if key is absent.
+    IStrategy* create_instance(const std::string& key);
+    // Destroys a create_instance() handle. Must only be called once no
+    // engine thread can touch the instance anymore. Frees retired modules
+    // when their count reaches zero.
+    void destroy_instance(IStrategy* inst);
 
-    // Delete stale versioned DLLs in out_dir (skips anything still locked).
+    // Delete stale versioned DLLs in out_dir (skips loaded/locked files).
     void sweep_stale();
 
     const std::string& gxx_path() const { return gxx_; }
 
 private:
+    struct Module {
+        ModuleView meta;
+        void* hmodule = nullptr;
+        IStrategy* (*create)() = nullptr;
+        int refs = 0;
+        bool retired = false;
+        std::filesystem::file_time_type src_mtime{};
+    };
+
+    void retire(std::unique_ptr<Module> m);
+    void release(Module* m);   // FreeLibrary + best-effort dll delete
+
     std::string gxx_, sdk_include_, out_dir_;
-    Loaded loaded_;
-    void* module_ = nullptr;   // HMODULE
-    uint64_t generation_ = 0;
+    std::map<std::string, std::unique_ptr<Module>> modules_;   // by key
+    std::vector<std::unique_ptr<Module>> retired_;             // await refs==0
+    std::map<IStrategy*, Module*> owners_;
 };
 
 } // namespace tt

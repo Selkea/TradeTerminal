@@ -5,32 +5,52 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace tt::ui {
 
 class BacktestPanel {
 public:
-    // symbol, interval, range, initial cash — strategy + params come from
-    // the Strategy Manager.
+    // strategy source ("" = built-in), symbol, interval, range, initial
+    // cash — params come from the Strategy Manager.
     using RunFn = std::function<void(const std::string&, const std::string&,
-                                     const std::string&, double)>;
+                                     const std::string&, const std::string&,
+                                     double)>;
+    // Re-run a captured .ttk session through the current strategy.
+    using ReplayFn = std::function<void(const std::string& path)>;
 
-    explicit BacktestPanel(Engine& eng) : eng_(eng) {}
+    BacktestPanel(Engine& eng, std::string sessions_dir)
+        : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
+    // sources/active_key: the strategy dropdown ("" entry = built-in SMA);
+    // loaded_fresh: whether a pick would run as-is or build first;
+    // activating: a build/load kicked off by Run is still in flight.
     // suppress_result: a parameter sweep owns the engine's results right now.
-    void draw(bool* open, const std::string& strategy_name, bool suppress_result,
-              const RunFn& run);
+    void draw(bool* open, const std::vector<std::string>& sources,
+              const std::string& active_key,
+              const std::function<bool(const std::string&)>& loaded_fresh,
+              bool activating, bool suppress_result, const RunFn& run,
+              const ReplayFn& replay);
 
     double cash() const { return cash_; }
     void set_cash(double c) { cash_ = c; }
+    // Watchlist click-through: point the next run at this symbol.
+    void set_symbol(const std::string& sym);
     // Last finished result, or null (chart overlays fills for its symbol).
     const BacktestResult* result() const { return has_res_ ? &res_ : nullptr; }
 
 private:
     void draw_results();
     void export_csv();
+    void scan_replay_files();
 
     Engine& eng_;
+    std::string sessions_dir_;
+    std::vector<std::string> replay_files_;   // .ttk basenames, newest first
+    int replay_idx_ = 0;
+    bool replay_scanned_ = false;
     char sym_[16] = "AAPL";
+    std::string strat_sel_;      // dropdown pick, by basename; "" = built-in
+    bool strat_init_ = false;    // first draw adopts whatever is loaded
     int interval_idx_ = 2;
     int range_idx_ = 3;
     double cash_ = 100'000.0;

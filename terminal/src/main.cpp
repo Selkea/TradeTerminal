@@ -20,9 +20,11 @@
 #endif
 #endif
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -35,6 +37,28 @@ fs::path appdata_dir() {
     if (const char* base = std::getenv("LOCALAPPDATA"))
         return fs::path(base) / "TradeTerminal";
     return fs::temp_directory_path() / "TradeTerminal";
+}
+
+// ImPlot doesn't persist its style/colors to imgui.ini (only axis state), so the
+// Style Editor's changes reset each launch. Save/restore the whole ImPlotStyle
+// (POD: color array + scalars, no pointers) as a binary blob, length-guarded so
+// a different ImPlot build is ignored rather than misread.
+void save_implot_style(const fs::path& path) {
+    const ImPlotStyle& s = ImPlot::GetStyle();
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+    const uint32_t sz = sizeof(ImPlotStyle);
+    f.write(reinterpret_cast<const char*>(&sz), sizeof sz);
+    f.write(reinterpret_cast<const char*>(&s), sizeof s);
+}
+void load_implot_style(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return;
+    uint32_t sz = 0;
+    f.read(reinterpret_cast<char*>(&sz), sizeof sz);
+    if (!f || sz != sizeof(ImPlotStyle)) return;   // absent or different ImPlot build
+    ImPlotStyle& s = ImPlot::GetStyle();
+    f.read(reinterpret_cast<char*>(&s), sizeof s);
 }
 
 void glfw_error_callback(int error, const char* description) {
@@ -98,6 +122,9 @@ int main() {
     const bool had_ini = fs::exists(ini_path);
     io.IniFilename = ini_path.c_str();
 
+    static std::string implot_style_path = (data_dir / "implot_style.dat").string();
+    load_implot_style(implot_style_path);   // restore saved ImPlot colors/style
+
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 4.0f;
@@ -119,8 +146,15 @@ int main() {
     app.log().add(std::string("ImGui ") + IMGUI_VERSION + " (docking) + ImPlot " + IMPLOT_VERSION);
     app.log().add("Runtime data: " + data_dir.string());
 
-    while (!glfwWindowShouldClose(window)) {
+    while (!app.should_quit()) {
         glfwPollEvents();
+        // The window X only requests a close; the app quits immediately when
+        // nothing is trading, or after confirming + safely stopping a live
+        // session. Reset the GLFW flag so the loop keeps rendering the dialog.
+        if (glfwWindowShouldClose(window)) {
+            glfwSetWindowShouldClose(window, GLFW_FALSE);
+            app.request_quit();
+        }
         if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
             ImGui_ImplGlfw_Sleep(10);
             continue;
@@ -141,6 +175,13 @@ int main() {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    // Flush ImGui + ImPlot settings (window layout, plot axis state) to imgui.ini
+    // while BOTH contexts are still alive — ImPlot's settings handler needs its
+    // context, and it would otherwise be gone before ImGui's own shutdown save.
+    ImGui::SaveIniSettingsToDisk(ini_path.c_str());
+    io.IniFilename = nullptr;   // prevent a second save after ImPlot is destroyed
+    save_implot_style(implot_style_path);   // persist ImPlot colors/style
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

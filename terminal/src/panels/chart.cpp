@@ -102,10 +102,6 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills) {
         ImGui::SameLine();
         ImGui::TextDisabled("(cache)");
     }
-    if (!ipc_.connected()) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.0f), "feed down");
-    }
 
     // Pull in fresh data if the store advanced.
     SeriesStore::Series series;

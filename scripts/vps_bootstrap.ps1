@@ -24,8 +24,10 @@ $ErrorActionPreference = "Stop"
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
 # --- 1. toolchain ------------------------------------------------------------
-Step "Installing Git, MSYS2 (winget)"
-$pkgs = @("Git.Git", "MSYS2.MSYS2")
+Step "Installing Git, Python, MSYS2 (winget)"
+# Python.Python.* installs a real interpreter on PATH (not the Store alias),
+# which the IBKR auto-login daemon needs to run headless under Task Scheduler.
+$pkgs = @("Git.Git", "Python.Python.3.12", "MSYS2.MSYS2")
 foreach ($p in $pkgs) {
     winget install --id $p -e --silent --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) { Write-Host "  ($p may already be installed - continuing)" }
@@ -96,6 +98,27 @@ if (Test-Path (Join-Path $gwDir "bin\run.bat")) {
     } else {
         Write-Host "  WARNING: extraction layout unexpected - see tools\README.md" -ForegroundColor Yellow
     }
+}
+
+# --- 2c. IBKR auto-login (headless login via IBeam) ---------------------------
+Step "Auto-login deps: Chrome + IBeam (pip)"
+# IBeam drives a headless Chrome to log the gateway in automatically. Chrome is
+# required by Selenium; the matching chromedriver is fetched at runtime by
+# Selenium Manager. Credentials are stored/consumed by scripts\Save-IbkrCred.ps1
+# and scripts\Start-IbkrLogin.ps1 (DPAPI-encrypted, never in the repo).
+winget install --id Google.Chrome -e --silent --accept-package-agreements --accept-source-agreements
+if ($LASTEXITCODE -ne 0) { Write-Host "  (Chrome may already be installed - continuing)" }
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [Environment]::GetEnvironmentVariable("Path", "User")
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    python -m pip install --upgrade pip | Out-Null
+    python -m pip install --upgrade ibeam
+    if ($LASTEXITCODE -ne 0) { throw "pip install ibeam failed" }
+    Write-Host "  IBeam installed. To enable auto-login on this box:"
+    Write-Host "    1) scripts\Save-IbkrCred.ps1         (store IBKR paper password, once)"
+    Write-Host "    2) scripts\Install-IbkrAutoLogin.ps1 (keep it logged in at every logon)"
+} else {
+    Write-Host "  WARNING: python not on PATH - open a fresh terminal, then: python -m pip install ibeam" -ForegroundColor Yellow
 }
 
 # --- 3. trading-box tuning ----------------------------------------------------

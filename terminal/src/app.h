@@ -6,6 +6,7 @@
 #include "engine/ibkr_broker.h"
 #include "engine/ibkr_feed.h"
 #include "engine/polygon_feed.h"
+#include "engine/finnhub_feed.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
@@ -42,6 +43,11 @@ public:
 
     void draw();
 
+    // Window-close request from the host loop. Quits immediately if nothing is
+    // trading; otherwise pops a confirm dialog and quits only once confirmed.
+    void request_quit();
+    bool should_quit() const { return should_quit_; }
+
     // Whether an imgui.ini existed at startup; if not, a default dock layout
     // is built on the first frame.
     void set_had_ini(bool v) { had_ini_ = v; }
@@ -49,12 +55,20 @@ public:
 
 private:
     void draw_menu_bar();
-    void draw_account_menu();
-    void draw_signin_modal();
+    void draw_account_menu();          // broker (IBKR) menu
+    void draw_data_menu();             // data-feed (Polygon/Finnhub) menu
+    void draw_account_modal();         // broker sign-in / switch dialog
+    void draw_data_modal();            // data-feed sign-in dialog
+    void draw_trading_guards();        // Sign Out / quit confirm dialogs
+    void safe_stop_live();            // kill switch + graceful stop, if live
+    void do_ibkr_signout();          // run Stop-IbkrLogin, log
+    void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
     // Signed-in Polygon key, falling back to POLYGON_API_KEY; "" = none.
     std::string polygon_key() const;
+    // Signed-in Finnhub key, falling back to FINNHUB_API_KEY; "" = none.
+    std::string finnhub_key() const;
 
     // Set on the UI thread when Run is clicked; consumed on the IPC thread
     // when the matching candle response arrives.
@@ -63,12 +77,40 @@ private:
         std::string symbol, interval;
         std::map<std::string, double> params;
         double cash = 0.0;
-        IStrategy* strategy = nullptr;   // captured at click time
-        uint64_t strategy_gen = 0;       // host generation at click time
+        IStrategy* strategy = nullptr;   // leased instance, captured at click
     };
     void start_pending_backtest(net::CandleBatch& batch);
-    void queue_backtest(const std::string& sym, const std::string& ivl,
-                        const std::string& rng, double cash);
+    void queue_backtest(const std::string& key, const std::string& sym,
+                        const std::string& ivl, const std::string& rng,
+                        double cash);
+
+    // ---- per-run strategy instances ----
+    // Every run (backtest, sweep, live, replay) gets its own instance; a
+    // lease tracks it until the run can no longer touch the pointer, then
+    // pump_leases() destroys it (host for DLLs, destroy() for the built-in).
+    struct StrategyLease {
+        IStrategy* inst = nullptr;
+        std::string key;                 // "" = built-in SMA
+        enum Kind { Backtest, Sweep, Live } kind = Backtest;
+    };
+    std::vector<StrategyLease> leases_;
+    IStrategy* acquire_strategy(const std::string& key);
+    void release_strategy(const StrategyLease& lease);
+    void pump_leases();                  // UI thread, per frame
+
+    // Backtest-panel dropdown picked a strategy that may not be loaded:
+    // build + load it via the Strategy Manager machinery, then run. All on
+    // the UI thread.
+    struct PendingStrategyRun {
+        bool active = false;
+        std::string src, symbol, interval, range;
+        double cash = 0.0;
+    };
+    PendingStrategyRun pending_run_;
+    void queue_backtest_as(const std::string& src, const std::string& sym,
+                           const std::string& ivl, const std::string& rng,
+                           double cash);
+    void pump_pending_run();   // UI thread, per frame
 
     // ---- parameter sweep (all state UI-thread only unless noted) ----
     void queue_sweep(const SweepPanel::Request& rq);
@@ -84,15 +126,15 @@ private:
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<IbkrBroker> ibkr_;
-    // Same reasoning: engine threads (live and backtest) call into the
-    // built-in strategy and the loaded strategy DLL, so both must outlive
-    // the engine.
-    SmaCrossover sma_;
+    // Same reasoning: the host destroys any leftover per-run strategy
+    // instances and unloads their DLLs, which must happen only after the
+    // engine's threads are joined.
     StrategyHost host_;
     Engine engine_;
     // Declared after engine_ on purpose: the feed pushes into the engine's
     // ring, so it must be destroyed (thread joined) before the engine.
     std::unique_ptr<PolygonFeed> polygon_feed_;
+    std::unique_ptr<FinnhubFeed> finnhub_feed_;
     std::unique_ptr<IbkrFeed> ibkr_feed_;
     std::atomic<bool> rt_feed_active_{false};   // worker thread: skip snapshot ticks
     AlertNotifier alerts_;
@@ -118,8 +160,9 @@ private:
         bool ready = false, waiting = false;
         SweepPanel::Request req;
         std::vector<Bar> bars;
-        IStrategy* strategy = nullptr;
-        uint64_t strategy_gen = 0;
+        IStrategy* strategy = nullptr;   // leased instance
+        std::string key;                 // strategy key, for the label
+        std::map<std::string, double> params;   // captured at queue time
     };
     SweepSetup sweep_setup_;
     SweepPanel::State sweep_;
@@ -127,7 +170,6 @@ private:
     std::vector<Bar> sweep_test_bars_;   // holdout slice (never optimized on)
     bool sweep_holdout_phase_ = false;
     IStrategy* sweep_strategy_ = nullptr;
-    uint64_t sweep_gen_ = 0;
 
     std::mutex pending_bt_mu_;
     PendingBacktest pending_bt_;
@@ -135,8 +177,13 @@ private:
     // ---- Account menu / Sign In modal ----
     AccountStore accounts_;
     struct SignIn {
-        bool request_open = false;        // menu clicked; OpenPopup next frame
-        int provider = 0;                 // 0 alpaca, 1 polygon, 2 ibkr (info only)
+        // Two separate dialogs: Account (broker/IBKR) and Data (feeds).
+        bool account_request_open = false;   // Account menu clicked; OpenPopup next frame
+        bool data_request_open = false;      // Data menu clicked
+        bool account_open = true;            // Account modal p_open (title-bar X)
+        bool data_open = true;               // Data modal p_open
+        int broker_provider = 0;             // Account dialog: 0 IBKR (room for more brokers)
+        int provider = 0;                    // Data dialog: 0 Polygon, 1 Finnhub
         char name[32] = "paper";
         char key[96] = "";
         char secret[128] = "";
@@ -145,10 +192,26 @@ private:
         std::string detail;               // guarded by mu_
         std::mutex mu;
         std::thread worker;               // joined before reuse and in ~App
+        // IBKR account picker (from ibkr-accounts.json; UI thread only)
+        std::vector<std::string> ibkr_accounts;     // unique keys (switch/remove)
+        std::vector<std::string> ibkr_labels;       // parallel: display names
+        std::vector<unsigned char> ibkr_paper;      // parallel: 1 = paper, 0 = live
+        std::vector<unsigned char> ibkr_readonly;   // parallel: 1 = trading disabled
+        std::string ibkr_active;
+        int ibkr_selected = -1;
+        std::string pending_account;   // account awaiting the "live trading" switch confirm
     } signin_;
+
+    // While the gateway is being launched, show "INITIALIZING" until it is up.
+    // Holds an ImGui::GetTime() deadline; 0 = not starting.
+    double gateway_starting_until_ = 0.0;
 
     std::string config_path_;
     AppConfig cfg_;
+
+    bool should_quit_ = false;        // host loop exits when true
+    bool pending_quit_ = false;       // quit awaiting the "live trading" confirm
+    bool pending_signout_ = false;    // sign-out awaiting the "live trading" confirm
 
     bool had_ini_ = false;
     bool layout_checked_ = false;
