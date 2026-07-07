@@ -86,16 +86,18 @@ public:
     EngineCtx(Engine& eng, const std::map<std::string, double>& params,
               const std::vector<std::string>& symbols, NowFn now, ExecSim& exec,
               Portfolio& pf, LatencyHistogram& lat, const RiskLimits* risk = nullptr,
-              OrderHook on_order = {}, IBrokerAdapter* broker = nullptr)
+              OrderHook on_order = {}, IBrokerAdapter* broker = nullptr,
+              const std::vector<RiskLimits>* symbol_risk = nullptr)
         : eng_(eng), params_(params), now_(std::move(now)), exec_(exec), pf_(pf),
-          lat_(lat), risk_(risk), on_order_(std::move(on_order)), broker_(broker) {
+          lat_(lat), risk_(risk), symbol_risk_(symbol_risk),
+          on_order_(std::move(on_order)), broker_(broker) {
         symbols_ = symbols;
     }
 
     uint64_t submit_order(const OrderRequest& r) noexcept override {
         if (r.qty <= 0.0 || r.symbol_id == 0 || r.symbol_id > symbols_.size())
             return 0;
-        if (risk_ && !risk_ok(r)) {
+        if ((risk_ || symbol_risk_) && !risk_ok(r)) {
             if (on_order_) on_order_(r, 0);   // recorded as Rejected
             return 0;
         }
@@ -139,20 +141,25 @@ public:
 
 private:
     bool risk_ok(const OrderRequest& r) noexcept {
-        if (r.qty > risk_->max_order_qty) {
+        // Per-symbol limits when provided, else the session-level fallback.
+        const RiskLimits* rl = risk_;
+        if (symbol_risk_ && r.symbol_id >= 1 && r.symbol_id <= symbol_risk_->size())
+            rl = &(*symbol_risk_)[r.symbol_id - 1];
+        if (!rl) return true;
+        if (r.qty > rl->max_order_qty) {
             eng_.push_log("risk: order qty exceeds limit, rejected");
             return false;
         }
         const double pos = pf_.position(r.symbol_id).qty;
         const double dir = r.side == Side::Buy ? 1.0 : -1.0;
-        if (std::abs(pos + dir * r.qty) > risk_->max_position_qty) {
+        if (std::abs(pos + dir * r.qty) > rl->max_position_qty) {
             eng_.push_log("risk: resulting position exceeds limit, rejected");
             return false;
         }
         const double last =
             r.symbol_id > 0 && r.symbol_id <= last_price_.size() ? last_price_[r.symbol_id - 1] : 0.0;
         if (r.type == OrdType::Limit && last > 0.0 &&
-            std::abs(r.limit_price - last) / last > risk_->price_band_pct) {
+            std::abs(r.limit_price - last) / last > rl->price_band_pct) {
             eng_.push_log("risk: limit price outside band, rejected (fat finger?)");
             return false;
         }
@@ -166,6 +173,7 @@ private:
     Portfolio& pf_;
     LatencyHistogram& lat_;
     const RiskLimits* risk_;
+    const std::vector<RiskLimits>* symbol_risk_ = nullptr;
     OrderHook on_order_;
     IBrokerAdapter* broker_;
     std::vector<std::string> symbols_;
@@ -602,7 +610,7 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
 
     IBrokerAdapter* const broker = cfg.broker;
     EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
-                  exec, pf, lat, &cfg.risk, record_order, broker);
+                  exec, pf, lat, &cfg.risk, record_order, broker, &cfg.symbol_risk);
 
     TickLogWriter capture;
     if (!cfg.capture_path.empty()) {

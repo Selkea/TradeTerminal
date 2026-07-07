@@ -76,7 +76,11 @@ struct LiveConfig {
     double initial_cash = 100'000.0;
     ExecParams exec{};
     std::map<std::string, double> params;
-    RiskLimits risk{};
+    RiskLimits risk{};              // session-level: equity + stale-feed halts
+    // Optional per-symbol order-level risk (parallel to symbols; empty = use
+    // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
+    // session-wide (per-symbol halting needs per-symbol portfolios).
+    std::vector<RiskLimits> symbol_risk;
     int bar_seconds = 60;           // tick->bar aggregation for on_bar (fallback)
     // Optional per-symbol bar size (parallel to symbols; 0/absent = bar_seconds).
     std::vector<int> symbol_bar_seconds;

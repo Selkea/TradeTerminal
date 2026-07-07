@@ -78,73 +78,93 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
                            [](unsigned char c) { return std::toupper(c); });
             const bool dup = std::any_of(pending_.begin(), pending_.end(),
                                          [&](const SymRow& r) { return r.symbol == sym; });
-            if (!dup) pending_.push_back({sym, def_bar_sec_, def_record_, 0});
+            if (!dup)
+                pending_.push_back(
+                    {sym, def_bar_sec_, def_record_, 0, def_risk_, def_risk_dd_pct_});
             input_[0] = '\0';
         }
 
-        // ---- per-symbol cards: each symbol its own cash / bar size / record ----
+        // ---- per-symbol tabs: each symbol its own cash / bar size / record ----
         int remove_at = -1;
-        for (size_t i = 0; i < pending_.size(); ++i) {
-            SymRow& r = pending_[i];
-            ImGui::PushID(static_cast<int>(i));
-            const std::string hdr = r.symbol + "###sym";   // stable id across renames
-            if (ImGui::CollapsingHeader(hdr.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::Indent();
-                // Capital: pick a sub-account when the login has them, else the
-                // shared account/pool.
-                if (account.subaccounts.size() > 1) {
-                    r.account_idx = std::clamp(
-                        r.account_idx, 0, static_cast<int>(account.subaccounts.size()) - 1);
-                    ImGui::SetNextItemWidth(160);
-                    if (ImGui::BeginCombo("cash",
-                                          account.subaccounts[r.account_idx].c_str())) {
-                        for (int a = 0; a < static_cast<int>(account.subaccounts.size()); ++a)
-                            if (ImGui::Selectable(account.subaccounts[a].c_str(),
-                                                  a == r.account_idx))
-                                r.account_idx = a;
-                        ImGui::EndCombo();
+        if (!pending_.empty() &&
+            ImGui::BeginTabBar("##symtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
+                                                ImGuiTabBarFlags_Reorderable)) {
+            for (size_t i = 0; i < pending_.size(); ++i) {
+                SymRow& r = pending_[i];
+                bool open = true;
+                // Tab id = symbol (unique, stable across add/remove); the tab's
+                // close button removes it.
+                if (ImGui::BeginTabItem(r.symbol.c_str(), &open)) {
+                    ImGui::PushID(r.symbol.c_str());
+                    // Capital: sub-account picker when the login has them, else the
+                    // shared account/pool.
+                    if (account.subaccounts.size() > 1) {
+                        r.account_idx = std::clamp(
+                            r.account_idx, 0,
+                            static_cast<int>(account.subaccounts.size()) - 1);
+                        ImGui::SetNextItemWidth(160);
+                        if (ImGui::BeginCombo("cash",
+                                              account.subaccounts[r.account_idx].c_str())) {
+                            for (int a = 0;
+                                 a < static_cast<int>(account.subaccounts.size()); ++a)
+                                if (ImGui::Selectable(account.subaccounts[a].c_str(),
+                                                      a == r.account_idx))
+                                    r.account_idx = a;
+                            ImGui::EndCombo();
+                        }
+                        ImGui::SetItemTooltip("Sub-account this symbol trades in");
+                    } else {
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextDisabled("cash: shared");
                     }
-                    ImGui::SetItemTooltip("Sub-account this symbol trades in");
-                } else {
-                    ImGui::TextDisabled("cash: shared");
+                    // Record: pinned to the top-right of the tab, on the cash row.
+                    const float rec_w = ImGui::GetFrameHeight() +
+                                        ImGui::GetStyle().ItemInnerSpacing.x +
+                                        ImGui::CalcTextSize("Record").x;
+                    ImGui::SameLine(ImGui::GetContentRegionMax().x - rec_w);
+                    ImGui::Checkbox("Record", &r.record);
+                    ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file "
+                                          "for replay");
+                    ImGui::SetNextItemWidth(100);
+                    ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
+                    r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
+                    if (ImGui::CollapsingHeader("Risk limits")) {
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::InputDouble("max order qty", &r.risk.max_order_qty, 0, 0,
+                                           "%.0f");
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::InputDouble("max position qty", &r.risk.max_position_qty, 0,
+                                           0, "%.0f");
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::InputDouble("daily max loss $", &r.risk.daily_max_loss, 0, 0,
+                                           "%.0f");
+                        ImGui::SetItemTooltip("Kill switch when this symbol's equity drops "
+                                              "this much below the session start. 0 = off");
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::InputDouble("max drawdown %", &r.risk_dd_pct, 0, 0, "%.1f");
+                        ImGui::SetItemTooltip("Kill switch this far below the session equity "
+                                              "high. 0 = off");
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::InputInt("stale feed sec", &r.risk.stale_feed_sec);
+                        ImGui::SetItemTooltip("Kill switch when no ticks arrive for this "
+                                              "long while a position is open. 0 = off");
+                        r.risk.stale_feed_sec = std::max(0, r.risk.stale_feed_sec);
+                        r.risk_dd_pct = std::clamp(r.risk_dd_pct, 0.0, 99.0);
+                    }
+                    ImGui::PopID();
+                    ImGui::EndTabItem();
                 }
-                ImGui::SameLine();
-                ImGui::Checkbox("Record", &r.record);
-                ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file for replay");
-                ImGui::SetNextItemWidth(100);
-                ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
-                r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
-                if (ImGui::SmallButton("remove")) remove_at = static_cast<int>(i);
-                ImGui::Unindent();
+                if (!open) remove_at = static_cast<int>(i);
             }
-            ImGui::PopID();
+            ImGui::EndTabBar();
         }
         if (remove_at >= 0) pending_.erase(pending_.begin() + remove_at);
-        // A newly added symbol inherits the last card's settings.
+        // A newly added symbol inherits the last tab's settings.
         if (!pending_.empty()) {
             def_bar_sec_ = pending_.back().bar_sec;
             def_record_ = pending_.back().record;
-        }
-
-        if (ImGui::CollapsingHeader("Risk limits")) {
-            ImGui::SetNextItemWidth(90);
-            ImGui::InputDouble("max order qty", &risk_.max_order_qty, 0, 0, "%.0f");
-            ImGui::SetNextItemWidth(90);
-            ImGui::InputDouble("max position qty", &risk_.max_position_qty, 0, 0, "%.0f");
-            ImGui::SetNextItemWidth(90);
-            ImGui::InputDouble("daily max loss $", &risk_.daily_max_loss, 0, 0, "%.0f");
-            ImGui::SetItemTooltip("Auto kill switch when equity drops this much below "
-                                  "the session start. 0 = off");
-            ImGui::SetNextItemWidth(90);
-            ImGui::InputDouble("max drawdown %", &risk_dd_pct_, 0, 0, "%.1f");
-            ImGui::SetItemTooltip("Auto kill switch this far below the session equity "
-                                  "high. 0 = off");
-            ImGui::SetNextItemWidth(90);
-            ImGui::InputInt("stale feed sec", &risk_.stale_feed_sec);
-            ImGui::SetItemTooltip("Auto kill switch when no ticks arrive for this long "
-                                  "while a position is open. 0 = off");
-            risk_.stale_feed_sec = std::max(0, risk_.stale_feed_sec);
-            risk_dd_pct_ = std::clamp(risk_dd_pct_, 0.0, 99.0);
+            def_risk_ = pending_.back().risk;
+            def_risk_dd_pct_ = pending_.back().risk_dd_pct;
         }
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
@@ -164,10 +184,10 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
                     account.subaccounts.size() > 1 &&
                             r.account_idx < static_cast<int>(account.subaccounts.size())
                         ? account.subaccounts[r.account_idx] : std::string();
-                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct});
+                RiskLimits rk = r.risk;
+                rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
+                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, rk});
             }
-            opts.risk = risk_;
-            opts.risk.max_drawdown_pct = risk_dd_pct_ / 100.0;
             start(opts);
         }
         ImGui::EndDisabled();

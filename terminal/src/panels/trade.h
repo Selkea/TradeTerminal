@@ -15,19 +15,20 @@ public:
     enum class Broker : int { Sim = 0, Ibkr = 1 };
     enum class DataFeed : int { Ibkr = 0, Polygon = 1, Finnhub = 2 };
 
-    // Per-symbol settings for a session (bar size, tick capture, sub-account).
+    // Per-symbol settings for a session (bar size, tick capture, sub-account,
+    // risk limits). max_drawdown_pct is already a fraction here.
     struct SymbolOpt {
         std::string symbol;
         int bar_seconds = 60;
         bool record = true;
         std::string account;   // IBKR sub-account id; "" = shared account/pool
+        RiskLimits risk{};
     };
     struct StartOpts {
         std::vector<SymbolOpt> symbols;   // one entry per traded symbol
         double session_cash = 100'000.0;  // shared pool (simulator / single account)
         Broker broker = Broker::Sim;      // where orders route
         DataFeed data = DataFeed::Ibkr;   // where ticks come from
-        RiskLimits risk{};                // session-wide
     };
     using StartFn = std::function<void(const StartOpts&)>;
 
@@ -60,12 +61,12 @@ public:
         data_idx_ = (data_idx >= 0 && data_idx <= 2) ? data_idx : 0;  // Ibkr/Poly/Finn
         def_record_ = record;
     }
-    // Risk limits persist across restarts (armed halts must stay armed).
-    const RiskLimits& risk() const { return risk_; }
-    double risk_dd_pct() const { return risk_dd_pct_; }
+    // Persisted default risk limits, seeded into each new symbol card.
+    const RiskLimits& risk() const { return def_risk_; }
+    double risk_dd_pct() const { return def_risk_dd_pct_; }
     void restore_risk(const RiskLimits& r, double dd_pct) {
-        risk_ = r;
-        risk_dd_pct_ = dd_pct;
+        def_risk_ = r;
+        def_risk_dd_pct_ = dd_pct;
     }
 
 private:
@@ -73,21 +74,23 @@ private:
     int data_idx_ = 0;               // DataFeed enum (persisted)
     int session_broker_ = 0;         // what the running session was started with
     char input_[16] = "";
-    // One card per pending symbol: its bar size, capture flag, and (when the
-    // account has sub-accounts) which one it trades in.
+    // One tab per pending symbol: its bar size, capture flag, sub-account (when
+    // the login has them), and its own risk limits.
     struct SymRow {
         std::string symbol;
         int bar_sec = 60;
         bool record = true;
-        int account_idx = 0;   // index into AccountInfo.subaccounts
+        int account_idx = 0;        // index into AccountInfo.subaccounts
+        RiskLimits risk{};
+        double risk_dd_pct = 0.0;   // UI percent; converted to fraction at start
     };
-    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0}};
+    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0}};
     // Shared-pool cash (simulator / single account) + per-symbol defaults.
     double session_cash_ = 100'000.0;
     int def_bar_sec_ = 60;
     bool def_record_ = true;
-    RiskLimits risk_{};
-    double risk_dd_pct_ = 0.0;   // UI shows percent; RiskLimits stores fraction
+    RiskLimits def_risk_{};
+    double def_risk_dd_pct_ = 0.0;   // UI shows percent; RiskLimits stores fraction
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
     int selected_symbol_idx_ = 0;

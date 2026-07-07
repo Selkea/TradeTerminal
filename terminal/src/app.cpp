@@ -754,12 +754,31 @@ void App::draw() {
                         std::vector<std::string> syms;
                         std::vector<int> sym_bars;
                         std::vector<std::string> sym_accts;
+                        std::vector<RiskLimits> sym_risk;
                         bool any_record = false;
+                        // Session-level equity/stale halts run on one portfolio, so
+                        // drive them from the tightest (min non-zero) per-symbol value.
+                        RiskLimits session_risk{};
+                        session_risk.daily_max_loss = 0;
+                        session_risk.max_drawdown_pct = 0;
+                        session_risk.stale_feed_sec = 0;
+                        auto tight = [](double cur, double v) {
+                            return v > 0 && (cur == 0 || v < cur) ? v : cur;
+                        };
                         for (const auto& so : opts.symbols) {
                             syms.push_back(so.symbol);
                             sym_bars.push_back(so.bar_seconds);
                             sym_accts.push_back(so.account);
+                            sym_risk.push_back(so.risk);
                             any_record = any_record || so.record;
+                            session_risk.daily_max_loss =
+                                tight(session_risk.daily_max_loss, so.risk.daily_max_loss);
+                            session_risk.max_drawdown_pct = tight(
+                                session_risk.max_drawdown_pct, so.risk.max_drawdown_pct);
+                            if (so.risk.stale_feed_sec > 0 &&
+                                (session_risk.stale_feed_sec == 0 ||
+                                 so.risk.stale_feed_sec < session_risk.stale_feed_sec))
+                                session_risk.stale_feed_sec = so.risk.stale_feed_sec;
                         }
                         // Session default bar size (feed gap-backfill granularity);
                         // each symbol still aggregates at its own size below.
@@ -771,7 +790,8 @@ void App::draw() {
                         cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
                         cfg.bar_seconds = session_bar;
                         cfg.symbol_bar_seconds = sym_bars;
-                        cfg.risk = opts.risk;
+                        cfg.risk = session_risk;
+                        cfg.symbol_risk = sym_risk;
                         // Every data source is real-time now => spin the engine
                         // thread; ticks are handled in ns, not after Sleep(5).
                         cfg.busy_spin = true;
