@@ -3,10 +3,27 @@
 // Loaded at startup, saved on clean exit. Missing/corrupt files fall back to
 // defaults silently — config must never block launch.
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace tt::ui {
+
+// One Trade-panel symbol tab, persisted so the session's symbols + their
+// strategies/settings survive a restart.
+struct TradeSymbol {
+    std::string symbol;
+    int bar_sec = 60;
+    bool record = true;
+    std::string strat_key;          // "" = built-in SMA
+    int account_idx = 0;            // index into the login's sub-accounts
+    double risk_max_order_qty = 1'000;
+    double risk_max_position_qty = 5'000;
+    double risk_daily_max_loss = 0;
+    int risk_stale_feed_sec = 0;
+    double risk_dd_pct = 0;         // percent, as shown in the UI
+    std::map<std::string, double> params;   // this symbol's strategy params
+};
 
 struct AppConfig {
     std::vector<std::string> watchlist = {"AAPL", "MSFT", "SPY"};
@@ -31,6 +48,14 @@ struct AppConfig {
     double risk_daily_max_loss = 0;
     double risk_max_drawdown_pct = 0;   // percent, as shown in the UI
     int risk_stale_feed_sec = 0;
+
+    // Trade panel: the symbol tabs from last session (empty = default AAPL).
+    std::vector<TradeSymbol> trade_symbols;
+    // Strategy panel: which strategies were loaded, which was active, and each
+    // one's edited parameter values — restored (rebuilt) on startup.
+    std::string strategy_active;                    // "" = built-in
+    std::vector<std::string> strategy_loaded;       // .cpp basenames to reload
+    std::map<std::string, std::map<std::string, double>> strategy_params;
 
     static AppConfig load(const std::string& path);
     void save(const std::string& path) const;

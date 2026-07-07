@@ -35,6 +35,37 @@ AppConfig AppConfig::load(const std::string& path) {
     c.risk_daily_max_loss = j.value("risk_daily_max_loss", c.risk_daily_max_loss);
     c.risk_max_drawdown_pct = j.value("risk_max_drawdown_pct", c.risk_max_drawdown_pct);
     c.risk_stale_feed_sec = j.value("risk_stale_feed_sec", c.risk_stale_feed_sec);
+
+    if (j.contains("trade_symbols") && j["trade_symbols"].is_array())
+        for (const auto& s : j["trade_symbols"]) {
+            if (!s.is_object()) continue;
+            TradeSymbol ts;
+            ts.symbol = s.value("symbol", std::string());
+            if (ts.symbol.empty()) continue;
+            ts.bar_sec = s.value("bar_sec", ts.bar_sec);
+            ts.record = s.value("record", ts.record);
+            ts.strat_key = s.value("strat_key", ts.strat_key);
+            ts.account_idx = s.value("account_idx", ts.account_idx);
+            ts.risk_max_order_qty = s.value("risk_max_order_qty", ts.risk_max_order_qty);
+            ts.risk_max_position_qty =
+                s.value("risk_max_position_qty", ts.risk_max_position_qty);
+            ts.risk_daily_max_loss = s.value("risk_daily_max_loss", ts.risk_daily_max_loss);
+            ts.risk_stale_feed_sec = s.value("risk_stale_feed_sec", ts.risk_stale_feed_sec);
+            ts.risk_dd_pct = s.value("risk_dd_pct", ts.risk_dd_pct);
+            if (s.contains("params") && s["params"].is_object())
+                for (const auto& [k, v] : s["params"].items())
+                    if (v.is_number()) ts.params[k] = v.get<double>();
+            c.trade_symbols.push_back(std::move(ts));
+        }
+    c.strategy_active = j.value("strategy_active", c.strategy_active);
+    if (j.contains("strategy_loaded") && j["strategy_loaded"].is_array())
+        for (const auto& s : j["strategy_loaded"])
+            if (s.is_string()) c.strategy_loaded.push_back(s.get<std::string>());
+    if (j.contains("strategy_params") && j["strategy_params"].is_object())
+        for (const auto& [key, pv] : j["strategy_params"].items())
+            if (pv.is_object())
+                for (const auto& [k, v] : pv.items())
+                    if (v.is_number()) c.strategy_params[key][k] = v.get<double>();
     return c;
 }
 
@@ -57,6 +88,24 @@ void AppConfig::save(const std::string& path) const {
         {"risk_max_drawdown_pct", risk_max_drawdown_pct},
         {"risk_stale_feed_sec", risk_stale_feed_sec},
     };
+    json syms = json::array();
+    for (const auto& ts : trade_symbols)
+        syms.push_back({{"symbol", ts.symbol},
+                        {"bar_sec", ts.bar_sec},
+                        {"record", ts.record},
+                        {"strat_key", ts.strat_key},
+                        {"account_idx", ts.account_idx},
+                        {"risk_max_order_qty", ts.risk_max_order_qty},
+                        {"risk_max_position_qty", ts.risk_max_position_qty},
+                        {"risk_daily_max_loss", ts.risk_daily_max_loss},
+                        {"risk_stale_feed_sec", ts.risk_stale_feed_sec},
+                        {"risk_dd_pct", ts.risk_dd_pct},
+                        {"params", ts.params}});
+    j["trade_symbols"] = std::move(syms);
+    j["strategy_active"] = strategy_active;
+    j["strategy_loaded"] = strategy_loaded;
+    j["strategy_params"] = strategy_params;
+
     std::ofstream f(path);
     if (f) f << j.dump(2);
 }
