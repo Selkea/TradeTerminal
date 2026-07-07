@@ -1,6 +1,7 @@
 #include "panels/trade.h"
 
 #include "imgui.h"
+#include "imgui_internal.h"   // GetCurrentTabBar: overflow-aware tab-list button
 #include "ui_hints.h"
 
 #include <algorithm>
@@ -88,7 +89,26 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         int remove_at = -1;
         if (!pending_.empty() &&
             ImGui::BeginTabBar("##symtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                                ImGuiTabBarFlags_Reorderable)) {
+                                                ImGuiTabBarFlags_Reorderable |
+                                                ImGuiTabBarFlags_FittingPolicyScroll |
+                                                ImGuiTabBarFlags_NoTabListScrollingButtons)) {
+            // Tabs keep full width (scroll instead of shrink). Show the tab-list
+            // button only when they overflow — i.e. a resize-down would have
+            // occurred — by peeking ImGui's ideal-vs-available width (last frame).
+            if (const ImGuiTabBar* tb = ImGui::GetCurrentTabBar();
+                tb && tb->WidthAllTabsIdeal > tb->BarRect.GetWidth() + 1.0f) {
+                if (ImGui::TabItemButton("  ##symtablist", ImGuiTabItemFlags_Leading |
+                                                               ImGuiTabItemFlags_NoTooltip))
+                    ImGui::OpenPopup("##symtablist");
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+                const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
+                const float rr = ImGui::GetFontSize() * 0.26f;
+                const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
+                                      ImVec2(cx + rr, cy - rr * 0.5f),
+                                      ImVec2(cx, cy + rr * 0.7f), col);
+            }
             for (size_t i = 0; i < pending_.size(); ++i) {
                 SymRow& r = pending_[i];
                 bool open = true;
@@ -184,21 +204,6 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                 if (!open) remove_at = static_cast<int>(i);
             }
             want_tab_ = -1;   // consumed by the SetSelected above
-            // Custom tab-list button: a down-triangle pinned to the right of the
-            // strip (like a docked panel's) that pops a menu of the symbols.
-            if (ImGui::TabItemButton("  ##symtablist", ImGuiTabItemFlags_Leading |
-                                                           ImGuiTabItemFlags_NoTooltip))
-                ImGui::OpenPopup("##symtablist");
-            {
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-                const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
-                const float rr = ImGui::GetFontSize() * 0.26f;
-                const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
-                dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
-                                      ImVec2(cx + rr, cy - rr * 0.5f),
-                                      ImVec2(cx, cy + rr * 0.7f), col);
-            }
             if (ImGui::BeginPopup("##symtablist")) {
                 for (size_t i = 0; i < pending_.size(); ++i)
                     if (ImGui::Selectable(pending_[i].symbol.c_str()))

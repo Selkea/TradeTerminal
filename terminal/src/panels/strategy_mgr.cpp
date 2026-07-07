@@ -1,6 +1,7 @@
 #include "panels/strategy_mgr.h"
 
 #include "imgui.h"
+#include "imgui_internal.h"   // GetCurrentTabBar: overflow-aware tab-list button
 #include "ui_hints.h"
 
 #include <filesystem>
@@ -261,8 +262,25 @@ void StrategyManagerPanel::draw(bool* open) {
 
     // ---- one tab per strategy: built-in + each loaded module ----
     if (ImGui::BeginTabBar("##strat_tabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                               ImGuiTabBarFlags_Reorderable)) {
+                                               ImGuiTabBarFlags_Reorderable |
+                                               ImGuiTabBarFlags_FittingPolicyScroll |
+                                               ImGuiTabBarFlags_NoTabListScrollingButtons)) {
         const std::vector<StrategyHost::ModuleView> mods = host_.modules();
+        // Tab-list button only when the tabs overflow (would have shrunk).
+        if (const ImGuiTabBar* tb = ImGui::GetCurrentTabBar();
+            tb && tb->WidthAllTabsIdeal > tb->BarRect.GetWidth() + 1.0f) {
+            if (ImGui::TabItemButton("  ##stratlist", ImGuiTabItemFlags_Leading |
+                                                          ImGuiTabItemFlags_NoTooltip))
+                ImGui::OpenPopup("##stratlist");
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
+            const float rr = ImGui::GetFontSize() * 0.26f;
+            const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+            dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
+                                  ImVec2(cx + rr, cy - rr * 0.5f),
+                                  ImVec2(cx, cy + rr * 0.7f), col);
+        }
         const ImGuiTabItemFlags bsel =
             want_tab_set_ && want_tab_.empty() ? ImGuiTabItemFlags_SetSelected : 0;
         if (ImGui::BeginTabItem("SMA (built-in)###builtin", nullptr, bsel)) {
@@ -279,21 +297,6 @@ void StrategyManagerPanel::draw(bool* open) {
             }
         }
         want_tab_set_ = false;   // consumed
-        // Custom tab-list button: a down-triangle at the right of the strip,
-        // popping a menu of the strategies.
-        if (ImGui::TabItemButton("  ##stratlist", ImGuiTabItemFlags_Leading |
-                                                      ImGuiTabItemFlags_NoTooltip))
-            ImGui::OpenPopup("##stratlist");
-        {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-            const float cx = (mn.x + mx.x) * 0.5f, cy = (mn.y + mx.y) * 0.5f;
-            const float rr = ImGui::GetFontSize() * 0.26f;
-            const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
-            dl->AddTriangleFilled(ImVec2(cx - rr, cy - rr * 0.5f),
-                                  ImVec2(cx + rr, cy - rr * 0.5f),
-                                  ImVec2(cx, cy + rr * 0.7f), col);
-        }
         if (ImGui::BeginPopup("##stratlist")) {
             if (ImGui::Selectable("SMA Crossover (built-in)")) {
                 want_tab_.clear();
