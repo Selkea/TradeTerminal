@@ -698,7 +698,7 @@ void App::draw() {
                               double cash) {
                            queue_backtest_as(src, sym, ivl, rng, cash);
                        },
-                       [this](const std::string& path) {
+                       [this](const std::string& path, int bar_seconds_override) {
                            TickLog log;
                            std::string err;
                            if (!tick_log_read(path, log, err)) {
@@ -709,6 +709,7 @@ void App::draw() {
                            cfg.name = "replay:" +
                                       std::filesystem::path(path).filename().string();
                            cfg.log = std::move(log);
+                           cfg.bar_seconds_override = bar_seconds_override;
                            cfg.initial_cash = backtest_.cash();
                            cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
                            const std::string strat_key = strat_mgr_.active_key();

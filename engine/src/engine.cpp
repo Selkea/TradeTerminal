@@ -378,7 +378,10 @@ void Engine::run_replay(ReplayConfig cfg, IStrategy* strategy) {
     res.initial_cash = cfg.initial_cash;
 
     const size_t n_sym = cfg.log.symbols.size();
-    const int64_t bar_ns = static_cast<int64_t>(cfg.log.bar_seconds) * 1'000'000'000;
+    // Replay at an overridden bar size when asked, else the recorded one.
+    const int bar_seconds =
+        cfg.bar_seconds_override > 0 ? cfg.bar_seconds_override : cfg.log.bar_seconds;
+    const int64_t bar_ns = static_cast<int64_t>(bar_seconds) * 1'000'000'000;
 
     // Same tick->bar aggregation as the live loop, so bar strategies replay
     // the way they ran.

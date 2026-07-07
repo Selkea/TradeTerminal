@@ -102,6 +102,10 @@ struct ReplayConfig {
     double initial_cash = 100'000.0;
     ExecParams exec{};
     std::map<std::string, double> params;
+    // >0: re-aggregate the recorded ticks into bars of this size instead of the
+    // size baked into the recording (log.bar_seconds). Lets one .ttk be replayed
+    // at several bar sizes to compare. 0 = use the recorded size.
+    int bar_seconds_override = 0;
 };
 
 enum class OrderStatus : uint8_t { Working = 0, Filled, Cancelled, Rejected };

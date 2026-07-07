@@ -15,15 +15,15 @@
 namespace tt::ui {
 
 namespace {
-constexpr const char* kIntervals[] = {"5m", "1h", "1d"};
+constexpr const char* kIntervals[] = {"1m", "2m", "5m", "15m", "30m", "1h", "1d"};
 constexpr const char* kRanges[] = {"1mo", "6mo", "1y", "2y", "5y", "max"};
 
 int max_range_idx(int interval_idx) {
-    switch (interval_idx) {
-    case 0: return 0;   // 5m -> 1mo (Yahoo intraday history limit)
-    case 1: return 2;   // 1h -> 1y
-    default: return 5;  // 1d -> anything
-    }
+    // Gateway history depth shrinks for finer bars; coarser bars go back further.
+    // kIntervals = {1m, 2m, 5m, 15m, 30m, 1h, 1d}
+    if (interval_idx <= 4) return 0;   // intraday (<=30m) -> 1mo
+    if (interval_idx == 5) return 2;   // 1h -> 1y
+    return 5;                          // 1d -> max
 }
 } // namespace
 
@@ -122,10 +122,15 @@ void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
                     replay_idx_ = i;
             ImGui::EndCombo();
         }
+        ImGui::SetNextItemWidth(70);
+        ImGui::InputInt("bar sec##replay", &replay_bar_sec_, 0, 0);
+        replay_bar_sec_ = std::max(0, replay_bar_sec_);
+        ImGui::SetItemTooltip("Re-bar the recording at this many seconds for on_bar "
+                              "strategies. 0 = use the size it was recorded with.");
         ImGui::SameLine();
         ImGui::BeginDisabled(eng_.running());
         if (ImGui::Button("Replay") && replay)
-            replay(sessions_dir_ + "\\" + replay_files_[replay_idx_]);
+            replay(sessions_dir_ + "\\" + replay_files_[replay_idx_], replay_bar_sec_);
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Re-run these captured ticks through the current strategy "
                               "+ fill simulator");

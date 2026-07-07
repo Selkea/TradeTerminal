@@ -17,7 +17,8 @@ public:
                                      const std::string&, const std::string&,
                                      double)>;
     // Re-run a captured .ttk session through the current strategy.
-    using ReplayFn = std::function<void(const std::string& path)>;
+    // bar_seconds_override: >0 re-bars the recording at that size, 0 = as recorded.
+    using ReplayFn = std::function<void(const std::string& path, int bar_seconds_override)>;
 
     BacktestPanel(Engine& eng, std::string sessions_dir)
         : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
@@ -47,11 +48,12 @@ private:
     std::string sessions_dir_;
     std::vector<std::string> replay_files_;   // .ttk basenames, newest first
     int replay_idx_ = 0;
+    int replay_bar_sec_ = 0;                  // re-bar size for replay; 0 = as recorded
     bool replay_scanned_ = false;
     char sym_[16] = "AAPL";
     std::string strat_sel_;      // dropdown pick, by basename; "" = built-in
     bool strat_init_ = false;    // first draw adopts whatever is loaded
-    int interval_idx_ = 2;
+    int interval_idx_ = 6;       // "1d" in kIntervals
     int range_idx_ = 3;
     double cash_ = 100'000.0;
     BacktestResult res_;

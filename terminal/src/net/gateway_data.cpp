@@ -40,8 +40,10 @@ double snap_num(const std::string& s) {
 
 const char* bar_for(const std::string& interval) {
     if (interval == "1m") return "1min";
+    if (interval == "2m") return "2min";
     if (interval == "5m") return "5min";
     if (interval == "15m") return "15min";
+    if (interval == "30m") return "30min";
     if (interval == "1h") return "1h";
     if (interval == "1d") return "1d";
     return nullptr;
