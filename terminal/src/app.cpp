@@ -197,9 +197,9 @@ App::App(std::string gateway_url)
         trade_.restore_risk(r, cfg_.risk_max_drawdown_pct);
     }
     trade_.restore_symbols(cfg_.trade_symbols);
-    // Re-activate + rebuild last session's strategies and their params.
-    strat_mgr_.restore_state(cfg_.strategy_active, cfg_.strategy_loaded,
-                             cfg_.strategy_params);
+    backtest_.set_strategy(cfg_.backtest_strategy);
+    // Rebuild last session's strategies and their params.
+    strat_mgr_.restore_state(cfg_.strategy_loaded, cfg_.strategy_params);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
     if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
@@ -562,7 +562,7 @@ App::~App() {
     cfg_.risk_max_drawdown_pct = trade_.risk_dd_pct();
     cfg_.risk_stale_feed_sec = trade_.risk().stale_feed_sec;
     cfg_.trade_symbols = trade_.symbols_config();
-    cfg_.strategy_active = strat_mgr_.active_key();
+    cfg_.backtest_strategy = backtest_.strategy();
     cfg_.strategy_loaded = strat_mgr_.loaded_keys();
     cfg_.strategy_params = strat_mgr_.all_param_values();
     cfg_.save(config_path_);
@@ -616,8 +616,8 @@ void App::draw() {
     // (headless end-to-end verification of the UI -> data -> engine path).
     if (!autorun_bt_done_ && gw_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
         autorun_bt_done_ = true;
-        queue_backtest(strat_mgr_.active_key(), "AAPL", "1d", "2y", 100'000.0);
-        log_.add("autorun: queued AAPL 1d 2y backtest (" + strat_mgr_.active_name() + ")");
+        queue_backtest("", "AAPL", "1d", "2y", 100'000.0);   // built-in SMA
+        log_.add("autorun: queued AAPL 1d 2y backtest (built-in SMA)");
     }
 
     // TT_AUTORUN_SWEEP=1: 4x4 fast/slow grid — headless verification of the
@@ -698,7 +698,7 @@ void App::draw() {
     pump_leases();
 
     if (show_backtest_)
-        backtest_.draw(&show_backtest_, strat_mgr_.sources(), strat_mgr_.active_key(),
+        backtest_.draw(&show_backtest_, strat_mgr_.sources(),
                        [this](const std::string& k) { return strat_mgr_.loaded_fresh(k); },
                        pending_run_.active || strat_mgr_.load_pending(),
                        sweep_.running,
@@ -809,7 +809,8 @@ void App::draw() {
                         LiveConfig cfg;
                         cfg.symbols = syms;
                         cfg.initial_cash = opts.session_cash;
-                        cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
+                        // Session-level params stay empty: every symbol carries its
+                        // own map in symbol_params (ctx.param resolves per symbol).
                         cfg.bar_seconds = session_bar;
                         cfg.symbol_bar_seconds = sym_bars;
                         cfg.risk = session_risk;
@@ -951,11 +952,12 @@ void App::draw() {
                             }
                             for (const std::string& sym : syms)
                                 watchlist_.ensure(sym);  // quote subscription feeds the engine
+                            // Log each symbol with the strategy it runs.
                             std::string joined;
-                            for (const std::string& sym : syms)
-                                joined += (joined.empty() ? "" : ",") + sym;
-                            log_.add("live: session queued for " + joined + " (" +
-                                     strat_mgr_.active_name() + ")");
+                            for (const auto& so : opts.symbols)
+                                joined += (joined.empty() ? "" : ", ") + so.symbol + ":" +
+                                          strat_mgr_.display_name(so.strat_key);
+                            log_.add("live: session queued for " + joined);
                         } else {
                             for (const auto& l : new_leases) release_strategy(l);
                             log_.add("live: cannot start (engine busy)");
@@ -993,17 +995,15 @@ void App::draw() {
             autorun_live_stage_ = 1;
             LiveConfig cfg;
             cfg.symbols = {"SIMTEST", "SIMTEST2"};   // proves multi-symbol routing headlessly
-            cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
+            cfg.params = strat_mgr_.param_values("");   // built-in SMA
             cfg.bar_seconds = 2;
-            if (IStrategy* strat = acquire_strategy(strat_mgr_.active_key())) {
+            if (IStrategy* strat = acquire_strategy("")) {
                 // Both SIMTEST symbols run the same one strategy instance here.
                 if (engine_.start_live(std::move(cfg),
                                        std::vector<IStrategy*>{strat, strat}))
-                    leases_.push_back(
-                        {strat, strat_mgr_.active_key(), StrategyLease::Live});
+                    leases_.push_back({strat, "", StrategyLease::Live});
                 else
-                    release_strategy(
-                        {strat, strat_mgr_.active_key(), StrategyLease::Live});
+                    release_strategy({strat, "", StrategyLease::Live});
             }
             log_.add("autorun-live: session started");
         } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {

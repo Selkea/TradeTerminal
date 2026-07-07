@@ -32,7 +32,6 @@ void BacktestPanel::set_symbol(const std::string& sym) {
 }
 
 void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
-                         const std::string& active_key,
                          const std::function<bool(const std::string&)>& loaded_fresh,
                          bool activating, bool suppress_result, const RunFn& run) {
     const bool visible = ImGui::Begin("Backtest", open);
@@ -61,11 +60,7 @@ void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
     ImGui::SetNextItemWidth(100);
     ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
 
-    // Strategy dropdown: Run builds + loads the pick if it isn't active yet.
-    if (!strat_init_) {
-        strat_sel_ = active_key;
-        strat_init_ = true;
-    }
+    // Strategy dropdown: Run builds + loads the pick if it isn't loaded yet.
     constexpr const char* kBuiltin = "SMA Crossover (built-in)";
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("##btstrat",

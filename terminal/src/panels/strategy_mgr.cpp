@@ -65,17 +65,13 @@ void StrategyManagerPanel::refresh_files() {
     if (build_sel_ >= static_cast<int>(files_.size())) build_sel_ = 0;
 }
 
-void StrategyManagerPanel::start_build(const std::string& src, bool make_active) {
+void StrategyManagerPanel::start_build(const std::string& src) {
     if (building_.exchange(true)) return;
     {
         std::lock_guard lock(out_mu_);
         output_.clear();
     }
     if (build_thread_.joinable()) build_thread_.join();
-    {
-        std::lock_guard lock(pending_mu_);
-        pending_make_active_ = make_active;
-    }
     build_thread_ = std::thread([this, src] {
         std::string dll;
         const bool ok = host_.compile(src, [this](std::string l) { console(std::move(l)); }, dll);
@@ -96,24 +92,21 @@ void StrategyManagerPanel::pump() {
         const std::string want = load_queue_.front();
         load_queue_.pop_front();
         if (!loaded_fresh(want))
-            start_build((fs::path(dir_) / want).string(), /*make_active=*/false);
+            start_build((fs::path(dir_) / want).string());
     }
 
     std::string dll, src;
-    bool make_active = false;
     {
         std::lock_guard lock(pending_mu_);
         dll.swap(pending_dll_);
         src.swap(pending_src_);
-        make_active = pending_make_active_;
     }
     if (dll.empty()) return;
     std::string err;
     if (host_.load(dll, src, err)) {
         const std::string key = fs::path(src).filename().string();
         adopt_params(key);
-        if (make_active) active_key_ = key;
-        console("loaded: " + display_name(key) + (make_active ? " (active)" : ""));
+        console("loaded: " + display_name(key));
     } else {
         console("load failed: " + err);
     }
@@ -169,10 +162,9 @@ StrategyManagerPanel::all_param_values() const {
 }
 
 void StrategyManagerPanel::restore_state(
-    const std::string& active, const std::vector<std::string>& loaded,
+    const std::vector<std::string>& loaded,
     const std::map<std::string, std::map<std::string, double>>& params) {
     saved_params_ = params;
-    active_key_ = active;
     // Apply saved values to the built-in (already seeded with descriptors).
     const auto b = saved_params_.find("");
     if (b != saved_params_.end())
@@ -252,8 +244,7 @@ void StrategyManagerPanel::draw(bool* open) {
         ImGui::BeginDisabled(building_.load());
         if (ImGui::Button(building_.load() ? "Building..." : "Build & Load"))
             start_build(
-                (fs::path(dir_) / files_[static_cast<size_t>(build_sel_)]).string(),
-                /*make_active=*/true);
+                (fs::path(dir_) / files_[static_cast<size_t>(build_sel_)]).string());
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Compile + hot-load into a tab. Compiler output is in "
                               "the Build Output window (View menu).");
@@ -316,15 +307,7 @@ void StrategyManagerPanel::draw(bool* open) {
 
 void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
                                              const StrategyHost::ModuleView* mod) {
-    // Active = the strategy backtest / replay / sweep use.
-    if (key == active_key_) {
-        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "active (backtest / replay)");
-    } else if (ImGui::SmallButton("Set active")) {
-        active_key_ = key;
-        console(display_name(key) + " active");
-    }
     if (mod) {
-        ImGui::SameLine();
         ImGui::TextDisabled("(%s)", mod->key.c_str());
         if (mod->instances > 0) {
             ImGui::SameLine();
@@ -336,18 +319,16 @@ void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
         }
         ImGui::BeginDisabled(building_.load());
         if (ImGui::SmallButton(building_.load() ? "Building..." : "Rebuild"))
-            start_build((fs::path(dir_) / key).string(),
-                        /*make_active=*/key == active_key_);
+            start_build((fs::path(dir_) / key).string());
         ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::SmallButton("Unload")) {
             host_.unload(key);
-            if (active_key_ == key) active_key_.clear();
             console("unloaded " + display_name(key) +
                     (mod->instances > 0 ? " (freed when its runs end)" : ""));
         }
+        ImGui::Separator();
     }
-    ImGui::Separator();
 
     // Per-strategy parameters.
     if (std::vector<ParamValue>* params = editor_params(key)) {

@@ -57,7 +57,7 @@ AppConfig AppConfig::load(const std::string& path) {
                     if (v.is_number()) ts.params[k] = v.get<double>();
             c.trade_symbols.push_back(std::move(ts));
         }
-    c.strategy_active = j.value("strategy_active", c.strategy_active);
+    c.backtest_strategy = j.value("backtest_strategy", c.backtest_strategy);
     if (j.contains("strategy_loaded") && j["strategy_loaded"].is_array())
         for (const auto& s : j["strategy_loaded"])
             if (s.is_string()) c.strategy_loaded.push_back(s.get<std::string>());
@@ -102,7 +102,7 @@ void AppConfig::save(const std::string& path) const {
                         {"risk_dd_pct", ts.risk_dd_pct},
                         {"params", ts.params}});
     j["trade_symbols"] = std::move(syms);
-    j["strategy_active"] = strategy_active;
+    j["backtest_strategy"] = backtest_strategy;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;
 

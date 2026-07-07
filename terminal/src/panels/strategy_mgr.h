@@ -32,9 +32,6 @@ public:
     // panel being visible.
     void pump();
 
-    // Strategy the live/replay/trade side runs ("" = built-in SMA).
-    const std::string& active_key() const { return active_key_; }
-    std::string active_name() const { return display_name(active_key_); }
     std::string display_name(const std::string& key) const;
     // UI-edited parameter values for a strategy (defaults when untouched).
     std::map<std::string, double> param_values(const std::string& key) const;
@@ -61,10 +58,10 @@ public:
 
     // ---- session persistence (config.json) ----
     // Currently-loaded module keys, each's param values ("" = built-in), and a
-    // restore that re-activates + rebuilds them and seeds their saved params.
+    // restore that rebuilds them and seeds their saved params.
     std::vector<std::string> loaded_keys() const;
     std::map<std::string, std::map<std::string, double>> all_param_values() const;
-    void restore_state(const std::string& active, const std::vector<std::string>& loaded,
+    void restore_state(const std::vector<std::string>& loaded,
                        const std::map<std::string, std::map<std::string, double>>& params);
 
 private:
@@ -74,10 +71,10 @@ private:
     };
 
     void refresh_files();
-    // One strategy's tab body: active/rebuild/unload controls + param editor.
+    // One strategy's tab body: rebuild/unload controls + param editor.
     // mod is null for the built-in.
     void draw_strategy_tab(const std::string& key, const StrategyHost::ModuleView* mod);
-    void start_build(const std::string& src, bool make_active);
+    void start_build(const std::string& src);
     // Seed/merge the param editor values from a module's declared params.
     void adopt_params(const std::string& key);
     void console(std::string line);
@@ -93,14 +90,12 @@ private:
     bool want_tab_set_ = false;
     double next_refresh_s_ = 0.0;
 
-    std::string active_key_;           // "" = built-in SMA
     std::deque<std::string> load_queue_;   // pending request_loads, built one at a time
 
     std::thread build_thread_;
     std::atomic<bool> building_{false};
     mutable std::mutex pending_mu_;
     std::string pending_dll_, pending_src_;
-    bool pending_make_active_ = false;
 
     mutable std::mutex out_mu_;
     std::deque<std::string> output_;

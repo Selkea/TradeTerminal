@@ -51,9 +51,10 @@ struct AppConfig {
 
     // Trade panel: the symbol tabs from last session (empty = default AAPL).
     std::vector<TradeSymbol> trade_symbols;
-    // Strategy panel: which strategies were loaded, which was active, and each
-    // one's edited parameter values — restored (rebuilt) on startup.
-    std::string strategy_active;                    // "" = built-in
+    // Backtest panel: last strategy pick ("" = built-in).
+    std::string backtest_strategy;
+    // Strategy panel: which strategies were loaded and each one's edited
+    // parameter values — restored (rebuilt) on startup.
     std::vector<std::string> strategy_loaded;       // .cpp basenames to reload
     std::map<std::string, std::map<std::string, double>> strategy_params;
 
