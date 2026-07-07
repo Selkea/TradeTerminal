@@ -261,7 +261,8 @@ void StrategyManagerPanel::draw(bool* open) {
 
     // ---- one tab per strategy: built-in + each loaded module ----
     if (ImGui::BeginTabBar("##strat_tabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                               ImGuiTabBarFlags_Reorderable)) {
+                                               ImGuiTabBarFlags_Reorderable |
+                                               ImGuiTabBarFlags_TabListPopupButton)) {
         if (ImGui::BeginTabItem("SMA (built-in)###builtin")) {
             draw_strategy_tab("", nullptr);
             ImGui::EndTabItem();

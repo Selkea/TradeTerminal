@@ -88,7 +88,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         int remove_at = -1;
         if (!pending_.empty() &&
             ImGui::BeginTabBar("##symtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
-                                                ImGuiTabBarFlags_Reorderable)) {
+                                                ImGuiTabBarFlags_Reorderable |
+                                                ImGuiTabBarFlags_TabListPopupButton)) {
             for (size_t i = 0; i < pending_.size(); ++i) {
                 SymRow& r = pending_[i];
                 bool open = true;
