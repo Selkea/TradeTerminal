@@ -747,7 +747,7 @@ void App::draw() {
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_build_output_) strat_mgr_.draw_build_output(&show_build_output_);
     if (show_trade_)
-        trade_.draw(&show_trade_, strat_mgr_.sources(),
+        trade_.draw(&show_trade_, strat_mgr_.loaded_keys(),
                     [this](const std::string& k) {
                         std::vector<TradePanel::StratParam> out;
                         for (const auto& s : strat_mgr_.param_specs(k))
