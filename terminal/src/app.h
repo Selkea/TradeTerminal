@@ -15,6 +15,7 @@
 #include "net/gateway_data.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
+#include "panels/replay.h"
 #include "panels/chart.h"
 #include "panels/journal_panel.h"
 #include "panels/log_console.h"
@@ -141,6 +142,7 @@ private:
     ChartPanel chart_;
     WatchlistPanel watchlist_;
     BacktestPanel backtest_;
+    ReplayPanel replay_;
     StrategyManagerPanel strat_mgr_;
     TradePanel trade_;
     BlotterPanel blotter_;
@@ -220,6 +222,7 @@ private:
     bool show_chart_ = true;
     bool show_watchlist_ = true;
     bool show_backtest_ = true;
+    bool show_replay_ = false;
     bool show_sweep_ = false;
     bool show_strategy_ = true;
     bool show_build_output_ = true;

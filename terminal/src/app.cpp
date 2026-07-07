@@ -149,7 +149,8 @@ App::App(std::string gateway_url)
       host_(gxx_path(), std::string(TT_REPO_ROOT) + "/sdk/include", strategies_out_dir()),
       chart_(gw_, series_),
       watchlist_(gw_, quotes_),
-      backtest_(engine_, sessions_dir()),
+      backtest_(engine_),
+      replay_(engine_, sessions_dir()),
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
       trade_(engine_),
       blotter_(engine_),
@@ -705,37 +706,40 @@ void App::draw() {
                               const std::string& ivl, const std::string& rng,
                               double cash) {
                            queue_backtest_as(src, sym, ivl, rng, cash);
-                       },
-                       [this](const std::string& path, int bar_seconds_override) {
-                           TickLog log;
-                           std::string err;
-                           if (!tick_log_read(path, log, err)) {
-                               log_.add("replay: " + err);
-                               return;
-                           }
-                           ReplayConfig cfg;
-                           cfg.name = "replay:" +
-                                      std::filesystem::path(path).filename().string();
-                           cfg.log = std::move(log);
-                           cfg.bar_seconds_override = bar_seconds_override;
-                           cfg.initial_cash = backtest_.cash();
-                           cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
-                           const std::string strat_key = strat_mgr_.active_key();
-                           IStrategy* strat = acquire_strategy(strat_key);
-                           if (!strat) {
-                               log_.add("replay: strategy '" + strat_key + "' is not loaded");
-                               return;
-                           }
-                           if (engine_.start_replay(std::move(cfg), strat)) {
-                               // Replay shares the backtest engine slot/flag.
-                               leases_.push_back({strat, strat_key, StrategyLease::Backtest});
-                               log_.add("replay: running " + path + " (" +
-                                        strat_mgr_.active_name() + ")");
-                           } else {
-                               release_strategy({strat, strat_key, StrategyLease::Backtest});
-                               log_.add("replay: engine busy, try again");
-                           }
                        });
+    if (show_replay_)
+        replay_.draw(&show_replay_, strat_mgr_.loaded_keys(),
+                     [this](const std::string& k) { return strat_mgr_.display_name(k); },
+                     [this](const std::string& path, int bar_seconds_override,
+                            const std::string& strat_key, double cash) {
+                         TickLog log;
+                         std::string err;
+                         if (!tick_log_read(path, log, err)) {
+                             log_.add("replay: " + err);
+                             return;
+                         }
+                         ReplayConfig cfg;
+                         cfg.name = "replay:" +
+                                    std::filesystem::path(path).filename().string();
+                         cfg.log = std::move(log);
+                         cfg.bar_seconds_override = bar_seconds_override;
+                         cfg.initial_cash = cash;
+                         cfg.params = strat_mgr_.param_values(strat_key);
+                         IStrategy* strat = acquire_strategy(strat_key);
+                         if (!strat) {
+                             log_.add("replay: strategy '" + strat_key + "' is not loaded");
+                             return;
+                         }
+                         if (engine_.start_replay(std::move(cfg), strat)) {
+                             // Replay shares the backtest engine slot/flag.
+                             leases_.push_back({strat, strat_key, StrategyLease::Backtest});
+                             log_.add("replay: running " + path + " (" +
+                                      strat_mgr_.display_name(strat_key) + ")");
+                         } else {
+                             release_strategy({strat, strat_key, StrategyLease::Backtest});
+                             log_.add("replay: engine busy, try again");
+                         }
+                     });
     if (show_sweep_)
         sweep_panel_.draw(&show_sweep_, strat_mgr_.active_name(),
                           strat_mgr_.param_values(strat_mgr_.active_key()), sweep_,
@@ -1458,6 +1462,7 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Chart", nullptr, &show_chart_);
         ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
         ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
+        ImGui::MenuItem("Replay", nullptr, &show_replay_);
         ImGui::MenuItem("Optimizer", nullptr, &show_sweep_);
         ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
         ImGui::MenuItem("Build Output", nullptr, &show_build_output_);

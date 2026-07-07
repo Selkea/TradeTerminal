@@ -16,12 +16,8 @@ public:
     using RunFn = std::function<void(const std::string&, const std::string&,
                                      const std::string&, const std::string&,
                                      double)>;
-    // Re-run a captured .ttk session through the current strategy.
-    // bar_seconds_override: >0 re-bars the recording at that size, 0 = as recorded.
-    using ReplayFn = std::function<void(const std::string& path, int bar_seconds_override)>;
 
-    BacktestPanel(Engine& eng, std::string sessions_dir)
-        : eng_(eng), sessions_dir_(std::move(sessions_dir)) {}
+    explicit BacktestPanel(Engine& eng) : eng_(eng) {}
     // sources/active_key: the strategy dropdown ("" entry = built-in SMA);
     // loaded_fresh: whether a pick would run as-is or build first;
     // activating: a build/load kicked off by Run is still in flight.
@@ -29,8 +25,7 @@ public:
     void draw(bool* open, const std::vector<std::string>& sources,
               const std::string& active_key,
               const std::function<bool(const std::string&)>& loaded_fresh,
-              bool activating, bool suppress_result, const RunFn& run,
-              const ReplayFn& replay);
+              bool activating, bool suppress_result, const RunFn& run);
 
     double cash() const { return cash_; }
     void set_cash(double c) { cash_ = c; }
@@ -42,14 +37,8 @@ public:
 private:
     void draw_results();
     void export_csv();
-    void scan_replay_files();
 
     Engine& eng_;
-    std::string sessions_dir_;
-    std::vector<std::string> replay_files_;   // .ttk basenames, newest first
-    int replay_idx_ = 0;
-    int replay_bar_sec_ = 0;                  // re-bar size for replay; 0 = as recorded
-    bool replay_scanned_ = false;
     char sym_[16] = "AAPL";
     std::string strat_sel_;      // dropdown pick, by basename; "" = built-in
     bool strat_init_ = false;    // first draw adopts whatever is loaded

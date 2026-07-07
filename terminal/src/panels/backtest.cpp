@@ -31,21 +31,10 @@ void BacktestPanel::set_symbol(const std::string& sym) {
     std::snprintf(sym_, sizeof(sym_), "%s", sym.c_str());
 }
 
-void BacktestPanel::scan_replay_files() {
-    replay_files_.clear();
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(sessions_dir_, ec))
-        if (e.is_regular_file() && e.path().extension() == ".ttk")
-            replay_files_.push_back(e.path().filename().string());
-    std::sort(replay_files_.rbegin(), replay_files_.rend());   // newest first
-    replay_idx_ = 0;
-}
-
 void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
                          const std::string& active_key,
                          const std::function<bool(const std::string&)>& loaded_fresh,
-                         bool activating, bool suppress_result, const RunFn& run,
-                         const ReplayFn& replay) {
+                         bool activating, bool suppress_result, const RunFn& run) {
     const bool visible = ImGui::Begin("Backtest", open);
     tab_drag_hint();
     if (!visible) {
@@ -103,40 +92,6 @@ void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
         ImGui::SameLine();
         ImGui::TextDisabled("(builds on Run)");
     }
-
-    // ---- session replay: re-run a captured .ttk session through the strategy ----
-    ImGui::Separator();
-    ImGui::TextDisabled("Session replay");
-    if (!replay_scanned_) {
-        scan_replay_files();
-        replay_scanned_ = true;
-    }
-    if (replay_files_.empty()) {
-        ImGui::TextDisabled("(no .ttk files yet — record a session in the Trade panel)");
-    } else {
-        if (replay_idx_ >= static_cast<int>(replay_files_.size())) replay_idx_ = 0;
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::BeginCombo("##replay_file", replay_files_[replay_idx_].c_str())) {
-            for (int i = 0; i < static_cast<int>(replay_files_.size()); ++i)
-                if (ImGui::Selectable(replay_files_[i].c_str(), i == replay_idx_))
-                    replay_idx_ = i;
-            ImGui::EndCombo();
-        }
-        ImGui::SetNextItemWidth(70);
-        ImGui::InputInt("bar sec##replay", &replay_bar_sec_, 0, 0);
-        replay_bar_sec_ = std::max(0, replay_bar_sec_);
-        ImGui::SetItemTooltip("Re-bar the recording at this many seconds for on_bar "
-                              "strategies. 0 = use the size it was recorded with.");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(eng_.running());
-        if (ImGui::Button("Replay") && replay)
-            replay(sessions_dir_ + "\\" + replay_files_[replay_idx_], replay_bar_sec_);
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Re-run these captured ticks through the current strategy "
-                              "+ fill simulator");
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("refresh")) scan_replay_files();
 
     if (has_res_) {
         ImGui::Separator();

@@ -16,6 +16,7 @@ add_executable(tt_terminal
     src/panels/chart.cpp
     src/panels/watchlist.cpp
     src/panels/backtest.cpp
+    src/panels/replay.cpp
     src/panels/strategy_mgr.cpp
     src/panels/sweep.cpp
     src/panels/trade.cpp
