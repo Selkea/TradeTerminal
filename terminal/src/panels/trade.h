@@ -1,8 +1,10 @@
 #pragma once
 
+#include "config.h"
 #include "engine/engine.h"
 
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -23,8 +25,18 @@ public:
         bool record = true;
         std::string account;      // IBKR sub-account id; "" = shared account/pool
         std::string strat_key;    // strategy source basename; "" = built-in SMA
+        std::map<std::string, double> params;   // this symbol's strategy params
         RiskLimits risk{};
     };
+    // A strategy's declared parameter, its current value, and range.
+    struct StratParam {
+        std::string name;
+        double value, min, max;
+    };
+    // Resolve a strategy key's parameters (for per-symbol editing).
+    using ParamSpecsFn = std::function<std::vector<StratParam>(const std::string& key)>;
+    // Resolve a strategy key ("" = built-in) to its display name.
+    using StratNameFn = std::function<std::string(const std::string& key)>;
     struct StartOpts {
         std::vector<SymbolOpt> symbols;   // one entry per traded symbol
         double session_cash = 100'000.0;  // shared pool (simulator / single account)
@@ -48,6 +60,7 @@ public:
     // exists right now. ibkr_ready: the IBKR gateway is connected, so orders
     // route to it; otherwise the local fill simulator is used.
     void draw(bool* open, const std::vector<std::string>& strat_sources,
+              const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
               bool polygon_available, bool finnhub_available, bool ibkr_ready,
               const AccountInfo& account, const StartFn& start);
 
@@ -70,6 +83,10 @@ public:
         def_risk_dd_pct_ = dd_pct;
     }
 
+    // The symbol tabs + their per-symbol settings, for session persistence.
+    std::vector<TradeSymbol> symbols_config() const;
+    void restore_symbols(const std::vector<TradeSymbol>& syms);
+
 private:
     Engine& eng_;
     int data_idx_ = 0;               // DataFeed enum (persisted)
@@ -85,8 +102,9 @@ private:
         RiskLimits risk{};
         double risk_dd_pct = 0.0;   // UI percent; converted to fraction at start
         std::string strat_key;      // strategy source basename; "" = built-in SMA
+        std::map<std::string, double> params;   // per-symbol strategy param edits
     };
-    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0, ""}};
+    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0, "", {}}};
     // Shared-pool cash (simulator / single account) + per-symbol defaults.
     double session_cash_ = 100'000.0;
     int def_bar_sec_ = 60;

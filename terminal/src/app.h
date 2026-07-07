@@ -222,6 +222,7 @@ private:
     bool show_backtest_ = true;
     bool show_sweep_ = false;
     bool show_strategy_ = true;
+    bool show_build_output_ = true;
     bool show_trade_ = true;
     bool show_blotter_ = true;
     bool show_positions_ = true;

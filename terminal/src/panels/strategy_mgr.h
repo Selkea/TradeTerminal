@@ -25,6 +25,8 @@ public:
     ~StrategyManagerPanel();
 
     void draw(bool* open);
+    // Compiler output, in its own dockable window.
+    void draw_build_output(bool* open);
     // Advances deferred work (queued builds, loading freshly built DLLs).
     // Called by the app every frame so progress doesn't depend on this
     // panel being visible.
@@ -37,6 +39,15 @@ public:
     // UI-edited parameter values for a strategy (defaults when untouched).
     std::map<std::string, double> param_values(const std::string& key) const;
 
+    // Declared parameters for a strategy, with each one's current value and
+    // range — for panels (e.g. per-symbol Trade tabs) that edit params too.
+    // Empty until the module is loaded (built-in is always available).
+    struct ParamSpec {
+        std::string name;
+        double value, min, max;
+    };
+    std::vector<ParamSpec> param_specs(const std::string& key) const;
+
     // ---- strategy selection for other panels (Backtest dropdown) ----
     // .cpp basenames in the strategies dir.
     const std::vector<std::string>& sources() const { return files_; }
@@ -48,6 +59,14 @@ public:
     // True while a build runs or a built DLL awaits loading.
     bool load_pending() const;
 
+    // ---- session persistence (config.json) ----
+    // Currently-loaded module keys, each's param values ("" = built-in), and a
+    // restore that re-activates + rebuilds them and seeds their saved params.
+    std::vector<std::string> loaded_keys() const;
+    std::map<std::string, std::map<std::string, double>> all_param_values() const;
+    void restore_state(const std::string& active, const std::vector<std::string>& loaded,
+                       const std::map<std::string, std::map<std::string, double>>& params);
+
 private:
     struct ParamValue {
         std::string name;
@@ -55,6 +74,9 @@ private:
     };
 
     void refresh_files();
+    // One strategy's tab body: active/rebuild/unload controls + param editor.
+    // mod is null for the built-in.
+    void draw_strategy_tab(const std::string& key, const StrategyHost::ModuleView* mod);
     void start_build(const std::string& src, bool make_active);
     // Seed/merge the param editor values from a module's declared params.
     void adopt_params(const std::string& key);
@@ -66,7 +88,7 @@ private:
     std::string dir_;
 
     std::vector<std::string> files_;   // .cpp basenames
-    int selected_ = 0;                 // 0 = built-in, 1.. = files_[i-1]
+    int build_sel_ = 0;                // index into files_ for the Build picker
     double next_refresh_s_ = 0.0;
 
     std::string active_key_;           // "" = built-in SMA
@@ -83,6 +105,8 @@ private:
 
     // Param values per strategy key ("" = built-in). UI thread only.
     std::map<std::string, std::vector<ParamValue>> param_vals_;
+    // Saved values from the last session, applied by adopt_params on (re)load.
+    std::map<std::string, std::map<std::string, double>> saved_params_;
 };
 
 } // namespace tt::ui

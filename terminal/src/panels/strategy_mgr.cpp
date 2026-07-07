@@ -9,9 +9,6 @@ namespace fs = std::filesystem;
 
 namespace tt::ui {
 
-namespace {
-constexpr const char* kBuiltinLabel = "(built-in SMA)";
-}
 
 StrategyManagerPanel::StrategyManagerPanel(StrategyHost& host, Engine& eng,
                                            std::string strategies_dir)
@@ -33,9 +30,15 @@ void StrategyManagerPanel::adopt_params(const std::string& key) {
     std::vector<ParamValue> fresh;
     fresh.reserve(mv.params.size());
     const auto old = param_vals_.find(key);
+    const auto saved = saved_params_.find(key);
     for (const auto& p : mv.params) {
         double value = p.def;
-        // A rebuild keeps the user's edited value when the param survived.
+        // Precedence: default < last-session saved value < current live edit
+        // (so a first load restores saved values, a rebuild keeps live edits).
+        if (saved != saved_params_.end()) {
+            const auto it = saved->second.find(p.name);
+            if (it != saved->second.end()) value = it->second;
+        }
         if (old != param_vals_.end())
             for (const auto& o : old->second)
                 if (o.name == p.name) value = o.value;
@@ -58,7 +61,7 @@ void StrategyManagerPanel::refresh_files() {
     for (const auto& e : fs::directory_iterator(dir_, ec))
         if (e.is_regular_file(ec) && e.path().extension() == ".cpp")
             files_.push_back(e.path().filename().string());
-    if (selected_ > static_cast<int>(files_.size())) selected_ = 0;
+    if (build_sel_ >= static_cast<int>(files_.size())) build_sel_ = 0;
 }
 
 void StrategyManagerPanel::start_build(const std::string& src, bool make_active) {
@@ -136,6 +139,52 @@ std::map<std::string, double> StrategyManagerPanel::param_values(
     return out;
 }
 
+std::vector<StrategyManagerPanel::ParamSpec> StrategyManagerPanel::param_specs(
+    const std::string& key) const {
+    std::vector<ParamSpec> out;
+    const auto it = param_vals_.find(key);
+    if (it != param_vals_.end()) {
+        for (const auto& p : it->second) out.push_back({p.name, p.value, p.min, p.max});
+        return out;
+    }
+    StrategyHost::ModuleView mv;   // loaded but never edited: declared defaults
+    if (host_.info(key, mv))
+        for (const auto& p : mv.params) out.push_back({p.name, p.def, p.min, p.max});
+    return out;
+}
+
+std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
+    std::vector<std::string> out;
+    for (const auto& m : host_.modules()) out.push_back(m.key);
+    return out;
+}
+
+std::map<std::string, std::map<std::string, double>>
+StrategyManagerPanel::all_param_values() const {
+    std::map<std::string, std::map<std::string, double>> out;
+    out[""] = param_values("");
+    for (const auto& m : host_.modules()) out[m.key] = param_values(m.key);
+    return out;
+}
+
+void StrategyManagerPanel::restore_state(
+    const std::string& active, const std::vector<std::string>& loaded,
+    const std::map<std::string, std::map<std::string, double>>& params) {
+    saved_params_ = params;
+    active_key_ = active;
+    // Apply saved values to the built-in (already seeded with descriptors).
+    const auto b = saved_params_.find("");
+    if (b != saved_params_.end())
+        for (auto& p : param_vals_[""]) {
+            const auto it = b->second.find(p.name);
+            if (it != b->second.end()) p.value = it->second;
+        }
+    // Rebuild + hot-load each saved strategy; adopt_params applies its saved
+    // params once the module is up.
+    for (const std::string& key : loaded)
+        if (!key.empty()) request_load(key);
+}
+
 bool StrategyManagerPanel::loaded_fresh(const std::string& key) const {
     if (key.empty()) return true;   // built-in never builds
     return host_.has(key) && !host_.stale(key);
@@ -182,94 +231,119 @@ void StrategyManagerPanel::draw(bool* open) {
         refresh_files();
     }
 
-    ImGui::TextDisabled("Active (live/replay/trade): %s", active_name().c_str());
-    ImGui::Separator();
-
-    // Source picker: entry 0 is the built-in, the rest are .cpp files.
-    const std::string sel_key =
-        selected_ > 0 && selected_ <= static_cast<int>(files_.size())
-            ? files_[static_cast<size_t>(selected_ - 1)]
-            : std::string();
-    ImGui::SetNextItemWidth(-100);
-    if (ImGui::BeginCombo("##srcfile",
-                          sel_key.empty() ? kBuiltinLabel : sel_key.c_str())) {
-        if (ImGui::Selectable(kBuiltinLabel, selected_ == 0)) selected_ = 0;
-        for (int i = 0; i < static_cast<int>(files_.size()); ++i)
-            if (ImGui::Selectable(files_[static_cast<size_t>(i)].c_str(),
-                                  i + 1 == selected_))
-                selected_ = i + 1;
-        ImGui::EndCombo();
-    }
+    // ---- build/load a source (a loaded strategy gets its own tab below) ----
+    ImGui::TextUnformatted("Build a strategy:");
     ImGui::SameLine();
-
-    if (sel_key.empty()) {
-        ImGui::BeginDisabled(active_key_.empty());
-        if (ImGui::Button("Set active")) {
-            active_key_.clear();
-            console("built-in SMA active");
-        }
-        ImGui::EndDisabled();
+    if (files_.empty()) {
+        ImGui::TextDisabled("(no .cpp files in strategies/)");
     } else {
+        if (build_sel_ >= static_cast<int>(files_.size())) build_sel_ = 0;
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::BeginCombo("##buildsrc",
+                              files_[static_cast<size_t>(build_sel_)].c_str())) {
+            for (int i = 0; i < static_cast<int>(files_.size()); ++i)
+                if (ImGui::Selectable(files_[static_cast<size_t>(i)].c_str(),
+                                      i == build_sel_))
+                    build_sel_ = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
         ImGui::BeginDisabled(building_.load());
         if (ImGui::Button(building_.load() ? "Building..." : "Build & Load"))
-            start_build((fs::path(dir_) / sel_key).string(), /*make_active=*/true);
+            start_build(
+                (fs::path(dir_) / files_[static_cast<size_t>(build_sel_)]).string(),
+                /*make_active=*/true);
         ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Compile + hot-load into a tab. Compiler output is in "
+                              "the Build Output window (View menu).");
     }
+    ImGui::Separator();
 
-    // Loaded modules: instances in use, activation, unload (safe anytime —
-    // running instances keep the retired DLL alive until they finish).
-    const std::vector<StrategyHost::ModuleView> mods = host_.modules();
-    if (!mods.empty()) {
-        ImGui::SeparatorText("Loaded");
+    // ---- one tab per strategy: built-in + each loaded module ----
+    if (ImGui::BeginTabBar("##strat_tabs", ImGuiTabBarFlags_AutoSelectNewTabs |
+                                               ImGuiTabBarFlags_Reorderable)) {
+        if (ImGui::BeginTabItem("SMA (built-in)###builtin")) {
+            draw_strategy_tab("", nullptr);
+            ImGui::EndTabItem();
+        }
+        const std::vector<StrategyHost::ModuleView> mods = host_.modules();
         for (const auto& m : mods) {
-            ImGui::PushID(m.key.c_str());
-            ImGui::Bullet();
-            ImGui::SameLine();
-            ImGui::TextUnformatted(m.name.c_str());
-            ImGui::SameLine();
-            if (m.key == active_key_) {
-                ImGui::TextDisabled("(%s, active)", m.key.c_str());
-            } else {
-                ImGui::TextDisabled("(%s)", m.key.c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Set active")) {
-                    active_key_ = m.key;
-                    console(m.name + " active");
-                }
+            const std::string label = m.name + "###" + m.key;   // stable id = key
+            if (ImGui::BeginTabItem(label.c_str())) {
+                draw_strategy_tab(m.key, &m);
+                ImGui::EndTabItem();
             }
-            if (m.instances > 0) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%d in use", m.instances);
-            }
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+
+void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
+                                             const StrategyHost::ModuleView* mod) {
+    // Active = the strategy backtest / replay / sweep use.
+    if (key == active_key_) {
+        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "active (backtest / replay)");
+    } else if (ImGui::SmallButton("Set active")) {
+        active_key_ = key;
+        console(display_name(key) + " active");
+    }
+    if (mod) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", mod->key.c_str());
+        if (mod->instances > 0) {
             ImGui::SameLine();
-            if (ImGui::SmallButton("Unload")) {
-                host_.unload(m.key);
-                if (active_key_ == m.key) active_key_.clear();
-                console("unloaded " + m.name +
-                        (m.instances > 0 ? " (freed when its runs end)" : ""));
-            }
-            ImGui::PopID();
+            ImGui::TextDisabled("- %d in use", mod->instances);
+        }
+        if (host_.stale(key)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.2f, 1), "- source changed");
+        }
+        ImGui::BeginDisabled(building_.load());
+        if (ImGui::SmallButton(building_.load() ? "Building..." : "Rebuild"))
+            start_build((fs::path(dir_) / key).string(),
+                        /*make_active=*/key == active_key_);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unload")) {
+            host_.unload(key);
+            if (active_key_ == key) active_key_.clear();
+            console("unloaded " + display_name(key) +
+                    (mod->instances > 0 ? " (freed when its runs end)" : ""));
         }
     }
+    ImGui::Separator();
 
-    // Parameter editor for the strategy selected above.
-    if (std::vector<ParamValue>* params = editor_params(sel_key)) {
-        ImGui::SeparatorText(
-            ("Parameters — " + display_name(sel_key)).c_str());
-        for (auto& p : *params) {
-            ImGui::SetNextItemWidth(140);
-            ImGui::DragScalar(p.name.c_str(), ImGuiDataType_Double, &p.value, 1.0f,
-                              &p.min, &p.max, "%.4g");
+    // Per-strategy parameters.
+    if (std::vector<ParamValue>* params = editor_params(key)) {
+        if (params->empty()) {
+            ImGui::TextDisabled("(no parameters)");
+        } else {
+            for (auto& p : *params) {
+                ImGui::SetNextItemWidth(140);
+                ImGui::DragScalar(p.name.c_str(), ImGuiDataType_Double, &p.value, 1.0f,
+                                  &p.min, &p.max, "%.4g");
+            }
+            if (ImGui::SmallButton("Reset defaults"))
+                for (auto& p : *params) p.value = p.def;
         }
-        if (ImGui::SmallButton("Reset defaults"))
-            for (auto& p : *params) p.value = p.def;
-    } else if (!sel_key.empty()) {
+    } else {
         ImGui::TextDisabled("Build & Load to edit this strategy's parameters.");
     }
+}
 
-    // Compiler console.
-    ImGui::SeparatorText("Compiler output");
-    if (ImGui::BeginChild("##cc", ImVec2(0, 0), ImGuiChildFlags_None,
+void StrategyManagerPanel::draw_build_output(bool* open) {
+    if (!ImGui::Begin("Build Output", open)) {
+        ImGui::End();
+        return;
+    }
+    tab_drag_hint();
+    if (ImGui::SmallButton("Clear")) {
+        std::lock_guard lock(out_mu_);
+        output_.clear();
+    }
+    ImGui::Separator();
+    if (ImGui::BeginChild("##ccout", ImVec2(0, 0), ImGuiChildFlags_None,
                           ImGuiWindowFlags_HorizontalScrollbar)) {
         std::lock_guard lock(out_mu_);
         for (const auto& l : output_) {

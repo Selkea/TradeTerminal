@@ -195,6 +195,10 @@ App::App(std::string gateway_url)
         r.stale_feed_sec = cfg_.risk_stale_feed_sec;
         trade_.restore_risk(r, cfg_.risk_max_drawdown_pct);
     }
+    trade_.restore_symbols(cfg_.trade_symbols);
+    // Re-activate + rebuild last session's strategies and their params.
+    strat_mgr_.restore_state(cfg_.strategy_active, cfg_.strategy_loaded,
+                             cfg_.strategy_params);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
     if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
@@ -556,6 +560,10 @@ App::~App() {
     cfg_.risk_daily_max_loss = trade_.risk().daily_max_loss;
     cfg_.risk_max_drawdown_pct = trade_.risk_dd_pct();
     cfg_.risk_stale_feed_sec = trade_.risk().stale_feed_sec;
+    cfg_.trade_symbols = trade_.symbols_config();
+    cfg_.strategy_active = strat_mgr_.active_key();
+    cfg_.strategy_loaded = strat_mgr_.loaded_keys();
+    cfg_.strategy_params = strat_mgr_.all_param_values();
     cfg_.save(config_path_);
 }
 
@@ -737,9 +745,17 @@ void App::draw() {
                               log_.add("sweep: cancelled");
                           });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
+    if (show_build_output_) strat_mgr_.draw_build_output(&show_build_output_);
     if (show_trade_)
-        trade_.draw(&show_trade_, strat_mgr_.sources(), !polygon_key().empty(),
-                    !finnhub_key().empty(), gw_.connected(),
+        trade_.draw(&show_trade_, strat_mgr_.sources(),
+                    [this](const std::string& k) {
+                        std::vector<TradePanel::StratParam> out;
+                        for (const auto& s : strat_mgr_.param_specs(k))
+                            out.push_back({s.name, s.value, s.min, s.max});
+                        return out;
+                    },
+                    [this](const std::string& k) { return strat_mgr_.display_name(k); },
+                    !polygon_key().empty(), !finnhub_key().empty(), gw_.connected(),
                     [&] {
                         TradePanel::AccountInfo a;
                         const auto ib = read_ibkr_accounts();
@@ -856,7 +872,8 @@ void App::draw() {
                             }
                             strategies.push_back(inst);
                             cfg.symbol_params.push_back(
-                                strat_mgr_.param_values(so.strat_key));
+                                so.params.empty() ? strat_mgr_.param_values(so.strat_key)
+                                                   : so.params);
                             new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
                         }
                         if (!acq_ok) {
@@ -1443,6 +1460,7 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
         ImGui::MenuItem("Optimizer", nullptr, &show_sweep_);
         ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
+        ImGui::MenuItem("Build Output", nullptr, &show_build_output_);
         ImGui::MenuItem("Trade", nullptr, &show_trade_);
         ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
         ImGui::MenuItem("Positions", nullptr, &show_positions_);

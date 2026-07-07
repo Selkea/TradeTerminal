@@ -11,6 +11,7 @@
 namespace tt::ui {
 
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
+                      const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
                       bool polygon_available, bool finnhub_available, bool ibkr_ready,
                       const AccountInfo& account, const StartFn& start) {
     const bool visible = ImGui::Begin("Trade", open);
@@ -79,7 +80,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                          [&](const SymRow& r) { return r.symbol == sym; });
             if (!dup)
                 pending_.push_back({sym, def_bar_sec_, def_record_, 0, def_risk_,
-                                    def_risk_dd_pct_, def_strat_key_});
+                                    def_risk_dd_pct_, def_strat_key_, {}});
             input_[0] = '\0';
         }
 
@@ -124,21 +125,31 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::Checkbox("Record", &r.record);
                     ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file "
                                           "for replay");
-                    // Strategy for this symbol (built-in SMA or a loaded source).
-                    constexpr const char* kBuiltin = "SMA Crossover (built-in)";
+                    // Strategy for this symbol (built-in SMA or a loaded source),
+                    // shown by display name but stored by key.
                     ImGui::SetNextItemWidth(220);
-                    if (ImGui::BeginCombo("strategy", r.strat_key.empty()
-                                                          ? kBuiltin
-                                                          : r.strat_key.c_str())) {
-                        if (ImGui::Selectable(kBuiltin, r.strat_key.empty()))
+                    if (ImGui::BeginCombo("strategy", strat_name(r.strat_key).c_str())) {
+                        if (ImGui::Selectable(strat_name("").c_str(), r.strat_key.empty()))
                             r.strat_key.clear();
-                        for (const std::string& src : strat_sources)
-                            if (ImGui::Selectable(src.c_str(), src == r.strat_key))
+                        for (const std::string& src : strat_sources) {
+                            const std::string lbl = strat_name(src) + "###" + src;
+                            if (ImGui::Selectable(lbl.c_str(), src == r.strat_key))
                                 r.strat_key = src;
+                        }
                         ImGui::EndCombo();
                     }
-                    ImGui::SetItemTooltip("Strategy this symbol trades; params come from "
-                                          "the Strategy panel");
+                    ImGui::SetItemTooltip("Strategy this symbol trades");
+                    // This symbol's own copy of the strategy's parameters.
+                    const std::vector<StratParam> specs = strat_params(r.strat_key);
+                    if (!specs.empty() && ImGui::CollapsingHeader("Parameters")) {
+                        for (const StratParam& sp : specs) {
+                            double& v =
+                                r.params.try_emplace(sp.name, sp.value).first->second;
+                            ImGui::SetNextItemWidth(120);
+                            ImGui::InputDouble(sp.name.c_str(), &v, 0, 0, "%.4g");
+                            if (sp.min < sp.max) v = std::clamp(v, sp.min, sp.max);
+                        }
+                    }
                     ImGui::SetNextItemWidth(100);
                     ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
                     r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
@@ -201,8 +212,15 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                         ? account.subaccounts[r.account_idx] : std::string();
                 RiskLimits rk = r.risk;
                 rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
+                // This symbol's params for its current strategy (edited value or
+                // the strategy's current value); other strategies' edits ignored.
+                std::map<std::string, double> p;
+                for (const StratParam& sp : strat_params(r.strat_key)) {
+                    const auto it = r.params.find(sp.name);
+                    p[sp.name] = it != r.params.end() ? it->second : sp.value;
+                }
                 opts.symbols.push_back(
-                    {r.symbol, r.bar_sec, r.record, acct, r.strat_key, rk});
+                    {r.symbol, r.bar_sec, r.record, acct, r.strat_key, p, rk});
             }
             start(opts);
         }
@@ -281,6 +299,47 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     if (ImGui::Button("Stop session", ImVec2(-1, 0))) eng_.stop_live();
 
     ImGui::End();
+}
+
+std::vector<TradeSymbol> TradePanel::symbols_config() const {
+    std::vector<TradeSymbol> out;
+    out.reserve(pending_.size());
+    for (const SymRow& r : pending_) {
+        TradeSymbol ts;
+        ts.symbol = r.symbol;
+        ts.bar_sec = r.bar_sec;
+        ts.record = r.record;
+        ts.strat_key = r.strat_key;
+        ts.account_idx = r.account_idx;
+        ts.risk_max_order_qty = r.risk.max_order_qty;
+        ts.risk_max_position_qty = r.risk.max_position_qty;
+        ts.risk_daily_max_loss = r.risk.daily_max_loss;
+        ts.risk_stale_feed_sec = r.risk.stale_feed_sec;
+        ts.risk_dd_pct = r.risk_dd_pct;
+        ts.params = r.params;
+        out.push_back(std::move(ts));
+    }
+    return out;
+}
+
+void TradePanel::restore_symbols(const std::vector<TradeSymbol>& syms) {
+    if (syms.empty()) return;   // keep the default AAPL tab
+    pending_.clear();
+    for (const TradeSymbol& ts : syms) {
+        SymRow r;
+        r.symbol = ts.symbol;
+        r.bar_sec = ts.bar_sec;
+        r.record = ts.record;
+        r.strat_key = ts.strat_key;
+        r.account_idx = ts.account_idx;
+        r.risk.max_order_qty = ts.risk_max_order_qty;
+        r.risk.max_position_qty = ts.risk_max_position_qty;
+        r.risk.daily_max_loss = ts.risk_daily_max_loss;
+        r.risk.stale_feed_sec = ts.risk_stale_feed_sec;
+        r.risk_dd_pct = ts.risk_dd_pct;
+        r.params = ts.params;
+        pending_.push_back(std::move(r));
+    }
 }
 
 } // namespace tt::ui
