@@ -54,6 +54,9 @@ public:
     // https root to open in a browser for the gateway's login page.
     std::string account() const;
     std::string login_url() const;
+    // Every tradeable (sub-)account under the login, in gateway order. Size <= 1
+    // means a single account (no sub-accounts).
+    std::vector<std::string> accounts() const;
 
     // Whether the live session is a paper or a real-money account (from the
     // gateway's isPaper flag); Unknown until a session is established.
@@ -89,8 +92,9 @@ private:
 
     std::atomic<AccountKind> account_kind_{AccountKind::Unknown};
 
-    mutable std::mutex mu_;   // guards account_, reqs_, subs_
+    mutable std::mutex mu_;   // guards account_, accounts_, reqs_, subs_
     std::string account_;
+    std::vector<std::string> accounts_;   // all tradeable (sub-)accounts
     std::vector<CandleReq> reqs_;
     std::unordered_map<uint32_t, std::vector<std::string>> subs_;
     int poll_s_ = 5;

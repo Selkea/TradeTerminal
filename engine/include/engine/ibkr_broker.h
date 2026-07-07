@@ -39,6 +39,9 @@ struct IbkrConfig {
     // TLS cert is accepted only because the hop never leaves the machine.
     std::string gateway_url = "https://127.0.0.1:5000/v1/api";
     std::vector<std::string> symbols;   // session symbol table: id = index + 1
+    // Optional per-symbol sub-account id (parallel to symbols). Empty entry =
+    // route that symbol's orders to the session's primary account.
+    std::vector<std::string> symbol_accounts;
     // When true, submit() refuses every order (no order ever reaches the
     // gateway). Set for accounts flagged read-only — a live login used only for
     // viewing/testing. Cancels/flatten are still allowed so positions can be
@@ -59,6 +62,9 @@ bool ibkr_parse_order_response(std::string_view json_text, IbkrOrderResp& out);
 
 // GET /iserver/accounts -> selected (or first) account id, "" if none.
 std::string ibkr_parse_first_account(std::string_view json_text);
+
+// GET /iserver/accounts -> every tradeable (sub-)account id, in order.
+std::vector<std::string> ibkr_parse_accounts(std::string_view json_text);
 
 // GET /iserver/secdef/search?symbol=X -> conid of the US stock, 0 if absent.
 int64_t ibkr_parse_conid(std::string_view json_text, const std::string& symbol);

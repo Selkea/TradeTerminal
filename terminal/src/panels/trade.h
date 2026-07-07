@@ -15,16 +15,30 @@ public:
     enum class Broker : int { Sim = 0, Ibkr = 1 };
     enum class DataFeed : int { Ibkr = 0, Polygon = 1, Finnhub = 2 };
 
-    struct StartOpts {
-        std::vector<std::string> symbols;
-        double cash = 100'000.0;
+    // Per-symbol settings for a session (bar size, tick capture, sub-account).
+    struct SymbolOpt {
+        std::string symbol;
         int bar_seconds = 60;
+        bool record = true;
+        std::string account;   // IBKR sub-account id; "" = shared account/pool
+    };
+    struct StartOpts {
+        std::vector<SymbolOpt> symbols;   // one entry per traded symbol
+        double session_cash = 100'000.0;  // shared pool (simulator / single account)
         Broker broker = Broker::Sim;      // where orders route
         DataFeed data = DataFeed::Ibkr;   // where ticks come from
-        bool record = true;                  // capture ticks to a .ttk session file
-        RiskLimits risk{};
+        RiskLimits risk{};                // session-wide
     };
     using StartFn = std::function<void(const StartOpts&)>;
+
+    // Active account shown in the panel header (from the gateway/store).
+    struct AccountInfo {
+        std::string label;   // e.g. "claudiagosselin"; empty = not signed in
+        int kind = 0;        // 0 unknown, 1 paper, 2 live
+        bool readonly = false;
+        // Tradeable (sub-)accounts under the login; >1 shows a per-symbol picker.
+        std::vector<std::string> subaccounts;
+    };
 
     explicit TradePanel(Engine& eng) : eng_(eng) {}
     // polygon_available / finnhub_available: a key for that vendor exists right
@@ -32,17 +46,19 @@ public:
     // happens at runtime. ibkr_ready: the IBKR gateway is connected, so orders
     // route to it; otherwise the local fill simulator is used.
     void draw(bool* open, const std::string& strategy_name, bool polygon_available,
-              bool finnhub_available, bool ibkr_ready, const StartFn& start);
+              bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
+              const StartFn& start);
 
-    double cash() const { return cash_; }
-    int bar_sec() const { return bar_sec_; }
+    // Persisted: the shared cash pool + per-symbol defaults for new cards.
+    double cash() const { return session_cash_; }
+    int bar_sec() const { return def_bar_sec_; }
     int data_idx() const { return data_idx_; }
-    bool record() const { return record_ticks_; }
+    bool record() const { return def_record_; }
     void restore(double cash, int bar_sec, int data_idx, bool record) {
-        cash_ = cash;
-        bar_sec_ = bar_sec;
+        session_cash_ = cash;
+        def_bar_sec_ = bar_sec;
         data_idx_ = (data_idx >= 0 && data_idx <= 2) ? data_idx : 0;  // Ibkr/Poly/Finn
-        record_ticks_ = record;
+        def_record_ = record;
     }
     // Risk limits persist across restarts (armed halts must stay armed).
     const RiskLimits& risk() const { return risk_; }
@@ -55,12 +71,21 @@ public:
 private:
     Engine& eng_;
     int data_idx_ = 0;               // DataFeed enum (persisted)
-    bool record_ticks_ = true;       // persisted
     int session_broker_ = 0;         // what the running session was started with
     char input_[16] = "";
-    std::vector<std::string> pending_symbols_ = {"AAPL"};
-    double cash_ = 100'000.0;
-    int bar_sec_ = 60;
+    // One card per pending symbol: its bar size, capture flag, and (when the
+    // account has sub-accounts) which one it trades in.
+    struct SymRow {
+        std::string symbol;
+        int bar_sec = 60;
+        bool record = true;
+        int account_idx = 0;   // index into AccountInfo.subaccounts
+    };
+    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0}};
+    // Shared-pool cash (simulator / single account) + per-symbol defaults.
+    double session_cash_ = 100'000.0;
+    int def_bar_sec_ = 60;
+    bool def_record_ = true;
     RiskLimits risk_{};
     double risk_dd_pct_ = 0.0;   // UI shows percent; RiskLimits stores fraction
     double manual_qty_ = 10.0;

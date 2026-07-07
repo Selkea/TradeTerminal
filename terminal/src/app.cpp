@@ -740,13 +740,37 @@ void App::draw() {
     if (show_trade_)
         trade_.draw(&show_trade_, strat_mgr_.active_name(), !polygon_key().empty(),
                     !finnhub_key().empty(), gw_.connected(),
+                    [&] {
+                        TradePanel::AccountInfo a;
+                        const auto ib = read_ibkr_accounts();
+                        for (const auto& x : ib.accounts)
+                            if (x.name == ib.active) { a.label = x.label; break; }
+                        a.kind = static_cast<int>(gw_.account_kind());
+                        a.readonly = ib.active_readonly();
+                        a.subaccounts = gw_.accounts();
+                        return a;
+                    }(),
                     [this](const TradePanel::StartOpts& opts) {
-                        const std::vector<std::string>& syms = opts.symbols;
+                        std::vector<std::string> syms;
+                        std::vector<int> sym_bars;
+                        std::vector<std::string> sym_accts;
+                        bool any_record = false;
+                        for (const auto& so : opts.symbols) {
+                            syms.push_back(so.symbol);
+                            sym_bars.push_back(so.bar_seconds);
+                            sym_accts.push_back(so.account);
+                            any_record = any_record || so.record;
+                        }
+                        // Session default bar size (feed gap-backfill granularity);
+                        // each symbol still aggregates at its own size below.
+                        const int session_bar =
+                            opts.symbols.empty() ? 60 : opts.symbols.front().bar_seconds;
                         LiveConfig cfg;
                         cfg.symbols = syms;
-                        cfg.initial_cash = opts.cash;
+                        cfg.initial_cash = opts.session_cash;
                         cfg.params = strat_mgr_.param_values(strat_mgr_.active_key());
-                        cfg.bar_seconds = opts.bar_seconds;
+                        cfg.bar_seconds = session_bar;
+                        cfg.symbol_bar_seconds = sym_bars;
                         cfg.risk = opts.risk;
                         // Every data source is real-time now => spin the engine
                         // thread; ticks are handled in ns, not after Sleep(5).
@@ -755,7 +779,7 @@ void App::draw() {
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
                             cfg.pin_core = std::atoi(pin);
-                        if (opts.record) {
+                        if (any_record) {
                             std::error_code ec;
                             std::filesystem::create_directories(sessions_dir(), ec);
                             char name[32];
@@ -771,6 +795,7 @@ void App::draw() {
                             if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
                                 ic.gateway_url = gw;
                             ic.symbols = syms;
+                            ic.symbol_accounts = sym_accts;   // per-symbol sub-account routing
                             ic.read_only = read_ibkr_accounts().active_readonly();
                             ibkr_broker = std::make_unique<IbkrBroker>(std::move(ic));
                             cfg.broker = ibkr_broker.get();
@@ -808,7 +833,7 @@ void App::draw() {
                                 pc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
                                     pc.pin_core = std::atoi(pin);
-                                pc.bar_seconds = opts.bar_seconds;
+                                pc.bar_seconds = session_bar;
                                 polygon_feed_ =
                                     std::make_unique<PolygonFeed>(std::move(pc), sink);
                                 polygon_feed_->start();
@@ -823,7 +848,7 @@ void App::draw() {
                                 fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
                                     fc.pin_core = std::atoi(pin);
-                                fc.bar_seconds = opts.bar_seconds;
+                                fc.bar_seconds = session_bar;
                                 finnhub_feed_ =
                                     std::make_unique<FinnhubFeed>(std::move(fc), sink);
                                 finnhub_feed_->start();
@@ -839,7 +864,7 @@ void App::draw() {
                                     fc.ws_url = ws + "/ws";
                                 }
                                 fc.symbols = syms;
-                                fc.bar_seconds = opts.bar_seconds;
+                                fc.bar_seconds = session_bar;
                                 if (const char* pin = std::getenv("TT_PIN_FEED"))
                                     fc.pin_core = std::atoi(pin);
                                 ibkr_feed_ =

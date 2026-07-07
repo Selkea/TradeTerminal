@@ -744,20 +744,27 @@ void Engine::run_live(LiveConfig cfg, IStrategy* strategy) {
              (broker && !broker->ready() ? " — waiting for broker connection" : ""));
 
     // Tick -> bar aggregation so bar-based strategies work on the live feed,
-    // one aggregator per symbol.
-    const int64_t bar_ns = static_cast<int64_t>(cfg.bar_seconds) * 1'000'000'000;
+    // one aggregator per symbol, each at its own bar size (falls back to the
+    // session default when no per-symbol size was given).
+    std::vector<int64_t> bar_ns(n_sym);
+    for (size_t i = 0; i < n_sym; ++i) {
+        const int bs = (i < cfg.symbol_bar_seconds.size() && cfg.symbol_bar_seconds[i] > 0)
+                           ? cfg.symbol_bar_seconds[i] : cfg.bar_seconds;
+        bar_ns[i] = static_cast<int64_t>(bs) * 1'000'000'000;
+    }
     struct BarAgg { Bar cur{}; bool open = false; };
     std::vector<BarAgg> bar_agg(n_sym);
     auto roll_bar = [&](uint32_t symbol_id, int64_t ts, double px) {
         if (symbol_id == 0 || symbol_id > n_sym) return;
+        const int64_t bn = bar_ns[symbol_id - 1];
         BarAgg& agg = bar_agg[symbol_id - 1];
-        if (agg.open && ts >= agg.cur.ts_ns + bar_ns) {
+        if (agg.open && ts >= agg.cur.ts_ns + bn) {
             if (!halted) strategy->on_bar(ctx, symbol_id, agg.cur);
             agg.open = false;
         }
         if (!agg.open) {
             agg.open = true;
-            agg.cur = Bar{ts / bar_ns * bar_ns, px, px, px, px, 0.0};
+            agg.cur = Bar{ts / bn * bn, px, px, px, px, 0.0};
             return;
         }
         agg.cur.high = std::max(agg.cur.high, px);

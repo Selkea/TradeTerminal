@@ -77,7 +77,9 @@ struct LiveConfig {
     ExecParams exec{};
     std::map<std::string, double> params;
     RiskLimits risk{};
-    int bar_seconds = 60;           // tick->bar aggregation for on_bar
+    int bar_seconds = 60;           // tick->bar aggregation for on_bar (fallback)
+    // Optional per-symbol bar size (parallel to symbols; 0/absent = bar_seconds).
+    std::vector<int> symbol_bar_seconds;
     // Optional real-broker routing (caller-owned, must outlive the session).
     // Null = orders fill in ExecSim as before.
     IBrokerAdapter* broker = nullptr;

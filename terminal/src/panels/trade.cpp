@@ -11,7 +11,9 @@
 namespace tt::ui {
 
 void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon_available,
-                      bool finnhub_available, bool ibkr_ready, const StartFn& start) {
+                      bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
+                      const StartFn& start) {
+    (void)strategy_name;
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -22,8 +24,49 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
     const LiveSnapshot s = eng_.live_snapshot();
 
     if (!s.running) {
-        ImGui::TextDisabled("Paper trading — %s", strategy_name.c_str());
+        // ---- top row: active account (left) + data feed (right) ----
+        if (ibkr_ready && !account.label.empty()) {
+            ImGui::TextUnformatted(account.label.c_str());
+            ImGui::SameLine();
+            if (account.kind == 2)
+                ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1), "LIVE");
+            else if (account.kind == 1)
+                ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "PAPER");
+            if (account.readonly) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.25f, 1), "read-only");
+            }
+        } else {
+            ImGui::TextDisabled("Simulator - sign in to route to IBKR");
+        }
+        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon", "Finnhub"};
+        const float combo_w = 120.0f;
+        const float lbl_w =
+            ImGui::CalcTextSize("data").x + ImGui::GetStyle().ItemInnerSpacing.x;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                      ImGui::GetWindowWidth() - combo_w - lbl_w -
+                                          ImGui::GetStyle().WindowPadding.x - 6.0f));
+        ImGui::SetNextItemWidth(combo_w);
+        ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
+        ImGui::SetItemTooltip("IBKR: ~250 ms conflated top-of-book via the gateway "
+                              "session — no extra data bill.\n"
+                              "Polygon: full tick stream, needs a Polygon key.\n"
+                              "Finnhub: real-time US trade prints, free key.");
+        if (data_idx_ == 1 && !polygon_available)
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "data feed needs a Polygon key");
+        else if (data_idx_ == 2 && !finnhub_available)
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "data feed needs a Finnhub key");
 
+        // Shared cash pool for the simulator. A real IBKR account uses its own
+        // balance; with sub-accounts, each symbol picks one instead (below).
+        if (!ibkr_ready) {
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputDouble("cash", &session_cash_, 0, 0, "%.0f");
+            ImGui::SetItemTooltip("Simulator starting cash, shared across symbols");
+        }
+
+        // ---- add a symbol ----
         ImGui::SetNextItemWidth(80);
         const bool entered = ImGui::InputText("##add_sym", input_, sizeof(input_),
                                               ImGuiInputTextFlags_EnterReturnsTrue |
@@ -33,52 +76,55 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             std::string sym(input_);
             std::transform(sym.begin(), sym.end(), sym.begin(),
                            [](unsigned char c) { return std::toupper(c); });
-            if (std::find(pending_symbols_.begin(), pending_symbols_.end(), sym) ==
-                pending_symbols_.end())
-                pending_symbols_.push_back(sym);
+            const bool dup = std::any_of(pending_.begin(), pending_.end(),
+                                         [&](const SymRow& r) { return r.symbol == sym; });
+            if (!dup) pending_.push_back({sym, def_bar_sec_, def_record_, 0});
             input_[0] = '\0';
         }
+
+        // ---- per-symbol cards: each symbol its own cash / bar size / record ----
         int remove_at = -1;
-        for (size_t i = 0; i < pending_symbols_.size(); ++i) {
+        for (size_t i = 0; i < pending_.size(); ++i) {
+            SymRow& r = pending_[i];
             ImGui::PushID(static_cast<int>(i));
-            ImGui::TextUnformatted(pending_symbols_[i].c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x")) remove_at = static_cast<int>(i);
+            const std::string hdr = r.symbol + "###sym";   // stable id across renames
+            if (ImGui::CollapsingHeader(hdr.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Indent();
+                // Capital: pick a sub-account when the login has them, else the
+                // shared account/pool.
+                if (account.subaccounts.size() > 1) {
+                    r.account_idx = std::clamp(
+                        r.account_idx, 0, static_cast<int>(account.subaccounts.size()) - 1);
+                    ImGui::SetNextItemWidth(160);
+                    if (ImGui::BeginCombo("cash",
+                                          account.subaccounts[r.account_idx].c_str())) {
+                        for (int a = 0; a < static_cast<int>(account.subaccounts.size()); ++a)
+                            if (ImGui::Selectable(account.subaccounts[a].c_str(),
+                                                  a == r.account_idx))
+                                r.account_idx = a;
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SetItemTooltip("Sub-account this symbol trades in");
+                } else {
+                    ImGui::TextDisabled("cash: shared");
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Record", &r.record);
+                ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file for replay");
+                ImGui::SetNextItemWidth(100);
+                ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
+                r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
+                if (ImGui::SmallButton("remove")) remove_at = static_cast<int>(i);
+                ImGui::Unindent();
+            }
             ImGui::PopID();
         }
-        if (remove_at >= 0) pending_symbols_.erase(pending_symbols_.begin() + remove_at);
-
-        ImGui::SetNextItemWidth(100);
-        ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
-        ImGui::SetNextItemWidth(80);
-        ImGui::InputInt("bar sec", &bar_sec_);
-        bar_sec_ = std::clamp(bar_sec_, 1, 3600);
-
-        // Broker follows the signed-in account: IBKR gateway when it's connected,
-        // otherwise the local fill simulator. No manual pick.
-        if (ibkr_ready)
-            ImGui::TextDisabled("broker: IBKR gateway");
-        else
-            ImGui::TextDisabled("broker: Simulator (sign in to route to IBKR)");
-        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon", "Finnhub"};
-        ImGui::SetNextItemWidth(140);
-        ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
-        ImGui::SetItemTooltip("IBKR: ~250 ms conflated top-of-book via the gateway "
-                              "session — no extra data bill.\n"
-                              "Polygon: full tick stream, needs a Polygon key "
-                              "(Account menu or POLYGON_API_KEY).\n"
-                              "Finnhub: real-time US trade prints via websocket, "
-                              "free key (Account menu or FINNHUB_API_KEY).");
-        if (data_idx_ == 1 && !polygon_available) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "needs a Polygon key");
-        } else if (data_idx_ == 2 && !finnhub_available) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "needs a Finnhub key");
+        if (remove_at >= 0) pending_.erase(pending_.begin() + remove_at);
+        // A newly added symbol inherits the last card's settings.
+        if (!pending_.empty()) {
+            def_bar_sec_ = pending_.back().bar_sec;
+            def_record_ = pending_.back().record;
         }
-        ImGui::Checkbox("Record", &record_ticks_);
-        ImGui::SetItemTooltip("Capture every tick to a .ttk file — replay the exact "
-                              "session later, deterministically");
 
         if (ImGui::CollapsingHeader("Risk limits")) {
             ImGui::SetNextItemWidth(90);
@@ -102,12 +148,9 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
         }
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
-        if (ImGui::Button("Start paper trading") && !pending_symbols_.empty() && start) {
+        if (ImGui::Button("Start Trading") && !pending_.empty() && start) {
             session_broker_ = ibkr_ready ? 1 : 0;   // IBKR if signed in, else Simulator
             StartOpts opts;
-            opts.symbols = pending_symbols_;
-            opts.cash = cash_;
-            opts.bar_seconds = bar_sec_;
             opts.broker = static_cast<Broker>(session_broker_);
             int data = data_idx_;
             if (data == 1 && !polygon_available)
@@ -115,7 +158,14 @@ void TradePanel::draw(bool* open, const std::string& strategy_name, bool polygon
             if (data == 2 && !finnhub_available)
                 data = 0;   // no Finnhub key: fall back to gateway data
             opts.data = static_cast<DataFeed>(data);
-            opts.record = record_ticks_;
+            opts.session_cash = session_cash_;
+            for (const SymRow& r : pending_) {
+                const std::string acct =
+                    account.subaccounts.size() > 1 &&
+                            r.account_idx < static_cast<int>(account.subaccounts.size())
+                        ? account.subaccounts[r.account_idx] : std::string();
+                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct});
+            }
             opts.risk = risk_;
             opts.risk.max_drawdown_pct = risk_dd_pct_ / 100.0;
             start(opts);

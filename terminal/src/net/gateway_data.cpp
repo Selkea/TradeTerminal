@@ -84,6 +84,11 @@ std::string GatewayData::account() const {
     return account_;
 }
 
+std::vector<std::string> GatewayData::accounts() const {
+    std::lock_guard lock(mu_);
+    return accounts_;
+}
+
 std::string GatewayData::login_url() const {
     // https://localhost:5000/v1/api -> https://localhost:5000
     const size_t p = gateway_url_.find("/v1/");
@@ -215,6 +220,7 @@ void GatewayData::worker() {
                 // Re-parse every poll (not just on connect) so a mid-session
                 // account switch updates the displayed id + paper/live kind.
                 std::string acct = ibkr_parse_first_account(body);
+                std::vector<std::string> all = ibkr_parse_accounts(body);
                 AccountKind kind = AccountKind::Unknown;
                 {
                     const json j = json::parse(body, nullptr, false);
@@ -231,6 +237,7 @@ void GatewayData::worker() {
                         account_ = acct;
                         changed = true;
                     }
+                    accounts_ = std::move(all);
                 }
                 if (!was) {
                     connected_.store(true, std::memory_order_release);
@@ -248,6 +255,7 @@ void GatewayData::worker() {
                 {
                     std::lock_guard lock(mu_);
                     account_.clear();
+                    accounts_.clear();
                 }
                 if (now - last_nag_ms > 30'000) {
                     last_nag_ms = now;

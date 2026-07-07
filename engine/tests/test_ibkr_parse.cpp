@@ -43,6 +43,16 @@ TEST_CASE("accounts: selectedAccount preferred, array fallback") {
     CHECK(ibkr_parse_first_account(R"({})").empty());
 }
 
+TEST_CASE("accounts: full tradeable list, in order") {
+    const auto a = ibkr_parse_accounts(
+        R"({"accounts":["DU111111","U222222"],"selectedAccount":"U222222"})");
+    REQUIRE(a.size() == 2);
+    CHECK(a[0] == "DU111111");
+    CHECK(a[1] == "U222222");
+    CHECK(ibkr_parse_accounts(R"({"accounts":["DU111111"]})").size() == 1);
+    CHECK(ibkr_parse_accounts(R"({})").empty());
+}
+
 TEST_CASE("conid: prefers the STK row matching the symbol") {
     const char* body = R"([
       {"conid":"11111","symbol":"AAPL","secType":"OPT"},

@@ -7,6 +7,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -77,6 +78,17 @@ std::string ibkr_parse_first_account(std::string_view json_text) {
     if (it != j.end() && it->is_array() && !it->empty() && (*it)[0].is_string())
         return (*it)[0].get<std::string>();
     return {};
+}
+
+std::vector<std::string> ibkr_parse_accounts(std::string_view json_text) {
+    std::vector<std::string> out;
+    const json j = json::parse(json_text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return out;
+    const auto it = j.find("accounts");
+    if (it != j.end() && it->is_array())
+        for (const json& a : *it)
+            if (a.is_string()) out.push_back(a.get<std::string>());
+    return out;
 }
 
 int64_t ibkr_parse_conid(std::string_view json_text, const std::string& symbol) {
@@ -169,6 +181,15 @@ struct IbkrBroker::Io {
     std::vector<int64_t> conids;             // per symbol_id-1; 0 = unresolved
     std::unordered_map<uint64_t, std::string> ibkr_by_local;
     std::unordered_map<std::string, uint64_t> local_by_ibkr;
+    std::unordered_map<uint64_t, std::string> acct_by_local;   // order -> sub-account
+
+    // Sub-account an order for `symbol_id` routes to (primary if unset).
+    std::string acct_for(uint32_t symbol_id) const {
+        if (symbol_id >= 1 && symbol_id <= b.cfg_.symbol_accounts.size() &&
+            !b.cfg_.symbol_accounts[symbol_id - 1].empty())
+            return b.cfg_.symbol_accounts[symbol_id - 1];
+        return account;
+    }
     std::unordered_map<uint64_t, std::string> last_status;   // local -> status
     std::unordered_set<std::string> seen_execs;
     int64_t last_tickle_ms = 0, last_poll_ms = 0, last_login_nag_ms = 0;
@@ -317,7 +338,14 @@ struct IbkrBroker::Io {
         if (c.req.take_profit > 0.0) tp_local = add_leg(OrdType::Limit, c.req.take_profit);
         if (c.req.stop_loss > 0.0) sl_local = add_leg(OrdType::Stop, c.req.stop_loss);
 
-        Response r = call("POST", "/iserver/account/" + account + "/orders",
+        // Route to the symbol's sub-account (primary if unset); remember it so
+        // cancels/flatten target the same account.
+        const std::string acct = acct_for(c.req.symbol_id);
+        acct_by_local[c.local_id] = acct;
+        if (tp_local) acct_by_local[tp_local] = acct;
+        if (sl_local) acct_by_local[sl_local] = acct;
+
+        Response r = call("POST", "/iserver/account/" + acct + "/orders",
                           json{{"orders", orders}}.dump());
         // The gateway may answer with confirmation questions (price caps,
         // size checks); confirm up to 3 rounds — risk checks live in the
@@ -359,7 +387,9 @@ struct IbkrBroker::Io {
                 b.log("cancel #" + std::to_string(c.local_id) + ": no broker id yet");
                 return;
             }
-            call("DELETE", "/iserver/account/" + account + "/order/" + it->second, "");
+            const auto ai = acct_by_local.find(c.local_id);
+            const std::string acct = ai != acct_by_local.end() ? ai->second : account;
+            call("DELETE", "/iserver/account/" + acct + "/order/" + it->second, "");
             break;
         }
         case Cmd::CancelAll: {
@@ -368,10 +398,12 @@ struct IbkrBroker::Io {
             if (r.ok() && ibkr_parse_orders(r.body, rows)) {
                 int n = 0;
                 for (const IbkrOrderStatus& o : rows) {
-                    if (!local_by_ibkr.count(o.order_id)) continue;
+                    const auto li = local_by_ibkr.find(o.order_id);
+                    if (li == local_by_ibkr.end()) continue;
                     if (o.status == "Filled" || o.status == "Cancelled") continue;
-                    call("DELETE", "/iserver/account/" + account + "/order/" + o.order_id,
-                         "");
+                    const auto ai = acct_by_local.find(li->second);
+                    const std::string acct = ai != acct_by_local.end() ? ai->second : account;
+                    call("DELETE", "/iserver/account/" + acct + "/order/" + o.order_id, "");
                     ++n;
                 }
                 b.log("cancel-all: " + std::to_string(n) + " working orders");
@@ -379,23 +411,32 @@ struct IbkrBroker::Io {
             break;
         }
         case Cmd::Flatten: {
-            const Response r = call("GET", "/portfolio/" + account + "/positions/0", "");
-            std::vector<IbkrPosition> pos;
-            if (!r.ok() || !ibkr_parse_positions(r.body, pos)) {
-                b.log("flatten: positions fetch failed");
-                return;
-            }
-            for (const IbkrPosition& p : pos) {
-                for (size_t i = 0; i < conids.size(); ++i) {
-                    if (conids[i] != p.conid) continue;
-                    Cmd close{};
-                    close.type = Cmd::Submit;
-                    close.local_id = b.next_id_.fetch_add(1, std::memory_order_relaxed);
-                    close.req.symbol_id = static_cast<uint32_t>(i + 1);
-                    close.req.side = p.qty > 0 ? Side::Sell : Side::Buy;
-                    close.req.type = OrdType::Market;
-                    close.req.qty = p.qty > 0 ? p.qty : -p.qty;
-                    handle_submit(close);
+            // Sweep the primary account plus every distinct sub-account a symbol
+            // trades in; closes route back to the right one via handle_submit.
+            std::vector<std::string> accts = {account};
+            for (const std::string& a : b.cfg_.symbol_accounts)
+                if (!a.empty() &&
+                    std::find(accts.begin(), accts.end(), a) == accts.end())
+                    accts.push_back(a);
+            for (const std::string& acct : accts) {
+                const Response r = call("GET", "/portfolio/" + acct + "/positions/0", "");
+                std::vector<IbkrPosition> pos;
+                if (!r.ok() || !ibkr_parse_positions(r.body, pos)) {
+                    b.log("flatten: positions fetch failed for " + acct);
+                    continue;
+                }
+                for (const IbkrPosition& p : pos) {
+                    for (size_t i = 0; i < conids.size(); ++i) {
+                        if (conids[i] != p.conid) continue;
+                        Cmd close{};
+                        close.type = Cmd::Submit;
+                        close.local_id = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+                        close.req.symbol_id = static_cast<uint32_t>(i + 1);
+                        close.req.side = p.qty > 0 ? Side::Sell : Side::Buy;
+                        close.req.type = OrdType::Market;
+                        close.req.qty = p.qty > 0 ? p.qty : -p.qty;
+                        handle_submit(close);
+                    }
                 }
             }
             b.log("flatten requested (close all session positions)");
