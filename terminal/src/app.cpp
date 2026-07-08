@@ -621,6 +621,137 @@ void App::pump_sweep() {
     }
 }
 
+// Optimize every loaded strategy (plus the built-in) on the same data; the
+// champion (best HOLDOUT score — never in-sample) is applied to the target
+// symbol's Trade tab. One candidate optimizes at a time through the normal
+// sweep pipeline.
+void App::start_tournament(SweepPanel::Request rq, const std::string& target_symbol) {
+    if (tourn_.active || sweep_.running || engine_.running()) {
+        log_.add("tournament: optimizer busy, try again");
+        return;
+    }
+    // Champion selection needs unseen-data scoring; force a holdout.
+    if (rq.holdout_pct <= 0) rq.holdout_pct = 25.0;
+    tourn_ = Tournament{};
+    tourn_.active = true;
+    tourn_.base = std::move(rq);
+    tourn_.target_symbol = target_symbol;
+    tourn_.candidates.push_back("");   // built-in SMA
+    for (const std::string& k : strat_mgr_.loaded_keys()) tourn_.candidates.push_back(k);
+    tourn_.stamp_s = ImGui::GetTime();
+
+    sweep_.tourney = {};
+    sweep_.tourney.active = true;
+    sweep_.tourney.total = static_cast<int>(tourn_.candidates.size());
+    sweep_.tourney.symbol = tourn_.base.symbol;
+    log_.add("tournament: " + std::to_string(tourn_.candidates.size()) +
+             " candidates on " + tourn_.base.symbol + " " + tourn_.base.interval + " " +
+             tourn_.base.range);
+}
+
+void App::pump_tournament() {
+    if (!tourn_.active) return;
+    const double now = ImGui::GetTime();
+    sweep_.tourney.idx = static_cast<int>(tourn_.idx);
+    sweep_.tourney.current = strat_mgr_.display_name(tourn_.candidates[tourn_.idx]);
+
+    auto advance = [&](Tournament::Entry e) {
+        tourn_.results.push_back(std::move(e));
+        if (++tourn_.idx >= tourn_.candidates.size()) {
+            finish_tournament();
+        } else {
+            tourn_.phase = Tournament::Phase::Launch;
+            tourn_.stamp_s = now;
+        }
+    };
+
+    switch (tourn_.phase) {
+    case Tournament::Phase::Launch:
+        if (!sweep_.running && !engine_.running()) {
+            SweepPanel::Request rq = tourn_.base;
+            rq.strat_key = tourn_.candidates[tourn_.idx];
+            queue_sweep(rq);
+            // Keep the tournament banner alive (queue_sweep reset sweep_ state
+            // when its candles arrive — re-assert below in Queued/Running).
+            tourn_.phase = Tournament::Phase::Queued;
+            tourn_.stamp_s = now;
+        } else if (now - tourn_.stamp_s > 120.0) {
+            log_.add("tournament: engine stayed busy, aborting");
+            tourn_.active = false;
+            sweep_.tourney.active = false;
+        }
+        break;
+    case Tournament::Phase::Queued:
+        sweep_.tourney.active = true;   // survive pump_sweep's sweep_ reset
+        sweep_.tourney.total = static_cast<int>(tourn_.candidates.size());
+        sweep_.tourney.idx = static_cast<int>(tourn_.idx);
+        sweep_.tourney.symbol = tourn_.base.symbol;
+        if (sweep_.running) {
+            tourn_.phase = Tournament::Phase::Running;
+        } else if (now - tourn_.stamp_s > 60.0) {
+            // Candle fetch / strategy load failed (details in the log).
+            Tournament::Entry e;
+            e.key = tourn_.candidates[tourn_.idx];
+            advance(std::move(e));
+        }
+        break;
+    case Tournament::Phase::Running:
+        if (sweep_.running) break;
+        {
+            Tournament::Entry e;
+            e.key = tourn_.candidates[tourn_.idx];
+            if (sweep_.has_best) {
+                e.params = sweep_.best;
+                e.holdout = sweep_.has_holdout;
+                e.score = sweep_.has_holdout ? sweep_.holdout_val : sweep_.best_metric;
+                e.valid = true;
+            }
+            advance(std::move(e));
+        }
+        break;
+    }
+}
+
+void App::finish_tournament() {
+    tourn_.active = false;
+    const bool minimize = sweep_metric_minimize(tourn_.base.metric);
+    int champ = -1;
+    for (int i = 0; i < static_cast<int>(tourn_.results.size()); ++i) {
+        const auto& e = tourn_.results[static_cast<size_t>(i)];
+        if (!e.valid) continue;
+        if (champ < 0 ||
+            (minimize ? e.score < tourn_.results[static_cast<size_t>(champ)].score
+                      : e.score > tourn_.results[static_cast<size_t>(champ)].score))
+            champ = i;
+    }
+
+    // Publish the ranking to the Optimizer panel.
+    sweep_.tourney.active = false;
+    sweep_.tourney.done = true;
+    sweep_.tourney.symbol = tourn_.base.symbol;
+    sweep_.tourney.rows.clear();
+    for (int i = 0; i < static_cast<int>(tourn_.results.size()); ++i) {
+        const auto& e = tourn_.results[static_cast<size_t>(i)];
+        sweep_.tourney.rows.push_back({strat_mgr_.display_name(e.key), e.score,
+                                       e.holdout, e.valid, i == champ});
+    }
+
+    if (champ < 0) {
+        log_.add("tournament: no candidate produced a result");
+        return;
+    }
+    const auto& c = tourn_.results[static_cast<size_t>(champ)];
+    strat_mgr_.set_param_values(c.key, c.params);   // champion's params stick
+    if (!tourn_.target_symbol.empty())
+        trade_.set_symbol_strategy(tourn_.target_symbol, c.key, c.params);
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "tournament: champion %s (%s %.4g%s) -> %s",
+                  strat_mgr_.display_name(c.key).c_str(),
+                  kSweepMetrics[tourn_.base.metric], c.score,
+                  c.holdout ? " on holdout" : "", tourn_.target_symbol.c_str());
+    log_.add(buf);
+}
+
 App::~App() {
 #ifdef _WIN32
     // Tear down the gateway + auto-login daemon we started (tied to app life).
@@ -771,6 +902,7 @@ void App::draw() {
     }
 
     pump_sweep();   // before the panels: sweep results must not be stolen
+    pump_tournament();
 
     draw_menu_bar();
     draw_account_modal();
@@ -853,9 +985,19 @@ void App::draw() {
                           [this](const std::string& k) { return strat_mgr_.param_values(k); },
                           sweep_,
                           [this](const SweepPanel::Request& rq) { queue_sweep(rq); },
+                          [this](const SweepPanel::Request& rq) {
+                              // Champion applies to this symbol's Trade tab.
+                              start_tournament(rq, rq.symbol);
+                          },
                           [this] {
                               sweep_.running = false;
-                              log_.add("sweep: cancelled");
+                              if (tourn_.active) {
+                                  tourn_.active = false;
+                                  sweep_.tourney.active = false;
+                                  log_.add("tournament: cancelled");
+                              } else {
+                                  log_.add("sweep: cancelled");
+                              }
                           });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
     if (show_build_output_) strat_mgr_.draw_build_output(&show_build_output_);
@@ -868,6 +1010,22 @@ void App::draw() {
                         return out;
                     },
                     [this](const std::string& k) { return strat_mgr_.display_name(k); },
+                    [this](const std::string& sym) {
+                        // Auto-pick: tournament on this symbol with the Optimizer
+                        // panel's data settings; champion lands back in the tab.
+                        const SweepPanel::Settings s = sweep_panel_.settings();
+                        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
+                        static constexpr const char* kRng[] = {"1mo", "6mo", "1y",
+                                                               "2y",  "5y",  "max"};
+                        SweepPanel::Request rq;
+                        rq.symbol = sym;
+                        rq.interval = kIvl[std::clamp(s.interval_idx, 0, 2)];
+                        rq.range = kRng[std::clamp(s.range_idx, 0, 5)];
+                        rq.cash = s.cash;
+                        rq.metric = s.metric;
+                        rq.holdout_pct = s.holdout ? s.holdout_pct : 25.0;
+                        start_tournament(rq, sym);
+                    },
                     !polygon_key().empty(), !finnhub_key().empty(), gw_.connected(),
                     [&] {
                         TradePanel::AccountInfo a;

@@ -43,9 +43,30 @@ public:
         double holdout_pct = 0;       // >0: holdout run follows the passes
         bool has_holdout = false;     // holdout_val is valid
         double holdout_val = 0;       // winner's metric on unseen data
+
+        // Strategy tournament (auto-pick): every loaded strategy is optimized
+        // on the same data; the champion (best holdout score) is applied.
+        struct TourneyRow {
+            std::string name;
+            double score = 0;
+            bool holdout = false;     // score came from unseen data
+            bool valid = false;
+            bool champion = false;
+        };
+        struct Tourney {
+            bool active = false;
+            int idx = 0, total = 0;
+            std::string current;      // candidate being optimized (display name)
+            std::string symbol;
+            bool done = false;        // rows hold the final ranking
+            std::vector<TourneyRow> rows;
+        } tourney;
     };
 
     using RunFn = std::function<void(const Request&)>;
+    // Same request; the app optimizes EVERY loaded strategy and applies the
+    // champion (strat_key in the request is ignored).
+    using TournamentFn = std::function<void(const Request&)>;
     using CancelFn = std::function<void()>;
     // Resolve a strategy key to its display name / current param values.
     using NameFn = std::function<std::string(const std::string& key)>;
@@ -57,7 +78,7 @@ public:
     // UI). The swept parameter names come from the picked strategy's params.
     void draw(bool* open, const std::vector<std::string>& strat_keys, const NameFn& name,
               const ParamsFn& params_of, const State& st, const RunFn& run,
-              const CancelFn& cancel);
+              const TournamentFn& tournament, const CancelFn& cancel);
 
     // Session persistence.
     struct Settings {

@@ -37,6 +37,8 @@ public:
     using ParamSpecsFn = std::function<std::vector<StratParam>(const std::string& key)>;
     // Resolve a strategy key ("" = built-in) to its display name.
     using StratNameFn = std::function<std::string(const std::string& key)>;
+    // Run a strategy tournament for this symbol (auto-pick the champion).
+    using AutoPickFn = std::function<void(const std::string& symbol)>;
     struct StartOpts {
         std::vector<SymbolOpt> symbols;   // one entry per traded symbol
         double session_cash = 100'000.0;  // shared pool (simulator / single account)
@@ -61,8 +63,13 @@ public:
     // route to it; otherwise the local fill simulator is used.
     void draw(bool* open, const std::vector<std::string>& strat_sources,
               const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
-              bool polygon_available, bool finnhub_available, bool ibkr_ready,
-              const AccountInfo& account, const StartFn& start);
+              const AutoPickFn& autopick, bool polygon_available, bool finnhub_available,
+              bool ibkr_ready, const AccountInfo& account, const StartFn& start);
+
+    // Tournament champion: point this symbol's tab at a strategy + its params
+    // (adds the tab if the symbol isn't pending yet).
+    void set_symbol_strategy(const std::string& symbol, const std::string& key,
+                             const std::map<std::string, double>& params);
 
     // Persisted: the shared cash pool + per-symbol defaults for new cards.
     double cash() const { return session_cash_; }

@@ -120,6 +120,32 @@ private:
     void start_sweep_cell();
     void start_opt_param();   // begin the current param's 1-D sweep
 
+    // ---- strategy tournament (auto-pick) ----
+    // Runs the optimizer once per candidate strategy on the same data, crowns
+    // the best holdout score, applies the champion to a Trade-tab symbol.
+    struct Tournament {
+        enum class Phase { Launch, Queued, Running };
+        bool active = false;
+        Phase phase = Phase::Launch;
+        std::vector<std::string> candidates;   // "" = built-in
+        size_t idx = 0;
+        struct Entry {
+            std::string key;
+            std::map<std::string, double> params;
+            double score = 0;
+            bool holdout = false;   // score came from unseen data
+            bool valid = false;
+        };
+        std::vector<Entry> results;
+        SweepPanel::Request base;
+        std::string target_symbol;   // Trade tab row the champion applies to
+        double stamp_s = 0;          // phase-entry time, for timeouts
+    };
+    Tournament tourn_;
+    void start_tournament(SweepPanel::Request rq, const std::string& target_symbol);
+    void pump_tournament();      // UI thread, per frame
+    void finish_tournament();
+
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {
         struct Param {

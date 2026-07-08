@@ -37,7 +37,8 @@ void SweepPanel::restore(const Settings& s) {
 
 void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
                       const NameFn& name, const ParamsFn& params_of, const State& st,
-                      const RunFn& run, const CancelFn& cancel) {
+                      const RunFn& run, const TournamentFn& tournament,
+                      const CancelFn& cancel) {
     const bool visible = ImGui::Begin("Optimizer", open);
     tab_drag_hint();
     if (!visible) {
@@ -95,19 +96,20 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     ImGui::EndDisabled();
     holdout_pct_ = std::clamp(holdout_pct_, 5.0, 50.0);
 
-    if (st.running) {
+    if (st.running || st.tourney.active) {
         ImGui::ProgressBar(st.total > 0 ? static_cast<float>(st.done) / st.total : 0.0f,
                            ImVec2(180, 0));
         ImGui::SameLine();
-        ImGui::Text("pass %d/%d — %s", st.pass + 1, st.n_passes, st.cur_param.c_str());
+        if (st.tourney.active)
+            ImGui::Text("candidate %d/%d — %s   (pass %d/%d — %s)", st.tourney.idx + 1,
+                        st.tourney.total, st.tourney.current.c_str(), st.pass + 1,
+                        st.n_passes, st.cur_param.c_str());
+        else
+            ImGui::Text("pass %d/%d — %s", st.pass + 1, st.n_passes, st.cur_param.c_str());
         ImGui::SameLine();
         if (ImGui::Button("Cancel") && cancel) cancel();
     } else {
-        ImGui::BeginDisabled(eng_.running() || !sym_[0]);
-        char label[64];
-        std::snprintf(label, sizeof label, "Optimize (%d backtests)",
-                      kSweepPasses * n_params * kSweepSteps);
-        if (ImGui::Button(label) && run) {
+        auto make_request = [&] {
             for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
             Request rq;
             rq.strat_key = strat_key_;
@@ -117,13 +119,23 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
             rq.cash = cash_;
             rq.metric = metric_;
             rq.holdout_pct = use_holdout_ ? holdout_pct_ : 0.0;
-            run(rq);
-        }
-        ImGui::EndDisabled();
+            return rq;
+        };
+        ImGui::BeginDisabled(eng_.running() || !sym_[0]);
+        char label[64];
+        std::snprintf(label, sizeof label, "Optimize (%d backtests)",
+                      kSweepPasses * n_params * kSweepSteps);
+        if (ImGui::Button(label) && run) run(make_request());
         ImGui::SetItemTooltip("Coordinate descent over every declared parameter: each "
                               "pass sweeps each param across its range with the others "
                               "fixed at the best so far; pass 2 refines around the "
                               "winner. The best values are applied to the strategy.");
+        ImGui::SameLine();
+        if (ImGui::Button("Tournament") && tournament) tournament(make_request());
+        ImGui::SetItemTooltip("Optimize EVERY loaded strategy (plus the built-in) on the "
+                              "same data and crown the best holdout score; the champion "
+                              "strategy + params are applied to this symbol's Trade tab.");
+        ImGui::EndDisabled();
     }
 
     // ---- results ----
@@ -157,6 +169,25 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
         if (st.applied)
             ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1),
                                "applied to the strategy's parameters");
+    }
+
+    // Tournament ranking (once finished).
+    if (st.tourney.done && !st.tourney.rows.empty()) {
+        ImGui::SeparatorText(("Tournament — " + st.tourney.symbol).c_str());
+        for (const auto& row : st.tourney.rows) {
+            if (!row.valid) {
+                ImGui::TextDisabled("%s — no result", row.name.c_str());
+                continue;
+            }
+            if (row.champion)
+                ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1),
+                                   "%s   %s %.4g%s   <- champion, applied",
+                                   row.name.c_str(), kSweepMetrics[st.metric], row.score,
+                                   row.holdout ? " (holdout)" : "");
+            else
+                ImGui::Text("%s   %s %.4g%s", row.name.c_str(), kSweepMetrics[st.metric],
+                            row.score, row.holdout ? " (holdout)" : "");
+        }
     }
 
     // Live plot of the current (or last) 1-D param sweep.

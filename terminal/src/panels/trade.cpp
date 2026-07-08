@@ -11,10 +11,23 @@
 
 namespace tt::ui {
 
+void TradePanel::set_symbol_strategy(const std::string& symbol, const std::string& key,
+                                     const std::map<std::string, double>& params) {
+    for (SymRow& r : pending_)
+        if (r.symbol == symbol) {
+            r.strat_key = key;
+            r.params = params;
+            return;
+        }
+    pending_.push_back({symbol, def_bar_sec_, def_record_, 0, def_risk_,
+                        def_risk_dd_pct_, key, params});
+}
+
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                       const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
-                      bool polygon_available, bool finnhub_available, bool ibkr_ready,
-                      const AccountInfo& account, const StartFn& start) {
+                      const AutoPickFn& autopick, bool polygon_available,
+                      bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
+                      const StartFn& start) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -161,6 +174,11 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                         ImGui::EndCombo();
                     }
                     ImGui::SetItemTooltip("Strategy this symbol trades");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Auto-pick") && autopick) autopick(r.symbol);
+                    ImGui::SetItemTooltip("Tournament: optimize every loaded strategy on "
+                                          "recent data (Optimizer panel's settings) and "
+                                          "apply the best holdout score here");
                     // This symbol's own copy of the strategy's parameters.
                     const std::vector<StratParam> specs = strat_params(r.strat_key);
                     if (!specs.empty() && ImGui::CollapsingHeader("Parameters")) {
