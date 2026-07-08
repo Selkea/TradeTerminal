@@ -1,0 +1,459 @@
+#include "engine/tws_broker.h"
+
+#include "engine/clock.h"
+
+// TWS API (fetched at configure time; see third_party/CMakeLists.txt).
+#include "CommissionReport.h"
+#include "Contract.h"
+#include "Decimal.h"
+#include "DefaultEWrapper.h"
+#include "EClientSocket.h"
+#include "EReader.h"
+#include "EReaderOSSignal.h"
+#include "Execution.h"
+#include "Order.h"
+#include "OrderCancel.h"
+
+#include <chrono>
+#include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace tt {
+
+namespace {
+using Clock = std::chrono::steady_clock;
+
+// Order-error codes that mean "this order is dead" (vs status noise). Anything
+// else order-scoped is logged but the order's fate comes via orderStatus.
+bool fatal_order_error(int code) {
+    switch (code) {
+    case 110:   // price out of range
+    case 200:   // no security definition
+    case 201:   // order rejected
+    case 203:   // security not allowed for account
+    case 321:   // server validation error
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+// All TWS API state lives on the I/O thread. DefaultEWrapper stubs the ~100
+// callbacks; we override the handful that matter.
+struct TwsBroker::Io final : DefaultEWrapper {
+    TwsBroker& b;
+    EReaderOSSignal signal;
+    std::unique_ptr<EClientSocket> client;
+    std::unique_ptr<EReader> reader;
+
+    long next_tws_id = -1;   // seeded by nextValidId on connect
+    std::unordered_map<long, uint64_t> local_by_tws;
+    std::unordered_map<uint64_t, long> tws_by_local;
+    std::unordered_map<uint64_t, Clock::time_point> submit_t;   // ack latency
+    std::unordered_set<uint64_t> acked;
+    std::unordered_set<uint64_t> done;                // filled/cancelled locals
+    std::unordered_map<uint64_t, uint32_t> sid_by_local;
+
+    // Executions wait (briefly) for their commissionReport so the fee rides
+    // the fill event; flushed with fee 0 if the report never shows.
+    struct PendingExec {
+        EngineEvent ev{};
+        Clock::time_point at;
+    };
+    std::unordered_map<std::string, PendingExec> pending_execs;
+    std::unordered_set<std::string> seen_execs;
+
+    std::vector<double> net_pos;   // session position per symbol (from fills)
+
+    explicit Io(TwsBroker& broker) : b(broker), signal(1000) {
+        net_pos.assign(b.cfg_.symbols.size(), 0.0);
+    }
+
+    // ---- connection ---------------------------------------------------------
+    bool connect_gateway() {
+        client = std::make_unique<EClientSocket>(this, &signal);
+        if (!client->eConnect(b.cfg_.host.c_str(), b.cfg_.port, b.cfg_.client_id)) {
+            client.reset();
+            return false;
+        }
+        reader = std::make_unique<EReader>(client.get(), &signal);
+        reader->start();
+        b.log("connecting to IB Gateway at " + b.cfg_.host + ":" +
+              std::to_string(b.cfg_.port));
+        return true;
+    }
+
+    void drop_connection() {
+        b.ready_.store(false, std::memory_order_release);
+        if (client) client->eDisconnect();
+        reader.reset();
+        client.reset();
+        next_tws_id = -1;
+    }
+
+    // ---- EWrapper callbacks (I/O thread, inside processMsgs) ----------------
+    void nextValidId(OrderId orderId) override {
+        next_tws_id = orderId;
+        b.ready_.store(true, std::memory_order_release);
+        b.log("connected (socket API), orders ready");
+    }
+
+    void connectionClosed() override {
+        b.ready_.store(false, std::memory_order_release);
+        b.log("connection closed");
+    }
+
+    void managedAccounts(const std::string& accounts) override {
+        b.log("accounts: " + accounts);
+    }
+
+    void error(int id, int errorCode, const std::string& errorString,
+               const std::string&) override {
+        // 21xx = data-farm status noise; 202 = cancel confirmations.
+        if (errorCode >= 2100 && errorCode <= 2170) return;
+        b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
+              "): " + errorString);
+        const auto it = local_by_tws.find(id);
+        if (it != local_by_tws.end() && fatal_order_error(errorCode) &&
+            !done.count(it->second)) {
+            done.insert(it->second);
+            b.push_reject(it->second);
+        }
+    }
+
+    void orderStatus(OrderId orderId, const std::string& status, Decimal /*filled*/,
+                     Decimal /*remaining*/, double /*avgFillPrice*/, int /*permId*/,
+                     int /*parentId*/, double /*lastFillPrice*/, int /*clientId*/,
+                     const std::string& /*whyHeld*/, double /*mktCapPrice*/) override {
+        const auto it = local_by_tws.find(orderId);
+        if (it == local_by_tws.end()) return;
+        const uint64_t local = it->second;
+
+        // First status = the ack; this is the order-path latency that matters.
+        if (!acked.count(local)) {
+            acked.insert(local);
+            const auto st = submit_t.find(local);
+            if (st != submit_t.end()) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    Clock::now() - st->second)
+                                    .count();
+                b.log("order #" + std::to_string(local) + " acked in " +
+                      std::to_string(ms) + " ms (" + status + ")");
+            }
+        }
+        if ((status == "Cancelled" || status == "ApiCancelled" ||
+             status == "Inactive") &&
+            !done.count(local)) {
+            done.insert(local);
+            EngineEvent ev{};
+            ev.type = static_cast<uint16_t>(EvType::OrderCancel);
+            if (status == "Inactive") ev.flags = kEvFlagRejected;
+            ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+            ev.u.order.order_id = local;
+            b.push_ev(ev);
+        }
+    }
+
+    void execDetails(int /*reqId*/, const Contract& /*contract*/,
+                     const Execution& execution) override {
+        if (seen_execs.count(execution.execId)) return;
+        seen_execs.insert(execution.execId);
+        const auto it = local_by_tws.find(static_cast<long>(execution.orderId));
+        if (it == local_by_tws.end()) return;
+        const uint64_t local = it->second;
+        done.insert(local);   // at least partially filled: never auto-reject it
+
+        const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
+        const bool buy = execution.side == "BOT";
+        const double qty = DecimalFunctions::decimalToDouble(execution.shares);
+        if (sid >= 1 && sid <= net_pos.size())
+            net_pos[sid - 1] += buy ? qty : -qty;
+
+        EngineEvent ev{};
+        ev.type = static_cast<uint16_t>(EvType::Fill);
+        ev.symbol_id = sid;
+        ev.ts_event_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        ev.u.fill.order_id = local;
+        ev.u.fill.price = execution.price;
+        ev.u.fill.qty = qty;
+        ev.u.fill.fee = 0.0;   // patched by commissionReport below
+        ev.u.fill.side = static_cast<uint8_t>(buy ? Side::Buy : Side::Sell);
+        pending_execs[execution.execId] = PendingExec{ev, Clock::now()};
+    }
+
+    void commissionReport(const CommissionReport& report) override {
+        const auto it = pending_execs.find(report.execId);
+        if (it == pending_execs.end()) return;
+        it->second.ev.u.fill.fee = report.commission;
+        b.push_ev(it->second.ev);
+        pending_execs.erase(it);
+    }
+
+    // Executions whose commission report never arrived still become fills.
+    void flush_stale_execs() {
+        const auto now = Clock::now();
+        for (auto it = pending_execs.begin(); it != pending_execs.end();) {
+            if (now - it->second.at > std::chrono::seconds(1)) {
+                b.push_ev(it->second.ev);
+                it = pending_execs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // ---- order plumbing -----------------------------------------------------
+    Contract make_contract(uint32_t sid) const {
+        Contract c;
+        c.symbol = b.cfg_.symbols[sid - 1];
+        c.secType = "STK";
+        c.exchange = "SMART";
+        c.currency = "USD";
+        return c;
+    }
+
+    std::string account_for(uint32_t sid) const {
+        if (sid >= 1 && sid <= b.cfg_.symbol_accounts.size())
+            return b.cfg_.symbol_accounts[sid - 1];
+        return {};
+    }
+
+    long place(uint64_t local, uint32_t sid, const Order& order, const Contract& c) {
+        const long tws_id = next_tws_id++;
+        local_by_tws[tws_id] = local;
+        tws_by_local[local] = tws_id;
+        sid_by_local[local] = sid;
+        submit_t[local] = Clock::now();
+        client->placeOrder(tws_id, c, order);
+        return tws_id;
+    }
+
+    void handle_submit(const Cmd& cmd) {
+        if (next_tws_id < 0 || !client) {
+            b.push_reject(cmd.local_id);
+            return;
+        }
+        const uint32_t sid = cmd.req.symbol_id;
+        const Contract c = make_contract(sid);
+        const bool bracket = cmd.req.take_profit > 0.0 || cmd.req.stop_loss > 0.0;
+
+        Order parent;
+        parent.action = cmd.req.side == Side::Buy ? "BUY" : "SELL";
+        parent.totalQuantity = DecimalFunctions::doubleToDecimal(cmd.req.qty);
+        parent.orderType = cmd.req.type == OrdType::Limit  ? "LMT"
+                           : cmd.req.type == OrdType::Stop ? "STP"
+                                                           : "MKT";
+        if (cmd.req.type == OrdType::Limit) parent.lmtPrice = cmd.req.limit_price;
+        if (cmd.req.type == OrdType::Stop) parent.auxPrice = cmd.req.stop_price;
+        parent.tif = "DAY";
+        parent.account = account_for(sid);
+        parent.transmit = !bracket;   // brackets transmit on the last child
+        const long parent_tws = place(cmd.local_id, sid, parent, c);
+
+        if (!bracket) return;
+        const std::string exit_action = cmd.req.side == Side::Buy ? "SELL" : "BUY";
+        uint64_t tp_local = 0, sl_local = 0;
+        if (cmd.req.take_profit > 0.0) {
+            Order tp;
+            tp.action = exit_action;
+            tp.totalQuantity = parent.totalQuantity;
+            tp.orderType = "LMT";
+            tp.lmtPrice = cmd.req.take_profit;
+            tp.tif = "DAY";
+            tp.account = parent.account;
+            tp.parentId = parent_tws;
+            tp.transmit = cmd.req.stop_loss <= 0.0;
+            tp_local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+            place(tp_local, sid, tp, c);
+        }
+        if (cmd.req.stop_loss > 0.0) {
+            Order sl;
+            sl.action = exit_action;
+            sl.totalQuantity = parent.totalQuantity;
+            sl.orderType = "STP";
+            sl.auxPrice = cmd.req.stop_loss;
+            sl.tif = "DAY";
+            sl.account = parent.account;
+            sl.parentId = parent_tws;
+            sl.transmit = true;   // last child transmits the whole bracket
+            sl_local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+            place(sl_local, sid, sl, c);
+        }
+        if (tp_local || sl_local)
+            b.log("order #" + std::to_string(cmd.local_id) + " bracket legs: #" +
+                  std::to_string(tp_local) +
+                  (sl_local ? ", #" + std::to_string(sl_local) : ""));
+    }
+
+    void handle_cmd(const Cmd& cmd) {
+        switch (cmd.type) {
+        case Cmd::Submit:
+            handle_submit(cmd);
+            break;
+        case Cmd::Cancel: {
+            const auto it = tws_by_local.find(cmd.local_id);
+            if (it == tws_by_local.end()) {
+                b.log("cancel #" + std::to_string(cmd.local_id) + ": unknown order");
+                return;
+            }
+            if (client) client->cancelOrder(it->second, OrderCancel{});
+            break;
+        }
+        case Cmd::CancelAll: {
+            int n = 0;
+            for (const auto& [local, tws_id] : tws_by_local)
+                if (!done.count(local) && client) {
+                    client->cancelOrder(tws_id, OrderCancel{});
+                    ++n;
+                }
+            b.log("cancel-all: " + std::to_string(n) + " working orders");
+            break;
+        }
+        case Cmd::Flatten: {
+            for (size_t i = 0; i < net_pos.size(); ++i) {
+                const double pos = net_pos[i];
+                if (pos == 0.0 || !client || next_tws_id < 0) continue;
+                Order close;
+                close.action = pos > 0 ? "SELL" : "BUY";
+                close.totalQuantity = DecimalFunctions::doubleToDecimal(std::abs(pos));
+                close.orderType = "MKT";
+                close.tif = "DAY";
+                close.account = account_for(static_cast<uint32_t>(i + 1));
+                close.transmit = true;
+                const uint64_t local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+                place(local, static_cast<uint32_t>(i + 1), close,
+                      make_contract(static_cast<uint32_t>(i + 1)));
+            }
+            b.log("flatten requested (close session positions)");
+            break;
+        }
+        }
+    }
+};
+
+// ---- adapter -----------------------------------------------------------------
+
+TwsBroker::TwsBroker(TwsConfig cfg) : cfg_(std::move(cfg)) {
+    io_thread_ = std::thread([this] { io_loop(); });
+}
+
+TwsBroker::~TwsBroker() {
+    stop_.store(true, std::memory_order_release);
+    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
+        s->issueSignal();
+    if (io_thread_.joinable()) io_thread_.join();
+}
+
+uint64_t TwsBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
+    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size()) return 0;
+    if (cfg_.read_only) {
+        log("order blocked: account is READ-ONLY (trading disabled)");
+        return 0;
+    }
+    if (!ready()) {
+        log("order rejected: socket API not connected");
+        return 0;
+    }
+    const uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    Cmd c;
+    c.type = Cmd::Submit;
+    c.local_id = id;
+    c.req = r;
+    return push_cmd(c) ? id : 0;
+}
+
+bool TwsBroker::cancel(uint64_t order_id) {
+    Cmd c;
+    c.type = Cmd::Cancel;
+    c.local_id = order_id;
+    return push_cmd(c);
+}
+
+void TwsBroker::cancel_all() {
+    Cmd c;
+    c.type = Cmd::CancelAll;
+    push_cmd(c);
+}
+
+void TwsBroker::flatten() {
+    Cmd c;
+    c.type = Cmd::Flatten;
+    push_cmd(c);
+}
+
+bool TwsBroker::push_cmd(const Cmd& c) {
+    if (!cmd_ring_->try_push(c)) {
+        log("command dropped: queue full");
+        return false;
+    }
+    // Wake the I/O thread immediately (it may be parked in waitForSignal).
+    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
+        s->issueSignal();
+    return true;
+}
+
+void TwsBroker::push_ev(const EngineEvent& ev) {
+    if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
+}
+
+void TwsBroker::push_reject(uint64_t local_id) {
+    EngineEvent ev{};
+    ev.type = static_cast<uint16_t>(EvType::OrderCancel);
+    ev.flags = kEvFlagRejected;
+    ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+    ev.u.order.order_id = local_id;
+    push_ev(ev);
+}
+
+void TwsBroker::log(std::string line) {
+    std::lock_guard lock(log_mu_);
+    logs_.push_back("tws: " + std::move(line));
+    while (logs_.size() > 500) logs_.pop_front();
+}
+
+bool TwsBroker::pop_log(std::string& out) {
+    std::lock_guard lock(log_mu_);
+    if (logs_.empty()) return false;
+    out = std::move(logs_.front());
+    logs_.pop_front();
+    return true;
+}
+
+void TwsBroker::io_loop() {
+    Io io(*this);
+    wake_.store(&io.signal, std::memory_order_release);
+
+    auto last_connect = Clock::time_point{};
+    while (!stop_.load(std::memory_order_acquire)) {
+        if (!io.client || !io.client->isConnected()) {
+            io.drop_connection();
+            const auto now = Clock::now();
+            if (now - last_connect >= std::chrono::seconds(3)) {
+                last_connect = now;
+                if (!io.connect_gateway())
+                    log("cannot reach IB Gateway at " + cfg_.host + ":" +
+                        std::to_string(cfg_.port) + " (is it running + API enabled?)");
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        } else {
+            io.signal.waitForSignal();
+            if (io.reader) io.reader->processMsgs();
+        }
+
+        Cmd c;
+        while (cmd_ring_->try_pop(c)) io.handle_cmd(c);
+        io.flush_stale_execs();
+    }
+
+    wake_.store(nullptr, std::memory_order_release);
+    io.drop_connection();
+}
+
+} // namespace tt
