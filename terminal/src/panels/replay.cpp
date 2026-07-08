@@ -50,10 +50,9 @@ void ReplayPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     ImGui::SameLine();
     if (ImGui::SmallButton("refresh")) scan_files();
 
-    // Strategy pick (loaded modules only; build via the Strategy panel).
-    if (!strat_key_.empty() &&
-        std::find(strat_keys.begin(), strat_keys.end(), strat_key_) == strat_keys.end())
-        strat_key_.clear();   // picked module was unloaded: fall back to built-in
+    // Strategy pick (loaded modules only; build via the Strategy panel). A pick
+    // that isn't loaded right now is kept — the startup restore rebuilds
+    // strategies asynchronously, and running it too early just logs an error.
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("strategy", name(strat_key_).c_str())) {
         if (ImGui::Selectable(name("").c_str(), strat_key_.empty())) strat_key_.clear();

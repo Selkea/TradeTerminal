@@ -58,6 +58,20 @@ AppConfig AppConfig::load(const std::string& path) {
             c.trade_symbols.push_back(std::move(ts));
         }
     c.backtest_strategy = j.value("backtest_strategy", c.backtest_strategy);
+    c.replay_strategy = j.value("replay_strategy", c.replay_strategy);
+    c.replay_cash = j.value("replay_cash", c.replay_cash);
+    c.replay_bar_sec = j.value("replay_bar_sec", c.replay_bar_sec);
+    c.sweep_strategy = j.value("sweep_strategy", c.sweep_strategy);
+    c.sweep_symbol = j.value("sweep_symbol", c.sweep_symbol);
+    c.sweep_interval_idx = j.value("sweep_interval_idx", c.sweep_interval_idx);
+    c.sweep_range_idx = j.value("sweep_range_idx", c.sweep_range_idx);
+    c.sweep_cash = j.value("sweep_cash", c.sweep_cash);
+    c.sweep_metric = j.value("sweep_metric", c.sweep_metric);
+    c.sweep_holdout = j.value("sweep_holdout", c.sweep_holdout);
+    c.sweep_holdout_pct = j.value("sweep_holdout_pct", c.sweep_holdout_pct);
+    if (j.contains("panels") && j["panels"].is_object())
+        for (const auto& [k, v] : j["panels"].items())
+            if (v.is_boolean()) c.panels[k] = v.get<bool>();
     if (j.contains("strategy_loaded") && j["strategy_loaded"].is_array())
         for (const auto& s : j["strategy_loaded"])
             if (s.is_string()) c.strategy_loaded.push_back(s.get<std::string>());
@@ -103,6 +117,18 @@ void AppConfig::save(const std::string& path) const {
                         {"params", ts.params}});
     j["trade_symbols"] = std::move(syms);
     j["backtest_strategy"] = backtest_strategy;
+    j["replay_strategy"] = replay_strategy;
+    j["replay_cash"] = replay_cash;
+    j["replay_bar_sec"] = replay_bar_sec;
+    j["sweep_strategy"] = sweep_strategy;
+    j["sweep_symbol"] = sweep_symbol;
+    j["sweep_interval_idx"] = sweep_interval_idx;
+    j["sweep_range_idx"] = sweep_range_idx;
+    j["sweep_cash"] = sweep_cash;
+    j["sweep_metric"] = sweep_metric;
+    j["sweep_holdout"] = sweep_holdout;
+    j["sweep_holdout_pct"] = sweep_holdout_pct;
+    j["panels"] = panels;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;
 

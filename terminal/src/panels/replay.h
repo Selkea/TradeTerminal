@@ -28,8 +28,15 @@ public:
     void draw(bool* open, const std::vector<std::string>& strat_keys, const NameFn& name,
               const ReplayFn& replay);
 
+    // Session persistence.
     double cash() const { return cash_; }
-    void set_cash(double c) { cash_ = c; }
+    const std::string& strategy() const { return strat_key_; }
+    int bar_sec() const { return bar_sec_; }
+    void restore(const std::string& strat, double cash, int bar_sec) {
+        strat_key_ = strat;
+        cash_ = cash;
+        bar_sec_ = bar_sec < 0 ? 0 : bar_sec;
+    }
 
 private:
     void scan_files();

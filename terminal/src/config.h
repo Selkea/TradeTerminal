@@ -53,6 +53,21 @@ struct AppConfig {
     std::vector<TradeSymbol> trade_symbols;
     // Backtest panel: last strategy pick ("" = built-in).
     std::string backtest_strategy;
+    // Replay panel: last strategy pick, cash, and re-bar override.
+    std::string replay_strategy;
+    double replay_cash = 100'000.0;
+    int replay_bar_sec = 0;
+    // Optimizer panel settings.
+    std::string sweep_strategy;
+    std::string sweep_symbol = "AAPL";
+    int sweep_interval_idx = 2;
+    int sweep_range_idx = 3;
+    double sweep_cash = 100'000.0;
+    int sweep_metric = 0;
+    bool sweep_holdout = true;
+    double sweep_holdout_pct = 25.0;
+    // Which panels (View menu) were open; missing entry = the panel's default.
+    std::map<std::string, bool> panels;
     // Strategy panel: which strategies were loaded and each one's edited
     // parameter values — restored (rebuilt) on startup.
     std::vector<std::string> strategy_loaded;       // .cpp basenames to reload

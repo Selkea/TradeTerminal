@@ -24,6 +24,17 @@ int max_range_idx(int interval_idx) {
 }
 } // namespace
 
+void SweepPanel::restore(const Settings& s) {
+    strat_key_ = s.strat_key;
+    std::snprintf(sym_, sizeof sym_, "%s", s.symbol.c_str());
+    interval_idx_ = std::clamp(s.interval_idx, 0, 2);
+    range_idx_ = std::clamp(s.range_idx, 0, 5);
+    cash_ = s.cash;
+    metric_ = std::clamp(s.metric, 0, static_cast<int>(IM_ARRAYSIZE(kSweepMetrics)) - 1);
+    use_holdout_ = s.holdout;
+    holdout_pct_ = std::clamp(s.holdout_pct, 5.0, 50.0);
+}
+
 void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
                       const NameFn& name, const ParamsFn& params_of, const State& st,
                       const RunFn& run, const CancelFn& cancel) {
@@ -35,9 +46,8 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     }
 
     // Strategy to optimize (loaded modules only; build via the Strategy panel).
-    if (!strat_key_.empty() &&
-        std::find(strat_keys.begin(), strat_keys.end(), strat_key_) == strat_keys.end())
-        strat_key_.clear();   // picked module was unloaded: fall back to built-in
+    // A pick that isn't loaded right now is kept — the startup restore rebuilds
+    // strategies asynchronously.
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("strategy", name(strat_key_).c_str())) {
         if (ImGui::Selectable(name("").c_str(), strat_key_.empty())) strat_key_.clear();

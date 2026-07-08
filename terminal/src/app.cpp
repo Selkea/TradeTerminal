@@ -198,6 +198,29 @@ App::App(std::string gateway_url)
     }
     trade_.restore_symbols(cfg_.trade_symbols);
     backtest_.set_strategy(cfg_.backtest_strategy);
+    replay_.restore(cfg_.replay_strategy, cfg_.replay_cash, cfg_.replay_bar_sec);
+    sweep_panel_.restore({cfg_.sweep_strategy, cfg_.sweep_symbol,
+                          cfg_.sweep_interval_idx, cfg_.sweep_range_idx, cfg_.sweep_cash,
+                          cfg_.sweep_metric, cfg_.sweep_holdout, cfg_.sweep_holdout_pct});
+    // Panel visibility from last session (missing entry = the panel's default).
+    {
+        auto vis = [&](const char* k, bool& flag) {
+            const auto it = cfg_.panels.find(k);
+            if (it != cfg_.panels.end()) flag = it->second;
+        };
+        vis("chart", show_chart_);
+        vis("watchlist", show_watchlist_);
+        vis("backtest", show_backtest_);
+        vis("replay", show_replay_);
+        vis("optimizer", show_sweep_);
+        vis("strategy", show_strategy_);
+        vis("build_output", show_build_output_);
+        vis("trade", show_trade_);
+        vis("blotter", show_blotter_);
+        vis("positions", show_positions_);
+        vis("journal", show_journal_);
+        vis("log", show_log_);
+    }
     // Rebuild last session's strategies and their params.
     strat_mgr_.restore_state(cfg_.strategy_loaded, cfg_.strategy_params);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
@@ -624,6 +647,32 @@ App::~App() {
     cfg_.risk_stale_feed_sec = trade_.risk().stale_feed_sec;
     cfg_.trade_symbols = trade_.symbols_config();
     cfg_.backtest_strategy = backtest_.strategy();
+    cfg_.replay_strategy = replay_.strategy();
+    cfg_.replay_cash = replay_.cash();
+    cfg_.replay_bar_sec = replay_.bar_sec();
+    {
+        const SweepPanel::Settings s = sweep_panel_.settings();
+        cfg_.sweep_strategy = s.strat_key;
+        cfg_.sweep_symbol = s.symbol;
+        cfg_.sweep_interval_idx = s.interval_idx;
+        cfg_.sweep_range_idx = s.range_idx;
+        cfg_.sweep_cash = s.cash;
+        cfg_.sweep_metric = s.metric;
+        cfg_.sweep_holdout = s.holdout;
+        cfg_.sweep_holdout_pct = s.holdout_pct;
+    }
+    cfg_.panels = {{"chart", show_chart_},
+                   {"watchlist", show_watchlist_},
+                   {"backtest", show_backtest_},
+                   {"replay", show_replay_},
+                   {"optimizer", show_sweep_},
+                   {"strategy", show_strategy_},
+                   {"build_output", show_build_output_},
+                   {"trade", show_trade_},
+                   {"blotter", show_blotter_},
+                   {"positions", show_positions_},
+                   {"journal", show_journal_},
+                   {"log", show_log_}};
     cfg_.strategy_loaded = strat_mgr_.loaded_keys();
     cfg_.strategy_params = strat_mgr_.all_param_values();
     cfg_.save(config_path_);

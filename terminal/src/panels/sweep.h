@@ -59,6 +59,21 @@ public:
               const ParamsFn& params_of, const State& st, const RunFn& run,
               const CancelFn& cancel);
 
+    // Session persistence.
+    struct Settings {
+        std::string strat_key, symbol;
+        int interval_idx = 2, range_idx = 3;
+        double cash = 100'000.0;
+        int metric = 0;
+        bool holdout = true;
+        double holdout_pct = 25.0;
+    };
+    Settings settings() const {
+        return {strat_key_, sym_,     interval_idx_, range_idx_,
+                cash_,      metric_,  use_holdout_,  holdout_pct_};
+    }
+    void restore(const Settings& s);
+
 private:
     Engine& eng_;
     std::string strat_key_;   // "" = built-in SMA
