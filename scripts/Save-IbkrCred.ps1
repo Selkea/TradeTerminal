@@ -66,17 +66,17 @@ function Read-Plain([Security.SecureString]$s) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
 }
 
-# For a live account: offer read-only (view/test with no real-money orders) and
-# an authenticator (TOTP) secret so the daemon can complete 2FA headlessly.
+# Read-only only makes sense for live (paper money is not real). The TOTP
+# prompt applies to BOTH modes: IBKR's Secure Login 2FA is per-username, so a
+# 2FA-enrolled login gets the challenge even with the Paper toggle.
 $readonly = $false
-$totpPlain = ''
 if (-not $paper) {
     $roAns = Read-Host 'Read-only (disable trading)? (Y/n)'
     $readonly = -not ($roAns -match '^[Nn]')   # default: read-only for live
-    Write-Host 'TOTP secret enables unattended login (from IBKR "Mobile Authenticator" setup; base32).'
-    $totpSec = Read-Host 'Authenticator TOTP secret (blank to skip)' -AsSecureString
-    $totpPlain = (Read-Plain $totpSec) -replace '\s', ''   # strip spaces/grouping
 }
+Write-Host 'TOTP secret enables unattended login when the username has 2FA (base32; blank to skip).'
+$totpSec = Read-Host 'Authenticator TOTP secret' -AsSecureString
+$totpPlain = (Read-Plain $totpSec) -replace '\s', ''   # strip spaces/grouping
 
 $plain = Read-Plain (Read-Host 'IBKR password' -AsSecureString)
 
