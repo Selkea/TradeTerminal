@@ -16,12 +16,15 @@
 
 namespace tt {
 
+// Commission model = IBKR Pro Fixed (US stocks): per-share rate with a $1
+// minimum per order, capped at 1% of the trade's value.
 struct ExecParams {
     int64_t latency_ns = 250'000;        // fixed one-way order latency
     int64_t latency_jitter_ns = 50'000;  // uniform [0, jitter)
     double slippage_bps = 1.0;           // market-order slippage, basis points
     double fee_per_share = 0.005;
     double min_fee = 1.0;
+    double max_fee_pct = 1.0;            // fee cap, % of trade value (0 = off)
     uint64_t seed = 42;                  // deterministic latency jitter
 };
 
@@ -62,7 +65,7 @@ private:
         int64_t effective_ns;   // now + modeled latency at submit
     };
 
-    double fee(double qty) const;
+    double fee(double qty, double price) const;
     int64_t latency();
 
     ExecParams params_;

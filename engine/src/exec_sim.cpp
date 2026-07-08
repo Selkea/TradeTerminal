@@ -12,8 +12,13 @@ int64_t ExecSim::latency() {
     return l;
 }
 
-double ExecSim::fee(double qty) const {
-    return std::max(params_.min_fee, std::abs(qty) * params_.fee_per_share);
+// IBKR Pro Fixed: per-share with a minimum per order, capped at a percentage
+// of trade value (the cap is what keeps tiny scalp-sized orders realistic).
+double ExecSim::fee(double qty, double price) const {
+    double f = std::max(params_.min_fee, std::abs(qty) * params_.fee_per_share);
+    if (params_.max_fee_pct > 0.0 && price > 0.0)
+        f = std::min(f, std::abs(qty) * price * params_.max_fee_pct / 100.0);
+    return f;
 }
 
 uint64_t ExecSim::submit(const OrderRequest& r, int64_t now_ns) {
@@ -90,7 +95,7 @@ void ExecSim::on_price(uint32_t symbol_id, double price, int64_t now_ns,
 
         if (fills) {
             out.push_back(Fill{o.id, o.symbol_id, o.side, {}, now_ns,
-                               fill_price, o.qty, fee(o.qty)});
+                               fill_price, o.qty, fee(o.qty, fill_price)});
             filled.push_back(o);
             it = pending_.erase(it);
         } else {
