@@ -205,6 +205,17 @@ public:
     void kill_switch();                     // cancel all + flatten + halt strategy
     LiveSnapshot live_snapshot() const;
 
+    // ---- live hot-swap (autopilot) ----
+    // Queue new params — and optionally a replacement strategy instance — for
+    // one symbol of the running session. The live thread applies a pending
+    // swap only while that symbol is FLAT, then re-inits the (new) instance so
+    // it re-reads its params with clean state; a watchdog halt on the symbol
+    // is lifted. The instance is caller-owned and must outlive the session
+    // (lease it like any live strategy). Latest queued swap per symbol wins.
+    void update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params);
+    void swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
+                              std::map<std::string, double> params);
+
 private:
     friend class EngineCtx;
     struct LiveCmd {
@@ -240,6 +251,19 @@ private:
 
     // ---- live state ----
     using CmdRing = SpscRing<LiveCmd, 1 << 12>;
+    // Pending hot-swaps (UI thread queues, live thread applies while flat).
+    // Not on the cmd ring: param maps aren't POD. has_swaps_ keeps the live
+    // loop's fast path to one relaxed atomic load.
+    struct PendingSwap {
+        uint32_t symbol_id = 0;
+        IStrategy* strategy = nullptr;   // null = params-only update
+        std::map<std::string, double> params;
+    };
+    std::mutex swap_mu_;
+    std::vector<PendingSwap> pending_swaps_;
+    std::atomic<bool> has_swaps_{false};
+    void queue_swap(PendingSwap s);
+
     std::unique_ptr<CmdRing> cmd_ring_ = std::make_unique<CmdRing>();
     std::thread live_thread_;
     std::atomic<bool> live_running_{false};

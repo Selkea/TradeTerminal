@@ -543,6 +543,30 @@ void Engine::kill_switch() {
     cmd_ring_->try_push(LiveCmd{LiveCmd::Kill, 0, 0, 0, 0});
 }
 
+void Engine::queue_swap(PendingSwap s) {
+    if (!live_running_.load(std::memory_order_relaxed) || s.symbol_id == 0) return;
+    std::lock_guard lock(swap_mu_);
+    // Latest swap per symbol wins.
+    for (auto& p : pending_swaps_)
+        if (p.symbol_id == s.symbol_id) {
+            p = std::move(s);
+            has_swaps_.store(true, std::memory_order_release);
+            return;
+        }
+    pending_swaps_.push_back(std::move(s));
+    has_swaps_.store(true, std::memory_order_release);
+}
+
+void Engine::update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params) {
+    queue_swap(PendingSwap{symbol_id, nullptr, std::move(params)});
+}
+
+void Engine::swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
+                                  std::map<std::string, double> params) {
+    if (!strategy) return;
+    queue_swap(PendingSwap{symbol_id, strategy, std::move(params)});
+}
+
 void Engine::stop_live() {
     if (live_running_.load(std::memory_order_relaxed))
         while (!cmd_ring_->try_push(LiveCmd{LiveCmd::Stop, 0, 0, 0, 0})) Sleep(1);
@@ -624,6 +648,15 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     };
 
     IBrokerAdapter* const broker = cfg.broker;
+    // Hot-swap target: one param slot per symbol (ctx reads through the
+    // pointer, so in-place updates are visible immediately after a re-init).
+    // Stale swaps from a previous session are dropped.
+    cfg.symbol_params.resize(cfg.symbols.size());
+    {
+        std::lock_guard lock(swap_mu_);
+        pending_swaps_.clear();
+        has_swaps_.store(false, std::memory_order_relaxed);
+    }
     EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
                   exec, pf, lat, &cfg.risk, record_order, broker, &cfg.symbol_risk,
                   &cfg.symbol_params);
@@ -823,6 +856,46 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         if (d > watchdog_ns) halt_symbol(sid, d);
     };
 
+    // Apply queued hot-swaps for symbols that are FLAT: install the new params
+    // (and instance, for a strategy swap), lift any watchdog halt, and re-init
+    // so the strategy re-reads its params with clean state. Symbols holding a
+    // position stay queued until they go flat. (Instances are per-symbol in
+    // the app; a shared instance would be reset for all its symbols.)
+    auto apply_swaps = [&] {
+        std::vector<PendingSwap> ready;
+        {
+            std::lock_guard lock(swap_mu_);
+            for (size_t i = 0; i < pending_swaps_.size();) {
+                PendingSwap& s = pending_swaps_[i];
+                if (s.symbol_id < 1 || s.symbol_id > n_sym) {
+                    pending_swaps_.erase(pending_swaps_.begin() +
+                                         static_cast<ptrdiff_t>(i));
+                    continue;
+                }
+                if (pf.position(s.symbol_id).qty != 0.0) {   // wait for flat
+                    ++i;
+                    continue;
+                }
+                ready.push_back(std::move(s));
+                pending_swaps_.erase(pending_swaps_.begin() + static_cast<ptrdiff_t>(i));
+            }
+            has_swaps_.store(!pending_swaps_.empty(), std::memory_order_release);
+        }
+        for (PendingSwap& s : ready) {
+            const size_t i = s.symbol_id - 1;
+            cfg.symbol_params[i] = std::move(s.params);
+            if (s.strategy) strategies[i] = s.strategy;
+            if (!strategies[i]) continue;
+            strat_halted[i] = 0;   // fresh start: watchdog halt lifted
+            ctx.set_current_event_tsc(0);
+            ctx.set_current_symbol(s.symbol_id);
+            strategies[i]->on_init(ctx);
+            push_log("live: " + cfg.symbols[i] +
+                     (s.strategy ? ": strategy swapped" : ": params updated") +
+                     " (re-init while flat)");
+        }
+    };
+
     // Tick -> bar aggregation so bar-based strategies work on the live feed,
     // one aggregator per symbol, each at its own bar size (falls back to the
     // session default when no per-symbol size was given).
@@ -861,6 +934,10 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     int idle = 0;
     bool stop = false;
     while (!stop) {
+        // Hot-swaps: one relaxed load per iteration; the work happens only
+        // when the autopilot actually queued something.
+        if (has_swaps_.load(std::memory_order_acquire)) apply_swaps();
+
         LiveCmd c;
         bool had_cmd = false;
         while (cmd_ring_->try_pop(c)) {
