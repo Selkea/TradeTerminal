@@ -246,6 +246,19 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
     Write-Host "  WARNING: python not on PATH - open a fresh terminal, then: python -m pip install ibeam pyotp" -ForegroundColor Yellow
 }
 
+# --- 2d. desktop shortcut ------------------------------------------------------
+Step "Desktop shortcut"
+$exe = Join-Path $buildDir "terminal\tt_terminal.exe"
+$lnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "TradeTerminal.lnk"
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut($lnk)
+$sc.TargetPath = $exe
+$sc.WorkingDirectory = Split-Path $exe
+$sc.IconLocation = "$exe,0"
+$sc.Description = "TradeTerminal"
+$sc.Save()
+Write-Host "  $lnk"
+
 # --- 3. trading-box tuning ----------------------------------------------------
 Step "Power plan: High performance (no core parking / frequency scaling)"
 powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
