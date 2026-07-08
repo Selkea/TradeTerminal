@@ -87,11 +87,30 @@ if (Test-Path "C:\msys64\usr\bin\bash.exe") {
 }
 
 Step "Installing MSYS2 UCRT64 packages"
-# First -Syu on a fresh MSYS2 can ask to restart the shell; running the
-# package install as a separate invocation handles that.
-& C:\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm" | Out-Null
+# On a fresh MSYS2 the first -Syu only upgrades the core and stops; a second
+# pass updates the rest. Both are no-ops when already current.
+& C:\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
+& C:\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
 & C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-glfw mingw-w64-ucrt-x86_64-curl mingw-w64-ucrt-x86_64-sqlite3"
 if ($LASTEXITCODE -ne 0) { throw "pacman package install failed" }
+
+# The UCRT64 runtime DLLs live in C:\msys64\ucrt64\bin, and g++'s cc1plus,
+# the built app (libcurl/glfw/sqlite3/libstdc++), and the Strategy panel's
+# hot-compile all resolve them via PATH - register it machine-wide.
+$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+if ($machinePath -notlike "*C:\msys64\ucrt64\bin*") {
+    [Environment]::SetEnvironmentVariable("Path", "C:\msys64\ucrt64\bin;" + $machinePath,
+                                          "Machine")
+}
+Update-PathEnv
+
+Step "Compiler sanity check"
+'int main(){return 0;}' | Set-Content "$env:TEMP\tt_cc_test.cpp"
+& C:\msys64\ucrt64\bin\g++.exe "$env:TEMP\tt_cc_test.cpp" -o "$env:TEMP\tt_cc_test.exe"
+if ($LASTEXITCODE -ne 0) {
+    throw "g++ cannot compile a test program (exit $LASTEXITCODE) - check that C:\msys64\ucrt64\bin is on PATH and antivirus is not blocking cc1plus"
+}
+Write-Host "  g++ OK"
 
 # --- 2. clone + build ---------------------------------------------------------
 Step "Cloning $RepoUrl"
@@ -107,6 +126,13 @@ git -C $RepoDir config --local user.email "4535629+Selkea@users.noreply.github.c
 
 Step "Building (ucrt64-release)"
 Set-Location $RepoDir
+# A previously failed configure leaves a poisoned cache (CMakeCache.txt with
+# no build.ninja) - wipe it so this run starts clean.
+$buildDir = "C:\dev\build\TradeTerminal\ucrt64-release"
+if ((Test-Path "$buildDir\CMakeCache.txt") -and -not (Test-Path "$buildDir\build.ninja")) {
+    Write-Host "  clearing stale CMake cache from a failed configure"
+    Remove-Item -Recurse -Force $buildDir
+}
 & C:\msys64\ucrt64\bin\cmake.exe --preset ucrt64-release
 if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 & C:\msys64\ucrt64\bin\cmake.exe --build --preset ucrt64-release
