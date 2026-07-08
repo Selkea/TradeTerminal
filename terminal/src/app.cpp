@@ -512,8 +512,16 @@ void App::pump_sweep() {
                 // starting from its current values.
                 opt_ = AutoOpt{};
                 opt_.key = sweep_setup_.key;
+                // Sizing knobs are not signal: optimizing them just maximizes
+                // leverage (the sim would happily oblige), so they keep their
+                // manual values and only signal params are swept.
+                auto is_sizing = [](const std::string& n) {
+                    return n == "qty" || n == "max_qty" || n == "alloc_pct" ||
+                           n == "risk_pct";
+                };
                 for (const auto& s : strat_mgr_.param_specs(opt_.key))
-                    if (s.max > s.min) opt_.params.push_back({s.name, s.min, s.max});
+                    if (s.max > s.min && !is_sizing(s.name))
+                        opt_.params.push_back({s.name, s.min, s.max});
                 opt_.best = sweep_base_.params;
 
                 sweep_ = SweepPanel::State{};
