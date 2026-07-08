@@ -16,8 +16,28 @@ $store = Join-Path $dir 'ibkr-accounts.json'
 
 $user = Read-Host 'IBKR username'
 if ([string]::IsNullOrWhiteSpace($user)) { Write-Error 'Username is required.'; exit 1 }
-$name = Read-Host "Account label [$user]"
+# The unique id is the key the app switches/removes by - it must be different
+# for every account. The display name (asked next) may be shared freely.
+$name = Read-Host "Unique account id [$user]"
 if ([string]::IsNullOrWhiteSpace($name)) { $name = $user }
+
+if (Test-Path $store) {
+    $o = Get-Content $store -Raw | ConvertFrom-Json
+} else {
+    $o = [pscustomobject]@{ active = ''; accounts = @() }
+}
+$existing = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
+if ($existing) {
+    $ow = Read-Host "An account with id '$name' already exists. Overwrite it? (y/N)"
+    if ($ow -notmatch '^[Yy]') { Write-Host 'Aborted - nothing changed.'; exit 1 }
+}
+
+$labelDefault = $name
+if ($existing -and ($existing.PSObject.Properties.Name -contains 'label') -and $existing.label) {
+    $labelDefault = [string]$existing.label
+}
+$display = Read-Host "Display name [$labelDefault]"
+if ([string]::IsNullOrWhiteSpace($display)) { $display = $labelDefault }
 
 $paperAns = Read-Host 'Paper account? (Y/n)'
 $paper = -not ($paperAns -match '^[Nn]')   # default: paper
@@ -48,23 +68,12 @@ function Protect-Str([string]$s) {
     ($enc | ForEach-Object { $_.ToString('x2') }) -join ''
 }
 
-if (Test-Path $store) {
-    $o = Get-Content $store -Raw | ConvertFrom-Json
-} else {
-    $o = [pscustomobject]@{ active = ''; accounts = @() }
-}
-
-# Preserve an existing display label so a re-save keeps the shown name (lets a
-# paper + live account share one label, e.g. "claudiagosselin"). Default to key.
-$existing = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
-$label = if ($existing -and $existing.label) { [string]$existing.label } else { $name }
-
 $totp = if ([string]::IsNullOrWhiteSpace($totpPlain)) { '' } else { Protect-Str $totpPlain }
-$entry = [pscustomobject]@{ name = $name; label = $label; user = (Protect-Str $user); pass = (Protect-Str $plain); paper = $paper; readonly = $readonly; totp = $totp }
+$entry = [pscustomobject]@{ name = $name; label = $display; user = (Protect-Str $user); pass = (Protect-Str $plain); paper = $paper; readonly = $readonly; totp = $totp }
 $plain = $null
 $totpPlain = $null
 
-# Upsert by label; keep the rest.
+# Upsert by unique id; keep the rest.
 $list = @($o.accounts | Where-Object { $_.name -ne $name })
 $list += $entry
 $o.accounts = $list
