@@ -16,16 +16,41 @@ function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 # --- IB Gateway (stable standalone) -------------------------------------------
 Step "IB Gateway"
 $jts = "C:\Jts\ibgateway"
-$haveGw = (Test-Path $jts) -and @(Get-ChildItem $jts -Directory -ErrorAction SilentlyContinue).Count -gt 0
-if ($haveGw) {
-    Write-Host "  already installed: $((Get-ChildItem $jts -Directory | Select-Object -First 1).FullName)"
+
+# IBC expects the install under the NUMERIC version dir (C:\Jts\ibgateway\1030
+# style). Detect the version from the launch jar and normalize the dir name.
+function Get-GwVersion($dir) {
+    $jar = Get-ChildItem (Join-Path $dir "jars") -Filter "*launch-*.jar" -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($jar -and $jar.Name -match '(\d{3,4})') { return $Matches[1] }
+    return $null
+}
+function Normalize-GwDir {
+    foreach ($d in @(Get-ChildItem $jts -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -match '^\d+$') { continue }
+        $ver = Get-GwVersion $d.FullName
+        if ($ver -and -not (Test-Path (Join-Path $jts $ver))) {
+            Rename-Item $d.FullName $ver
+            Write-Host "  normalized $($d.Name) -> $ver"
+        }
+    }
+}
+
+$numeric = @(Get-ChildItem $jts -Directory -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match '^\d+$' })
+if ($numeric.Count -eq 0) { Normalize-GwDir }
+$numeric = @(Get-ChildItem $jts -Directory -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match '^\d+$' })
+if ($numeric.Count -gt 0) {
+    Write-Host "  already installed: $($numeric[0].FullName)"
 } else {
     $exe = Join-Path $env:TEMP "ibgateway-stable.exe"
     curl.exe -sL -o $exe "https://download2.interactivebrokers.com/installers/ibgateway/stable-standalone/ibgateway-stable-standalone-windows-x64.exe"
     if ($LASTEXITCODE -ne 0) { throw "IB Gateway download failed" }
-    # install4j installer: -q = silent, default dir C:\Jts.
-    Start-Process $exe -ArgumentList "-q" -Wait
-    if (-not (Test-Path $jts)) { throw "IB Gateway install did not produce C:\Jts\ibgateway" }
+    # install4j silent install NEEDS an explicit -dir (bare -q no-ops).
+    Start-Process $exe -ArgumentList "-q", "-dir", "$jts\_install" -Wait
+    if (-not (Test-Path "$jts\_install")) { throw "IB Gateway install produced nothing" }
+    Normalize-GwDir
     Write-Host "  installed"
 }
 

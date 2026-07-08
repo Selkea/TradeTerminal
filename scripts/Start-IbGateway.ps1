@@ -50,8 +50,9 @@ $port = if ($isPaper) { 4002 } else { 4001 }
 
 # --- locate IB Gateway + IBC ---------------------------------------------------
 $gwVer = Get-ChildItem "C:\Jts\ibgateway" -Directory -ErrorAction SilentlyContinue |
-         Sort-Object Name -Descending | Select-Object -First 1
-if (-not $gwVer) { Write-Error "IB Gateway not installed. Run Install-IbGateway.ps1."; exit 1 }
+         Where-Object { $_.Name -match '^\d+$' } |
+         Sort-Object { [int]$_.Name } -Descending | Select-Object -First 1
+if (-not $gwVer) { Write-Error "IB Gateway not installed (no numeric version dir). Run Install-IbGateway.ps1."; exit 1 }
 if (-not (Test-Path "C:\IBC\IBC.jar")) { Write-Error "IBC not installed. Run Install-IbGateway.ps1."; exit 1 }
 
 # --- IBC config (no secrets) ---------------------------------------------------
