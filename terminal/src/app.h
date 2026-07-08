@@ -7,6 +7,8 @@
 #include "engine/ibkr_feed.h"
 #include "engine/polygon_feed.h"
 #include "engine/finnhub_feed.h"
+#include "engine/tws_broker.h"
+#include "engine/tws_feed.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
@@ -202,6 +204,7 @@ private:
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<IbkrBroker> ibkr_;
+    std::unique_ptr<TwsBroker> tws_;   // same ordering contract as ibkr_
     // Same reasoning: the host destroys any leftover per-run strategy
     // instances and unloads their DLLs, which must happen only after the
     // engine's threads are joined.
@@ -212,6 +215,7 @@ private:
     std::unique_ptr<PolygonFeed> polygon_feed_;
     std::unique_ptr<FinnhubFeed> finnhub_feed_;
     std::unique_ptr<IbkrFeed> ibkr_feed_;
+    std::unique_ptr<TwsFeed> tws_feed_;
     std::atomic<bool> rt_feed_active_{false};   // worker thread: skip snapshot ticks
     AlertNotifier alerts_;
     ChartPanel chart_;

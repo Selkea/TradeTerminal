@@ -54,7 +54,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         } else {
             ImGui::TextDisabled("Simulator - sign in to route to IBKR");
         }
-        static constexpr const char* kData[] = {"IBKR (gateway)", "Polygon", "Finnhub"};
+        static constexpr const char* kData[] = {"IBKR (web)", "Polygon", "Finnhub",
+                                                "IBKR (TWS)"};
         const float combo_w = 120.0f;
         const float lbl_w =
             ImGui::CalcTextSize("data").x + ImGui::GetStyle().ItemInnerSpacing.x;
@@ -64,14 +65,34 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                           ImGui::GetStyle().WindowPadding.x - 6.0f));
         ImGui::SetNextItemWidth(combo_w);
         ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
-        ImGui::SetItemTooltip("IBKR: ~250 ms conflated top-of-book via the gateway "
-                              "session — no extra data bill.\n"
+        ImGui::SetItemTooltip("IBKR (web): ~250 ms conflated top-of-book via the CP "
+                              "gateway session — no extra data bill.\n"
                               "Polygon: full tick stream, needs a Polygon key.\n"
-                              "Finnhub: real-time US trade prints, free key.");
+                              "Finnhub: real-time US trade prints, free key.\n"
+                              "IBKR (TWS): tick-by-tick via IB Gateway's socket API "
+                              "(real-time needs a market-data subscription).");
         if (data_idx_ == 1 && !polygon_available)
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "data feed needs a Polygon key");
         else if (data_idx_ == 2 && !finnhub_available)
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "data feed needs a Finnhub key");
+
+        // Order route: which IBKR door orders go through.
+        ImGui::AlignTextToFramePadding();
+        if (route_ == 1)
+            ImGui::TextDisabled("broker: IBKR via TWS socket");
+        else if (ibkr_ready)
+            ImGui::TextDisabled("broker: IBKR via web API");
+        else
+            ImGui::TextDisabled("broker: Simulator (sign in to route to IBKR)");
+        ImGui::SameLine();
+        static constexpr const char* kRoutes[] = {"Web API", "TWS"};
+        ImGui::SetNextItemWidth(90);
+        ImGui::Combo("route", &route_, kRoutes, IM_ARRAYSIZE(kRoutes));
+        ImGui::SetItemTooltip(
+            "Which IBKR interface orders use.\n"
+            "Web API: the Client Portal gateway (~75 ms orders; auto-login).\n"
+            "TWS: IB Gateway's socket API (~5-20 ms orders; needs IB Gateway "
+            "running and logged in, port 4002 paper / 4001 live).");
 
         // Shared cash pool for the simulator. A real IBKR account uses its own
         // balance; with sub-accounts, each symbol picks one instead (below).
@@ -284,7 +305,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
         if (ImGui::Button("Start Trading") && !pending_.empty() && start) {
-            session_broker_ = ibkr_ready ? 1 : 0;   // IBKR if signed in, else Simulator
+            // TWS route is explicit; web route follows the sign-in (else sim).
+            session_broker_ = route_ == 1 ? 2 : (ibkr_ready ? 1 : 0);
             StartOpts opts;
             opts.broker = static_cast<Broker>(session_broker_);
             int data = data_idx_;
@@ -328,8 +350,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     ImGui::SameLine();
     if (s.halted)
         ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "HALTED");
+    else if (session_broker_ == 2)
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr tws)");
     else if (session_broker_ == 1)
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr)");
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr web)");
     else
         ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "LIVE (paper)");
 

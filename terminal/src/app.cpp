@@ -187,7 +187,7 @@ App::App(std::string gateway_url)
     chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
     backtest_.set_cash(cfg_.backtest_cash);
     trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec, cfg_.trade_data_idx,
-                   cfg_.trade_record);
+                   cfg_.trade_record, cfg_.trade_route);
     {
         RiskLimits r;
         r.max_order_qty = cfg_.risk_max_order_qty;
@@ -926,6 +926,7 @@ App::~App() {
     cfg_.trade_bar_sec = trade_.bar_sec();
     cfg_.trade_data_idx = trade_.data_idx();
     cfg_.trade_record = trade_.record();
+    cfg_.trade_route = trade_.route();
     cfg_.risk_max_order_qty = trade_.risk().max_order_qty;
     cfg_.risk_max_position_qty = trade_.risk().max_position_qty;
     cfg_.risk_daily_max_loss = trade_.risk().daily_max_loss;
@@ -984,6 +985,16 @@ void App::draw() {
             alert_scan(line);
             log_.add(std::move(line));
         }
+    if (tws_)
+        while (tws_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
+    if (tws_feed_)
+        while (tws_feed_->pop_log(line)) {
+            alert_scan(line);
+            log_.add(std::move(line));
+        }
     if (polygon_feed_)
         while (polygon_feed_->pop_log(line)) {
             alert_scan(line);
@@ -1000,11 +1011,13 @@ void App::draw() {
             log_.add(std::move(line));
         }
     // Session over: stop streaming (frees the vendor connection slot).
-    if ((polygon_feed_ || finnhub_feed_ || ibkr_feed_) && !engine_.live_running()) {
+    if ((polygon_feed_ || finnhub_feed_ || ibkr_feed_ || tws_feed_) &&
+        !engine_.live_running()) {
         rt_feed_active_.store(false, std::memory_order_relaxed);
         polygon_feed_.reset();
         finnhub_feed_.reset();
         ibkr_feed_.reset();
+        tws_feed_.reset();
         log_.add("live: real-time feed stopped");
     }
 
@@ -1268,7 +1281,19 @@ void App::draw() {
                             std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
                             cfg.capture_path = sessions_dir() + "\\" + name;
                         }
+                        // IB Gateway socket port follows the active account's mode.
+                        auto tws_port = [&] {
+                            const auto ib = read_ibkr_accounts();
+                            bool paper = true;
+                            for (const auto& a : ib.accounts)
+                                if (a.name == ib.active) paper = a.paper;
+                            int port = paper ? 4002 : 4001;
+                            if (const char* p = std::getenv("TT_TWS_PORT"))
+                                port = std::atoi(p);
+                            return port;
+                        };
                         std::unique_ptr<IbkrBroker> ibkr_broker;
+                        std::unique_ptr<TwsBroker> tws_broker;
                         if (opts.broker == TradePanel::Broker::Ibkr) {
                             IbkrConfig ic;
                             if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
@@ -1281,6 +1306,17 @@ void App::draw() {
                             log_.add(ic.read_only
                                          ? "live: IBKR account is READ-ONLY — orders blocked"
                                          : "live: routing orders to IBKR gateway");
+                        } else if (opts.broker == TradePanel::Broker::Tws) {
+                            TwsConfig tc;
+                            tc.port = tws_port();
+                            tc.symbols = syms;
+                            tc.symbol_accounts = sym_accts;
+                            tc.read_only = read_ibkr_accounts().active_readonly();
+                            const int port = tc.port;
+                            tws_broker = std::make_unique<TwsBroker>(std::move(tc));
+                            cfg.broker = tws_broker.get();
+                            log_.add("live: routing orders via TWS socket (port " +
+                                     std::to_string(port) + ")");
                         }
                         // Each symbol needs its strategy built + loaded first.
                         std::string unbuilt;
@@ -1342,9 +1378,11 @@ void App::draw() {
                             // Previous session's thread was joined inside
                             // start_live, so replacing the old broker is safe.
                             ibkr_ = std::move(ibkr_broker);
+                            tws_ = std::move(tws_broker);
                             polygon_feed_.reset();   // previous session's feeds
                             finnhub_feed_.reset();
                             ibkr_feed_.reset();
+                            tws_feed_.reset();
                             rt_feed_active_.store(false, std::memory_order_relaxed);
                             const auto sink = [this](const EngineEvent& ev) {
                                 return engine_.push_feed_event(ev);
@@ -1365,6 +1403,14 @@ void App::draw() {
                                 polygon_feed_ =
                                     std::make_unique<PolygonFeed>(std::move(pc), sink);
                                 polygon_feed_->start();
+                                rt_feed_active_.store(true, std::memory_order_relaxed);
+                            } else if (opts.data == TradePanel::DataFeed::Tws) {
+                                TwsFeedConfig fc;
+                                fc.port = tws_port();
+                                fc.symbols = syms;
+                                tws_feed_ =
+                                    std::make_unique<TwsFeed>(std::move(fc), sink);
+                                tws_feed_->start();
                                 rt_feed_active_.store(true, std::memory_order_relaxed);
                             } else if (opts.data == TradePanel::DataFeed::Finnhub &&
                                        !finnhub_key().empty()) {

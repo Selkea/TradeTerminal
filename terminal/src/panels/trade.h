@@ -14,8 +14,8 @@ namespace tt::ui {
 // switch, and session status. (Session replay lives in the Backtest panel.)
 class TradePanel {
 public:
-    enum class Broker : int { Sim = 0, Ibkr = 1 };
-    enum class DataFeed : int { Ibkr = 0, Polygon = 1, Finnhub = 2 };
+    enum class Broker : int { Sim = 0, Ibkr = 1, Tws = 2 };
+    enum class DataFeed : int { Ibkr = 0, Polygon = 1, Finnhub = 2, Tws = 3 };
 
     // Per-symbol settings for a session (bar size, tick capture, sub-account,
     // risk limits). max_drawdown_pct is already a fraction here.
@@ -81,12 +81,14 @@ public:
     double cash() const { return session_cash_; }
     int bar_sec() const { return def_bar_sec_; }
     int data_idx() const { return data_idx_; }
+    int route() const { return route_; }
     bool record() const { return def_record_; }
-    void restore(double cash, int bar_sec, int data_idx, bool record) {
+    void restore(double cash, int bar_sec, int data_idx, bool record, int route) {
         session_cash_ = cash;
         def_bar_sec_ = bar_sec;
-        data_idx_ = (data_idx >= 0 && data_idx <= 2) ? data_idx : 0;  // Ibkr/Poly/Finn
+        data_idx_ = (data_idx >= 0 && data_idx <= 3) ? data_idx : 0;
         def_record_ = record;
+        route_ = (route >= 0 && route <= 1) ? route : 0;
     }
     // Persisted default risk limits, seeded into each new symbol card.
     const RiskLimits& risk() const { return def_risk_; }
@@ -103,6 +105,7 @@ public:
 private:
     Engine& eng_;
     int data_idx_ = 0;               // DataFeed enum (persisted)
+    int route_ = 0;                  // order route: 0 Web API (auto), 1 TWS socket
     int session_broker_ = 0;         // what the running session was started with
     int want_tab_ = -1;              // tab-list button: symbol index to select
     char input_[16] = "";
