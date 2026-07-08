@@ -373,7 +373,8 @@ void StrategyManagerPanel::draw_build_output(bool* open) {
     }
     ImGui::Separator();
     if (ImGui::BeginChild("##ccout", ImVec2(0, 0), ImGuiChildFlags_None,
-                          ImGuiWindowFlags_HorizontalScrollbar)) {
+                          ImGuiWindowFlags_HorizontalScrollbar |
+                              ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
         std::lock_guard lock(out_mu_);
         for (const auto& l : output_) {
             const bool is_err = l.find("error") != std::string::npos;
@@ -382,8 +383,13 @@ void StrategyManagerPanel::draw_build_output(bool* open) {
             else
                 ImGui::TextUnformatted(l.c_str());
         }
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.0f);
+        // Follow new output only when already at the bottom; scrolling up to
+        // read is never fought.
+        if (output_.size() != out_seen_) {
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+                ImGui::SetScrollHereY(1.0f);
+            out_seen_ = output_.size();
+        }
     }
     ImGui::EndChild();
     ImGui::End();

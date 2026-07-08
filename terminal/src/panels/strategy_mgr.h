@@ -103,6 +103,7 @@ private:
 
     mutable std::mutex out_mu_;
     std::deque<std::string> output_;
+    size_t out_seen_ = 0;   // lines already on screen (auto-scroll on new ones)
 
     // Param values per strategy key ("" = built-in). UI thread only.
     std::map<std::string, std::vector<ParamValue>> param_vals_;
