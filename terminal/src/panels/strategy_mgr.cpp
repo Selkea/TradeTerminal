@@ -295,9 +295,17 @@ void StrategyManagerPanel::draw(bool* open) {
             const std::string label = m.name + "###" + m.key;   // stable id = key
             const ImGuiTabItemFlags msel =
                 want_tab_set_ && want_tab_ == m.key ? ImGuiTabItemFlags_SetSelected : 0;
-            if (ImGui::BeginTabItem(label.c_str(), nullptr, msel)) {
+            // The tab's close button unloads the module — but only offer it
+            // when no running session/backtest is using an instance.
+            bool tab_open = true;
+            if (ImGui::BeginTabItem(label.c_str(),
+                                    m.instances > 0 ? nullptr : &tab_open, msel)) {
                 draw_strategy_tab(m.key, &m);
                 ImGui::EndTabItem();
+            }
+            if (!tab_open) {
+                host_.unload(m.key);
+                console("unloaded " + m.name);
             }
         }
         want_tab_set_ = false;   // consumed
@@ -334,12 +342,6 @@ void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
         if (ImGui::SmallButton(building_.load() ? "Building..." : "Rebuild"))
             start_build((fs::path(dir_) / key).string());
         ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Unload")) {
-            host_.unload(key);
-            console("unloaded " + display_name(key) +
-                    (mod->instances > 0 ? " (freed when its runs end)" : ""));
-        }
         ImGui::Separator();
     }
 
