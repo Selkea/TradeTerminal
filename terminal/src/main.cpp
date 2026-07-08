@@ -61,15 +61,31 @@ void load_implot_style(const fs::path& path) {
     f.read(reinterpret_cast<char*>(&s), sizeof s);
 }
 
+// Keep the last GLFW error: the app is a windowed exe, so stderr goes nowhere
+// — fatal init failures surface in a message box instead.
+std::string g_glfw_error = "(no error reported)";
 void glfw_error_callback(int error, const char* description) {
     std::fprintf(stderr, "GLFW error %d: %s\n", error, description);
+    g_glfw_error = description ? description : "";
+}
+
+void fatal_startup_error(const std::string& msg) {
+#ifdef _WIN32
+    MessageBoxA(nullptr, msg.c_str(), "TradeTerminal - startup failed",
+                MB_OK | MB_ICONERROR);
+#else
+    std::fprintf(stderr, "%s\n", msg.c_str());
+#endif
 }
 
 } // namespace
 
 int main() {
     glfwSetErrorCallback(glfw_error_callback);
-    if (!glfwInit()) return 1;
+    if (!glfwInit()) {
+        fatal_startup_error("GLFW failed to initialize:\n\n" + g_glfw_error);
+        return 1;
+    }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -77,6 +93,11 @@ int main() {
 
     GLFWwindow* window = glfwCreateWindow(1600, 900, "TradeTerminal", nullptr, nullptr);
     if (!window) {
+        fatal_startup_error(
+            "Could not create an OpenGL 3.3 window:\n\n" + g_glfw_error +
+            "\n\nOn a VPS / RDP session without a GPU driver, Windows only offers "
+            "OpenGL 1.1. Fix: place the Mesa software-OpenGL opengl32.dll next to "
+            "tt_terminal.exe (scripts\\vps_bootstrap.ps1 deploys it automatically).");
         glfwTerminate();
         return 1;
     }
