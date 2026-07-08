@@ -345,6 +345,7 @@ struct IbkrBroker::Io {
         if (tp_local) acct_by_local[tp_local] = acct;
         if (sl_local) acct_by_local[sl_local] = acct;
 
+        const auto t0 = std::chrono::steady_clock::now();
         Response r = call("POST", "/iserver/account/" + acct + "/orders",
                           json{{"orders", orders}}.dump());
         // The gateway may answer with confirmation questions (price caps,
@@ -362,6 +363,14 @@ struct IbkrBroker::Io {
             if (!resp.order_id.empty()) {
                 ibkr_by_local[c.local_id] = resp.order_id;
                 local_by_ibkr[resp.order_id] = c.local_id;
+                // Real order-path latency: submit -> gateway+IBKR ack (includes
+                // any confirmation rounds). This is the number scalp edges must
+                // survive.
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+                b.log("order #" + std::to_string(c.local_id) + " acked in " +
+                      std::to_string(ms) + " ms");
                 if (tp_local || sl_local)
                     b.log("order #" + std::to_string(c.local_id) + " bracket legs: #" +
                           std::to_string(tp_local) + (sl_local ? ", #" +
