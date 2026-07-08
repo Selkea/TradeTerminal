@@ -23,6 +23,12 @@ struct TradeSymbol {
     int risk_stale_feed_sec = 0;
     double risk_dd_pct = 0;         // percent, as shown in the UI
     std::map<std::string, double> params;   // this symbol's strategy params
+    // Autopilot (re-optimize while trading): mode 0 off / 1 params / 2 full;
+    // trigger 0 timer / 1 drawdown / 2 both.
+    int ap_mode = 0;
+    int ap_trigger = 0;
+    double ap_interval_min = 30;
+    double ap_dd_pct = 5;
 };
 
 struct AppConfig {

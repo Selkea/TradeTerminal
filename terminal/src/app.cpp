@@ -625,7 +625,8 @@ void App::pump_sweep() {
 // champion (best HOLDOUT score — never in-sample) is applied to the target
 // symbol's Trade tab. One candidate optimizes at a time through the normal
 // sweep pipeline.
-void App::start_tournament(SweepPanel::Request rq, const std::string& target_symbol) {
+void App::start_tournament(SweepPanel::Request rq, const std::string& target_symbol,
+                           std::vector<std::string> candidates) {
     if (tourn_.active || sweep_.running || engine_.running()) {
         log_.add("tournament: optimizer busy, try again");
         return;
@@ -636,8 +637,13 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     tourn_.active = true;
     tourn_.base = std::move(rq);
     tourn_.target_symbol = target_symbol;
-    tourn_.candidates.push_back("");   // built-in SMA
-    for (const std::string& k : strat_mgr_.loaded_keys()) tourn_.candidates.push_back(k);
+    if (candidates.empty()) {
+        tourn_.candidates.push_back("");   // built-in SMA
+        for (const std::string& k : strat_mgr_.loaded_keys())
+            tourn_.candidates.push_back(k);
+    } else {
+        tourn_.candidates = std::move(candidates);
+    }
     tourn_.stamp_s = ImGui::GetTime();
 
     sweep_.tourney = {};
@@ -750,6 +756,147 @@ void App::finish_tournament() {
                   kSweepMetrics[tourn_.base.metric], c.score,
                   c.holdout ? " on holdout" : "", tourn_.target_symbol.c_str());
     log_.add(buf);
+}
+
+namespace {
+// Challenger must beat the incumbent by a real margin — 5% of the incumbent's
+// scale (floored so near-zero incumbents don't make any noise a "win").
+bool ap_better(int metric, double challenger, double incumbent) {
+    const double margin = 0.05 * std::max(std::abs(incumbent), 0.1);
+    return tt::ui::sweep_metric_minimize(metric) ? challenger < incumbent - margin
+                                                 : challenger > incumbent + margin;
+}
+} // namespace
+
+void App::pump_autopilot() {
+    if (!engine_.live_running()) {
+        if (!ap_.syms.empty()) ap_ = Autopilot{};   // session over: disarm
+        return;
+    }
+    if (ap_.syms.empty()) return;
+    const double now = ImGui::GetTime();
+
+    // Session-equity high for the drawdown trigger (session-level proxy until
+    // per-symbol portfolios exist).
+    const LiveSnapshot s = engine_.live_snapshot();
+    ap_.session_high_eq = std::max(ap_.session_high_eq, s.equity);
+    const double dd = ap_.session_high_eq > 0
+                          ? (ap_.session_high_eq - s.equity) / ap_.session_high_eq * 100.0
+                          : 0.0;
+
+    // A cycle is in flight: wait for its tournament, then evaluate.
+    if (ap_.in_flight >= 0) {
+        if (tourn_.active) return;
+        autopilot_evaluate();
+        ap_.in_flight = -1;
+        return;
+    }
+
+    // Idle: launch the next due cycle — one at a time, never over a manual run.
+    if (tourn_.active || sweep_.running || engine_.running()) return;
+    for (int i = 0; i < static_cast<int>(ap_.syms.size()); ++i) {
+        Autopilot::Sym& S = ap_.syms[static_cast<size_t>(i)];
+        if (S.mode <= 0) continue;
+        const bool timer_due = (S.trigger == 0 || S.trigger == 2) &&
+                               now - S.last_cycle_s >= S.interval_min * 60.0;
+        const bool dd_due = (S.trigger == 1 || S.trigger == 2) && dd >= S.dd_pct &&
+                            now - ap_.last_dd_cycle_s >= 600.0;   // 10 min cooldown
+        if (!timer_due && !dd_due) continue;
+
+        // Data settings come from the Optimizer panel; symbol from the session.
+        const SweepPanel::Settings st = sweep_panel_.settings();
+        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
+        static constexpr const char* kRng[] = {"1mo", "6mo", "1y", "2y", "5y", "max"};
+        SweepPanel::Request rq;
+        rq.symbol = S.symbol;
+        rq.interval = kIvl[std::clamp(st.interval_idx, 0, 2)];
+        rq.range = kRng[std::clamp(st.range_idx, 0, 5)];
+        rq.cash = st.cash;
+        rq.metric = st.metric;
+        rq.holdout_pct = st.holdout ? st.holdout_pct : 25.0;
+        ap_.metric = rq.metric;
+        std::vector<std::string> candidates;
+        if (S.mode == 1) candidates.push_back(S.key);   // params-only: incumbent
+        start_tournament(std::move(rq), S.symbol, std::move(candidates));
+        if (!tourn_.active) return;   // could not start; retry next frame
+        ap_.in_flight = i;
+        S.last_cycle_s = now;
+        if (dd_due) ap_.last_dd_cycle_s = now;
+        log_.add("autopilot: " + S.symbol + " cycle started (" +
+                 (S.mode == 1 ? "params" : "full") +
+                 (dd_due ? ", drawdown trigger)" : ", timer)"));
+        return;
+    }
+}
+
+// The in-flight cycle's tournament finished: apply its champion to the LIVE
+// session under the hysteresis / streak rules.
+void App::autopilot_evaluate() {
+    Autopilot::Sym& S = ap_.syms[static_cast<size_t>(ap_.in_flight)];
+    const bool minimize = sweep_metric_minimize(ap_.metric);
+    const Tournament::Entry* champ = nullptr;
+    for (const auto& e : tourn_.results)
+        if (e.valid &&
+            (!champ ||
+             (minimize ? e.score < champ->score : e.score > champ->score)))
+            champ = &e;
+    if (!champ) {
+        log_.add("autopilot: " + S.symbol + " cycle produced no result");
+        return;
+    }
+
+    if (champ->key == S.key) {
+        // Same strategy: refresh params only if they genuinely score better.
+        if (!S.has_score || ap_better(ap_.metric, champ->score, S.incumbent_score)) {
+            engine_.update_symbol_params(S.sid, champ->params);
+            trade_.set_symbol_strategy(S.symbol, champ->key, champ->params);
+            S.incumbent_score = champ->score;
+            S.has_score = true;
+            char buf[160];
+            std::snprintf(buf, sizeof buf,
+                          "autopilot: %s params queued (%s %.4g, applies when flat)",
+                          S.symbol.c_str(), kSweepMetrics[ap_.metric], champ->score);
+            log_.add(buf);
+        } else {
+            log_.add("autopilot: " + S.symbol + " kept (no improvement)");
+        }
+        S.challenger.clear();
+        S.streak = 0;
+        return;
+    }
+
+    // A different strategy won (full mode): swap only after it beats the
+    // incumbent decisively twice in a row.
+    if (S.has_score && !ap_better(ap_.metric, champ->score, S.incumbent_score)) {
+        log_.add("autopilot: " + S.symbol + " challenger " +
+                 strat_mgr_.display_name(champ->key) + " not decisive, kept " +
+                 strat_mgr_.display_name(S.key));
+        S.challenger.clear();
+        S.streak = 0;
+        return;
+    }
+    if (S.challenger != champ->key) {
+        S.challenger = champ->key;
+        S.streak = 1;
+        log_.add("autopilot: " + S.symbol + " challenger " +
+                 strat_mgr_.display_name(champ->key) + " (win 1/2)");
+        return;
+    }
+    IStrategy* inst = acquire_strategy(champ->key);
+    if (!inst) {
+        log_.add("autopilot: " + S.symbol + " swap failed (strategy not loaded)");
+        return;
+    }
+    leases_.push_back({inst, champ->key, StrategyLease::Live});
+    engine_.swap_symbol_strategy(S.sid, inst, champ->params);
+    trade_.set_symbol_strategy(S.symbol, champ->key, champ->params);
+    S.key = champ->key;
+    S.incumbent_score = champ->score;
+    S.has_score = true;
+    S.challenger.clear();
+    S.streak = 0;
+    log_.add("autopilot: " + S.symbol + " strategy swap queued -> " +
+             strat_mgr_.display_name(champ->key) + " (applies when flat)");
 }
 
 App::~App() {
@@ -903,6 +1050,7 @@ void App::draw() {
 
     pump_sweep();   // before the panels: sweep results must not be stolen
     pump_tournament();
+    pump_autopilot();
 
     draw_menu_bar();
     draw_account_modal();
@@ -1154,6 +1302,25 @@ void App::draw() {
                         }
                         if (engine_.start_live(std::move(cfg), std::move(strategies))) {
                             for (const auto& l : new_leases) leases_.push_back(l);
+                            // Arm the autopilot for symbols that asked for it.
+                            ap_ = Autopilot{};
+                            for (size_t i = 0; i < opts.symbols.size(); ++i) {
+                                const auto& so = opts.symbols[i];
+                                if (so.ap_mode <= 0) continue;
+                                Autopilot::Sym aps;
+                                aps.symbol = so.symbol;
+                                aps.sid = static_cast<uint32_t>(i + 1);
+                                aps.mode = so.ap_mode;
+                                aps.trigger = so.ap_trigger;
+                                aps.interval_min = so.ap_interval_min;
+                                aps.dd_pct = so.ap_dd_pct;
+                                aps.key = so.strat_key;
+                                aps.last_cycle_s = ImGui::GetTime();
+                                ap_.syms.push_back(std::move(aps));
+                            }
+                            if (!ap_.syms.empty())
+                                log_.add("autopilot: armed for " +
+                                         std::to_string(ap_.syms.size()) + " symbol(s)");
                             // Previous session's thread was joined inside
                             // start_live, so replacing the old broker is safe.
                             ibkr_ = std::move(ibkr_broker);

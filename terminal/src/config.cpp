@@ -52,6 +52,10 @@ AppConfig AppConfig::load(const std::string& path) {
             ts.risk_daily_max_loss = s.value("risk_daily_max_loss", ts.risk_daily_max_loss);
             ts.risk_stale_feed_sec = s.value("risk_stale_feed_sec", ts.risk_stale_feed_sec);
             ts.risk_dd_pct = s.value("risk_dd_pct", ts.risk_dd_pct);
+            ts.ap_mode = s.value("ap_mode", ts.ap_mode);
+            ts.ap_trigger = s.value("ap_trigger", ts.ap_trigger);
+            ts.ap_interval_min = s.value("ap_interval_min", ts.ap_interval_min);
+            ts.ap_dd_pct = s.value("ap_dd_pct", ts.ap_dd_pct);
             if (s.contains("params") && s["params"].is_object())
                 for (const auto& [k, v] : s["params"].items())
                     if (v.is_number()) ts.params[k] = v.get<double>();
@@ -114,7 +118,11 @@ void AppConfig::save(const std::string& path) const {
                         {"risk_daily_max_loss", ts.risk_daily_max_loss},
                         {"risk_stale_feed_sec", ts.risk_stale_feed_sec},
                         {"risk_dd_pct", ts.risk_dd_pct},
-                        {"params", ts.params}});
+                        {"params", ts.params},
+                        {"ap_mode", ts.ap_mode},
+                        {"ap_trigger", ts.ap_trigger},
+                        {"ap_interval_min", ts.ap_interval_min},
+                        {"ap_dd_pct", ts.ap_dd_pct}});
     j["trade_symbols"] = std::move(syms);
     j["backtest_strategy"] = backtest_strategy;
     j["replay_strategy"] = replay_strategy;

@@ -142,9 +142,40 @@ private:
         double stamp_s = 0;          // phase-entry time, for timeouts
     };
     Tournament tourn_;
-    void start_tournament(SweepPanel::Request rq, const std::string& target_symbol);
+    // candidates: explicit strategy keys to race; empty = built-in + all loaded.
+    void start_tournament(SweepPanel::Request rq, const std::string& target_symbol,
+                          std::vector<std::string> candidates = {});
     void pump_tournament();      // UI thread, per frame
     void finish_tournament();
+
+    // ---- autopilot: re-optimize symbols while the live session trades ----
+    // Cycles run through the tournament machinery (params mode = a one-
+    // candidate tournament of the incumbent); results apply to the LIVE
+    // session via the engine's flat-only hot-swap, guarded by hysteresis and,
+    // for strategy swaps, a two-consecutive-wins streak.
+    struct Autopilot {
+        struct Sym {
+            std::string symbol;
+            uint32_t sid = 0;
+            int mode = 0;              // 0 off, 1 params, 2 full
+            int trigger = 0;           // 0 timer, 1 drawdown, 2 both
+            double interval_min = 30, dd_pct = 5;
+            std::string key;           // incumbent strategy
+            double last_cycle_s = 0;
+            double incumbent_score = 0;
+            bool has_score = false;
+            std::string challenger;    // full mode: pending challenger + streak
+            int streak = 0;
+        };
+        std::vector<Sym> syms;
+        int in_flight = -1;            // index into syms; -1 = idle
+        int metric = 0;                // cycle's scoring metric
+        double session_high_eq = 0;
+        double last_dd_cycle_s = 0;    // drawdown-trigger cooldown
+    };
+    Autopilot ap_;
+    void pump_autopilot();       // UI thread, per frame
+    void autopilot_evaluate();   // consume a finished cycle's tournament result
 
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {

@@ -20,7 +20,8 @@ void TradePanel::set_symbol_strategy(const std::string& symbol, const std::strin
             return;
         }
     pending_.push_back({symbol, def_bar_sec_, def_record_, 0, def_risk_,
-                        def_risk_dd_pct_, key, params});
+                        def_risk_dd_pct_, key, params, def_ap_mode_, def_ap_trigger_,
+                        def_ap_interval_min_, def_ap_dd_pct_});
 }
 
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
@@ -94,7 +95,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                          [&](const SymRow& r) { return r.symbol == sym; });
             if (!dup)
                 pending_.push_back({sym, def_bar_sec_, def_record_, 0, def_risk_,
-                                    def_risk_dd_pct_, def_strat_key_, {}});
+                                    def_risk_dd_pct_, def_strat_key_, {}, def_ap_mode_,
+                                    def_ap_trigger_, def_ap_interval_min_, def_ap_dd_pct_});
             input_[0] = '\0';
         }
 
@@ -193,6 +195,42 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::SetNextItemWidth(100);
                     ImGui::InputInt("bar sec", &r.bar_sec, 1, 10);
                     r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
+                    // Autopilot: re-optimize this symbol while it trades.
+                    static constexpr const char* kApModes[] = {"Off", "Params", "Full"};
+                    static constexpr const char* kApTrigs[] = {"Timer", "Drawdown",
+                                                               "Both"};
+                    ImGui::SetNextItemWidth(80);
+                    ImGui::Combo("autopilot", &r.ap_mode, kApModes,
+                                 IM_ARRAYSIZE(kApModes));
+                    ImGui::SetItemTooltip(
+                        "Re-optimize this symbol while it trades (applied only while "
+                        "flat, holdout-scored with hysteresis).\n"
+                        "Params: re-tune the current strategy's parameters.\n"
+                        "Full: params + the strategy itself can be swapped when a "
+                        "challenger wins decisively twice in a row.");
+                    if (r.ap_mode > 0) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(90);
+                        ImGui::Combo("##aptrig", &r.ap_trigger, kApTrigs,
+                                     IM_ARRAYSIZE(kApTrigs));
+                        ImGui::SetItemTooltip("What triggers a re-optimization cycle");
+                        if (r.ap_trigger != 1) {   // timer involved
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(44);
+                            ImGui::InputDouble("min##apmin", &r.ap_interval_min, 0, 0,
+                                               "%.0f");
+                            r.ap_interval_min = std::clamp(r.ap_interval_min, 5.0, 480.0);
+                        }
+                        if (r.ap_trigger >= 1) {   // drawdown involved
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(44);
+                            ImGui::InputDouble("dd%##apdd", &r.ap_dd_pct, 0, 0, "%.1f");
+                            ImGui::SetItemTooltip("Re-optimize when session equity is "
+                                                  "this far below its high (10 min "
+                                                  "cooldown)");
+                            r.ap_dd_pct = std::clamp(r.ap_dd_pct, 0.5, 50.0);
+                        }
+                    }
                     if (ImGui::CollapsingHeader("Risk limits")) {
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputDouble("max order qty", &r.risk.max_order_qty, 0, 0,
@@ -238,6 +276,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
             def_risk_ = pending_.back().risk;
             def_risk_dd_pct_ = pending_.back().risk_dd_pct;
             def_strat_key_ = pending_.back().strat_key;
+            def_ap_mode_ = pending_.back().ap_mode;
+            def_ap_trigger_ = pending_.back().ap_trigger;
+            def_ap_interval_min_ = pending_.back().ap_interval_min;
+            def_ap_dd_pct_ = pending_.back().ap_dd_pct;
         }
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
@@ -266,8 +308,9 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     const auto it = r.params.find(sp.name);
                     p[sp.name] = it != r.params.end() ? it->second : sp.value;
                 }
-                opts.symbols.push_back(
-                    {r.symbol, r.bar_sec, r.record, acct, r.strat_key, p, rk});
+                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, r.strat_key,
+                                        p, rk, r.ap_mode, r.ap_trigger,
+                                        r.ap_interval_min, r.ap_dd_pct});
             }
             start(opts);
         }
@@ -364,6 +407,10 @@ std::vector<TradeSymbol> TradePanel::symbols_config() const {
         ts.risk_stale_feed_sec = r.risk.stale_feed_sec;
         ts.risk_dd_pct = r.risk_dd_pct;
         ts.params = r.params;
+        ts.ap_mode = r.ap_mode;
+        ts.ap_trigger = r.ap_trigger;
+        ts.ap_interval_min = r.ap_interval_min;
+        ts.ap_dd_pct = r.ap_dd_pct;
         out.push_back(std::move(ts));
     }
     return out;
@@ -385,6 +432,10 @@ void TradePanel::restore_symbols(const std::vector<TradeSymbol>& syms) {
         r.risk.stale_feed_sec = ts.risk_stale_feed_sec;
         r.risk_dd_pct = ts.risk_dd_pct;
         r.params = ts.params;
+        r.ap_mode = ts.ap_mode;
+        r.ap_trigger = ts.ap_trigger;
+        r.ap_interval_min = ts.ap_interval_min;
+        r.ap_dd_pct = ts.ap_dd_pct;
         pending_.push_back(std::move(r));
     }
 }

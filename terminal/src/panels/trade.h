@@ -27,6 +27,12 @@ public:
         std::string strat_key;    // strategy source basename; "" = built-in SMA
         std::map<std::string, double> params;   // this symbol's strategy params
         RiskLimits risk{};
+        // Autopilot: re-optimize while trading. mode 0 off, 1 params-only,
+        // 2 full (strategy can be swapped). trigger 0 timer, 1 drawdown, 2 both.
+        int ap_mode = 0;
+        int ap_trigger = 0;
+        double ap_interval_min = 30;
+        double ap_dd_pct = 5;
     };
     // A strategy's declared parameter, its current value, and range.
     struct StratParam {
@@ -111,8 +117,11 @@ private:
         double risk_dd_pct = 0.0;   // UI percent; converted to fraction at start
         std::string strat_key;      // strategy source basename; "" = built-in SMA
         std::map<std::string, double> params;   // per-symbol strategy param edits
+        int ap_mode = 0;            // autopilot: 0 off, 1 params, 2 full
+        int ap_trigger = 0;         // 0 timer, 1 drawdown, 2 both
+        double ap_interval_min = 30, ap_dd_pct = 5;
     };
-    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0, "", {}}};
+    std::vector<SymRow> pending_ = {{"AAPL", 60, true, 0, {}, 0.0, "", {}, 0, 0, 30, 5}};
     // Shared-pool cash (simulator / single account) + per-symbol defaults.
     double session_cash_ = 100'000.0;
     int def_bar_sec_ = 60;
@@ -120,6 +129,8 @@ private:
     RiskLimits def_risk_{};
     double def_risk_dd_pct_ = 0.0;   // UI shows percent; RiskLimits stores fraction
     std::string def_strat_key_;      // strategy seeded into the next added symbol
+    int def_ap_mode_ = 0, def_ap_trigger_ = 0;
+    double def_ap_interval_min_ = 30, def_ap_dd_pct_ = 5;
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
     int selected_symbol_idx_ = 0;
