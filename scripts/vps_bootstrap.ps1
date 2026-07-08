@@ -10,7 +10,7 @@
 #
 # Note: Windows Server images sometimes lack winget. If the winget steps fail,
 # install "App Installer" from the Microsoft Store, or install Git/Python/MSYS2
-# manually and re-run — the rest of the script picks up from there.
+# manually and re-run - the rest of the script picks up from there.
 
 param(
     [string]$RepoUrl = "https://github.com/Selkea/TradeTerminal.git",
@@ -50,6 +50,9 @@ if (-not (Test-Path "$RepoDir\.git")) {
 } else {
     git -C $RepoDir pull --ff-only
 }
+# Commits from this box (if any) use the GitHub username + noreply address.
+git -C $RepoDir config --local user.name "Selkea"
+git -C $RepoDir config --local user.email "4535629+Selkea@users.noreply.github.com"
 
 Step "Building (ucrt64-release)"
 Set-Location $RepoDir
@@ -72,7 +75,7 @@ if (Get-Command java -ErrorAction SilentlyContinue) {
 }
 
 # Into the repo's tools\ dir. Caveat: the gateway's web server fails to bind
-# port 5000 from OneDrive paths or paths containing '+' — the default
+# port 5000 from OneDrive paths or paths containing '+' - the default
 # C:\dev\TradeTerminal is clean; keep -RepoDir clean too.
 Step "Client Portal Gateway (tools\clientportal.gw)"
 $gwDir = Join-Path $RepoDir "tools\clientportal.gw"
@@ -112,13 +115,14 @@ $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
             [Environment]::GetEnvironmentVariable("Path", "User")
 if (Get-Command python -ErrorAction SilentlyContinue) {
     python -m pip install --upgrade pip | Out-Null
-    python -m pip install --upgrade ibeam
+    python -m pip install --upgrade ibeam pyotp   # pyotp: authenticator (TOTP) 2FA
     if ($LASTEXITCODE -ne 0) { throw "pip install ibeam failed" }
     Write-Host "  IBeam installed. To enable auto-login on this box:"
-    Write-Host "    1) scripts\Save-IbkrCred.ps1         (store IBKR paper password, once)"
-    Write-Host "    2) scripts\Install-IbkrAutoLogin.ps1 (keep it logged in at every logon)"
+    Write-Host "    1) scripts\Save-IbkrCred.ps1  (store IBKR credentials, once per account)"
+    Write-Host "    2) launch TradeTerminal - the gateway + auto-login daemon start and"
+    Write-Host "       stop with the app (no scheduled task needed)"
 } else {
-    Write-Host "  WARNING: python not on PATH - open a fresh terminal, then: python -m pip install ibeam" -ForegroundColor Yellow
+    Write-Host "  WARNING: python not on PATH - open a fresh terminal, then: python -m pip install ibeam pyotp" -ForegroundColor Yellow
 }
 
 # --- 3. trading-box tuning ----------------------------------------------------
@@ -135,7 +139,8 @@ Step "Core pinning env vars (machine): engine=$PinEngineCore feed=$PinFeedCore"
 # --- 4. wire check ------------------------------------------------------------
 Step "Network placement check (connect times, lower is better)"
 foreach ($ep in @("https://api.ibkr.com/v1/api/tickle",
-                  "https://data.alpaca.markets/v2/stocks/AAPL/bars")) {
+                  "https://finnhub.io/api/v1/quote?symbol=AAPL",
+                  "https://api.polygon.io/v3/reference/tickers?limit=1")) {
     $times = 1..5 | ForEach-Object {
         [double](curl.exe -o NUL -s -w "%{time_connect}" $ep)
     }
@@ -146,12 +151,15 @@ foreach ($ep in @("https://api.ibkr.com/v1/api/tickle",
 Step "Done"
 Write-Host @"
 Next steps (manual):
-  1. Launch: C:\dev\build\TradeTerminal\ucrt64-release\terminal\tt_terminal.exe
-     (allow the Windows Firewall prompts on private networks only)
-  2. Account menu > Sign In > IBKR > Launch gateway, then Open login page
-     and log in with your IBKR paper credentials (browser, on this machine).
-  3. Set Windows Update active hours to cover the trading day.
-  4. When leaving RDP, CLOSE the window (disconnect) - do not sign out.
-  5. For remote monitoring, install Tailscale; do NOT open dashboard/RDP
+  1. scripts\Save-IbkrCred.ps1 - store IBKR credentials (DPAPI-encrypted; add
+     a TOTP secret for a live account so 2FA completes headlessly).
+  2. Launch: C:\dev\build\TradeTerminal\ucrt64-release\terminal\tt_terminal.exe
+     (allow the Windows Firewall prompts on private networks only).
+     The gateway + auto-login start with the app; the Account menu shows the
+     session, and switching accounts lives in Account > Sign In.
+  3. Data feed keys (optional): Data menu > Add Feed for Finnhub/Polygon.
+  4. Set Windows Update active hours to cover the trading day.
+  5. When leaving RDP, CLOSE the window (disconnect) - do not sign out.
+  6. For remote monitoring, install Tailscale; do NOT open dashboard/RDP
      ports to the public internet.
 "@
