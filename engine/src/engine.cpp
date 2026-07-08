@@ -103,6 +103,32 @@ public:
             if (on_order_) on_order_(r, 0);   // recorded as Rejected
             return 0;
         }
+        // Buying power (simulator only — a real broker enforces its own
+        // margin): a risk-INCREASING order must be coverable at ~1x. Buys need
+        // cash for the full cost; a new/larger short's notional must fit within
+        // equity. Reducing or closing always passes, so exits are never blocked.
+        if (!broker_) {
+            const double pos = pf_.position(r.symbol_id).qty;
+            const double dir = r.side == Side::Buy ? 1.0 : -1.0;
+            const double after = pos + dir * r.qty;
+            if (std::abs(after) > std::abs(pos)) {
+                double px = r.type == OrdType::Limit   ? r.limit_price
+                            : r.type == OrdType::Stop ? r.stop_price
+                                                      : 0.0;
+                if (px <= 0.0 && r.symbol_id <= last_price_.size())
+                    px = last_price_[r.symbol_id - 1];
+                bool ok = true;
+                if (px > 0.0) {
+                    if (r.side == Side::Buy) ok = r.qty * px <= pf_.cash();
+                    else if (after < 0.0) ok = -after * px <= pf_.equity();
+                }
+                if (!ok) {
+                    eng_.push_log("risk: buying power exceeded, rejected");
+                    if (on_order_) on_order_(r, 0);
+                    return 0;
+                }
+            }
+        }
         const uint64_t id = broker_ ? broker_->submit(r, now_()) : exec_.submit(r, now_());
         if (id && cur_event_tsc_)
             lat_.record(tsc::to_ns(rdtsc() - cur_event_tsc_));  // tick -> order
@@ -330,6 +356,7 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
         const double price = ev.type == static_cast<uint16_t>(EvType::Tick)
                                  ? ev.u.tick.price
                                  : ev.u.bar.close;
+        ctx.set_last_price(ev.symbol_id, price);   // price band + buying power
 
         fills.clear();
         exec.on_price(ev.symbol_id, price, clock.now_ns(), fills);
