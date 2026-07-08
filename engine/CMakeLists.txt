@@ -22,6 +22,7 @@ add_library(tt_net STATIC
     src/polygon_feed.cpp
     src/finnhub_feed.cpp
     src/tws_broker.cpp
+    src/tws_feed.cpp
 )
 target_link_libraries(tt_net
     PUBLIC tt_engine ws2_32 twsapi   # ws2_32: select() in the socket wait path
