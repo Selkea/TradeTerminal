@@ -13,6 +13,7 @@ backtest, without restarting the app.
 | `bollinger_reversion.cpp` | mean reversion | z ≤ −entry / z back inside band | time stop + trend filter (no price stop, on purpose) |
 | `orb_breakout.cpp` | intraday breakout | opening-range stop entries / bracket TP-SL | range-based sizing, manual OCO, EOD flatten |
 | `rsi2_pullback.cpp` | pullback (Connors) | RSI(2) dip in uptrend / close > exit SMA | regime filter + small fixed allocation |
+| `scalper_burst.cpp` | scalping (tick-driven) | burst_bps move within window_s of prints / TP-SL bracket | manual OCO + time-stop + cooldown; validate via tick Replay, never candle backtests |
 
 Patterns worth copying from them: protective stops are **resting Stop orders
 the strategy owns** (id known → cancellable → trailable), never bracket legs
