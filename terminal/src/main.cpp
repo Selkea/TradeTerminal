@@ -145,6 +145,11 @@ int main() {
 
     static std::string implot_style_path = (data_dir / "implot_style.dat").string();
     load_implot_style(implot_style_path);   // restore saved ImPlot colors/style
+    // Chart axes show timestamps in LOCAL time, matching the Watchlist/Trade
+    // clocks (ImPlot defaults to UTC). After the style load: the saved blob
+    // carries the old flag.
+    ImPlot::GetStyle().UseLocalTime = true;
+    ImPlot::GetStyle().Use24HourClock = true;
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
