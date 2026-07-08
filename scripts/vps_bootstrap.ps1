@@ -16,7 +16,11 @@ param(
     [string]$RepoUrl = "https://github.com/Selkea/TradeTerminal.git",
     [string]$RepoDir = "C:\dev\TradeTerminal",
     [int]$PinEngineCore = 4,   # engine thread's core (leave 0-1 for Windows)
-    [int]$PinFeedCore = 5      # feed I/O thread's core (must differ)
+    [int]$PinFeedCore = 5,     # feed I/O thread's core (must differ)
+    # The app needs OpenGL 3.3; a GPU-less VPS over RDP only offers 1.1, so by
+    # default Mesa's software renderer is deployed next to the exe. Skip on a
+    # box with a real GPU driver (Mesa in the app dir would override it).
+    [switch]$SkipSoftwareGL
 )
 
 $ErrorActionPreference = "Stop"
@@ -137,6 +141,33 @@ if ((Test-Path "$buildDir\CMakeCache.txt") -and -not (Test-Path "$buildDir\build
 if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 & C:\msys64\ucrt64\bin\cmake.exe --build --preset ucrt64-release
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+# --- 2b'. software OpenGL (GPU-less VPS: RDP only exposes OpenGL 1.1) ---------
+if (-not $SkipSoftwareGL) {
+    Step "Mesa software OpenGL (llvmpipe) beside the app"
+    $exeDir = Join-Path $buildDir "terminal"
+    if (Test-Path (Join-Path $exeDir "opengl32.dll")) {
+        Write-Host "  already deployed"
+    } else {
+        $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+        if (-not (Test-Path $sevenZip)) {
+            $szExe = Join-Path $env:TEMP "7zsetup.exe"
+            Get-File "https://www.7-zip.org/a/7z2409-x64.exe" $szExe
+            Start-Process $szExe -ArgumentList "/S" -Wait
+        }
+        $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
+        $asset = $rel.assets | Where-Object { $_.name -match "release-msvc\.7z$" } |
+                 Select-Object -First 1
+        if (-not $asset) { throw "could not resolve a mesa-dist-win release asset" }
+        $archive = Join-Path $env:TEMP $asset.name
+        Get-File $asset.browser_download_url $archive
+        $mesaDir = Join-Path $env:TEMP "mesa3d"
+        & $sevenZip x $archive "-o$mesaDir" -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "mesa archive extraction failed" }
+        Copy-Item (Join-Path $mesaDir "x64\*") $exeDir -Recurse -Force
+        Write-Host "  deployed - the app renders in software (fine for a UI over RDP)"
+    }
+}
 
 # --- 2b. IBKR Client Portal Gateway (all market data + orders flow here) ------
 Step "Java runtime (gateway requirement)"
