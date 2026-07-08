@@ -1119,6 +1119,10 @@ void App::draw() {
                          cfg.log = std::move(log);
                          cfg.bar_seconds_override = bar_seconds_override;
                          cfg.initial_cash = cash;
+                         // Same realistic order latency as live-sim sessions, so
+                         // a replayed scalp fills the way it would have live.
+                         cfg.exec.latency_ns = 75'000'000;
+                         cfg.exec.latency_jitter_ns = 25'000'000;
                          cfg.params = strat_mgr_.param_values(strat_key);
                          IStrategy* strat = acquire_strategy(strat_key);
                          if (!strat) {
@@ -1243,6 +1247,12 @@ void App::draw() {
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
                             cfg.pin_core = std::atoi(pin);
+                        // Simulator fills model the real IBKR order path measured
+                        // from the VPS (~15 ms RTT + gateway/backend processing):
+                        // an order rests ~50-100 ms before it can fill. Matters
+                        // for scalping; negligible for bar-scale strategies.
+                        cfg.exec.latency_ns = 75'000'000;
+                        cfg.exec.latency_jitter_ns = 25'000'000;
                         // Per-strategy callback watchdog (huge headroom over the
                         // µs a normal callback takes; catches runaways only).
                         cfg.watchdog_ms = 250;
