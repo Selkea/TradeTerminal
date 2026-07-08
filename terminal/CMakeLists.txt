@@ -50,7 +50,7 @@ if(WIN32)
     target_link_libraries(tt_terminal PRIVATE dwmapi)
 endif()
 
-# Release builds are windowed (no console); debug keeps the console for logs.
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
-endif()
+# Windowed (no console) in every config — the app logs to its own Log Console
+# panel, so the attached console was just a blank window. Under a debugger,
+# stdout/stderr are captured by the IDE regardless of subsystem.
+set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
