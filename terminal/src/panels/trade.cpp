@@ -173,7 +173,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                         }
                     }
                     ImGui::SetNextItemWidth(100);
-                    ImGui::InputInt("bars/sec", &r.bar_sec, 1, 10);
+                    ImGui::InputInt("bar sec", &r.bar_sec, 1, 10);
                     r.bar_sec = std::clamp(r.bar_sec, 1, 3600);
                     if (ImGui::CollapsingHeader("Risk limits")) {
                         ImGui::SetNextItemWidth(90);
