@@ -56,7 +56,9 @@ if (-not $gwVer) { Write-Error "IB Gateway not installed (no numeric version dir
 if (-not (Test-Path "C:\IBC\IBC.jar")) { Write-Error "IBC not installed. Run Install-IbGateway.ps1."; exit 1 }
 
 # --- IBC config (no secrets) ---------------------------------------------------
-$ibcCfgDir = Join-Path $env:LOCALAPPDATA 'TradeTerminal\ibc'
+# Written to IBC's DEFAULT location: IBC 3.24's launcher ignores a custom
+# IBC_INI env var and resolves %USERPROFILE%\Documents\IBC\config.ini itself.
+$ibcCfgDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'IBC'
 New-Item -ItemType Directory -Force -Path $ibcCfgDir | Out-Null
 $ini = Join-Path $ibcCfgDir 'config.ini'
 @"
@@ -74,7 +76,7 @@ MinimizeMainWindow=yes
 "@ | Set-Content -Path $ini -Encoding ASCII
 
 # --- launch via IBC's documented wrapper interface -----------------------------
-$logDir = Join-Path $ibcCfgDir 'logs'
+$logDir = Join-Path $env:LOCALAPPDATA 'TradeTerminal\ibc\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $env:TWS_MAJOR_VRSN = $gwVer.Name
 $env:IBC_INI = $ini
