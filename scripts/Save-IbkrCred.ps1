@@ -8,9 +8,9 @@
     %LOCALAPPDATA%\TradeTerminal\ibkr-accounts.json. Re-run any time to add
     another account or update one.
 
-    The store's unique id is derived automatically: the username, with a
-    -paper/-live suffix only when the same username is saved in the other mode
-    (IBKR lets one login run either mode). -Id overrides it for custom keys.
+    The store's unique id is derived automatically as <username>-paper or
+    <username>-live, so the mode is always explicit (IBKR lets one login run
+    either mode). -Id overrides it for custom keys.
 #>
 param(
     [string]$Id   # optional: custom unique id (default: derived from username)
@@ -33,19 +33,12 @@ if (Test-Path $store) {
     $o = [pscustomobject]@{ active = ''; accounts = @() }
 }
 
-# Unique id: the username, suffixed only if the same username already exists
-# in the other mode (so paper + live entries of one login can coexist).
+# Unique id: always <username>-paper / <username>-live, so the mode is
+# explicit everywhere the id shows up (the store, `active`, switch/remove).
+# -Id overrides for custom keys.
 $name = $Id
 if ([string]::IsNullOrWhiteSpace($name)) {
-    $name = $user
-    $clash = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
-    if ($clash) {
-        $clashPaper = $true
-        if ($clash.PSObject.Properties.Name -contains 'paper') { $clashPaper = [bool]$clash.paper }
-        if ($clashPaper -ne $paper) {
-            $name = $user + $(if ($paper) { '-paper' } else { '-live' })
-        }
-    }
+    $name = $user + $(if ($paper) { '-paper' } else { '-live' })
 }
 $existing = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
 if ($existing) {
