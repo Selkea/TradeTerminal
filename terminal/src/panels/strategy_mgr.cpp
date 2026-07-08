@@ -178,6 +178,19 @@ void StrategyManagerPanel::restore_state(
         if (!key.empty()) request_load(key);
 }
 
+void StrategyManagerPanel::set_param_values(const std::string& key,
+                                            const std::map<std::string, double>& values) {
+    std::vector<ParamValue>* ps = editor_params(key);
+    if (!ps) return;
+    for (auto& p : *ps) {
+        const auto it = values.find(p.name);
+        if (it == values.end()) continue;
+        p.value = it->second;
+        if (p.value < p.min) p.value = p.min;
+        if (p.value > p.max) p.value = p.max;
+    }
+}
+
 bool StrategyManagerPanel::loaded_fresh(const std::string& key) const {
     if (key.empty()) return true;   // built-in never builds
     return host_.has(key) && !host_.stale(key);

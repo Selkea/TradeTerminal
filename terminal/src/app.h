@@ -118,6 +118,24 @@ private:
     void stash_pending_sweep(net::CandleBatch& batch);   // IPC thread
     void pump_sweep();                                   // UI thread, per frame
     void start_sweep_cell();
+    void start_opt_param();   // begin the current param's 1-D sweep
+
+    // Coordinate-descent state for the auto-optimizer (UI thread only).
+    struct AutoOpt {
+        struct Param {
+            std::string name;
+            double min = 0, max = 0;
+        };
+        std::vector<Param> params;
+        std::map<std::string, double> best;   // best values so far
+        std::string key;                      // strategy being optimized
+        int pass = 0;
+        int pi = 0;                           // index into params
+        int step = 0;                         // index into sweep_.xs
+        double best_metric = 0;
+        bool metric_valid = false;
+    };
+    AutoOpt opt_;
 
     LogConsole log_;
     SeriesStore series_;

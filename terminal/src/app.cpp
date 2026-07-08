@@ -411,17 +411,40 @@ void App::stash_pending_sweep(net::CandleBatch& batch) {
     sweep_setup_.ready = true;
 }
 
+// One backtest: the best-so-far values with the current param overridden by
+// the current 1-D grid point.
 void App::start_sweep_cell() {
-    const int nx = static_cast<int>(sweep_.xs.size());
-    const int ix = sweep_.done % nx;
-    const int iy = sweep_.done / nx;
     BacktestConfig cfg = sweep_base_;   // copies bars (a few MB at worst)
-    cfg.params[sweep_.px] = sweep_.xs[static_cast<size_t>(ix)];
-    if (!sweep_.py.empty()) cfg.params[sweep_.py] = sweep_.ys[static_cast<size_t>(iy)];
+    cfg.params = opt_.best;
+    cfg.params[opt_.params[static_cast<size_t>(opt_.pi)].name] =
+        sweep_.xs[static_cast<size_t>(opt_.step)];
     if (!engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
-        log_.add("sweep: engine busy, aborted");
+        log_.add("optimizer: engine busy, aborted");
         sweep_.running = false;
     }
+}
+
+// Set up the 1-D grid for the current (pass, param) and run its first cell.
+// Pass 0 spans the param's full declared range; later passes refine in a
+// narrower window centered on the best value so far.
+void App::start_opt_param() {
+    const AutoOpt::Param& p = opt_.params[static_cast<size_t>(opt_.pi)];
+    double lo = p.min, hi = p.max;
+    if (opt_.pass > 0) {
+        const double w = (p.max - p.min) * kSweepRefineWindow;
+        const double c = opt_.best[p.name];
+        lo = std::max(p.min, c - w / 2);
+        hi = std::min(p.max, lo + w);
+        lo = std::max(p.min, hi - w);
+    }
+    sweep_.cur_param = p.name;
+    sweep_.pass = opt_.pass;
+    sweep_.xs.clear();
+    for (int i = 0; i < kSweepSteps; ++i)
+        sweep_.xs.push_back(lo + (hi - lo) * i / (kSweepSteps - 1));
+    sweep_.vals.assign(kSweepSteps, std::numeric_limits<double>::quiet_NaN());
+    opt_.step = 0;
+    start_sweep_cell();
 }
 
 // UI thread, before the panels draw (so a finished cell's result is consumed
@@ -462,24 +485,28 @@ void App::pump_sweep() {
                     }
                 }
 
+                // Coordinate descent over the strategy's declared parameters,
+                // starting from its current values.
+                opt_ = AutoOpt{};
+                opt_.key = sweep_setup_.key;
+                for (const auto& s : strat_mgr_.param_specs(opt_.key))
+                    if (s.max > s.min) opt_.params.push_back({s.name, s.min, s.max});
+                opt_.best = sweep_base_.params;
+
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;
-                sweep_.running = true;
-                sweep_.px = rq.px;
-                sweep_.py = rq.py;
                 sweep_.metric = rq.metric;
-                for (int i = 0; i < rq.nx; ++i)
-                    sweep_.xs.push_back(rq.x0 + (rq.x1 - rq.x0) * i / (rq.nx - 1));
-                if (!rq.py.empty())
-                    for (int i = 0; i < rq.ny; ++i)
-                        sweep_.ys.push_back(rq.y0 + (rq.y1 - rq.y0) * i / (rq.ny - 1));
-                const int total = rq.nx * (rq.py.empty() ? 1 : rq.ny);
-                sweep_.total = total;
-                sweep_.vals.assign(static_cast<size_t>(total),
-                                   std::numeric_limits<double>::quiet_NaN());
                 sweep_.label = rq.symbol + " " + rq.interval + " " + rq.range + " — " +
                                strat_mgr_.display_name(sweep_setup_.key);
-                start_sweep_cell();
+                if (opt_.params.empty()) {
+                    log_.add("optimizer: no tunable parameters");
+                } else {
+                    sweep_.running = true;
+                    sweep_.n_passes = kSweepPasses;
+                    sweep_.total = kSweepPasses *
+                                   static_cast<int>(opt_.params.size()) * kSweepSteps;
+                    start_opt_param();
+                }
             }
         }
     }
@@ -496,43 +523,77 @@ void App::pump_sweep() {
         sweep_holdout_phase_ = false;
         sweep_.running = false;
         char buf[128];
-        std::snprintf(buf, sizeof buf, "sweep: holdout %s %.4g (last %.0f%%, unseen)",
+        std::snprintf(buf, sizeof buf, "optimizer: holdout %s %.4g (last %.0f%%, unseen)",
                       kSweepMetrics[sweep_.metric], sweep_.holdout_val,
                       sweep_.holdout_pct);
         log_.add(buf);
         return;
     }
 
-    sweep_.vals[static_cast<size_t>(sweep_.done)] = sweep_metric_of(r, sweep_.metric);
+    sweep_.vals[static_cast<size_t>(opt_.step)] = sweep_metric_of(r, sweep_.metric);
     ++sweep_.done;
-    if (sweep_.done < sweep_.total) {
+    ++opt_.step;
+    if (opt_.step < kSweepSteps) {
         start_sweep_cell();
         return;
     }
-    log_.add("sweep: finished " + std::to_string(sweep_.total) + " backtests (" +
-             sweep_.label + ")");
+
+    // This param's 1-D sweep is done: adopt its best point if it doesn't
+    // worsen the best metric seen so far (the current value may sit between
+    // grid points, so a blind adopt could regress).
+    const bool minimize = sweep_metric_minimize(sweep_.metric);
+    int bi = 0;
+    for (int i = 1; i < kSweepSteps; ++i) {
+        const double a = sweep_.vals[static_cast<size_t>(i)];
+        const double b = sweep_.vals[static_cast<size_t>(bi)];
+        if (minimize ? a < b : a > b) bi = i;
+    }
+    const double bv = sweep_.vals[static_cast<size_t>(bi)];
+    if (!opt_.metric_valid || (minimize ? bv <= opt_.best_metric
+                                        : bv >= opt_.best_metric)) {
+        opt_.best[opt_.params[static_cast<size_t>(opt_.pi)].name] =
+            sweep_.xs[static_cast<size_t>(bi)];
+        opt_.best_metric = bv;
+        opt_.metric_valid = true;
+    }
+    sweep_.best = opt_.best;
+    sweep_.best_metric = opt_.best_metric;
+    sweep_.has_best = true;
+
+    // Next param / pass.
+    if (++opt_.pi >= static_cast<int>(opt_.params.size())) {
+        opt_.pi = 0;
+        ++opt_.pass;
+    }
+    if (opt_.pass < kSweepPasses) {
+        start_opt_param();
+        return;
+    }
+
+    // All passes done: apply the winner to the strategy's parameters.
+    strat_mgr_.set_param_values(opt_.key, opt_.best);
+    sweep_.applied = true;
+    std::string bests;
+    for (const auto& [k, v] : opt_.best) {
+        char kv[64];
+        std::snprintf(kv, sizeof kv, "%s%s=%.4g", bests.empty() ? "" : " ", k.c_str(), v);
+        bests += kv;
+    }
+    log_.add("optimizer: finished " + std::to_string(sweep_.done) + " backtests (" +
+             sweep_.label + ") — applied " + bests);
+
     if (sweep_.holdout_pct <= 0 || sweep_test_bars_.empty()) {
         sweep_.running = false;
         return;
     }
-    // Score the best cell on the held-out tail it never saw.
-    int best = -1;
-    for (int i = 0; i < sweep_.total; ++i) {
-        if (best < 0) { best = i; continue; }
-        const double a = sweep_.vals[static_cast<size_t>(i)];
-        const double b = sweep_.vals[static_cast<size_t>(best)];
-        if (sweep_metric_minimize(sweep_.metric) ? a < b : a > b) best = i;
-    }
-    const int nx = static_cast<int>(sweep_.xs.size());
+    // Score the winner on the held-out tail it never saw.
     BacktestConfig cfg = sweep_base_;
     cfg.bars = sweep_test_bars_;
-    cfg.params[sweep_.px] = sweep_.xs[static_cast<size_t>(best % nx)];
-    if (!sweep_.py.empty())
-        cfg.params[sweep_.py] = sweep_.ys[static_cast<size_t>(best / nx)];
+    cfg.params = opt_.best;
     if (engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
         sweep_holdout_phase_ = true;
     } else {
-        log_.add("sweep: holdout run could not start (engine busy)");
+        log_.add("optimizer: holdout run could not start (engine busy)");
         sweep_.running = false;
     }
 }
@@ -620,21 +681,18 @@ void App::draw() {
         log_.add("autorun: queued AAPL 1d 2y backtest (built-in SMA)");
     }
 
-    // TT_AUTORUN_SWEEP=1: 4x4 fast/slow grid — headless verification of the
-    // sweep runner ("sweep: finished 16 backtests" on success).
+    // TT_AUTORUN_SWEEP=1: auto-optimize the built-in SMA — headless
+    // verification of the optimizer ("optimizer: finished ..." on success).
     if (!autorun_sweep_done_ && gw_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
         autorun_sweep_done_ = true;
         SweepPanel::Request rq;
+        rq.strat_key = "";   // built-in SMA
         rq.symbol = "AAPL";
         rq.interval = "1d";
         rq.range = "1y";
-        rq.px = "fast";
-        rq.x0 = 5;  rq.x1 = 20;  rq.nx = 4;
-        rq.py = "slow";
-        rq.y0 = 30; rq.y1 = 120; rq.ny = 4;
         rq.holdout_pct = 25;   // exercises the walk-forward phase headlessly
         queue_sweep(rq);
-        log_.add("autorun: queued 4x4 fast/slow sweep");
+        log_.add("autorun: queued auto-optimize (built-in SMA)");
     }
 
     // Journal: session rows are keyed off the live_running transition (works

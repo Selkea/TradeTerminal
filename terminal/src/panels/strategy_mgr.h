@@ -44,6 +44,10 @@ public:
         double value, min, max;
     };
     std::vector<ParamSpec> param_specs(const std::string& key) const;
+    // Overwrite a strategy's current param values (clamped to declared ranges);
+    // used by the auto-optimizer to apply the best cell it found.
+    void set_param_values(const std::string& key,
+                          const std::map<std::string, double>& values);
 
     // ---- strategy selection for other panels (Backtest dropdown) ----
     // .cpp basenames in the strategies dir.
