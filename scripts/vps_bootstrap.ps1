@@ -8,9 +8,9 @@
 # builds TradeTerminal (release), and applies trading-box tuning (power plan,
 # clock sync, core-pinning env vars). Re-runnable: every step is idempotent.
 #
-# Note: Windows Server images sometimes lack winget. If the winget steps fail,
-# install "App Installer" from the Microsoft Store, or install Git/Python/MSYS2
-# manually and re-run - the rest of the script picks up from there.
+# Note: Windows Server images often lack winget; when it is missing the script
+# falls back to direct silent installers (Git, Python, MSYS2, Temurin, Chrome)
+# automatically.
 
 param(
     [string]$RepoUrl = "https://github.com/Selkea/TradeTerminal.git",
@@ -20,20 +20,71 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
+function Update-PathEnv {
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [Environment]::GetEnvironmentVariable("Path", "User")
+}
+$haveWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+function Install-ViaWinget($id) {
+    winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Host "  ($id may already be installed - continuing)" }
+    Update-PathEnv
+}
+function Get-File($url, $out) {
+    curl.exe -sL -o $out $url
+    if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+}
 
 # --- 1. toolchain ------------------------------------------------------------
-Step "Installing Git, Python, MSYS2 (winget)"
-# Python.Python.* installs a real interpreter on PATH (not the Store alias),
-# which the IBKR auto-login daemon needs to run headless under Task Scheduler.
-$pkgs = @("Git.Git", "Python.Python.3.12", "MSYS2.MSYS2")
-foreach ($p in $pkgs) {
-    winget install --id $p -e --silent --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) { Write-Host "  ($p may already be installed - continuing)" }
+Step "Toolchain: Git, Python, MSYS2"
+if (-not $haveWinget) {
+    Write-Host "  winget not available - using direct installers" -ForegroundColor Yellow
 }
-$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [Environment]::GetEnvironmentVariable("Path", "User")
+
+# Git
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    Write-Host "  git present"
+} elseif ($haveWinget) {
+    Install-ViaWinget "Git.Git"
+} else {
+    $rel = Invoke-RestMethod "https://api.github.com/repos/git-for-windows/git/releases/latest"
+    $asset = $rel.assets | Where-Object { $_.name -match "^Git-.*-64-bit\.exe$" } |
+             Select-Object -First 1
+    if (-not $asset) { throw "could not resolve the Git for Windows installer" }
+    $exe = Join-Path $env:TEMP $asset.name
+    Get-File $asset.browser_download_url $exe
+    Start-Process $exe -ArgumentList "/VERYSILENT", "/NORESTART" -Wait
+    Update-PathEnv
+}
+
+# Python: a real interpreter on PATH (not the Store alias), which the IBKR
+# auto-login daemon needs to run headless.
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    Write-Host "  python present"
+} elseif ($haveWinget) {
+    Install-ViaWinget "Python.Python.3.12"
+} else {
+    $exe = Join-Path $env:TEMP "python-3.12.10-amd64.exe"
+    Get-File "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" $exe
+    Start-Process $exe -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1",
+                                     "Include_test=0" -Wait
+    Update-PathEnv
+}
+
+# MSYS2
+if (Test-Path "C:\msys64\usr\bin\bash.exe") {
+    Write-Host "  msys2 present"
+} elseif ($haveWinget) {
+    Install-ViaWinget "MSYS2.MSYS2"
+} else {
+    $sfx = Join-Path $env:TEMP "msys2-base.sfx.exe"
+    Get-File "https://github.com/msys2/msys2-installer/releases/latest/download/msys2-base-x86_64-latest.sfx.exe" $sfx
+    & $sfx -y "-oC:\" | Out-Null   # self-extracts to C:\msys64
+    if (-not (Test-Path "C:\msys64\usr\bin\bash.exe")) { throw "MSYS2 extraction failed" }
+}
 
 Step "Installing MSYS2 UCRT64 packages"
 # First -Syu on a fresh MSYS2 can ask to restart the shell; running the
@@ -66,9 +117,15 @@ Step "Java runtime (gateway requirement)"
 if (Get-Command java -ErrorAction SilentlyContinue) {
     Write-Host "  java present: $((Get-Command java).Source)"
 } else {
-    winget install --id EclipseAdoptium.Temurin.21.JRE -e --silent --accept-package-agreements --accept-source-agreements
-    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($haveWinget) {
+        Install-ViaWinget "EclipseAdoptium.Temurin.21.JRE"
+    } else {
+        # Adoptium's API redirects to the latest Temurin 21 JRE MSI.
+        $msi = Join-Path $env:TEMP "temurin21-jre.msi"
+        Get-File "https://api.adoptium.net/v3/installer/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse" $msi
+        Start-Process msiexec.exe -ArgumentList "/i", $msi, "/quiet", "/norestart" -Wait
+        Update-PathEnv
+    }
     if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
         Write-Host "  WARNING: java still not on PATH - open a fresh terminal or install Temurin manually" -ForegroundColor Yellow
     }
@@ -109,10 +166,17 @@ Step "Auto-login deps: Chrome + IBeam (pip)"
 # required by Selenium; the matching chromedriver is fetched at runtime by
 # Selenium Manager. Credentials are stored/consumed by scripts\Save-IbkrCred.ps1
 # and scripts\Start-IbkrLogin.ps1 (DPAPI-encrypted, never in the repo).
-winget install --id Google.Chrome -e --silent --accept-package-agreements --accept-source-agreements
-if ($LASTEXITCODE -ne 0) { Write-Host "  (Chrome may already be installed - continuing)" }
-$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [Environment]::GetEnvironmentVariable("Path", "User")
+$chromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+if (Test-Path $chromeExe) {
+    Write-Host "  chrome present"
+} elseif ($haveWinget) {
+    Install-ViaWinget "Google.Chrome"
+} else {
+    $msi = Join-Path $env:TEMP "chrome64.msi"
+    Get-File "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi" $msi
+    Start-Process msiexec.exe -ArgumentList "/i", $msi, "/quiet", "/norestart" -Wait
+}
+Update-PathEnv
 if (Get-Command python -ErrorAction SilentlyContinue) {
     python -m pip install --upgrade pip | Out-Null
     python -m pip install --upgrade ibeam pyotp   # pyotp: authenticator (TOTP) 2FA
