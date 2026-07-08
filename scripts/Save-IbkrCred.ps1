@@ -1,13 +1,20 @@
 <#
     Save-IbkrCred.ps1 - add (or update) an IBKR account for auto-login.
 
-    Prompts for an account label, username, and password. The password is
-    entered here, locally, and encrypted with Windows DPAPI (CurrentUser scope)
-    - bound to this Windows user + machine, like TradeTerminal's other secrets.
-    Accounts are stored in %LOCALAPPDATA%\TradeTerminal\ibkr-accounts.json
-    (usernames/passwords DPAPI-encrypted; only the label is plaintext, so the
-    app can list accounts). Re-run any time to add another or update one.
+    Prompts for the username, mode, a display name, and the password. The
+    password is entered here, locally, and encrypted with Windows DPAPI
+    (CurrentUser scope) - bound to this Windows user + machine, like
+    TradeTerminal's other secrets. Accounts are stored in
+    %LOCALAPPDATA%\TradeTerminal\ibkr-accounts.json. Re-run any time to add
+    another account or update one.
+
+    The store's unique id is derived automatically: the username, with a
+    -paper/-live suffix only when the same username is saved in the other mode
+    (IBKR lets one login run either mode). -Id overrides it for custom keys.
 #>
+param(
+    [string]$Id   # optional: custom unique id (default: derived from username)
+)
 Add-Type -AssemblyName System.Security
 
 $dir = Join-Path $env:LOCALAPPDATA 'TradeTerminal'
@@ -16,19 +23,33 @@ $store = Join-Path $dir 'ibkr-accounts.json'
 
 $user = Read-Host 'IBKR username'
 if ([string]::IsNullOrWhiteSpace($user)) { Write-Error 'Username is required.'; exit 1 }
-# The unique id is the key the app switches/removes by - it must be different
-# for every account. The display name (asked next) may be shared freely.
-$name = Read-Host "Unique account id [$user]"
-if ([string]::IsNullOrWhiteSpace($name)) { $name = $user }
+
+$paperAns = Read-Host 'Paper account? (Y/n)'
+$paper = -not ($paperAns -match '^[Nn]')   # default: paper
 
 if (Test-Path $store) {
     $o = Get-Content $store -Raw | ConvertFrom-Json
 } else {
     $o = [pscustomobject]@{ active = ''; accounts = @() }
 }
+
+# Unique id: the username, suffixed only if the same username already exists
+# in the other mode (so paper + live entries of one login can coexist).
+$name = $Id
+if ([string]::IsNullOrWhiteSpace($name)) {
+    $name = $user
+    $clash = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
+    if ($clash) {
+        $clashPaper = $true
+        if ($clash.PSObject.Properties.Name -contains 'paper') { $clashPaper = [bool]$clash.paper }
+        if ($clashPaper -ne $paper) {
+            $name = $user + $(if ($paper) { '-paper' } else { '-live' })
+        }
+    }
+}
 $existing = @($o.accounts) | Where-Object { $_.name -eq $name } | Select-Object -First 1
 if ($existing) {
-    $ow = Read-Host "An account with id '$name' already exists. Overwrite it? (y/N)"
+    $ow = Read-Host "Account '$name' already exists. Overwrite it? (y/N)"
     if ($ow -notmatch '^[Yy]') { Write-Host 'Aborted - nothing changed.'; exit 1 }
 }
 
@@ -38,9 +59,6 @@ if ($existing -and ($existing.PSObject.Properties.Name -contains 'label') -and $
 }
 $display = Read-Host "Display name [$labelDefault]"
 if ([string]::IsNullOrWhiteSpace($display)) { $display = $labelDefault }
-
-$paperAns = Read-Host 'Paper account? (Y/n)'
-$paper = -not ($paperAns -match '^[Nn]')   # default: paper
 
 function Read-Plain([Security.SecureString]$s) {
     $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
