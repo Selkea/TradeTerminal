@@ -373,8 +373,7 @@ void StrategyManagerPanel::draw_build_output(bool* open) {
     }
     ImGui::Separator();
     if (ImGui::BeginChild("##ccout", ImVec2(0, 0), ImGuiChildFlags_None,
-                          ImGuiWindowFlags_HorizontalScrollbar |
-                              ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+                          ImGuiWindowFlags_HorizontalScrollbar)) {
         std::lock_guard lock(out_mu_);
         for (const auto& l : output_) {
             const bool is_err = l.find("error") != std::string::npos;
