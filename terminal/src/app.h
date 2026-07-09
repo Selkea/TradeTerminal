@@ -66,6 +66,7 @@ private:
     void draw_trading_guards();        // Sign Out / quit confirm dialogs
     void safe_stop_live();            // kill switch + graceful stop, if live
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
+    void save_config();              // panel state -> cfg_ -> config.json
     void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
@@ -299,6 +300,10 @@ private:
     // While the gateway is being launched, show "INITIALIZING" until it is up.
     // Holds an ImGui::GetTime() deadline; 0 = not starting.
     double gateway_starting_until_ = 0.0;
+
+    // Last periodic config save (ImGui::GetTime()); saves run once a minute
+    // so a force-killed process loses at most a minute of settings.
+    double last_cfg_save_ = 0.0;
 
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm

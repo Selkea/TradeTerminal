@@ -947,6 +947,13 @@ App::~App() {
     gw_.stop();
     tws_data_.stop();
     if (signin_.worker.joinable()) signin_.worker.join();
+    save_config();
+}
+
+// Gather panel state into cfg_ and write config.json. Called on exit and once
+// a minute from draw() — settings must survive a force-killed exe (rebuilds
+// kill the process, and the destructor never runs).
+void App::save_config() {
     cfg_.watchlist = watchlist_.symbols();
     cfg_.chart_symbol = chart_.symbol();
     cfg_.chart_interval_idx = chart_.interval_idx();
@@ -998,6 +1005,10 @@ App::~App() {
 void App::draw() {
     const ImGuiID dockspace_id =
         ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_NoWindowMenuButton);
+    if (ImGui::GetTime() - last_cfg_save_ > 60.0) {
+        last_cfg_save_ = ImGui::GetTime();
+        save_config();
+    }
     if (!layout_checked_) {
         layout_checked_ = true;
         if (!had_ini_) setup_default_layout(dockspace_id);
