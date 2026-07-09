@@ -81,6 +81,21 @@ void fatal_startup_error(const std::string& msg) {
 } // namespace
 
 int main() {
+#ifdef _WIN32
+    // Refuse to run twice: instances fight over the TWS API client ids (only
+    // one connection per id), and whichever exits last clobbers config.json
+    // with its stale settings. The mutex dies with the process, so a crashed
+    // instance never blocks the next launch.
+    CreateMutexA(nullptr, TRUE, "Local\\TradeTerminal.single-instance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxA(nullptr,
+                    "TradeTerminal is already running.\n\nCheck the taskbar - the "
+                    "window may be minimized, or a quit-confirm dialog may be "
+                    "waiting if a live session was trading when it was closed.",
+                    "TradeTerminal", MB_OK | MB_ICONWARNING);
+        return 0;
+    }
+#endif
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         fatal_startup_error("GLFW failed to initialize:\n\n" + g_glfw_error);
