@@ -14,17 +14,19 @@
 [CmdletBinding()]
 param(
     [string]$Account,   # store id; default = the active account
-    [switch]$Stop
+    [switch]$Stop,
+    [switch]$Restart    # stop, then fall through into a fresh launch + login
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Security
 
-if ($Stop) {
+if ($Stop -or $Restart) {
     Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" |
         Where-Object { $_.CommandLine -match 'ibcalpha\.ibc|ibgateway' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
     "IB Gateway stopped."
-    exit 0
+    if (-not $Restart) { exit 0 }
+    Start-Sleep -Seconds 2   # let the API port + settings files release
 }
 
 function Unprotect-Str([string]$hex) {
