@@ -105,8 +105,11 @@ $env:FIXPASSWORD = ''
 $env:JAVA_PATH = ''
 $env:APP = 'GATEWAY'
 
+# Hidden: this is only IBC's console (banner + log mirror; the real logs land
+# in $logDir). Hiding it also makes it impossible to kill the gateway by
+# closing a stray console window. The gateway GUI itself still shows.
 Start-Process -FilePath (Join-Path $env:IBC_PATH 'scripts\DisplayBannerAndLaunch.bat') `
-    -WindowStyle Minimized
+    -WindowStyle Hidden
 Start-Sleep -Seconds 2
 $env:TWSUSERID = $null
 $env:TWSPASSWORD = $null
