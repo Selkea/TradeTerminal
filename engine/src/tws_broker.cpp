@@ -49,6 +49,9 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unique_ptr<EReader> reader;
 
     long next_tws_id = -1;   // seeded by nextValidId on connect
+    // Handshake rejected (e.g. paper disclaimer not accepted yet): tear down
+    // and retry from io_loop — destroying the reader inside a callback is unsafe.
+    bool reset_conn = false;
     std::unordered_map<long, uint64_t> local_by_tws;
     std::unordered_map<uint64_t, long> tws_by_local;
     std::unordered_map<uint64_t, Clock::time_point> submit_t;   // ack latency
@@ -113,6 +116,11 @@ struct TwsBroker::Io final : DefaultEWrapper {
                const std::string&) override {
         // 21xx = data-farm status noise; 202 = cancel confirmations.
         if (errorCode >= 2100 && errorCode <= 2170) return;
+        if (errorCode == 10141) {   // paper disclaimer dialog not clicked yet (IBC lags login)
+            b.log("gateway still accepting the paper disclaimer - retrying shortly");
+            reset_conn = true;
+            return;
+        }
         b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
               "): " + errorString);
         const auto it = local_by_tws.find(id);
@@ -445,6 +453,11 @@ void TwsBroker::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
+            if (io.reset_conn) {
+                io.reset_conn = false;
+                io.drop_connection();
+                last_connect = Clock::now();   // full backoff before the retry
+            }
         }
 
         Cmd c;

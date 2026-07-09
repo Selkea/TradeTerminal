@@ -110,6 +110,11 @@ struct TwsData::Io final : DefaultEWrapper {
     std::unordered_map<std::string, Stream> streams;
     int next_quote_req = kQuoteBase;
 
+    // Handshake rejected (e.g. paper disclaimer not accepted yet): the socket
+    // stays open but no session will come; io_loop tears down and retries.
+    // Set inside EWrapper callbacks, where destroying the reader is unsafe.
+    bool reset_conn = false;
+
     explicit Io(TwsData& data) : d(data), signal(1000) {}
 
     bool connect_gateway() {
@@ -251,6 +256,14 @@ struct TwsData::Io final : DefaultEWrapper {
     void error(int id, int errorCode, const std::string& errorString,
                const std::string&) override {
         if (errorCode >= 2100 && errorCode <= 2170) return;   // farm status noise
+        if (errorCode == 10141) {
+            // Paper disclaimer dialog not accepted yet — IBC clicks it a
+            // couple of seconds after login, so connecting right after the
+            // gateway boots races it. Back off and reconnect.
+            d.log("gateway still accepting the paper disclaimer - retrying shortly");
+            reset_conn = true;
+            return;
+        }
         const auto it = hist.find(id);
         if (it != hist.end()) {
             if (d.cbs_.on_error)
@@ -419,6 +432,11 @@ void TwsData::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
+            if (io.reset_conn) {
+                io.reset_conn = false;
+                io.drop_connection();
+                last_connect = std::chrono::steady_clock::now();   // full backoff
+            }
             io.pump_requests();
         }
     }

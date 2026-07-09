@@ -32,6 +32,9 @@ struct TwsFeed::Io final : DefaultEWrapper {
     std::unique_ptr<EClientSocket> client;
     std::unique_ptr<EReader> reader;
     bool subscribed = false;
+    // Handshake rejected (e.g. paper disclaimer not accepted yet): tear down
+    // and retry from io_loop — destroying the reader inside a callback is unsafe.
+    bool reset_conn = false;
 
     struct BidAsk {
         double bid = 0.0, ask = 0.0;
@@ -118,6 +121,11 @@ struct TwsFeed::Io final : DefaultEWrapper {
     void error(int id, int errorCode, const std::string& errorString,
                const std::string&) override {
         if (errorCode >= 2100 && errorCode <= 2170) return;   // farm status noise
+        if (errorCode == 10141) {   // paper disclaimer dialog not clicked yet (IBC lags login)
+            f.log("gateway still accepting the paper disclaimer - retrying shortly");
+            reset_conn = true;
+            return;
+        }
         // Tick-by-tick refused (no subscription / stream limit): fall back to
         // streaming market data for that symbol. BidAsk refusals just leave
         // bid/ask at 0 if the Last fallback already runs.
@@ -230,6 +238,11 @@ void TwsFeed::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
+            if (io.reset_conn) {
+                io.reset_conn = false;
+                io.drop_connection();
+                last_connect = std::chrono::steady_clock::now();   // full backoff
+            }
         }
     }
 
