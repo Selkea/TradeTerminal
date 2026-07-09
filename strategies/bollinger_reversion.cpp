@@ -29,6 +29,9 @@ constexpr ParamDesc kParams[] = {
     {"trend_len", 200, 0, 1000},   // SMA trend filter (0 = off)
     {"alloc_pct", 20, 1, 100},     // % of cash per entry
     {"max_qty", 5000, 1, 100000},  // hard share cap per position
+    // Entry window, local hours (9.5 = 09:30). 0/24 = always; exits not gated.
+    {"enter_from_h", 0, 0, 24},
+    {"enter_until_h", 24, 0, 24},
 };
 }
 
@@ -42,6 +45,8 @@ public:
         trend_len_ = static_cast<int>(ctx.param("trend_len", 200));
         alloc_pct_ = ctx.param("alloc_pct", 20);
         max_qty_ = ctx.param("max_qty", 5000);
+        enter_from_h_ = ctx.param("enter_from_h", 0);
+        enter_until_h_ = ctx.param("enter_until_h", 24);
         if (length_ < 2) length_ = 2;
         if (exit_z_ > entry_z_) exit_z_ = entry_z_;  // exit band inside entry band
 
@@ -106,7 +111,9 @@ public:
         if (entry_id_ != 0 || exit_id_ != 0) return;  // an order is in flight
         const bool trend_ok =
             trend_len_ == 0 || bar.close > trend_sum_ / trend_len_;
-        if (z <= -entry_z_ && trend_ok) {
+        const double hod = hour_of_day_local(bar.ts_ns);
+        const bool time_ok = hod >= enter_from_h_ && hod < enter_until_h_;
+        if (z <= -entry_z_ && trend_ok && time_ok) {
             const double cash = ctx.cash();
             double qty = std::floor(cash * (alloc_pct_ / 100.0) / bar.close);
             qty = std::min(qty, max_qty_);
@@ -141,6 +148,7 @@ public:
 private:
     int length_ = 20, time_stop_ = 12, trend_len_ = 200;
     double entry_z_ = 2.0, exit_z_ = 0.25, alloc_pct_ = 20, max_qty_ = 5000;
+    double enter_from_h_ = 0, enter_until_h_ = 24;
 
     uint32_t sym_ = 0;
     std::vector<double> closes_;

@@ -29,6 +29,9 @@ AppConfig AppConfig::load(const std::string& path) {
     c.trade_data_idx = j.value("trade_data_idx", c.trade_data_idx);
     c.trade_record = j.value("trade_record", c.trade_record);
     c.trade_route = j.value("trade_route", c.trade_route);
+    c.trade_sched_on = j.value("trade_sched_on", c.trade_sched_on);
+    c.trade_sched_start = j.value("trade_sched_start", c.trade_sched_start);
+    c.trade_sched_stop = j.value("trade_sched_stop", c.trade_sched_stop);
     c.alert_webhook = j.value("alert_webhook", c.alert_webhook);
     c.ibkr_gateway_cmd = j.value("ibkr_gateway_cmd", c.ibkr_gateway_cmd);
     c.risk_max_order_qty = j.value("risk_max_order_qty", c.risk_max_order_qty);
@@ -100,6 +103,9 @@ void AppConfig::save(const std::string& path) const {
         {"trade_data_idx", trade_data_idx},
         {"trade_record", trade_record},
         {"trade_route", trade_route},
+        {"trade_sched_on", trade_sched_on},
+        {"trade_sched_start", trade_sched_start},
+        {"trade_sched_stop", trade_sched_stop},
         {"alert_webhook", alert_webhook},
         {"ibkr_gateway_cmd", ibkr_gateway_cmd},
         {"risk_max_order_qty", risk_max_order_qty},

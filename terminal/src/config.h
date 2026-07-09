@@ -42,6 +42,10 @@ struct AppConfig {
     int trade_data_idx = 0;      // last data-feed pick (DataFeed enum)
     bool trade_record = true;    // last "Record" toggle
     int trade_route = 0;         // order route: 0 IBKR web API, 1 TWS socket
+    // Session schedule: auto start/stop ("HH:MM", local clock, weekdays).
+    bool trade_sched_on = false;
+    std::string trade_sched_start = "09:25";
+    std::string trade_sched_stop = "15:55";
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;

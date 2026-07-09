@@ -35,6 +35,10 @@ constexpr ParamDesc kParams[] = {
     {"allow_short", 0, 0, 1},      // 1 = also scalp downside bursts
     {"alloc_pct", 25, 1, 100},     // % of cash per entry (sizing: not optimized)
     {"max_qty", 2000, 1, 100000},  // hard share cap per position
+    // Entry window, local hours (9.5 = 09:30). 0/24 = always. Exits are never
+    // gated. from >= until disables entries entirely.
+    {"enter_from_h", 0, 0, 24},
+    {"enter_until_h", 24, 0, 24},
 };
 }
 
@@ -51,6 +55,8 @@ public:
         allow_short_ = ctx.param("allow_short", 0) >= 0.5;
         alloc_pct_ = ctx.param("alloc_pct", 25);
         max_qty_ = ctx.param("max_qty", 2000);
+        enter_from_h_ = ctx.param("enter_from_h", 0);
+        enter_until_h_ = ctx.param("enter_until_h", 24);
 
         sym_ = 0;
         window_.clear();
@@ -104,6 +110,10 @@ public:
         const bool up = move_bps >= burst_bps_;
         const bool down = allow_short_ && move_bps <= -burst_bps_;
         if (!up && !down) return;
+
+        // Time-of-day gate on new entries only (exits above are never gated).
+        const double hod = hour_of_day_local(now);
+        if (hod < enter_from_h_ || hod >= enter_until_h_) return;
 
         double qty = std::floor(ctx.cash() * (alloc_pct_ / 100.0) / tick.price);
         qty = std::min(qty, max_qty_);
@@ -178,6 +188,7 @@ private:
 
     double window_s_ = 3, burst_bps_ = 8, tp_bps_ = 10, sl_bps_ = 8;
     double hold_max_s_ = 30, cooldown_s_ = 10, alloc_pct_ = 25, max_qty_ = 2000;
+    double enter_from_h_ = 0, enter_until_h_ = 24;
     int min_ticks_ = 5;
     bool allow_short_ = false;
 

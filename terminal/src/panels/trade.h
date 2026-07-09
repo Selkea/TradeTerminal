@@ -90,6 +90,13 @@ public:
         def_record_ = record;
         route_ = (route >= 0 && route <= 1) ? route : 0;
     }
+    // Persisted session schedule: auto start/stop times ("HH:MM", local clock,
+    // weekdays only). The stop flattens via the kill switch.
+    bool sched_on() const { return sched_on_; }
+    std::string sched_start() const { return sched_start_; }
+    std::string sched_stop() const { return sched_stop_; }
+    void restore_schedule(bool on, const std::string& start, const std::string& stop);
+
     // Persisted default risk limits, seeded into each new symbol card.
     const RiskLimits& risk() const { return def_risk_; }
     double risk_dd_pct() const { return def_risk_dd_pct_; }
@@ -137,6 +144,13 @@ private:
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
     int selected_symbol_idx_ = 0;
+
+    // Session schedule (persisted: sched_on_ + the two "HH:MM" strings).
+    bool sched_on_ = false;
+    char sched_start_[8] = "09:25";
+    char sched_stop_[8] = "15:55";
+    int sched_last_start_day_ = -1;   // tm_yday: one auto-start per day
+    int sched_prev_min_ = -1;         // edge detector for the scheduled stop
 };
 
 } // namespace tt::ui

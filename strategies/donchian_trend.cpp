@@ -28,6 +28,9 @@ constexpr ParamDesc kParams[] = {
     {"risk_pct", 0.5, 0.05, 5},    // % of cash risked per trade
     {"stop_atr", 2.0, 0.5, 10},    // stop distance in ATRs
     {"max_qty", 5000, 1, 100000},  // hard share cap per position
+    // Entry window, local hours (9.5 = 09:30). 0/24 = always; exits not gated.
+    {"enter_from_h", 0, 0, 24},
+    {"enter_until_h", 24, 0, 24},
 };
 
 // Rolling extreme over the trailing N bars, O(1) amortized.
@@ -58,6 +61,8 @@ public:
         risk_pct_ = ctx.param("risk_pct", 0.5);
         stop_atr_ = ctx.param("stop_atr", 2.0);
         max_qty_ = ctx.param("max_qty", 5000);
+        enter_from_h_ = ctx.param("enter_from_h", 0);
+        enter_until_h_ = ctx.param("enter_until_h", 24);
         if (entry_len_ < 2) entry_len_ = 2;
         if (exit_len_ < 2) exit_len_ = 2;
         if (atr_len_ < 2) atr_len_ = 2;
@@ -109,7 +114,9 @@ public:
             manage_long(ctx, bar, pos);
         } else if (warmed && entry_id_ == 0 && exit_id_ == 0 && !highs_.empty() &&
                    bar.close > highs_.front()) {
-            open_long(ctx, bar.close);
+            // Time-of-day gate on new entries only; exits are never gated.
+            const double hod = hour_of_day_local(bar.ts_ns);
+            if (hod >= enter_from_h_ && hod < enter_until_h_) open_long(ctx, bar.close);
         }
 
         // Roll the channels: current bar enters the window, old bars leave.
@@ -204,6 +211,7 @@ private:
 
     int entry_len_ = 20, exit_len_ = 10, atr_len_ = 14;
     double risk_pct_ = 0.5, stop_atr_ = 2.0, max_qty_ = 5000;
+    double enter_from_h_ = 0, enter_until_h_ = 24;
 
     uint32_t sym_ = 0;
     int64_t bar_i_ = 0;

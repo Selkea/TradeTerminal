@@ -6,10 +6,30 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 
 namespace tt::ui {
+
+namespace {
+// "HH:MM" (24h) -> minutes since midnight, or -1 if malformed.
+int parse_hhmm(const char* s) {
+    int h = -1, m = -1;
+    if (std::sscanf(s, "%d:%d", &h, &m) != 2) return -1;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+    return h * 60 + m;
+}
+} // namespace
+
+void TradePanel::restore_schedule(bool on, const std::string& start,
+                                  const std::string& stop) {
+    sched_on_ = on;
+    if (!start.empty() && start.size() < sizeof sched_start_)
+        std::snprintf(sched_start_, sizeof sched_start_, "%s", start.c_str());
+    if (!stop.empty() && stop.size() < sizeof sched_stop_)
+        std::snprintf(sched_stop_, sizeof sched_stop_, "%s", stop.c_str());
+}
 
 void TradePanel::set_symbol_strategy(const std::string& symbol, const std::string& key,
                                      const std::map<std::string, double>& params) {
@@ -303,8 +323,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
             def_ap_dd_pct_ = pending_.back().ap_dd_pct;
         }
 
-        ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
-        if (ImGui::Button("Start Trading") && !pending_.empty() && start) {
+        auto do_start = [&] {
             // TWS route is explicit; web route follows the sign-in (else sim).
             session_broker_ = route_ == 1 ? 2 : (ibkr_ready ? 1 : 0);
             StartOpts opts;
@@ -335,14 +354,72 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                         r.ap_interval_min, r.ap_dd_pct});
             }
             start(opts);
-        }
+        };
+
+        ImGui::BeginDisabled(eng_.running());   // not while a backtest runs
+        if (ImGui::Button("Start Trading") && !pending_.empty() && start) do_start();
         ImGui::EndDisabled();
+
+        // ---- session schedule (auto start/stop, local time, weekdays) ----
+        ImGui::SameLine();
+        ImGui::Checkbox("auto", &sched_on_);
+        ImGui::SetItemTooltip(
+            "Start the session at the first time and stop it at the second\n"
+            "(local clock, weekdays only). The stop cancels orders and flattens\n"
+            "positions via the kill switch. A manually stopped session does not\n"
+            "auto-restart the same day.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(48);
+        ImGui::InputText("##schedstart", sched_start_, sizeof sched_start_);
+        ImGui::SameLine();
+        ImGui::TextUnformatted("-");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(48);
+        ImGui::InputText("##schedstop", sched_stop_, sizeof sched_stop_);
+
+        // Auto-start: level-triggered inside the window so a reboot mid-morning
+        // still brings the session up; the once-per-day guard (also set while a
+        // session runs, below) keeps a manual stop from bouncing right back.
+        if (sched_on_ && !pending_.empty() && start && !eng_.running()) {
+            const int start_min = parse_hhmm(sched_start_);
+            const int stop_min = parse_hhmm(sched_stop_);
+            std::time_t now_tt = std::time(nullptr);
+            std::tm tm{};
+            localtime_s(&tm, &now_tt);
+            const int now_min = tm.tm_hour * 60 + tm.tm_min;
+            const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
+            if (start_min >= 0 && stop_min >= 0 && weekday &&
+                tm.tm_yday != sched_last_start_day_ && now_min >= start_min &&
+                now_min < stop_min) {
+                sched_last_start_day_ = tm.tm_yday;
+                do_start();
+            }
+        }
 
         ImGui::End();
         return;
     }
 
     // ---- running session ----
+    // Scheduled stop: cancel + flatten + stop when the local clock crosses the
+    // stop time. Edge-triggered, so a session started manually after hours is
+    // left alone. While anything runs, mark today as "started" so a manual
+    // stop is not followed by a same-day auto-restart.
+    if (sched_on_) {
+        std::time_t now_tt = std::time(nullptr);
+        std::tm tm{};
+        localtime_s(&tm, &now_tt);
+        const int now_min = tm.tm_hour * 60 + tm.tm_min;
+        const int stop_min = parse_hhmm(sched_stop_);
+        sched_last_start_day_ = tm.tm_yday;
+        if (stop_min >= 0 && sched_prev_min_ >= 0 && sched_prev_min_ < stop_min &&
+            now_min >= stop_min) {
+            eng_.kill_switch();   // cancel all orders + flatten positions
+            eng_.stop_live();     // graceful stop, joins the live thread
+        }
+        sched_prev_min_ = now_min;
+    }
+
     std::string sym_list;
     for (const SymbolState& sym : s.symbols)
         sym_list += (sym_list.empty() ? "" : ", ") + sym.symbol;
@@ -356,6 +433,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr web)");
     else
         ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "LIVE (paper)");
+    if (sched_on_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(auto-stop %s)", sched_stop_);
+    }
 
     char tbuf[16] = "--";
     if (s.last_tick_ts_ms > 0) {

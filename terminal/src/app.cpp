@@ -202,6 +202,8 @@ App::App(std::string gateway_url)
     backtest_.set_cash(cfg_.backtest_cash);
     trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec, cfg_.trade_data_idx,
                    cfg_.trade_record, cfg_.trade_route);
+    trade_.restore_schedule(cfg_.trade_sched_on, cfg_.trade_sched_start,
+                            cfg_.trade_sched_stop);
     {
         RiskLimits r;
         r.max_order_qty = cfg_.risk_max_order_qty;
@@ -964,6 +966,9 @@ void App::save_config() {
     cfg_.trade_data_idx = trade_.data_idx();
     cfg_.trade_record = trade_.record();
     cfg_.trade_route = trade_.route();
+    cfg_.trade_sched_on = trade_.sched_on();
+    cfg_.trade_sched_start = trade_.sched_start();
+    cfg_.trade_sched_stop = trade_.sched_stop();
     cfg_.risk_max_order_qty = trade_.risk().max_order_qty;
     cfg_.risk_max_position_qty = trade_.risk().max_position_qty;
     cfg_.risk_daily_max_loss = trade_.risk().daily_max_loss;

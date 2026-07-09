@@ -12,11 +12,28 @@
 
 #include "events.h"
 
+#include <ctime>
+
 // v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
 // OrdType gained Stop. Old DLLs are rejected by the version check.
 #define TT_SDK_VERSION 2u
 
 namespace tt {
+
+// Local-time hour of day (9.5 = 09:30) for an engine timestamp — the building
+// block for time-of-day gates ("only enter between 9.5 and 11"). Uses the
+// machine's timezone, so US-market windows assume an Eastern-time box; replays
+// of recorded sessions convert with the same rules they traded under.
+inline double hour_of_day_local(int64_t ts_ns) noexcept {
+    const time_t secs = static_cast<time_t>(ts_ns / 1'000'000'000);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &secs);
+#else
+    localtime_r(&secs, &tm);
+#endif
+    return tm.tm_hour + tm.tm_min / 60.0 + tm.tm_sec / 3600.0;
+}
 
 // Implemented by the engine; only valid for the duration of a callback.
 class IStrategyContext {
