@@ -83,8 +83,10 @@ ExistingSessionDetectedAction=primary
 ReloginAfterSecondFactorAuthenticationTimeout=yes
 SecondFactorAuthenticationExitInterval=60
 AutoRestartTime=11:55 PM
-MinimizeMainWindow=yes
+MinimizeMainWindow=no
 "@ | Set-Content -Path $ini -Encoding ASCII
+# MinimizeMainWindow stays 'no': dialogs (paper-trading disclaimer, 2FA) are
+# modal children of the main window and get lost when it is minimized.
 
 # --- launch via IBC's documented wrapper interface -----------------------------
 $logDir = Join-Path $env:LOCALAPPDATA 'TradeTerminal\ibc\logs'
