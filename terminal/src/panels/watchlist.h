@@ -1,7 +1,7 @@
 #pragma once
 
 #include "market_data.h"
-#include "net/gateway_data.h"
+#include "net/market_source.h"
 
 #include <algorithm>
 #include <functional>
@@ -12,7 +12,7 @@ namespace tt::ui {
 
 class WatchlistPanel {
 public:
-    WatchlistPanel(net::GatewayData& ipc, QuoteBook& quotes) : ipc_(ipc), quotes_(quotes) {}
+    WatchlistPanel(net::IMarketData& ipc, QuoteBook& quotes) : ipc_(ipc), quotes_(quotes) {}
 
     // on_select fires when the user clicks a row (chart follows).
     void draw(bool* open, const std::function<void(const std::string&)>& on_select);
@@ -34,7 +34,7 @@ public:
 private:
     void resubscribe();
 
-    net::GatewayData& ipc_;
+    net::IMarketData& ipc_;
     QuoteBook& quotes_;
 
     std::vector<std::string> symbols_ = {"AAPL", "MSFT", "SPY"};

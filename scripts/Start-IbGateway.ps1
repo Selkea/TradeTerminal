@@ -48,6 +48,17 @@ if ($acc.PSObject.Properties.Name -contains 'paper') { $isPaper = [bool]$acc.pap
 $mode = if ($isPaper) { 'paper' } else { 'live' }
 $port = if ($isPaper) { 4002 } else { 4001 }
 
+# Already running? Launching IBC twice would put two gateways in a login
+# fight over the same username. The app calls this script on every start
+# (TWS route), so this makes it idempotent.
+try {
+    $probe = [Net.Sockets.TcpClient]::new()
+    $probe.Connect('127.0.0.1', $port)
+    $probe.Close()
+    "IB Gateway already up (api port $port)."
+    exit 0
+} catch {}
+
 # --- locate IB Gateway + IBC ---------------------------------------------------
 $gwVer = Get-ChildItem "C:\Jts\ibgateway" -Directory -ErrorAction SilentlyContinue |
          Where-Object { $_.Name -match '^\d+$' } |

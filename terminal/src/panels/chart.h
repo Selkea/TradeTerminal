@@ -1,7 +1,7 @@
 #pragma once
 
 #include "market_data.h"
-#include "net/gateway_data.h"
+#include "net/market_source.h"
 
 #include <cstdint>
 #include <string>
@@ -18,7 +18,7 @@ struct FillMarker {
 
 class ChartPanel {
 public:
-    ChartPanel(net::GatewayData& ipc, SeriesStore& store) : ipc_(ipc), store_(store) {}
+    ChartPanel(net::IMarketData& ipc, SeriesStore& store) : ipc_(ipc), store_(store) {}
 
     // fills: markers for the currently charted symbol (App matches symbols).
     void draw(bool* open, const std::vector<FillMarker>& fills = {});
@@ -34,7 +34,7 @@ private:
     void request();
     void rebuild_plot_arrays(const SeriesStore::Series& s);
 
-    net::GatewayData& ipc_;
+    net::IMarketData& ipc_;
     SeriesStore& store_;
 
     char sym_[16] = "AAPL";

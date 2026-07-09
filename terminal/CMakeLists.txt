@@ -12,6 +12,7 @@ add_executable(tt_terminal
     src/panels/journal_panel.cpp
     src/candle_plot.cpp
     src/net/gateway_data.cpp
+    src/net/tws_data.cpp
     src/panels/log_console.cpp
     src/panels/chart.cpp
     src/panels/watchlist.cpp

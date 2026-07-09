@@ -95,6 +95,17 @@ IbkrAccountList read_ibkr_accounts() {
     return r;
 }
 
+// IB Gateway socket port follows the active account's mode.
+int tws_api_port() {
+    const auto ib = read_ibkr_accounts();
+    bool paper = true;
+    for (const auto& a : ib.accounts)
+        if (a.name == ib.active) paper = a.paper;
+    int port = paper ? 4002 : 4001;
+    if (const char* p = std::getenv("TT_TWS_PORT")) port = std::atoi(p);
+    return port;
+}
+
 #ifdef _WIN32
 // Launch "powershell.exe <args>" with no console window at all. ShellExecute's
 // SW_HIDE can still flash a console for console-subsystem apps; CREATE_NO_WINDOW
@@ -124,8 +135,8 @@ void badge_paper_live(bool paper) {
     else
         ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1), "LIVE");
 }
-void badge_kind(net::GatewayData::AccountKind k) {
-    using K = net::GatewayData::AccountKind;
+void badge_kind(net::AccountKind k) {
+    using K = net::AccountKind;
     if (k == K::Paper) badge_paper_live(true);
     else if (k == K::Live) badge_paper_live(false);
     // Unknown: no badge
@@ -145,10 +156,15 @@ std::string App::finnhub_key() const {
 }
 
 App::App(std::string gateway_url)
-    : gw_(std::move(gateway_url)),
+    : config_path_((data_dir() / "config.json").string()),
+      cfg_(AppConfig::load(config_path_)),
+      gw_(std::move(gateway_url)),
+      use_tws_data_(cfg_.trade_route == 1),
+      data_(use_tws_data_ ? static_cast<net::IMarketData&>(tws_data_)
+                          : static_cast<net::IMarketData&>(gw_)),
       host_(gxx_path(), std::string(TT_REPO_ROOT) + "/sdk/include", strategies_out_dir()),
-      chart_(gw_, series_),
-      watchlist_(gw_, quotes_),
+      chart_(data_, series_),
+      watchlist_(data_, quotes_),
       backtest_(engine_),
       replay_(engine_, sessions_dir()),
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
@@ -157,7 +173,7 @@ App::App(std::string gateway_url)
       positions_(engine_),
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
-    net::GatewayData::Callbacks cbs;
+    net::IMarketData::Callbacks cbs;
     cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
@@ -179,10 +195,8 @@ App::App(std::string gateway_url)
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
     };
 
-    // Session persistence + file logging.
+    // Session persistence (cfg_ is loaded in the init list) + file logging.
     log_.set_log_file((data_dir() / "logs" / "terminal.log").string());
-    config_path_ = (data_dir() / "config.json").string();
-    cfg_ = AppConfig::load(config_path_);
     watchlist_.set_symbols(cfg_.watchlist);
     chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
     backtest_.set_cash(cfg_.backtest_cash);
@@ -234,19 +248,32 @@ App::App(std::string gateway_url)
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
 #endif
 
-    gw_.start(std::move(cbs));
+    if (use_tws_data_) {
+        tws_data_.set_endpoint("127.0.0.1", tws_api_port());
+        tws_data_.start(std::move(cbs));
+        log_.add("data: TWS route - charts/watchlist/backtests ride IB Gateway; "
+                 "CP web gateway stays down (one brokerage session per username)");
+    } else {
+        gw_.start(std::move(cbs));
+    }
 
 #ifdef _WIN32
-    // Tie the IBKR gateway + auto-login daemon to this app's lifetime: start it
-    // now (if an account is configured) and stop it in the destructor.
+    // Tie the broker gateway to this app's lifetime. Web route: CP gateway +
+    // IBeam auto-login, stopped again in the destructor. TWS route: IB Gateway
+    // via IBC - started if not already up, and left running on exit so the
+    // login (and any typed 2FA code) survives app restarts.
     {
         const auto ib = read_ibkr_accounts();
         if (!ib.accounts.empty() && !ib.active.empty()) {
-            const std::string args = ps_args("Start-IbkrLogin.ps1", true, "-Daemon");
+            const std::string args =
+                use_tws_data_ ? ps_args("Start-IbGateway.ps1")
+                              : ps_args("Start-IbkrLogin.ps1", true, "-Daemon");
             if (!args.empty()) {
                 run_hidden(args);
                 gateway_starting_until_ = 90.0;   // show INITIALIZING until it connects
-                log_.add("account: starting IBKR gateway + auto-login (tied to app)");
+                log_.add(use_tws_data_
+                             ? "account: starting IB Gateway (TWS route)"
+                             : "account: starting IBKR gateway + auto-login (tied to app)");
             }
         }
     }
@@ -283,7 +310,7 @@ void App::start_pending_backtest(net::CandleBatch& batch) {
 void App::queue_backtest(const std::string& key, const std::string& sym,
                          const std::string& ivl, const std::string& rng,
                          double cash) {
-    if (!gw_.connected()) {
+    if (!data_.connected()) {
         log_.add("backtest: feed is down, cannot fetch data");
         return;
     }
@@ -297,7 +324,7 @@ void App::queue_backtest(const std::string& key, const std::string& sym,
         std::lock_guard lock(pending_bt_mu_);
         pending_bt_ = {true, sym, ivl, strat_mgr_.param_values(key), cash, inst};
     }
-    gw_.request_candles(sym, ivl, rng);
+    data_.request_candles(sym, ivl, rng);
 }
 
 // "" = a fresh built-in SMA; otherwise an instance from the module's factory.
@@ -391,7 +418,7 @@ void App::pump_pending_run() {
 
 // UI thread: capture the request + strategy and fetch the data.
 void App::queue_sweep(const SweepPanel::Request& rq) {
-    if (!gw_.connected()) {
+    if (!data_.connected()) {
         log_.add("sweep: feed is down, cannot fetch data");
         return;
     }
@@ -415,7 +442,7 @@ void App::queue_sweep(const SweepPanel::Request& rq) {
         sweep_setup_.key = key;
         sweep_setup_.params = strat_mgr_.param_values(key);
     }
-    gw_.request_candles(rq.symbol, rq.interval, rq.range);
+    data_.request_candles(rq.symbol, rq.interval, rq.range);
 }
 
 // IPC thread: if this batch is what the sweep is waiting for, stash the
@@ -909,13 +936,16 @@ void App::autopilot_evaluate() {
 
 App::~App() {
 #ifdef _WIN32
-    // Tear down the gateway + auto-login daemon we started (tied to app life).
-    {
+    // Tear down the CP gateway + auto-login daemon we started (tied to app
+    // life). TWS route: IB Gateway is deliberately left running - its login
+    // survives app restarts and nothing else fights over the session.
+    if (!use_tws_data_) {
         const std::string args = ps_args("Stop-IbkrSession.ps1", true);
         if (!args.empty()) run_hidden(args, /*wait=*/true);
     }
 #endif
     gw_.stop();
+    tws_data_.stop();
     if (signin_.worker.joinable()) signin_.worker.join();
     cfg_.watchlist = watchlist_.symbols();
     cfg_.chart_symbol = chart_.symbol();
@@ -1023,7 +1053,7 @@ void App::draw() {
 
     // TT_AUTORUN_BACKTEST=1: fire one AAPL backtest as soon as the feed is up
     // (headless end-to-end verification of the UI -> data -> engine path).
-    if (!autorun_bt_done_ && gw_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
+    if (!autorun_bt_done_ && data_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
         autorun_bt_done_ = true;
         queue_backtest("", "AAPL", "1d", "2y", 100'000.0);   // built-in SMA
         log_.add("autorun: queued AAPL 1d 2y backtest (built-in SMA)");
@@ -1031,7 +1061,7 @@ void App::draw() {
 
     // TT_AUTORUN_SWEEP=1: auto-optimize the built-in SMA — headless
     // verification of the optimizer ("optimizer: finished ..." on success).
-    if (!autorun_sweep_done_ && gw_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
+    if (!autorun_sweep_done_ && data_.connected() && std::getenv("TT_AUTORUN_SWEEP")) {
         autorun_sweep_done_ = true;
         SweepPanel::Request rq;
         rq.strat_key = "";   // built-in SMA
@@ -1199,15 +1229,15 @@ void App::draw() {
                         rq.holdout_pct = s.holdout ? s.holdout_pct : 25.0;
                         start_tournament(rq, sym);
                     },
-                    !polygon_key().empty(), !finnhub_key().empty(), gw_.connected(),
+                    !polygon_key().empty(), !finnhub_key().empty(), data_.connected(),
                     [&] {
                         TradePanel::AccountInfo a;
                         const auto ib = read_ibkr_accounts();
                         for (const auto& x : ib.accounts)
                             if (x.name == ib.active) { a.label = x.label; break; }
-                        a.kind = static_cast<int>(gw_.account_kind());
+                        a.kind = static_cast<int>(data_.account_kind());
                         a.readonly = ib.active_readonly();
-                        a.subaccounts = gw_.accounts();
+                        a.subaccounts = data_.accounts();
                         return a;
                     }(),
                     [this](const TradePanel::StartOpts& opts) {
@@ -1281,17 +1311,6 @@ void App::draw() {
                             std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
                             cfg.capture_path = sessions_dir() + "\\" + name;
                         }
-                        // IB Gateway socket port follows the active account's mode.
-                        auto tws_port = [&] {
-                            const auto ib = read_ibkr_accounts();
-                            bool paper = true;
-                            for (const auto& a : ib.accounts)
-                                if (a.name == ib.active) paper = a.paper;
-                            int port = paper ? 4002 : 4001;
-                            if (const char* p = std::getenv("TT_TWS_PORT"))
-                                port = std::atoi(p);
-                            return port;
-                        };
                         std::unique_ptr<IbkrBroker> ibkr_broker;
                         std::unique_ptr<TwsBroker> tws_broker;
                         if (opts.broker == TradePanel::Broker::Ibkr) {
@@ -1308,7 +1327,7 @@ void App::draw() {
                                          : "live: routing orders to IBKR gateway");
                         } else if (opts.broker == TradePanel::Broker::Tws) {
                             TwsConfig tc;
-                            tc.port = tws_port();
+                            tc.port = tws_api_port();
                             tc.symbols = syms;
                             tc.symbol_accounts = sym_accts;
                             tc.read_only = read_ibkr_accounts().active_readonly();
@@ -1406,7 +1425,7 @@ void App::draw() {
                                 rt_feed_active_.store(true, std::memory_order_relaxed);
                             } else if (opts.data == TradePanel::DataFeed::Tws) {
                                 TwsFeedConfig fc;
-                                fc.port = tws_port();
+                                fc.port = tws_api_port();
                                 fc.symbols = syms;
                                 tws_feed_ =
                                     std::make_unique<TwsFeed>(std::move(fc), sink);
@@ -1595,11 +1614,12 @@ void App::draw_trading_guards() {
 
 void App::draw_account_menu() {
     if (!ImGui::BeginMenu("Account")) return;
-    if (gw_.connected()) {
-        const std::string acct = gw_.account();
-        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "ibkr: session active%s",
-                           acct.empty() ? "" : ("  (" + acct + ")").c_str());
-        badge_kind(gw_.account_kind());   // PAPER (green) / LIVE (red)
+    if (data_.connected()) {
+        const std::string acct = data_.account();
+        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "ibkr: session active%s%s",
+                           acct.empty() ? "" : ("  (" + acct + ")").c_str(),
+                           use_tws_data_ ? "  [tws]" : "");
+        badge_kind(data_.account_kind());   // PAPER (green) / LIVE (red)
         if (read_ibkr_accounts().active_readonly()) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.25f, 1), "READ-ONLY");
@@ -1610,13 +1630,19 @@ void App::draw_account_menu() {
     ImGui::Separator();
 
     // Account switching lives in the dialog (pick an account, click it).
-    if (ImGui::MenuItem(gw_.connected() ? "Switch" : "Sign In"))
+    // TWS route: the session belongs to IB Gateway, which Switch-IbkrAccount /
+    // Stop-IbkrLogin (CP web scripts) know nothing about — hide the footguns.
+    if (use_tws_data_) {
+        ImGui::TextDisabled("TWS route: session is managed by IB Gateway");
+        ImGui::TextDisabled("(switch: scripts\\Start-IbGateway.ps1 -Account <id>)");
+    } else if (ImGui::MenuItem(data_.connected() ? "Switch" : "Sign In")) {
         signin_.account_request_open = true;
+    }
 
     const auto ibkr = read_ibkr_accounts();
 
-    if (ImGui::BeginMenu("Sign Out", gw_.connected())) {
-        const std::string acct = gw_.account();
+    if (ImGui::BeginMenu("Sign Out", data_.connected() && !use_tws_data_)) {
+        const std::string acct = data_.account();
         const std::string label =
             "IBKR gateway" + (acct.empty() ? std::string() : ": " + acct);
         if (ImGui::MenuItem(label.c_str())) {
@@ -1743,13 +1769,19 @@ void App::draw_account_modal() {
 
     refresh_ibkr_accounts();   // pick up accounts added via "Add New"
 
-    const bool up = gw_.connected();
+    const bool up = data_.connected();
     const bool initializing = !up && ImGui::GetTime() < gateway_starting_until_;
 
     // Kick off a sign-in (disconnected) or switch (connected, different
     // account) for `name`. Both run Switch-IbkrAccount, which tears the old
-    // session down first.
+    // session down first. TWS route: that script only drives the CP web
+    // gateway — switching means re-logging IB Gateway, done via script.
     auto do_switch = [&](const std::string& name) {
+        if (use_tws_data_) {
+            log_.add("account: TWS route - switch with scripts\\Start-IbGateway.ps1 "
+                     "-Stop, then Start-IbGateway.ps1 -Account \"" + name + "\"");
+            return;
+        }
         const std::string args = switch_args(name);
         if (args.empty()) return;
         run_hidden(args);
@@ -1995,7 +2027,7 @@ void App::draw_menu_bar() {
     }
 
     // Right-aligned gateway session indicator.
-    const bool up = gw_.connected();
+    const bool up = data_.connected();
     const bool initializing = !up && ImGui::GetTime() < gateway_starting_until_;
     const char* label = up ? "GATEWAY UP" : (initializing ? "INITIALIZING" : "GATEWAY DOWN");
     const ImVec4 col = up ? ImVec4(0.25f, 0.85f, 0.45f, 1.0f)

@@ -15,6 +15,7 @@
 #include "journal.h"
 #include "market_data.h"
 #include "net/gateway_data.h"
+#include "net/tws_data.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/replay.h"
@@ -196,10 +197,22 @@ private:
     };
     AutoOpt opt_;
 
+    // Loaded first (declaration order matters): the persisted trade route
+    // decides which market-data backbone the members below are wired to.
+    std::string config_path_;
+    AppConfig cfg_;
+
     LogConsole log_;
     SeriesStore series_;
     QuoteBook quotes_;
     net::GatewayData gw_;
+    net::TwsData tws_data_;
+    // The active backbone. TWS route: everything (charts, watchlist, trading)
+    // rides IB Gateway's socket and the CP web gateway is never started —
+    // IBKR allows one brokerage session per username, so holding a CP web
+    // session next to a TWS session makes the two kick each other forever.
+    bool use_tws_data_ = false;
+    net::IMarketData& data_;
     // Declared before engine_ on purpose: the engine's live thread holds a
     // raw pointer to the broker, so the broker must be destroyed after the
     // engine (members destruct in reverse declaration order).
@@ -286,9 +299,6 @@ private:
     // While the gateway is being launched, show "INITIALIZING" until it is up.
     // Holds an ImGui::GetTime() deadline; 0 = not starting.
     double gateway_starting_until_ = 0.0;
-
-    std::string config_path_;
-    AppConfig cfg_;
 
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm
