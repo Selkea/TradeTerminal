@@ -453,7 +453,14 @@ void TwsBroker::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
-            if (io.reset_conn) {
+            // Half-open guard: socket up but no nextValidId — the gateway is
+            // holding the handshake (rejected client id, mid-login, dialog
+            // pending...). Without this the connection wedges silently forever.
+            const bool stalled = !ready_.load(std::memory_order_acquire) &&
+                                 Clock::now() - last_connect > std::chrono::seconds(10);
+            if (io.reset_conn || stalled) {
+                if (stalled && !io.reset_conn)
+                    log("no API handshake within 10s - reconnecting");
                 io.reset_conn = false;
                 io.drop_connection();
                 last_connect = Clock::now();   // full backoff before the retry

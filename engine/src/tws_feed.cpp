@@ -238,7 +238,13 @@ void TwsFeed::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
-            if (io.reset_conn) {
+            // Half-open guard: socket up but no nextValidId within 10s.
+            const bool stalled =
+                !connected_.load(std::memory_order_acquire) &&
+                std::chrono::steady_clock::now() - last_connect > std::chrono::seconds(10);
+            if (io.reset_conn || stalled) {
+                if (stalled && !io.reset_conn)
+                    log("no API handshake within 10s - reconnecting");
                 io.reset_conn = false;
                 io.drop_connection();
                 last_connect = std::chrono::steady_clock::now();   // full backoff
