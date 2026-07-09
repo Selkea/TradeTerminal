@@ -105,6 +105,7 @@ struct TwsData::Io final : DefaultEWrapper {
     // Active quote streams: symbol -> tickerId + last known quote state.
     struct Stream {
         int req_id = 0;
+        int mkt_type = 0;   // last marketDataType (1 rt / 3 delayed); 0 = unknown
         Quote q;
     };
     std::unordered_map<std::string, Stream> streams;
@@ -313,6 +314,23 @@ struct TwsData::Io final : DefaultEWrapper {
             st.q.ts_ms = now_ms();
             if (d.cbs_.on_tick) d.cbs_.on_tick(sym, st.q);
             break;
+        }
+    }
+
+    // With reqMarketDataType(3) the gateway answers per stream whether it
+    // granted real-time or delayed data — the subscription litmus test.
+    void marketDataType(TickerId reqId, int marketDataType) override {
+        static constexpr const char* kNames[] = {
+            "?", "REAL-TIME", "frozen", "DELAYED (15 min)", "delayed-frozen"};
+        for (auto& [sym, st] : streams) {
+            if (st.req_id != static_cast<int>(reqId)) continue;
+            if (st.mkt_type == marketDataType) return;
+            st.mkt_type = marketDataType;
+            const char* name =
+                marketDataType >= 1 && marketDataType <= 4 ? kNames[marketDataType]
+                                                           : kNames[0];
+            d.log(sym + ": " + name + " market data");
+            return;
         }
     }
 
