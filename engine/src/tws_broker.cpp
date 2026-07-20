@@ -1,6 +1,7 @@
 #include "engine/tws_broker.h"
 
 #include "engine/clock.h"
+#include "engine/price_tick.h"
 
 // TWS API (fetched at configure time; see third_party/CMakeLists.txt).
 #include "CommissionReport.h"
@@ -257,8 +258,8 @@ struct TwsBroker::Io final : DefaultEWrapper {
         parent.orderType = cmd.req.type == OrdType::Limit  ? "LMT"
                            : cmd.req.type == OrdType::Stop ? "STP"
                                                            : "MKT";
-        if (cmd.req.type == OrdType::Limit) parent.lmtPrice = cmd.req.limit_price;
-        if (cmd.req.type == OrdType::Stop) parent.auxPrice = cmd.req.stop_price;
+        if (cmd.req.type == OrdType::Limit) parent.lmtPrice = snap_to_tick(cmd.req.limit_price);
+        if (cmd.req.type == OrdType::Stop) parent.auxPrice = snap_to_tick(cmd.req.stop_price);
         parent.tif = "DAY";
         parent.account = account_for(sid);
         parent.transmit = !bracket;   // brackets transmit on the last child
@@ -272,7 +273,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
             tp.action = exit_action;
             tp.totalQuantity = parent.totalQuantity;
             tp.orderType = "LMT";
-            tp.lmtPrice = cmd.req.take_profit;
+            tp.lmtPrice = snap_to_tick(cmd.req.take_profit);
             tp.tif = "DAY";
             tp.account = parent.account;
             tp.parentId = parent_tws;
@@ -285,7 +286,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
             sl.action = exit_action;
             sl.totalQuantity = parent.totalQuantity;
             sl.orderType = "STP";
-            sl.auxPrice = cmd.req.stop_loss;
+            sl.auxPrice = snap_to_tick(cmd.req.stop_loss);
             sl.tif = "DAY";
             sl.account = parent.account;
             sl.parentId = parent_tws;

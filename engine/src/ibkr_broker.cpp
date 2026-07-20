@@ -3,6 +3,7 @@
 #include "net_util.h"
 #include "net_ws.h"
 #include "engine/clock.h"
+#include "engine/price_tick.h"
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -302,11 +303,11 @@ struct IbkrBroker::Io {
         switch (r.type) {
         case OrdType::Limit:
             o["orderType"] = "LMT";
-            o["price"] = r.limit_price;
+            o["price"] = snap_to_tick(r.limit_price);
             break;
         case OrdType::Stop:
             o["orderType"] = "STP";
-            o["price"] = r.stop_price;
+            o["price"] = snap_to_tick(r.stop_price);
             break;
         default:
             o["orderType"] = "MKT";
