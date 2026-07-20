@@ -18,6 +18,7 @@
 // /iserver/account/trades, deduped by execution id — push updates via the
 // gateway websocket are a future refinement.
 
+#include "engine/ack_latency.h"
 #include "engine/broker.h"
 #include "engine/spsc_ring.h"
 
@@ -111,6 +112,9 @@ public:
     // Status/log lines (I/O thread produces, UI drains each frame).
     bool pop_log(std::string& out);
 
+    // Measured order-path latency (submit -> gateway/IBKR ack), for the fill sim.
+    AckSummary ack_latency() const { return ack_lat_.summary(); }
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -139,6 +143,8 @@ private:
 
     std::mutex log_mu_;
     std::deque<std::string> logs_;
+
+    AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
 
     uintptr_t wake_tx_ = static_cast<uintptr_t>(-1);
     uintptr_t wake_rx_ = static_cast<uintptr_t>(-1);

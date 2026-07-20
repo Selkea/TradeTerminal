@@ -14,6 +14,7 @@
 // the session's own net position (tracked from our fills), mirroring the
 // simulator's "close what this session opened" semantics.
 
+#include "engine/ack_latency.h"
 #include "engine/broker.h"
 #include "engine/spsc_ring.h"
 
@@ -54,6 +55,9 @@ public:
     // Status/log lines (I/O thread produces, UI drains each frame).
     bool pop_log(std::string& out);
 
+    // Measured order-path latency (submit -> first ack), for the fill sim.
+    AckSummary ack_latency() const { return ack_lat_.summary(); }
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -85,6 +89,8 @@ private:
 
     std::mutex log_mu_;
     std::deque<std::string> logs_;
+
+    AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
 
     std::thread io_thread_;
 };

@@ -370,6 +370,7 @@ struct IbkrBroker::Io {
                 const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
+                b.ack_lat_.record_ms(ms);   // feeds the fill-sim latency model
                 b.log("order #" + std::to_string(c.local_id) + " acked in " +
                       std::to_string(ms) + " ms");
                 if (tp_local || sl_local)

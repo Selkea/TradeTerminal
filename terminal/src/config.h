@@ -3,6 +3,7 @@
 // Loaded at startup, saved on clean exit. Missing/corrupt files fall back to
 // defaults silently — config must never block launch.
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -77,6 +78,13 @@ struct AppConfig {
     int sweep_metric = 0;
     bool sweep_holdout = true;
     double sweep_holdout_pct = 25.0;
+    // Order-path latency measured from the live broker's submit->ack round-trips
+    // (median + p90-p50 spread, ns), fed into backtest/optimizer fills so they
+    // model the real venue path instead of the 250 us default. count 0 = never
+    // measured -> the sim falls back to the realistic VPS default (~75 ms).
+    int64_t measured_lat_ns = 0;
+    int64_t measured_lat_jitter_ns = 0;
+    int64_t measured_lat_count = 0;
     // Which panels (View menu) were open; missing entry = the panel's default.
     std::map<std::string, bool> panels;
     // Strategy panel: which strategies were loaded and each one's edited

@@ -35,6 +35,7 @@ add_executable(tt_engine_tests
     tests/test_tick_log.cpp
     tests/test_exec_brackets.cpp
     tests/test_price_tick.cpp
+    tests/test_ack_latency.cpp
 )
 target_link_libraries(tt_engine_tests PRIVATE tt_engine doctest)
 target_compile_definitions(tt_engine_tests PRIVATE

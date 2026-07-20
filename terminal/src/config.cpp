@@ -77,6 +77,9 @@ AppConfig AppConfig::load(const std::string& path) {
     c.sweep_metric = j.value("sweep_metric", c.sweep_metric);
     c.sweep_holdout = j.value("sweep_holdout", c.sweep_holdout);
     c.sweep_holdout_pct = j.value("sweep_holdout_pct", c.sweep_holdout_pct);
+    c.measured_lat_ns = j.value("measured_lat_ns", c.measured_lat_ns);
+    c.measured_lat_jitter_ns = j.value("measured_lat_jitter_ns", c.measured_lat_jitter_ns);
+    c.measured_lat_count = j.value("measured_lat_count", c.measured_lat_count);
     if (j.contains("panels") && j["panels"].is_object())
         for (const auto& [k, v] : j["panels"].items())
             if (v.is_boolean()) c.panels[k] = v.get<bool>();
@@ -144,6 +147,9 @@ void AppConfig::save(const std::string& path) const {
     j["sweep_metric"] = sweep_metric;
     j["sweep_holdout"] = sweep_holdout;
     j["sweep_holdout_pct"] = sweep_holdout_pct;
+    j["measured_lat_ns"] = measured_lat_ns;
+    j["measured_lat_jitter_ns"] = measured_lat_jitter_ns;
+    j["measured_lat_count"] = measured_lat_count;
     j["panels"] = panels;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;

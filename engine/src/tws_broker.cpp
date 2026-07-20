@@ -148,6 +148,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
                 const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     Clock::now() - st->second)
                                     .count();
+                b.ack_lat_.record_ms(ms);   // feeds the fill-sim latency model
                 b.log("order #" + std::to_string(local) + " acked in " +
                       std::to_string(ms) + " ms (" + status + ")");
             }

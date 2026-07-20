@@ -9,6 +9,8 @@
 #include <shellapi.h>   // ShellExecuteA (gateway login page / launch)
 #endif
 
+#include "engine/ack_latency.h"
+
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -16,10 +18,27 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <utility>
 
 namespace tt::ui {
 
 namespace {
+// Fill-sim order latency: once the live broker has logged at least this many
+// acks, backtest/optimizer/replay use the measured median + spread; until then
+// they use the realistic VPS default (~75 ms), not the 250 us ExecParams toy.
+constexpr uint64_t kMinLatSamples = 20;
+constexpr int64_t kDefaultLatNs = 75'000'000;
+constexpr int64_t kDefaultLatJitterNs = 25'000'000;
+
+// {base_ns, jitter_ns} for ExecParams fills: measured live latency once enough
+// acks are in, else the realistic VPS default.
+std::pair<int64_t, int64_t> sim_exec_latency(const AppConfig& c) {
+    if (static_cast<uint64_t>(c.measured_lat_count) >= kMinLatSamples &&
+        c.measured_lat_ns > 0)
+        return {c.measured_lat_ns, c.measured_lat_jitter_ns};
+    return {kDefaultLatNs, kDefaultLatJitterNs};
+}
+
 std::filesystem::path data_dir() {
     const char* base = std::getenv("LOCALAPPDATA");
     return std::filesystem::path(base ? base : ".") / "TradeTerminal";
@@ -304,6 +323,17 @@ void App::start_pending_backtest(net::CandleBatch& batch) {
                                c.close, c.volume});
     cfg.initial_cash = pending_bt_.cash;
     cfg.params = std::move(pending_bt_.params);
+    // Fills use the live-measured order latency when we have it, else the VPS
+    // default — never the 250 us ExecParams toy (unrealistic for scalping).
+    const auto [bt_lat, bt_jit] = sim_exec_latency(cfg_);
+    cfg.exec.latency_ns = bt_lat;
+    cfg.exec.latency_jitter_ns = bt_jit;
+    log_.add(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
+                 ? "backtest fill latency: measured " +
+                       std::to_string(bt_lat / 1'000'000) + "+/-" +
+                       std::to_string(bt_jit / 1'000'000) + " ms (" +
+                       std::to_string(cfg_.measured_lat_count) + " live acks)"
+                 : "backtest fill latency: default 75 ms (no live acks yet)");
     if (!engine_.start_backtest(std::move(cfg), pending_bt_.strategy))
         log_.add("backtest: engine busy, try again");
 }
@@ -516,6 +546,19 @@ void App::pump_sweep() {
                 sweep_base_.bars = std::move(sweep_setup_.bars);
                 sweep_base_.initial_cash = rq.cash;
                 sweep_base_.params = std::move(sweep_setup_.params);
+                // Every sweep cell copies sweep_base_, so set the fill latency
+                // once here (measured live latency, else the VPS default).
+                {
+                    const auto [sw_lat, sw_jit] = sim_exec_latency(cfg_);
+                    sweep_base_.exec.latency_ns = sw_lat;
+                    sweep_base_.exec.latency_jitter_ns = sw_jit;
+                    log_.add(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
+                                 ? "optimizer fill latency: measured " +
+                                       std::to_string(sw_lat / 1'000'000) + "+/-" +
+                                       std::to_string(sw_jit / 1'000'000) + " ms (" +
+                                       std::to_string(cfg_.measured_lat_count) + " live acks)"
+                                 : "optimizer fill latency: default 75 ms (no live acks yet)");
+                }
                 sweep_strategy_ = sweep_setup_.strategy;
 
                 // Walk-forward split: the newest slice is held out of the
@@ -1004,6 +1047,16 @@ void App::save_config() {
                    {"log", show_log_}};
     cfg_.strategy_loaded = strat_mgr_.loaded_keys();
     cfg_.strategy_params = strat_mgr_.all_param_values();
+    // Capture the live broker's order-path latency so the optimizer models the
+    // real venue instead of the 250 us default (consumed by sim_exec_latency).
+    AckSummary ack{};
+    if (ibkr_) ack = ibkr_->ack_latency();
+    else if (tws_) ack = tws_->ack_latency();
+    if (ack.count >= kMinLatSamples && ack.base_ns > 0) {
+        cfg_.measured_lat_ns = ack.base_ns;
+        cfg_.measured_lat_jitter_ns = ack.jitter_ns;
+        cfg_.measured_lat_count = static_cast<int64_t>(ack.count);
+    }
     cfg_.save(config_path_);
 }
 
@@ -1179,9 +1232,13 @@ void App::draw() {
                          cfg.bar_seconds_override = bar_seconds_override;
                          cfg.initial_cash = cash;
                          // Same realistic order latency as live-sim sessions, so
-                         // a replayed scalp fills the way it would have live.
-                         cfg.exec.latency_ns = 75'000'000;
-                         cfg.exec.latency_jitter_ns = 25'000'000;
+                         // a replayed scalp fills the way it would have live
+                         // (measured submit->ack latency, else the VPS default).
+                         {
+                             const auto [lat, jit] = sim_exec_latency(cfg_);
+                             cfg.exec.latency_ns = lat;
+                             cfg.exec.latency_jitter_ns = jit;
+                         }
                          cfg.params = strat_mgr_.param_values(strat_key);
                          IStrategy* strat = acquire_strategy(strat_key);
                          if (!strat) {
@@ -1306,12 +1363,16 @@ void App::draw() {
                         // core index): kills scheduler-migration jitter.
                         if (const char* pin = std::getenv("TT_PIN_ENGINE"))
                             cfg.pin_core = std::atoi(pin);
-                        // Simulator fills model the real IBKR order path measured
-                        // from the VPS (~15 ms RTT + gateway/backend processing):
-                        // an order rests ~50-100 ms before it can fill. Matters
-                        // for scalping; negligible for bar-scale strategies.
-                        cfg.exec.latency_ns = 75'000'000;
-                        cfg.exec.latency_jitter_ns = 25'000'000;
+                        // Simulator fills model the real IBKR order path: the
+                        // live-measured submit->ack latency once enough acks are
+                        // in, else the VPS default (~15 ms RTT + gateway/backend
+                        // processing => ~75 ms). Matters for scalping; negligible
+                        // for bar-scale strategies.
+                        {
+                            const auto [lat, jit] = sim_exec_latency(cfg_);
+                            cfg.exec.latency_ns = lat;
+                            cfg.exec.latency_jitter_ns = jit;
+                        }
                         // Per-strategy callback watchdog (huge headroom over the
                         // µs a normal callback takes; catches runaways only).
                         cfg.watchdog_ms = 250;
