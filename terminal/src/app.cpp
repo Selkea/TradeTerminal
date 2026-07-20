@@ -1,4 +1,5 @@
 #include "app.h"
+#include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
 #include "dev_paths.h"
 
 #include "imgui_internal.h"  // DockBuilder API (default first-run layout) + private dock node flags
@@ -10,6 +11,7 @@
 #endif
 
 #include "engine/ack_latency.h"
+#include "engine/version.h"
 
 #include <nlohmann/json.hpp>
 
@@ -18,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <utility>
 
 namespace tt::ui {
@@ -37,6 +40,115 @@ std::pair<int64_t, int64_t> sim_exec_latency(const AppConfig& c) {
         c.measured_lat_ns > 0)
         return {c.measured_lat_ns, c.measured_lat_jitter_ns};
     return {kDefaultLatNs, kDefaultLatJitterNs};
+}
+
+// 128-bit random bearer token as 32 lowercase hex chars, for the diagnostics
+// endpoint. std::random_device is fine here: this guards a read-only monitor on
+// an encrypted tailnet, not a cryptographic key.
+std::string gen_diag_token() {
+    std::random_device rd;
+    std::uniform_int_distribution<int> hex(0, 15);
+    static const char* d = "0123456789abcdef";
+    std::string t(32, '0');
+    for (char& c : t) c = d[hex(rd)];
+    return t;
+}
+
+// epoch seconds -> "YYYY-MM-DDTHH:MM:SSZ" (UTC), for /diag timestamps.
+std::string iso_utc(std::time_t t) {
+    if (t == 0) return "";
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+const char* order_type_name(uint8_t t) {
+    switch (static_cast<OrdType>(t)) {
+        case OrdType::Market: return "market";
+        case OrdType::Limit:  return "limit";
+        case OrdType::Stop:   return "stop";
+    }
+    return "?";
+}
+
+// Self-contained monitoring page served at GET /. Carries no data itself: its
+// JS forwards the page URL's ?token= to /diag and renders the JSON, refreshing
+// every 2 s. Kept inline (no external assets) so it works over a bare tailnet.
+const char* diag_html() {
+    return R"HTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TradeTerminal diag</title>
+<style>
+ body{font:13px/1.5 ui-monospace,Consolas,monospace;background:#0f1216;color:#d7dde3;margin:0;padding:16px}
+ h1{font-size:15px;margin:14px 0 4px;color:#8ab4f8}
+ .muted{color:#7a848f}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:12px 0}
+ .card{background:#171b21;border:1px solid #232a32;border-radius:6px;padding:8px 10px}
+ .k{color:#7a848f;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+ .v{font-size:16px}
+ .bad{color:#ff6b6b}.good{color:#57d38c}.warn{color:#e6b455}
+ table{border-collapse:collapse;width:100%;margin-top:6px}
+ th,td{text-align:left;padding:3px 8px;border-bottom:1px solid #232a32}
+ th{color:#7a848f;font-weight:600}
+ pre{white-space:pre-wrap;background:#171b21;border:1px solid #232a32;border-radius:6px;padding:8px;max-height:40vh;overflow:auto}
+ #err{color:#ff6b6b}
+</style></head><body>
+<h1 style="margin-top:0">TradeTerminal — diagnostics</h1>
+<div class="muted" id="sub">connecting…</div>
+<div id="err"></div>
+<div class="grid" id="cards"></div>
+<h1>Positions</h1>
+<table id="pos"><thead><tr><th>Symbol</th><th>Pos</th><th>Avg</th><th>Last</th><th>uPnL</th><th>Strategy</th><th>Guard</th></tr></thead><tbody></tbody></table>
+<h1>Recent rejects</h1>
+<table id="rej"><thead><tr><th>Id</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th></tr></thead><tbody></tbody></table>
+<h1 class="muted">Raw /diag</h1>
+<pre id="raw"></pre>
+<script>
+const q=location.search;
+function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
+function fmt(n,d){return (typeof n==='number')?n.toFixed(d===undefined?2:d):n;}
+async function tick(){
+ try{
+  const r=await fetch('/diag'+q,{cache:'no-store'});
+  if(!r.ok){document.getElementById('err').textContent='HTTP '+r.status+(r.status==401?' — add ?token=... to the URL':'');return;}
+  document.getElementById('err').textContent='';
+  const d=await r.json();
+  document.getElementById('sub').textContent=d.git_commit+(d.git_dirty?'*':'')+' · '+d.route+' · up '+d.uptime_sec+'s · '+d.now;
+  let c='';
+  c+=card('Live',d.live_running?'RUNNING':'idle',d.live_running?'good':'muted');
+  c+=card('Halted',d.halted?'HALTED':'no',d.halted?'bad':'good');
+  c+=card('Equity','$'+fmt(d.equity));
+  c+=card('Cash','$'+fmt(d.cash));
+  c+=card('Unprotected',d.unprotected_positions,d.unprotected_positions>0?'bad':'good');
+  c+=card('Rejects',d.reject_count,d.reject_count>0?'warn':'good');
+  c+=card('Feed stale',(d.feed_stale_ms<0?'—':d.feed_stale_ms+' ms'),d.feed_stale_ms>10000?'warn':'');
+  c+=card('Dropped ticks',d.dropped_ticks,d.dropped_ticks>0?'warn':'');
+  c+=card('Ack p50',fmt(d.latency.ack_p50_ms)+' ms');
+  c+=card('Ack p90',fmt(d.latency.ack_p90_ms)+' ms');
+  document.getElementById('cards').innerHTML=c;
+  let pb='';
+  for(const s of d.symbols){
+   const guard=s.position==0?'flat':(s.unprotected?'NAKED':'ok');
+   pb+='<tr><td>'+s.symbol+'</td><td>'+fmt(s.position,0)+'</td><td>'+fmt(s.avg_price)+'</td><td>'+fmt(s.last_price)+'</td><td class="'+(s.unrealized_pnl<0?'bad':'good')+'">'+fmt(s.unrealized_pnl)+'</td><td>'+(s.strategy||'')+'</td><td class="'+(s.unprotected?'bad':'good')+'">'+guard+'</td></tr>';
+  }
+  document.querySelector('#pos tbody').innerHTML=pb||'<tr><td colspan=7 class=muted>none</td></tr>';
+  let rb='';
+  for(const x of d.rejects_recent){rb+='<tr><td>'+x.id+'</td><td>'+x.symbol+'</td><td>'+x.side+'</td><td>'+x.type+'</td><td>'+fmt(x.qty,0)+'</td><td>'+fmt(x.limit_price)+'</td></tr>';}
+  document.querySelector('#rej tbody').innerHTML=rb||'<tr><td colspan=6 class=muted>none</td></tr>';
+  document.getElementById('raw').textContent=JSON.stringify(d,null,2);
+ }catch(e){document.getElementById('err').textContent=String(e);}
+}
+tick();setInterval(tick,2000);
+</script>
+</body></html>
+)HTML";
 }
 
 std::filesystem::path data_dir() {
@@ -299,6 +411,9 @@ App::App(std::string gateway_url)
         }
     }
 #endif
+
+    session_start_ = std::time(nullptr);
+    start_diag_server();
 }
 
 // IPC thread: if this candle batch is the one a queued backtest is waiting
@@ -980,6 +1095,10 @@ void App::autopilot_evaluate() {
 }
 
 App::~App() {
+    // Stop the diagnostics server first: its provider lambda captures `this` and
+    // reads diag_json_, so the accept thread must be joined before any member it
+    // could touch is destroyed.
+    diag_srv_.stop();
 #ifdef _WIN32
     // Tear down the CP gateway + auto-login daemon we started (tied to app
     // life). TWS route: IB Gateway is deliberately left running - its login
@@ -1060,6 +1179,150 @@ void App::save_config() {
     cfg_.save(config_path_);
 }
 
+// Generate/persist the bearer token, then bind the read-only diagnostics socket.
+// Called once from the constructor.
+void App::start_diag_server() {
+    if (!cfg_.diag_enabled) {
+        log_.add("diag: endpoint disabled (diag_enabled=false in config.json)");
+        return;
+    }
+    if (cfg_.diag_token.empty()) {
+        cfg_.diag_token = gen_diag_token();
+        cfg_.save(config_path_);   // persist so the token is stable across restarts
+    }
+    const uint16_t port = static_cast<uint16_t>(cfg_.diag_port);
+    diag_json_ = build_diag_json();   // seed so the first request isn't "{}"
+    const bool ok = diag_srv_.start(
+        cfg_.diag_bind, port, cfg_.diag_token,
+        [this] { std::lock_guard<std::mutex> g(diag_mu_); return diag_json_; },
+        [] { return std::string(diag_html()); },
+        [this](std::string l) { log_.add(std::move(l)); });
+    if (ok)
+        log_.add("diag: read-only endpoint on " + cfg_.diag_bind + ":" +
+                 std::to_string(port) + "  —  browse  http://<tailscale-ip>:" +
+                 std::to_string(port) + "/?token=" + cfg_.diag_token);
+    else
+        log_.add("diag: endpoint failed to start (is port " + std::to_string(port) +
+                 " already in use?)");
+}
+
+// UI thread, per frame: re-render the /diag body at ~1 Hz into diag_json_, which
+// the server thread copies out under diag_mu_.
+void App::pump_diag() {
+    if (!diag_srv_.running()) return;
+    const double now = ImGui::GetTime();
+    if (now < diag_next_build_s_) return;
+    diag_next_build_s_ = now + 1.0;
+    std::string body = build_diag_json();
+    std::lock_guard<std::mutex> g(diag_mu_);
+    diag_json_ = std::move(body);
+}
+
+// Render the current diagnostics snapshot as JSON. UI thread only (reads
+// engine_.live_snapshot() and cfg_ the same way the panels do).
+std::string App::build_diag_json() {
+    using nlohmann::json;
+    const LiveSnapshot s = engine_.live_snapshot();
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+
+    json j;
+    // ---- build / session identity ----
+    j["engine_version"] = engine_version();
+    j["git_commit"] = TT_GIT_COMMIT;
+    j["git_dirty"] = TT_GIT_DIRTY;
+    j["build_date"] = TT_BUILD_DATE;
+    j["session_start"] = iso_utc(session_start_);
+    j["uptime_sec"] =
+        session_start_ ? static_cast<int64_t>(std::time(nullptr) - session_start_) : 0;
+    j["now"] = iso_utc(std::time(nullptr));
+    j["control"] = "read-only";
+    j["route"] = cfg_.trade_route == 1 ? "TWS socket" : "IBKR web";
+    j["broker_connected"] = ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false);
+
+    // ---- session state ----
+    j["live_running"] = s.running;
+    j["halted"] = s.halted;
+    j["cash"] = s.cash;
+    j["equity"] = s.equity;
+    j["ticks"] = s.ticks;
+    j["dropped_ticks"] = s.dropped_ticks;
+    j["feed_stale_ms"] = s.last_tick_ts_ms > 0 ? (now_ms - s.last_tick_ts_ms) : -1;
+
+    auto strat_for = [&](const std::string& sym) -> const TradeSymbol* {
+        for (const auto& ts : cfg_.trade_symbols)
+            if (ts.symbol == sym) return &ts;
+        return nullptr;
+    };
+    // A symbol is "unprotected" when it holds a nonzero position but has no
+    // Working stop order — the async-reject gap that leaves a naked position.
+    auto has_working_stop = [&](const std::string& sym) {
+        for (const auto& o : s.orders)
+            if (o.symbol == sym && o.status == OrderStatus::Working &&
+                o.type == static_cast<uint8_t>(OrdType::Stop))
+                return true;
+        return false;
+    };
+
+    json syms = json::array();
+    int unprotected = 0;
+    for (const auto& ss : s.symbols) {
+        json e;
+        e["symbol"] = ss.symbol;
+        e["last_price"] = ss.last_price;
+        e["position"] = ss.position.qty;
+        e["avg_price"] = ss.position.avg_price;
+        e["unrealized_pnl"] = ss.position.unrealized_pnl;
+        e["realized_pnl"] = ss.position.realized_pnl;
+        const bool naked = ss.position.qty != 0.0 && !has_working_stop(ss.symbol);
+        e["unprotected"] = naked;
+        if (naked) ++unprotected;
+        if (const TradeSymbol* ts = strat_for(ss.symbol)) {
+            e["strategy"] = ts->strat_key.empty() ? "built-in SMA" : ts->strat_key;
+            e["params"] = ts->params;
+        }
+        syms.push_back(std::move(e));
+    }
+    j["symbols"] = std::move(syms);
+    j["unprotected_positions"] = unprotected;
+
+    // ---- rejects feed (count + recent; rich reject codes live in /logs) ----
+    int reject_count = 0;
+    for (const auto& o : s.orders)
+        if (o.status == OrderStatus::Rejected) ++reject_count;
+    json rejects = json::array();
+    for (auto it = s.orders.rbegin(); it != s.orders.rend() && rejects.size() < 10; ++it)
+        if (it->status == OrderStatus::Rejected) {
+            json r;
+            r["id"] = it->id;
+            r["symbol"] = it->symbol;
+            r["side"] = it->side == static_cast<uint8_t>(Side::Buy) ? "buy" : "sell";
+            r["type"] = order_type_name(it->type);
+            r["qty"] = it->qty;
+            r["limit_price"] = it->limit_price;
+            rejects.push_back(std::move(r));
+        }
+    j["reject_count"] = reject_count;
+    j["rejects_recent"] = std::move(rejects);
+
+    // ---- latency ----
+    AckSummary ack{};
+    if (ibkr_) ack = ibkr_->ack_latency();
+    else if (tws_) ack = tws_->ack_latency();
+    json lat;
+    lat["ack_count"] = ack.count;
+    lat["ack_p50_ms"] = ack.base_ns / 1'000'000.0;
+    lat["ack_p90_ms"] = (ack.base_ns + ack.jitter_ns) / 1'000'000.0;
+    lat["tick_to_order_p50_us"] = s.lat_p50 / 1000.0;
+    lat["tick_to_order_p99_us"] = s.lat_p99 / 1000.0;
+    lat["tick_to_order_max_us"] = s.lat_max / 1000.0;
+    lat["tick_to_order_count"] = s.lat_count;
+    j["latency"] = std::move(lat);
+
+    return j.dump(2);
+}
+
 void App::draw() {
     const ImGuiID dockspace_id =
         ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_NoWindowMenuButton);
@@ -1067,6 +1330,7 @@ void App::draw() {
         last_cfg_save_ = ImGui::GetTime();
         save_config();
     }
+    pump_diag();   // re-render the /diag body (throttled) for the remote monitor
     if (!layout_checked_) {
         layout_checked_ = true;
         if (!had_ini_) setup_default_layout(dockspace_id);

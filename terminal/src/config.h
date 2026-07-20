@@ -85,6 +85,14 @@ struct AppConfig {
     int64_t measured_lat_ns = 0;
     int64_t measured_lat_jitter_ns = 0;
     int64_t measured_lat_count = 0;
+    // Read-only diagnostics HTTP endpoint for remote monitoring over the tailnet
+    // (see net/diag_server.h). Bound to diag_bind:diag_port, guarded by a bearer
+    // token auto-generated on first run (empty -> generated + persisted, and
+    // printed once to the log). diag_enabled = false stops the server starting.
+    bool diag_enabled = true;
+    std::string diag_bind = "0.0.0.0";   // tailnet peers reach it; VPS firewall keeps it off the public net
+    int diag_port = 8787;
+    std::string diag_token;
     // Which panels (View menu) were open; missing entry = the panel's default.
     std::map<std::string, bool> panels;
     // Strategy panel: which strategies were loaded and each one's edited

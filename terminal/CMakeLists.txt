@@ -2,6 +2,21 @@ set(TT_REPO_ROOT ${CMAKE_SOURCE_DIR})
 find_package(CURL REQUIRED)   # alert webhook POSTs
 configure_file(src/dev_paths.h.in ${CMAKE_CURRENT_BINARY_DIR}/dev_paths.h @ONLY)
 
+# Stamp the git commit into build_info.h at build time (not configure time) so
+# /diag always reports the exact source running on the VPS. The custom target
+# reruns git each build; configure_file only rewrites the header when the commit
+# actually moved, so it doesn't churn the build.
+set(TT_BUILD_INFO ${CMAKE_CURRENT_BINARY_DIR}/build_info.h)
+add_custom_target(tt_build_info
+    BYPRODUCTS ${TT_BUILD_INFO}
+    COMMAND ${CMAKE_COMMAND}
+        -DIN=${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.h.in
+        -DOUT=${TT_BUILD_INFO}
+        -DGIT_SRC=${TT_REPO_ROOT}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_commit.cmake
+    COMMENT "Stamping git commit into build_info.h"
+    VERBATIM)
+
 add_executable(tt_terminal
     src/main.cpp
     src/account_store.cpp
@@ -13,6 +28,7 @@ add_executable(tt_terminal
     src/candle_plot.cpp
     src/net/gateway_data.cpp
     src/net/tws_data.cpp
+    src/net/diag_server.cpp
     src/panels/log_console.cpp
     src/panels/chart.cpp
     src/panels/watchlist.cpp
@@ -31,6 +47,7 @@ if(WIN32)
     set_source_files_properties(resources/app.rc PROPERTIES OBJECT_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico)
 endif()
+add_dependencies(tt_terminal tt_build_info)   # generate build_info.h before compiling
 target_include_directories(tt_terminal PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 # Debug-only features (Debug menu, tick simulator) compile out of release.
 target_compile_definitions(tt_terminal PRIVATE $<$<CONFIG:Debug>:TT_DEBUG>)

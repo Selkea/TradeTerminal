@@ -14,6 +14,7 @@
 #include "engine/strategy_host.h"
 #include "journal.h"
 #include "market_data.h"
+#include "net/diag_server.h"
 #include "net/gateway_data.h"
 #include "net/tws_data.h"
 #include "panels/backtest.h"
@@ -31,6 +32,7 @@
 #include "imgui.h"
 
 #include <atomic>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <string>
@@ -67,6 +69,13 @@ private:
     void safe_stop_live();            // kill switch + graceful stop, if live
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
     void save_config();              // panel state -> cfg_ -> config.json
+    // Read-only diagnostics endpoint (net/diag_server.h). start_diag_server()
+    // generates/persists the bearer token and binds the socket; pump_diag()
+    // re-renders the /diag body on the UI thread (throttled) into diag_json_,
+    // which the server thread copies out under diag_mu_.
+    void start_diag_server();
+    void pump_diag();
+    std::string build_diag_json();
     void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
@@ -304,6 +313,13 @@ private:
     // Last periodic config save (ImGui::GetTime()); saves run once a minute
     // so a force-killed process loses at most a minute of settings.
     double last_cfg_save_ = 0.0;
+
+    // ---- diagnostics endpoint (net/diag_server.h) ----
+    DiagServer diag_srv_;
+    std::mutex diag_mu_;
+    std::string diag_json_ = "{}";     // published by pump_diag(), read by the server
+    double diag_next_build_s_ = 0.0;   // next UI-thread re-render (ImGui::GetTime())
+    std::time_t session_start_ = 0;    // wall-clock app start, for /diag uptime
 
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm

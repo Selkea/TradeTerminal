@@ -1,0 +1,8 @@
+#pragma once
+// Generated at build time by cmake/git_commit.cmake — records the exact source
+// the running binary was built from, surfaced in /diag so you can confirm
+// what's actually deployed on the VPS. configure_file only rewrites this when
+// the values change, so it doesn't force needless rebuilds.
+#define TT_GIT_COMMIT "@TT_GIT_COMMIT@"
+#define TT_GIT_DIRTY @TT_GIT_DIRTY@
+#define TT_BUILD_DATE "@TT_BUILD_DATE@"
