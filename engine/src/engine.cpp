@@ -1027,14 +1027,32 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     apply_fill(f);
                 } else if (bev.type == static_cast<uint16_t>(EvType::OrderCancel)) {
                     const bool rejected = (bev.flags & kEvFlagRejected) != 0;
+                    // Pull the reason once per event (take_reject erases it), so
+                    // /diag can show why, not just that, an order was rejected.
+                    RejectReason rr;
+                    if (rejected) rr = broker->take_reject(bev.u.order.order_id);
+                    const bool have_reason = rr.code || !rr.message.empty();
                     for (auto& o : orders)
                         if (o.id == bev.u.order.order_id) {
                             o.status =
                                 rejected ? OrderStatus::Rejected : OrderStatus::Cancelled;
+                            // Only overwrite when this event carried a reason, so
+                            // a later reason-less reject can't wipe a captured one.
+                            if (rejected && have_reason) {
+                                o.reject_code = rr.code;
+                                o.reject_msg = rr.message;
+                            }
                             orders_dirty = true;
                         }
-                    push_log("live: order #" + std::to_string(bev.u.order.order_id) +
-                             (rejected ? " rejected by broker" : " cancelled"));
+                    std::string line = "live: order #" +
+                                       std::to_string(bev.u.order.order_id) +
+                                       (rejected ? " rejected by broker" : " cancelled");
+                    if (rejected && have_reason) {
+                        line += " [";
+                        if (rr.code) line += std::to_string(rr.code) + " ";
+                        line += rr.message + "]";
+                    }
+                    push_log(line);
                 } else if (bev.type == static_cast<uint16_t>(EvType::PosSnap)) {
                     pf.seed_position(bev.symbol_id, bev.u.pos.qty, bev.u.pos.avg_price);
                     risk_base_eq = risk_high_eq = pf.equity();   // new baseline

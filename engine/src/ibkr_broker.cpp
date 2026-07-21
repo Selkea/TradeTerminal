@@ -355,10 +355,10 @@ struct IbkrBroker::Io {
         for (int round = 0; round < 3; ++round) {
             IbkrOrderResp resp;
             if (!r.ok() || !ibkr_parse_order_response(r.body, resp)) {
-                b.log("order #" + std::to_string(c.local_id) + " rejected: " +
-                      (r.rc != CURLE_OK ? curl_easy_strerror(r.rc)
-                                        : r.body.substr(0, 200)));
-                b.push_reject(c.local_id);
+                const std::string reason =
+                    r.rc != CURLE_OK ? curl_easy_strerror(r.rc) : r.body.substr(0, 200);
+                b.log("order #" + std::to_string(c.local_id) + " rejected: " + reason);
+                b.push_reject(c.local_id, 0, reason);
                 return;
             }
             if (!resp.order_id.empty()) {
@@ -384,7 +384,7 @@ struct IbkrBroker::Io {
             r = call("POST", "/iserver/reply/" + resp.reply_id, R"({"confirmed":true})");
         }
         b.log("order #" + std::to_string(c.local_id) + " stuck in confirmation loop");
-        b.push_reject(c.local_id);
+        b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop");
     }
 
     void handle_cmd(const Cmd& c) {
@@ -587,13 +587,30 @@ void IbkrBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void IbkrBroker::push_reject(uint64_t local_id) {
+void IbkrBroker::push_reject(uint64_t local_id, int code, std::string msg) {
+    if (code || !msg.empty()) {
+        std::lock_guard lock(reject_mu_);
+        // Record BEFORE pushing the event so the reason is visible by the time
+        // the engine thread drains it. Bounded: rejects are rare, and every
+        // entry is normally consumed by take_reject().
+        if (reject_reasons_.size() > 512) reject_reasons_.clear();
+        reject_reasons_[local_id] = RejectReason{code, std::move(msg)};
+    }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
     ev.flags = kEvFlagRejected;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);
+}
+
+RejectReason IbkrBroker::take_reject(uint64_t order_id) {
+    std::lock_guard lock(reject_mu_);
+    const auto it = reject_reasons_.find(order_id);
+    if (it == reject_reasons_.end()) return {};
+    RejectReason r = std::move(it->second);
+    reject_reasons_.erase(it);
+    return r;
 }
 
 void IbkrBroker::log(std::string line) {
@@ -625,7 +642,7 @@ void IbkrBroker::io_loop() {
         while (cmd_ring_->try_pop(c)) {
             worked = true;
             if (now_ready) io.handle_cmd(c);
-            else if (c.type == Cmd::Submit) push_reject(c.local_id);
+            else if (c.type == Cmd::Submit) push_reject(c.local_id, 0, "gateway not ready");
         }
         if (now_ready) {
             io.tickle();

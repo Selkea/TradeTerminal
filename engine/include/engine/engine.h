@@ -132,6 +132,10 @@ struct OrderRecord {
     OrderStatus status = OrderStatus::Working;
     double qty = 0, limit_price = 0, fill_price = 0, fee = 0;
     bool manual = false;
+    // Populated when status == Rejected and the broker reported a reason
+    // (e.g. IBKR code 110 + text). code 0 / empty msg = no reason captured.
+    int reject_code = 0;
+    std::string reject_msg;
 };
 
 // One entry per symbol in a live session, in symbol_id order (index 0 = id 1).

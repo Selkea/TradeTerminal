@@ -1,5 +1,6 @@
 #include "doctest.h"
 
+#include "engine/broker.h"
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/exec_sim.h"
@@ -143,4 +144,26 @@ TEST_CASE("backtest: SMA trades on synthetic data and reruns are bit-identical")
         CHECK(a.fills[i].price == b.fills[i].price);
         CHECK(a.fills[i].qty == b.fills[i].qty);
     }
+}
+
+// run_live calls broker->take_reject() for every Rejected event and stores
+// whatever comes back. An adapter that captures no reason must yield an empty
+// one (code 0, empty msg) so the order simply reads "rejected", never garbage.
+// This pins the base-class default that the reference/sim adapters inherit.
+namespace {
+struct StubBroker : IBrokerAdapter {
+    uint64_t submit(const OrderRequest&, int64_t) override { return 0; }
+    bool cancel(uint64_t) override { return false; }
+    void cancel_all() override {}
+    void flatten() override {}
+    bool poll_event(EngineEvent&) override { return false; }
+    bool ready() const override { return false; }
+};
+} // namespace
+
+TEST_CASE("broker: default take_reject reports no reason") {
+    StubBroker b;
+    const RejectReason r = b.take_reject(42);
+    CHECK(r.code == 0);
+    CHECK(r.message.empty());
 }

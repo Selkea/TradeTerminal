@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace tt {
@@ -107,6 +108,7 @@ public:
     void cancel_all() override;
     void flatten() override;
     bool poll_event(EngineEvent& out) override { return ev_ring_->try_pop(out); }
+    RejectReason take_reject(uint64_t order_id) override;
     bool ready() const override { return ready_.load(std::memory_order_acquire); }
 
     // Status/log lines (I/O thread produces, UI drains each frame).
@@ -125,7 +127,9 @@ private:
 
     void io_loop();
     void push_ev(const EngineEvent& ev);
-    void push_reject(uint64_t local_id);
+    // Record a reject reason (I/O thread) then push the Rejected event. code 0
+    // and empty msg = no reason available (leaves the reason table untouched).
+    void push_reject(uint64_t local_id, int code = 0, std::string msg = {});
     void log(std::string line);
     bool push_cmd(const Cmd& c);
 
@@ -143,6 +147,12 @@ private:
 
     std::mutex log_mu_;
     std::deque<std::string> logs_;
+
+    // Reject reasons keyed by local order id: I/O thread writes on reject, the
+    // engine thread consumes via take_reject(). An entry lives only until the
+    // matching Rejected event is drained.
+    std::mutex reject_mu_;
+    std::unordered_map<uint64_t, RejectReason> reject_reasons_;
 
     AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
 

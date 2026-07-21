@@ -111,7 +111,7 @@ const char* diag_html() {
 <h1>Positions</h1>
 <table id="pos"><thead><tr><th>Symbol</th><th>Pos</th><th>Avg</th><th>Last</th><th>uPnL</th><th>Strategy</th><th>Guard</th></tr></thead><tbody></tbody></table>
 <h1>Recent rejects</h1>
-<table id="rej"><thead><tr><th>Id</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th></tr></thead><tbody></tbody></table>
+<table id="rej"><thead><tr><th>Id</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th><th>Reason</th></tr></thead><tbody></tbody></table>
 <h1>Log <span class="muted" id="logstat"></span></h1>
 <pre id="log"></pre>
 <h1 class="muted">Raw /diag</h1>
@@ -120,6 +120,7 @@ const char* diag_html() {
 const q=location.search;
 function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
 function fmt(n,d){return (typeof n==='number')?n.toFixed(d===undefined?2:d):n;}
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function tick(){
  try{
   const r=await fetch('/diag'+q,{cache:'no-store'});
@@ -147,8 +148,8 @@ async function tick(){
   }
   document.querySelector('#pos tbody').innerHTML=pb||'<tr><td colspan=7 class=muted>none</td></tr>';
   let rb='';
-  for(const x of d.rejects_recent){rb+='<tr><td>'+x.id+'</td><td>'+x.symbol+'</td><td>'+x.side+'</td><td>'+x.type+'</td><td>'+fmt(x.qty,0)+'</td><td>'+fmt(x.limit_price)+'</td></tr>';}
-  document.querySelector('#rej tbody').innerHTML=rb||'<tr><td colspan=6 class=muted>none</td></tr>';
+  for(const x of d.rejects_recent){const reason=((x.reject_code?x.reject_code+' ':'')+(x.reject_msg||'')).trim()||'—';rb+='<tr><td>'+x.id+'</td><td>'+esc(x.symbol)+'</td><td>'+x.side+'</td><td>'+x.type+'</td><td>'+fmt(x.qty,0)+'</td><td>'+fmt(x.limit_price)+'</td><td class=bad>'+esc(reason)+'</td></tr>';}
+  document.querySelector('#rej tbody').innerHTML=rb||'<tr><td colspan=7 class=muted>none</td></tr>';
   document.getElementById('raw').textContent=JSON.stringify(d,null,2);
  }catch(e){document.getElementById('err').textContent=String(e);}
 }
@@ -1364,7 +1365,7 @@ std::string App::build_diag_json() {
     j["symbols"] = std::move(syms);
     j["unprotected_positions"] = unprotected;
 
-    // ---- rejects feed (count + recent; rich reject codes live in /logs) ----
+    // ---- rejects feed (count + recent, with the broker's reject reason) ----
     int reject_count = 0;
     for (const auto& o : s.orders)
         if (o.status == OrderStatus::Rejected) ++reject_count;
@@ -1378,6 +1379,8 @@ std::string App::build_diag_json() {
             r["type"] = order_type_name(it->type);
             r["qty"] = it->qty;
             r["limit_price"] = it->limit_price;
+            r["reject_code"] = it->reject_code;   // 0 = no numeric code captured
+            r["reject_msg"] = it->reject_msg;      // "" = no reason captured
             rejects.push_back(std::move(r));
         }
     j["reject_count"] = reject_count;

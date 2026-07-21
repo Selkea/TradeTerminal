@@ -29,8 +29,18 @@
 #include "tt/events.h"
 
 #include <cstdint>
+#include <string>
 
 namespace tt {
+
+// Why an order was rejected, captured by the adapter alongside a Rejected
+// OrderCancel event. The numeric code is the broker's (e.g. IBKR 110 "price
+// doesn't conform to min tick"); message is its human text. Both empty/0 when
+// the reject path carried no reason (e.g. an order that just went Inactive).
+struct RejectReason {
+    int code = 0;
+    std::string message;
+};
 
 class IBrokerAdapter {
 public:
@@ -44,6 +54,12 @@ public:
 
     // Engine thread: drain pending fills/cancels/rejects. False = none left.
     virtual bool poll_event(EngineEvent& out) = 0;
+
+    // Consume the reason for a rejected order id, if the adapter recorded one
+    // when it pushed the Rejected event. Called on the engine thread as that
+    // event is drained; erases the entry so it is returned at most once.
+    // Default: adapters that don't track reasons return an empty reason.
+    virtual RejectReason take_reject(uint64_t /*order_id*/) { return {}; }
 
     // True once the adapter is connected and accepting orders.
     virtual bool ready() const = 0;

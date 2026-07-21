@@ -128,7 +128,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (it != local_by_tws.end() && fatal_order_error(errorCode) &&
             !done.count(it->second)) {
             done.insert(it->second);
-            b.push_reject(it->second);
+            b.push_reject(it->second, errorCode, errorString);
         }
     }
 
@@ -246,7 +246,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
     void handle_submit(const Cmd& cmd) {
         if (next_tws_id < 0 || !client) {
-            b.push_reject(cmd.local_id);
+            b.push_reject(cmd.local_id, 0, "not connected to gateway");
             return;
         }
         const uint32_t sid = cmd.req.symbol_id;
@@ -412,13 +412,30 @@ void TwsBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void TwsBroker::push_reject(uint64_t local_id) {
+void TwsBroker::push_reject(uint64_t local_id, int code, std::string msg) {
+    if (code || !msg.empty()) {
+        std::lock_guard lock(reject_mu_);
+        // Record BEFORE pushing the event so the reason is visible by the time
+        // the engine thread drains it. Bounded: rejects are rare, and every
+        // entry is normally consumed by take_reject().
+        if (reject_reasons_.size() > 512) reject_reasons_.clear();
+        reject_reasons_[local_id] = RejectReason{code, std::move(msg)};
+    }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
     ev.flags = kEvFlagRejected;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);
+}
+
+RejectReason TwsBroker::take_reject(uint64_t order_id) {
+    std::lock_guard lock(reject_mu_);
+    const auto it = reject_reasons_.find(order_id);
+    if (it == reject_reasons_.end()) return {};
+    RejectReason r = std::move(it->second);
+    reject_reasons_.erase(it);
+    return r;
 }
 
 void TwsBroker::log(std::string line) {
