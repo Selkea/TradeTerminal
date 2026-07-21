@@ -183,6 +183,7 @@ struct IbkrBroker::Io {
     std::unordered_map<uint64_t, std::string> ibkr_by_local;
     std::unordered_map<std::string, uint64_t> local_by_ibkr;
     std::unordered_map<uint64_t, std::string> acct_by_local;   // order -> sub-account
+    std::unordered_map<uint64_t, uint32_t> protective_sym_;    // stop-loss leg -> symbol
 
     // Sub-account an order for `symbol_id` routes to (primary if unset).
     std::string acct_for(uint32_t symbol_id) const {
@@ -337,7 +338,10 @@ struct IbkrBroker::Io {
         };
         uint64_t tp_local = 0, sl_local = 0;
         if (c.req.take_profit > 0.0) tp_local = add_leg(OrdType::Limit, c.req.take_profit);
-        if (c.req.stop_loss > 0.0) sl_local = add_leg(OrdType::Stop, c.req.stop_loss);
+        if (c.req.stop_loss > 0.0) {
+            sl_local = add_leg(OrdType::Stop, c.req.stop_loss);
+            protective_sym_[sl_local] = c.req.symbol_id;   // reject => position naked
+        }
 
         // Route to the symbol's sub-account (primary if unset); remember it so
         // cancels/flatten target the same account.
@@ -475,6 +479,13 @@ struct IbkrBroker::Io {
                     EngineEvent ev{};
                     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
                     ev.flags = o.status == "Inactive" ? kEvFlagRejected : 0;
+                    if (o.status == "Inactive") {
+                        const auto ps = protective_sym_.find(it->second);
+                        if (ps != protective_sym_.end()) {   // naked-position guard rejected
+                            ev.flags |= kEvFlagProtective;
+                            ev.symbol_id = ps->second;
+                        }
+                    }
                     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
                     ev.u.order.order_id = it->second;
                     b.push_ev(ev);
@@ -587,7 +598,8 @@ void IbkrBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void IbkrBroker::push_reject(uint64_t local_id, int code, std::string msg) {
+void IbkrBroker::push_reject(uint64_t local_id, int code, std::string msg,
+                             uint32_t symbol_id, bool protective) {
     if (code || !msg.empty()) {
         std::lock_guard lock(reject_mu_);
         // Record BEFORE pushing the event so the reason is visible by the time
@@ -598,7 +610,9 @@ void IbkrBroker::push_reject(uint64_t local_id, int code, std::string msg) {
     }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
-    ev.flags = kEvFlagRejected;
+    ev.flags = static_cast<uint16_t>(kEvFlagRejected |
+                                     (protective ? kEvFlagProtective : 0));
+    ev.symbol_id = protective ? symbol_id : 0;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);

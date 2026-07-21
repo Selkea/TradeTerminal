@@ -59,6 +59,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unordered_set<uint64_t> acked;
     std::unordered_set<uint64_t> done;                // filled/cancelled locals
     std::unordered_map<uint64_t, uint32_t> sid_by_local;
+    std::unordered_set<uint64_t> protective;          // stop-loss leg locals
 
     // Executions wait (briefly) for their commissionReport so the fee rides
     // the fill event; flushed with fee 0 if the report never shows.
@@ -127,8 +128,11 @@ struct TwsBroker::Io final : DefaultEWrapper {
         const auto it = local_by_tws.find(id);
         if (it != local_by_tws.end() && fatal_order_error(errorCode) &&
             !done.count(it->second)) {
-            done.insert(it->second);
-            b.push_reject(it->second, errorCode, errorString);
+            const uint64_t local = it->second;
+            done.insert(local);
+            const bool prot = protective.count(local) != 0;
+            const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
+            b.push_reject(local, errorCode, errorString, sid, prot);
         }
     }
 
@@ -159,7 +163,13 @@ struct TwsBroker::Io final : DefaultEWrapper {
             done.insert(local);
             EngineEvent ev{};
             ev.type = static_cast<uint16_t>(EvType::OrderCancel);
-            if (status == "Inactive") ev.flags = kEvFlagRejected;
+            if (status == "Inactive") {
+                ev.flags = kEvFlagRejected;
+                if (protective.count(local)) {   // naked-position: guard rejected
+                    ev.flags |= kEvFlagProtective;
+                    ev.symbol_id = sid_by_local.count(local) ? sid_by_local[local] : 0;
+                }
+            }
             ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
             ev.u.order.order_id = local;
             b.push_ev(ev);
@@ -293,6 +303,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
             sl.parentId = parent_tws;
             sl.transmit = true;   // last child transmits the whole bracket
             sl_local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+            protective.insert(sl_local);   // its reject means the position is naked
             place(sl_local, sid, sl, c);
         }
         if (tp_local || sl_local)
@@ -412,7 +423,8 @@ void TwsBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void TwsBroker::push_reject(uint64_t local_id, int code, std::string msg) {
+void TwsBroker::push_reject(uint64_t local_id, int code, std::string msg,
+                            uint32_t symbol_id, bool protective) {
     if (code || !msg.empty()) {
         std::lock_guard lock(reject_mu_);
         // Record BEFORE pushing the event so the reason is visible by the time
@@ -423,7 +435,9 @@ void TwsBroker::push_reject(uint64_t local_id, int code, std::string msg) {
     }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
-    ev.flags = kEvFlagRejected;
+    ev.flags = static_cast<uint16_t>(kEvFlagRejected |
+                                     (protective ? kEvFlagProtective : 0));
+    ev.symbol_id = protective ? symbol_id : 0;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);

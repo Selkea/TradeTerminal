@@ -864,7 +864,9 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // unwound from this thread (nothing safely can).
     const int64_t watchdog_ns = static_cast<int64_t>(cfg.watchdog_ms) * 1'000'000;
     std::vector<char> strat_halted(n_sym, 0);
-    auto halt_symbol = [&](uint32_t sid, int64_t dur_ns) {
+    // Flatten one symbol's position at market and stop dispatching to its
+    // strategy. Shared by the watchdog and the protective-reject safety net.
+    auto flatten_halt_symbol = [&](uint32_t sid, const std::string& why) {
         if (sid < 1 || sid > n_sym || strat_halted[sid - 1]) return;
         strat_halted[sid - 1] = 1;
         const double pos = pf.position(sid).qty;
@@ -876,13 +878,17 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                                     : exec.submit(r, rt.now_ns()));
             next_is_manual = false;
         }
+        push_log("live: " + why);
+    };
+    auto halt_symbol = [&](uint32_t sid, int64_t dur_ns) {
+        if (sid < 1 || sid > n_sym || strat_halted[sid - 1]) return;
         char buf[176];
         std::snprintf(buf, sizeof buf,
-                      "live: WATCHDOG halt — %s strategy callback ran %lld ms "
+                      "WATCHDOG halt — %s strategy callback ran %lld ms "
                       "(budget %d ms); halted + flattened",
                       cfg.symbols[sid - 1].c_str(),
                       static_cast<long long>(dur_ns / 1'000'000), cfg.watchdog_ms);
-        push_log(buf);
+        flatten_halt_symbol(sid, buf);
     };
     // Time a strategy callback; halt the symbol if it overruns. No-op when off.
     auto guarded = [&](uint32_t sid, auto&& fn) {
@@ -1063,6 +1069,25 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                         line += rr.message + "]";
                     }
                     push_log(line);
+                    // Naked-position safety net: a protective stop rejected by the
+                    // broker leaves the position it guarded exposed. Flatten that
+                    // symbol at market and halt just it (the broker sets symbol_id
+                    // + kEvFlagProtective on such rejects).
+                    if (rejected && (bev.flags & kEvFlagProtective) &&
+                        bev.symbol_id >= 1 && bev.symbol_id <= n_sym) {
+                        const uint32_t sid = bev.symbol_id;
+                        const std::string sym = symbol_name(sid);
+                        if (pf.position(sid).qty != 0.0 && !halted &&
+                            !strat_halted[sid - 1]) {
+                            flatten_halt_symbol(
+                                sid, "PROTECTIVE STOP REJECTED on " + sym +
+                                         " — position was naked; flattened + halted symbol");
+                            check_risk();
+                        } else {
+                            push_log("live: protective stop rejected on " + sym +
+                                     " but position already flat/halted — no action");
+                        }
+                    }
                 } else if (bev.type == static_cast<uint16_t>(EvType::PosSnap)) {
                     pf.seed_position(bev.symbol_id, bev.u.pos.qty, bev.u.pos.avg_price);
                     risk_base_eq = risk_high_eq = pf.equity();   // new baseline

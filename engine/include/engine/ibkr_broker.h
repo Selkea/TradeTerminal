@@ -129,7 +129,10 @@ private:
     void push_ev(const EngineEvent& ev);
     // Record a reject reason (I/O thread) then push the Rejected event. code 0
     // and empty msg = no reason available (leaves the reason table untouched).
-    void push_reject(uint64_t local_id, int code = 0, std::string msg = {});
+    // symbol_id + protective mark a rejected protective stop leg so the engine
+    // can flatten the position it was guarding (see kEvFlagProtective).
+    void push_reject(uint64_t local_id, int code = 0, std::string msg = {},
+                     uint32_t symbol_id = 0, bool protective = false);
     void log(std::string line);
     bool push_cmd(const Cmd& c);
 
