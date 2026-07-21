@@ -319,6 +319,15 @@ struct IbkrBroker::Io {
     void handle_submit(const Cmd& c) {
         json orders = json::array();
         orders.push_back(order_json(c.local_id, c.req));
+        // A standalone Stop order (not an engine-native bracket leg — e.g. a
+        // strategy's own manual OCO exit submitted as its own top-level order)
+        // is, functionally, protecting whatever position it exits. Tag it too,
+        // so its reject still trips the naked-position safety net. If it's
+        // actually an entry stop (no position open yet), run_live's
+        // position!=0 check harmlessly no-ops.
+        const bool is_bracket_parent = c.req.take_profit > 0.0 || c.req.stop_loss > 0.0;
+        if (c.req.type == OrdType::Stop && !is_bracket_parent)
+            protective_sym_[c.local_id] = c.req.symbol_id;
         const std::string parent_coid = b.client_prefix_ + std::to_string(c.local_id);
         // Bracket legs: children referencing the parent cOID, own local ids
         // so their fills route back like any other order.
@@ -362,7 +371,11 @@ struct IbkrBroker::Io {
                 const std::string reason =
                     r.rc != CURLE_OK ? curl_easy_strerror(r.rc) : r.body.substr(0, 200);
                 b.log("order #" + std::to_string(c.local_id) + " rejected: " + reason);
-                b.push_reject(c.local_id, 0, reason);
+                const auto ps = protective_sym_.find(c.local_id);
+                if (ps != protective_sym_.end())
+                    b.push_reject(c.local_id, 0, reason, ps->second, true);
+                else
+                    b.push_reject(c.local_id, 0, reason);
                 return;
             }
             if (!resp.order_id.empty()) {
@@ -388,7 +401,14 @@ struct IbkrBroker::Io {
             r = call("POST", "/iserver/reply/" + resp.reply_id, R"({"confirmed":true})");
         }
         b.log("order #" + std::to_string(c.local_id) + " stuck in confirmation loop");
-        b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop");
+        {
+            const auto ps = protective_sym_.find(c.local_id);
+            if (ps != protective_sym_.end())
+                b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop",
+                             ps->second, true);
+            else
+                b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop");
+        }
     }
 
     void handle_cmd(const Cmd& c) {
@@ -656,7 +676,14 @@ void IbkrBroker::io_loop() {
         while (cmd_ring_->try_pop(c)) {
             worked = true;
             if (now_ready) io.handle_cmd(c);
-            else if (c.type == Cmd::Submit) push_reject(c.local_id, 0, "gateway not ready");
+            else if (c.type == Cmd::Submit) {
+                // Never reached handle_submit, so protective_sym_ was never set for
+                // this id — decide protective-ness straight from the request: any
+                // standalone Stop (not an engine bracket parent) protects a fill.
+                const bool is_bracket = c.req.take_profit > 0.0 || c.req.stop_loss > 0.0;
+                const bool prot = c.req.type == OrdType::Stop && !is_bracket;
+                push_reject(c.local_id, 0, "gateway not ready", c.req.symbol_id, prot);
+            }
         }
         if (now_ready) {
             io.tickle();

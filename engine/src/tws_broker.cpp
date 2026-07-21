@@ -280,7 +280,14 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
     void handle_submit(const Cmd& cmd) {
         if (next_tws_id < 0 || !client) {
-            b.push_reject(cmd.local_id, 0, "not connected to gateway");
+            // place() (which would tag a standalone stop protective) is never
+            // reached on this early return — decide protective-ness straight
+            // from the request instead: any standalone Stop (not an engine
+            // bracket parent) protects a fill.
+            const bool is_bracket = cmd.req.take_profit > 0.0 || cmd.req.stop_loss > 0.0;
+            const bool prot = cmd.req.type == OrdType::Stop && !is_bracket;
+            b.push_reject(cmd.local_id, 0, "not connected to gateway",
+                          cmd.req.symbol_id, prot);
             return;
         }
         const uint32_t sid = cmd.req.symbol_id;
@@ -299,6 +306,13 @@ struct TwsBroker::Io final : DefaultEWrapper {
         parent.account = account_for(sid);
         parent.transmit = !bracket;   // brackets transmit on the last child
         const long parent_tws = place(cmd.local_id, sid, parent, c);
+        // A standalone Stop order (not an engine-native bracket child — e.g. a
+        // strategy's own manual OCO exit submitted as its own top-level order)
+        // is, functionally, protecting whatever position it exits. Tag it too,
+        // so its reject still trips the naked-position safety net below. If
+        // it's actually an entry stop (no position open yet), run_live's
+        // position!=0 check harmlessly no-ops.
+        if (cmd.req.type == OrdType::Stop && !bracket) protective.insert(cmd.local_id);
 
         if (!bracket) return;
         const std::string exit_action = cmd.req.side == Side::Buy ? "SELL" : "BUY";
