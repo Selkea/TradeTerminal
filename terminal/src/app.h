@@ -76,7 +76,9 @@ private:
     void start_diag_server();
     void pump_diag();
     std::string build_diag_json();
+    std::string build_metrics();                   // Prometheus exposition text
     std::string build_logs_json(uint64_t since);   // server thread (LogConsole is thread-safe)
+    std::string build_logs_sse(uint64_t& cursor);  // server (stream) thread; advances cursor
     void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
@@ -319,6 +321,7 @@ private:
     DiagServer diag_srv_;
     std::mutex diag_mu_;
     std::string diag_json_ = "{}";     // published by pump_diag(), read by the server
+    std::string metrics_text_;         // Prometheus /metrics body, published alongside
     double diag_next_build_s_ = 0.0;   // next UI-thread re-render (ImGui::GetTime())
     std::time_t session_start_ = 0;    // wall-clock app start, for /diag uptime
     // Set by the diag server thread on POST /control/kill; consumed on the UI

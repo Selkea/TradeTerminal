@@ -63,11 +63,15 @@ public:
     // read-only token). Call before start(); an empty token leaves control off.
     void set_control(std::string token, ControlFn fn);
 
+    // Enable GET /metrics (Prometheus exposition text, read-only token). Call
+    // before start(); unset leaves /metrics returning 404.
+    void set_metrics(BodyProvider fn);
+
 private:
     void accept_loop();
     void serve(uintptr_t client);
 
-    BodyProvider diag_, root_;
+    BodyProvider diag_, root_, metrics_;
     LogsProvider logs_;
     ControlFn control_;
     LogFn log_;

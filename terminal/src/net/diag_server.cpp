@@ -166,6 +166,8 @@ void DiagServer::set_control(std::string token, ControlFn fn) {
     control_ = std::move(fn);
 }
 
+void DiagServer::set_metrics(BodyProvider fn) { metrics_ = std::move(fn); }
+
 void DiagServer::stop() {
     const bool had_socket = listen_sock_ != ~uintptr_t{0};
     if (!had_socket && !thread_.joinable()) return;
@@ -260,6 +262,13 @@ void DiagServer::serve(uintptr_t client) {
 
     if (path == "/diag") {
         send_all(s, http_response(200, "OK", "application/json", diag_ ? diag_() : "{}"));
+    } else if (path == "/metrics") {
+        if (metrics_)
+            send_all(s, http_response(200, "OK",
+                                      "text/plain; version=0.0.4; charset=utf-8",
+                                      metrics_()));
+        else
+            send_all(s, http_response(404, "Not Found", "text/plain", "metrics disabled\n"));
     } else if (path == "/logs") {
         uint64_t since = 0;
         try {

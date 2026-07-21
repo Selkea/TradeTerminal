@@ -54,6 +54,15 @@ std::string gen_diag_token() {
     return t;
 }
 
+// Compact, locale-independent number for Prometheus values: up to 10
+// significant figures, no exponent for the ranges we emit (equity, counts,
+// fractions), no trailing-zero noise.
+std::string fmt_num(double v) {
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%.10g", v);
+    return buf;
+}
+
 // epoch seconds -> "YYYY-MM-DDTHH:MM:SSZ" (UTC), for /diag timestamps.
 std::string iso_utc(std::time_t t) {
     if (t == 0) return "";
@@ -1256,6 +1265,9 @@ void App::start_diag_server() {
         });
     }
     diag_json_ = build_diag_json();   // seed so the first request isn't "{}"
+    metrics_text_ = build_metrics();  // seed /metrics too
+    diag_srv_.set_metrics(
+        [this] { std::lock_guard<std::mutex> g(diag_mu_); return metrics_text_; });
     const bool ok = diag_srv_.start(
         cfg_.diag_bind, port, cfg_.diag_token,
         [this] { std::lock_guard<std::mutex> g(diag_mu_); return diag_json_; },
@@ -1293,8 +1305,10 @@ void App::pump_diag() {
     if (now < diag_next_build_s_) return;
     diag_next_build_s_ = now + 1.0;
     std::string body = build_diag_json();
+    std::string metrics = build_metrics();
     std::lock_guard<std::mutex> g(diag_mu_);
     diag_json_ = std::move(body);
+    metrics_text_ = std::move(metrics);
 }
 
 // Render the current diagnostics snapshot as JSON. UI thread only (reads
@@ -1430,6 +1444,80 @@ std::string App::build_diag_json() {
     j["latency"] = std::move(lat);
 
     return j.dump(2);
+}
+
+// Prometheus exposition text (GET /metrics). Built on the UI thread in
+// pump_diag alongside the /diag JSON — same threading contract (reads cfg_ and
+// the live snapshot the way the panels do), published under diag_mu_.
+std::string App::build_metrics() {
+    const LiveSnapshot s = engine_.live_snapshot();
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    AckSummary ack{};
+    if (ibkr_) ack = ibkr_->ack_latency();
+    else if (tws_) ack = tws_->ack_latency();
+
+    int reject_count = 0;
+    for (const auto& o : s.orders)
+        if (o.status == OrderStatus::Rejected) ++reject_count;
+
+    // Escape a Prometheus label value (backslash, double-quote, newline).
+    auto lbl = [](const std::string& v) {
+        std::string o;
+        o.reserve(v.size());
+        for (char ch : v) {
+            if (ch == '\\' || ch == '"') { o += '\\'; o += ch; }
+            else if (ch == '\n') o += "\\n";
+            else o += ch;
+        }
+        return o;
+    };
+
+    std::string m;
+    m.reserve(2048);
+    auto g = [&](const char* name, const char* help, double val) {
+        m += "# HELP "; m += name; m += ' '; m += help; m += '\n';
+        m += "# TYPE "; m += name; m += " gauge\n";
+        m += name; m += ' '; m += fmt_num(val); m += '\n';
+    };
+    g("tt_up", "1 while the terminal process is serving metrics", 1);
+    g("tt_live_running", "1 if a live session is active", s.running ? 1 : 0);
+    g("tt_halted", "1 if the session is halted", s.halted ? 1 : 0);
+    g("tt_broker_connected", "1 if the broker is connected",
+      (ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false)) ? 1 : 0);
+    g("tt_equity_dollars", "account equity", s.equity);
+    g("tt_cash_dollars", "account cash", s.cash);
+    g("tt_ticks_total", "market-data ticks this session", static_cast<double>(s.ticks));
+    g("tt_dropped_ticks_total", "ticks dropped (ring full)",
+      static_cast<double>(s.dropped_ticks));
+    g("tt_reject_count", "orders rejected this session", reject_count);
+    g("tt_feed_stale_ms", "ms since the last tick (-1 = none yet)",
+      s.last_tick_ts_ms > 0 ? static_cast<double>(now_ms - s.last_tick_ts_ms) : -1);
+    g("tt_ack_latency_p50_ms", "order submit->ack p50", ack.base_ns / 1'000'000.0);
+    g("tt_ack_latency_p90_ms", "order submit->ack p90",
+      (ack.base_ns + ack.jitter_ns) / 1'000'000.0);
+    g("tt_tick_to_order_p99_us", "tick->order p99", s.lat_p99 / 1000.0);
+    g("tt_halt_proximity", "0 safe .. 1 at the nearest armed equity halt", [&] {
+        double n = 0.0;
+        if (s.risk.daily_loss_limit > 0)
+            n = std::max(n, s.risk.daily_loss / s.risk.daily_loss_limit);
+        if (s.risk.drawdown_limit_pct > 0)
+            n = std::max(n, s.risk.drawdown_pct / s.risk.drawdown_limit_pct);
+        return n < 0.0 ? 0.0 : n;
+    }());
+
+    // Per-symbol position + unrealized pnl (labelled series).
+    m += "# HELP tt_position Signed position size per symbol\n# TYPE tt_position gauge\n";
+    for (const auto& ss : s.symbols)
+        m += "tt_position{symbol=\"" + lbl(ss.symbol) + "\"} " +
+             fmt_num(ss.position.qty) + '\n';
+    m += "# HELP tt_unrealized_pnl_dollars Unrealized P&L per symbol\n"
+         "# TYPE tt_unrealized_pnl_dollars gauge\n";
+    for (const auto& ss : s.symbols)
+        m += "tt_unrealized_pnl_dollars{symbol=\"" + lbl(ss.symbol) + "\"} " +
+             fmt_num(ss.position.unrealized_pnl) + '\n';
+    return m;
 }
 
 // Incremental log tail for GET /logs. Runs on the server thread — safe because
