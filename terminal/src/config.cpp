@@ -84,6 +84,8 @@ AppConfig AppConfig::load(const std::string& path) {
     c.diag_bind = j.value("diag_bind", c.diag_bind);
     c.diag_port = j.value("diag_port", c.diag_port);
     c.diag_token = j.value("diag_token", c.diag_token);
+    c.diag_control_enabled = j.value("diag_control_enabled", c.diag_control_enabled);
+    c.diag_control_token = j.value("diag_control_token", c.diag_control_token);
     if (j.contains("panels") && j["panels"].is_object())
         for (const auto& [k, v] : j["panels"].items())
             if (v.is_boolean()) c.panels[k] = v.get<bool>();
@@ -158,6 +160,8 @@ void AppConfig::save(const std::string& path) const {
     j["diag_bind"] = diag_bind;
     j["diag_port"] = diag_port;
     j["diag_token"] = diag_token;
+    j["diag_control_enabled"] = diag_control_enabled;
+    j["diag_control_token"] = diag_control_token;
     j["panels"] = panels;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;

@@ -321,6 +321,9 @@ private:
     std::string diag_json_ = "{}";     // published by pump_diag(), read by the server
     double diag_next_build_s_ = 0.0;   // next UI-thread re-render (ImGui::GetTime())
     std::time_t session_start_ = 0;    // wall-clock app start, for /diag uptime
+    // Set by the diag server thread on POST /control/kill; consumed on the UI
+    // thread (the sole producer to the engine's SPSC command ring).
+    std::atomic<bool> diag_kill_requested_{false};
 
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm

@@ -8,10 +8,12 @@
 // the minimum on the Winsock stack the app already links (see engine net_ws.h
 // for the same low-level socket style).
 //
-// Routes: GET /diag       -> JSON body from the diag provider (auth required),
-//         GET /logs?since=N-> incremental log lines from the logs provider (auth),
-//         GET /           -> HTML shell from the root provider (no auth: no
-//                            secrets, its JS forwards the URL's ?token= onward).
+// Routes: GET  /diag        -> JSON body from the diag provider (auth required),
+//         GET  /logs?since=N-> incremental log lines from the logs provider (auth),
+//         GET  /            -> HTML shell from the root provider (no auth: no
+//                             secrets, its JS forwards the URL's ?token= onward),
+//         POST /control/<a> -> control action (opt-in; SEPARATE token; see
+//                             set_control). Absent a control token, /control/* 404s.
 // Auth accepts either "Authorization: Bearer <token>" or a ?token=<token> query
 // param, so both curl and a browser work; the token is high-entropy and the hop
 // never leaves the encrypted tailnet.
@@ -35,6 +37,11 @@ public:
     using BodyProvider = std::function<std::string()>;
     // /logs body for everything after cursor `since` (called on the server thread).
     using LogsProvider = std::function<std::string(uint64_t since)>;
+    // Handles POST /control/<action>; returns the JSON response body. Invoked on
+    // the server thread, so it must be thread-safe — it should hand the action
+    // off to the owner (e.g. set an atomic the UI thread consumes), NOT mutate
+    // engine state directly.
+    using ControlFn = std::function<std::string(const std::string& action)>;
     using LogFn = std::function<void(std::string)>;
 
     DiagServer() = default;
@@ -52,14 +59,20 @@ public:
     void stop();   // idempotent; unblocks and joins the accept thread
     bool running() const { return running_.load(std::memory_order_acquire); }
 
+    // Enable POST /control/<action>, guarded by `token` (separate from the
+    // read-only token). Call before start(); an empty token leaves control off.
+    void set_control(std::string token, ControlFn fn);
+
 private:
     void accept_loop();
     void serve(uintptr_t client);
 
     BodyProvider diag_, root_;
     LogsProvider logs_;
+    ControlFn control_;
     LogFn log_;
     std::string token_;
+    std::string control_token_;   // empty = control disabled
     uintptr_t listen_sock_ = ~uintptr_t{0};   // INVALID_SOCKET
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_{false};

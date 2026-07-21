@@ -103,6 +103,10 @@ const char* diag_html() {
 <h1 style="margin-top:0">TradeTerminal — diagnostics</h1>
 <div class="muted" id="sub">connecting…</div>
 <div id="err"></div>
+<div id="ctl" style="display:none;margin:10px 0">
+ <button id="killbtn" style="background:#7a1f1f;color:#fff;border:1px solid #ff6b6b;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer">&#9940; KILL SWITCH — flatten &amp; halt</button>
+ <span class="muted">asks for the control token</span>
+</div>
 <div class="grid" id="cards"></div>
 <h1>Positions</h1>
 <table id="pos"><thead><tr><th>Symbol</th><th>Pos</th><th>Avg</th><th>Last</th><th>uPnL</th><th>Strategy</th><th>Guard</th></tr></thead><tbody></tbody></table>
@@ -123,6 +127,7 @@ async function tick(){
   document.getElementById('err').textContent='';
   const d=await r.json();
   document.getElementById('sub').textContent=d.git_commit+(d.git_dirty?'*':'')+' · '+d.route+' · up '+d.uptime_sec+'s · '+d.now;
+  document.getElementById('ctl').style.display=(d.control==='enabled')?'block':'none';
   let c='';
   c+=card('Live',d.live_running?'RUNNING':'idle',d.live_running?'good':'muted');
   c+=card('Halted',d.halted?'HALTED':'no',d.halted?'bad':'good');
@@ -148,6 +153,18 @@ async function tick(){
  }catch(e){document.getElementById('err').textContent=String(e);}
 }
 tick();setInterval(tick,2000);
+// Kill switch: confirm, then prompt for the control token (kept out of the URL
+// and history), then POST /control/kill with it.
+document.getElementById('killbtn').onclick=async()=>{
+ if(!confirm('Flatten ALL positions, cancel open orders, and HALT trading now?'))return;
+ const tok=prompt('Control token (from config.json diag_control_token):');
+ if(!tok)return;
+ try{
+  const r=await fetch('/control/kill?token='+encodeURIComponent(tok),{method:'POST'});
+  const t=await r.text();
+  alert(r.ok?('Kill sent — '+t):('FAILED: HTTP '+r.status+' '+t));
+ }catch(e){alert('Error: '+e);}
+};
 // incremental log tail: poll /logs?since=cursor and append only new lines.
 let logCursor=0;const logEl=document.getElementById('log');
 async function logTick(){
@@ -1218,6 +1235,24 @@ void App::start_diag_server() {
         cfg_.save(config_path_);   // persist so the token is stable across restarts
     }
     const uint16_t port = static_cast<uint16_t>(cfg_.diag_port);
+    // Remote control (opt-in): a SEPARATE token guards POST /control/kill. The
+    // server thread only sets a flag — the actual kill_switch() runs on the UI
+    // thread (see pump_diag), the sole producer to the engine's command ring.
+    if (cfg_.diag_control_enabled) {
+        if (cfg_.diag_control_token.empty()) {
+            cfg_.diag_control_token = gen_diag_token();
+            cfg_.save(config_path_);
+        }
+        diag_srv_.set_control(cfg_.diag_control_token, [this](const std::string& action) {
+            if (action == "kill") {
+                diag_kill_requested_.store(true, std::memory_order_relaxed);
+                log_.add("diag: REMOTE KILL-SWITCH requested via POST /control/kill");
+                return std::string(
+                    "{\"status\":\"kill queued\",\"note\":\"watch /diag halted+positions to confirm\"}");
+            }
+            return std::string("{\"error\":\"unknown control action\"}");
+        });
+    }
     diag_json_ = build_diag_json();   // seed so the first request isn't "{}"
     const bool ok = diag_srv_.start(
         cfg_.diag_bind, port, cfg_.diag_token,
@@ -1225,11 +1260,14 @@ void App::start_diag_server() {
         [this](uint64_t since) { return build_logs_json(since); },
         [] { return std::string(diag_html()); },
         [this](std::string l) { log_.add(std::move(l)); });
-    if (ok)
+    if (ok) {
         log_.add("diag: read-only endpoint on " + cfg_.diag_bind + ":" +
                  std::to_string(port) + "  —  browse  http://<tailscale-ip>:" +
                  std::to_string(port) + "/?token=" + cfg_.diag_token);
-    else
+        if (cfg_.diag_control_enabled)
+            log_.add("diag: REMOTE CONTROL ENABLED — POST /control/kill flattens + halts; "
+                     "control token is in config.json (diag_control_token)");
+    } else
         log_.add("diag: endpoint failed to start (is port " + std::to_string(port) +
                  " already in use?)");
 }
@@ -1237,6 +1275,17 @@ void App::start_diag_server() {
 // UI thread, per frame: re-render the /diag body at ~1 Hz into diag_json_, which
 // the server thread copies out under diag_mu_.
 void App::pump_diag() {
+    // Execute a remote kill request here, on the UI thread — the only producer
+    // allowed to touch the engine's SPSC command ring (the diag server thread
+    // just set the flag).
+    if (diag_kill_requested_.exchange(false, std::memory_order_relaxed)) {
+        if (engine_.live_running()) {
+            engine_.kill_switch();
+            log_.add("diag: KILL-SWITCH EXECUTED — cancel all + flatten + halt");
+        } else {
+            log_.add("diag: kill-switch requested but no live session is running");
+        }
+    }
     if (!diag_srv_.running()) return;
     const double now = ImGui::GetTime();
     if (now < diag_next_build_s_) return;
@@ -1265,7 +1314,7 @@ std::string App::build_diag_json() {
     j["uptime_sec"] =
         session_start_ ? static_cast<int64_t>(std::time(nullptr) - session_start_) : 0;
     j["now"] = iso_utc(std::time(nullptr));
-    j["control"] = "read-only";
+    j["control"] = cfg_.diag_control_enabled ? "enabled" : "read-only";
     j["route"] = cfg_.trade_route == 1 ? "TWS socket" : "IBKR web";
     j["broker_connected"] = ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false);
 

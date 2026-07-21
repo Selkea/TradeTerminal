@@ -161,6 +161,11 @@ bool DiagServer::start(const std::string& host, uint16_t port, std::string token
     return true;
 }
 
+void DiagServer::set_control(std::string token, ControlFn fn) {
+    control_token_ = std::move(token);
+    control_ = std::move(fn);
+}
+
 void DiagServer::stop() {
     const bool had_socket = listen_sock_ != ~uintptr_t{0};
     if (!had_socket && !thread_.joinable()) return;
@@ -203,6 +208,25 @@ void DiagServer::serve(uintptr_t client) {
     std::string method, target;
     parse_request_line(req, method, target);
     const std::string path = target.substr(0, target.find('?'));
+
+    // Control routes (POST /control/<action>): opt-in, guarded by a SEPARATE
+    // token, POST-only so no browser prefetch or GET can trip a state change.
+    if (path.rfind("/control/", 0) == 0) {
+        if (control_token_.empty() || !control_)
+            send_all(s, http_response(404, "Not Found", "text/plain", "control disabled\n"));
+        else if (method != "POST")
+            send_all(s, http_response(405, "Method Not Allowed", "text/plain",
+                                      "control actions are POST-only\n"));
+        else if (header_bearer(req) != control_token_ &&
+                 query_param(target, "token") != control_token_)
+            send_all(s, http_response(401, "Unauthorized", "application/json",
+                                      "{\"error\":\"unauthorized\"}"));
+        else
+            send_all(s, http_response(200, "OK", "application/json",
+                                      control_(path.substr(9))));   // strlen("/control/")
+        ::closesocket(s);
+        return;
+    }
 
     if (method != "GET") {
         send_all(s, http_response(405, "Method Not Allowed", "text/plain", "GET only\n"));

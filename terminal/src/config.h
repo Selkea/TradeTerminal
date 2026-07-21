@@ -93,6 +93,12 @@ struct AppConfig {
     std::string diag_bind = "0.0.0.0";   // tailnet peers reach it; VPS firewall keeps it off the public net
     int diag_port = 8787;
     std::string diag_token;
+    // Remote control (POST /control/kill -> engine kill switch: cancel all +
+    // flatten + halt). OFF by default — the endpoint stays read-only until you
+    // set this true. Uses a SEPARATE token so a leaked monitoring URL can never
+    // flatten the book; auto-generated when control is first enabled.
+    bool diag_control_enabled = false;
+    std::string diag_control_token;
     // Which panels (View menu) were open; missing entry = the panel's default.
     std::map<std::string, bool> panels;
     // Strategy panel: which strategies were loaded and each one's edited
