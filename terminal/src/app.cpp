@@ -260,9 +260,11 @@ int tws_api_port() {
 #ifdef _WIN32
 // Launch "powershell.exe <args>" with no console window at all. ShellExecute's
 // SW_HIDE can still flash a console for console-subsystem apps; CREATE_NO_WINDOW
-// does not, and child processes inherit the no-window state. If wait is set,
-// block (up to 12s) for it to finish — used for cleanup on shutdown.
-void run_hidden(const std::string& args, bool wait = false) {
+// does not, and child processes inherit the no-window state. wait_ms > 0 blocks
+// up to that many ms for it to finish (0 = fire-and-forget). Kept short on the
+// shutdown path so a slow cleanup script can't stall the exit and hold the
+// single-instance mutex; the child keeps running independently either way.
+void run_hidden(const std::string& args, unsigned wait_ms = 0) {
     std::string cmd = "powershell.exe " + args;
     std::vector<char> buf(cmd.begin(), cmd.end());
     buf.push_back('\0');
@@ -271,7 +273,7 @@ void run_hidden(const std::string& args, bool wait = false) {
     PROCESS_INFORMATION pi{};
     if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        if (wait) WaitForSingleObject(pi.hProcess, 12000);
+        if (wait_ms) WaitForSingleObject(pi.hProcess, wait_ms);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
@@ -1115,23 +1117,28 @@ void App::autopilot_evaluate() {
 }
 
 App::~App() {
-    // Stop the diagnostics server first: its provider lambda captures `this` and
+    // Persist settings first: the shutdown watchdog (main.cpp) may hard-kill this
+    // process if a network I/O thread wedges during teardown, so config.json must
+    // be written before any of the potentially-slow stops below.
+    save_config();
+    // Stop the diagnostics server next: its provider lambda captures `this` and
     // reads diag_json_, so the accept thread must be joined before any member it
     // could touch is destroyed.
     diag_srv_.stop();
 #ifdef _WIN32
     // Tear down the CP gateway + auto-login daemon we started (tied to app
     // life). TWS route: IB Gateway is deliberately left running - its login
-    // survives app restarts and nothing else fights over the session.
+    // survives app restarts and nothing else fights over the session. Short wait:
+    // the script's cleanup continues in its own process; we don't block exit on
+    // it (a stalled logout must not keep us holding the single-instance mutex).
     if (!use_tws_data_) {
         const std::string args = ps_args("Stop-IbkrSession.ps1", true);
-        if (!args.empty()) run_hidden(args, /*wait=*/true);
+        if (!args.empty()) run_hidden(args, /*wait_ms=*/3000);
     }
 #endif
     gw_.stop();
     tws_data_.stop();
     if (signin_.worker.joinable()) signin_.worker.join();
-    save_config();
 }
 
 // Gather panel state into cfg_ and write config.json. Called on exit and once

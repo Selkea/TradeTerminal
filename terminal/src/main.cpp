@@ -20,12 +20,14 @@
 #endif
 #endif
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -216,6 +218,21 @@ int main() {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+#ifdef _WIN32
+    // Shutdown watchdog. The broker/data I/O threads can block for many seconds
+    // tearing down — a blocking eConnect to a down IB Gateway (~20 s OS timeout,
+    // uninterruptible), or an in-flight gateway poll. Until this process exits it
+    // holds the single-instance mutex, so a leftover window-less tt_terminal.exe
+    // blocks the next launch ("already running") — exactly the auto-restart
+    // failure. Guarantee death: if teardown isn't done within the deadline, force
+    // exit. Settings are safe — imgui.ini is flushed just below and config.json
+    // is saved first thing in ~App, both well inside the window.
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(8));
+        TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
+#endif
 
     // Flush ImGui + ImPlot settings (window layout, plot axis state) to imgui.ini
     // while BOTH contexts are still alive — ImPlot's settings handler needs its

@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -19,6 +20,19 @@ using nlohmann::json;
 size_t write_cb(char* p, size_t sz, size_t nm, void* ud) {
     static_cast<std::string*>(ud)->append(p, sz * nm);
     return sz * nm;
+}
+
+// Progress callback that aborts an in-flight transfer the moment the worker is
+// told to stop, so stop()/join() doesn't wait out a curl timeout (up to 15 s)
+// during shutdown. XFERINFODATA carries the running_ flag; a non-zero return
+// makes curl bail with CURLE_ABORTED_BY_CALLBACK.
+int abort_if_stopping(void* p, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return static_cast<std::atomic<bool>*>(p)->load(std::memory_order_relaxed) ? 0 : 1;
+}
+void set_abort_on_stop(CURL* h, std::atomic<bool>* running) {
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, abort_if_stopping);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, running);
 }
 
 int64_t steady_ms() {
@@ -140,6 +154,7 @@ int64_t GatewayData::conid_for(const std::string& symbol) {
     curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+    set_abort_on_stop(h, &running_);
     long status = 0;
     if (curl_easy_perform(h) == CURLE_OK)
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
@@ -168,6 +183,7 @@ void GatewayData::worker() {
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 15000L);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+        set_abort_on_stop(h, &running_);
         long status = 0;
         if (curl_easy_perform(h) == CURLE_OK)
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
@@ -190,6 +206,7 @@ void GatewayData::worker() {
         // Empty POST must still carry Content-Length: 0 — the gateway
         // answers 411 without it and the session kick never lands.
         curl_easy_setopt(h, CURLOPT_POSTFIELDS, "");
+        set_abort_on_stop(h, &running_);
         long status = 0;
         if (curl_easy_perform(h) == CURLE_OK)
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
