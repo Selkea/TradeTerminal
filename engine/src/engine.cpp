@@ -705,6 +705,12 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     std::vector<double> last_price(n_sym, 0.0);
     int64_t last_ts_ms = 0;
 
+    // Automated-halt anchors, declared here so publish() can report the current
+    // headroom; check_risk (below) reads/updates them, and broker reconciliation
+    // re-anchors both to the reconciled equity.
+    double risk_base_eq = pf.equity();   // equity at session start
+    double risk_high_eq = risk_base_eq;  // running session equity high
+
     // Percentiles are recomputed only when a new sample landed (orders are
     // rare next to ticks) — publish() itself stays flat.
     uint64_t lat_seen = 0;
@@ -727,6 +733,12 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         snap_.halted = halted;
         snap_.cash = pf.cash();
         snap_.equity = pf.equity();
+        snap_.risk.daily_loss = risk_base_eq - snap_.equity;
+        snap_.risk.daily_loss_limit = cfg.risk.daily_max_loss;
+        snap_.risk.drawdown_pct =
+            risk_high_eq > 0 ? (risk_high_eq - snap_.equity) / risk_high_eq : 0.0;
+        snap_.risk.drawdown_limit_pct = cfg.risk.max_drawdown_pct;
+        snap_.risk.stale_feed_sec = cfg.risk.stale_feed_sec;
         for (size_t i = 0; i < n_sym; ++i) {
             snap_.symbols[i].last_price = last_price[i];
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
@@ -813,8 +825,6 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     };
 
     // Automated halts: equity-based limits re-checked after every fill/tick.
-    double risk_base_eq = pf.equity();   // re-anchored by broker reconciliation
-    double risk_high_eq = risk_base_eq;
     auto check_risk = [&] {
         if (halted) return;
         const double eq = pf.equity();

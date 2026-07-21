@@ -145,11 +145,22 @@ struct SymbolState {
     Position position{};
 };
 
+// Live headroom to the session's automated equity halts, so a remote monitor
+// can see how close it is to tripping. A limit of 0 = that halt is disarmed.
+struct RiskState {
+    double daily_loss = 0;          // equity lost since session start (>0 = down)
+    double daily_loss_limit = 0;    // halt when daily_loss reaches this ($)
+    double drawdown_pct = 0;        // fraction below the session equity high
+    double drawdown_limit_pct = 0;  // halt when drawdown_pct reaches this
+    int stale_feed_sec = 0;         // stale-feed halt threshold (with a position)
+};
+
 struct LiveSnapshot {
     bool running = false, halted = false;
     double cash = 0, equity = 0;
     std::vector<SymbolState> symbols;
     std::vector<OrderRecord> orders;   // newest last, capped
+    RiskState risk;
     uint64_t ticks = 0, dropped_ticks = 0;
     int64_t last_tick_ts_ms = 0;       // most recent tick across any symbol
     // Tick -> order submit latency for this session (strategy orders only).

@@ -135,6 +135,7 @@ async function tick(){
   c+=card('Equity','$'+fmt(d.equity));
   c+=card('Cash','$'+fmt(d.cash));
   c+=card('Unprotected',d.unprotected_positions,d.unprotected_positions>0?'bad':'good');
+  if(d.live_running&&d.risk&&d.risk.nearest_halt!=='none'){const f=d.risk.nearest_halt_frac;c+=card('Halt room',Math.max(0,Math.round((1-f)*100))+'% ('+d.risk.nearest_halt+')',f>0.8?'bad':f>0.5?'warn':'good');}
   c+=card('Rejects',d.reject_count,d.reject_count>0?'warn':'good');
   c+=card('Feed stale',(d.feed_stale_ms<0?'—':d.feed_stale_ms+' ms'),d.feed_stale_ms>10000?'warn':'');
   c+=card('Dropped ticks',d.dropped_ticks,d.dropped_ticks>0?'warn':'');
@@ -1385,6 +1386,34 @@ std::string App::build_diag_json() {
         }
     j["reject_count"] = reject_count;
     j["rejects_recent"] = std::move(rejects);
+
+    // ---- risk-halt headroom (how close the session is to an automated halt) ----
+    // nearest_halt_frac is 0 (safe) .. 1 (at the halt), the max proximity across
+    // the armed equity limits — one at-a-glance "distance to halt" number.
+    {
+        const auto& rk = s.risk;
+        json risk;
+        risk["daily_loss"] = rk.daily_loss;
+        risk["daily_loss_limit"] = rk.daily_loss_limit;
+        risk["drawdown_pct"] = rk.drawdown_pct;
+        risk["drawdown_limit_pct"] = rk.drawdown_limit_pct;
+        risk["stale_feed_sec"] = rk.stale_feed_sec;
+        double nearest = 0.0;
+        const char* which = "none";
+        if (rk.daily_loss_limit > 0) {
+            risk["daily_loss_room"] = rk.daily_loss_limit - rk.daily_loss;
+            const double f = rk.daily_loss / rk.daily_loss_limit;
+            if (f > nearest) { nearest = f; which = "daily_loss"; }
+        }
+        if (rk.drawdown_limit_pct > 0) {
+            risk["drawdown_room_pct"] = rk.drawdown_limit_pct - rk.drawdown_pct;
+            const double f = rk.drawdown_pct / rk.drawdown_limit_pct;
+            if (f > nearest) { nearest = f; which = "drawdown"; }
+        }
+        risk["nearest_halt"] = which;
+        risk["nearest_halt_frac"] = nearest < 0.0 ? 0.0 : nearest;   // clamp (up on day)
+        j["risk"] = std::move(risk);
+    }
 
     // ---- latency ----
     AckSummary ack{};
