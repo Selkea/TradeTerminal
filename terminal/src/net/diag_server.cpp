@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <memory>
+#include <mutex>
 #include <string_view>
+#include <thread>
 
 namespace tt::ui {
 namespace {
@@ -43,14 +47,16 @@ std::string http_response(int code, const char* status, std::string_view ctype,
     return r;
 }
 
-void send_all(SOCKET s, const std::string& data) {
+// Returns false if the peer went away mid-send (used to end an SSE stream).
+bool send_all(SOCKET s, const std::string& data) {
     size_t off = 0;
     while (off < data.size()) {
         const int n = ::send(s, data.data() + off,
                              static_cast<int>(data.size() - off), 0);
-        if (n <= 0) return;
+        if (n <= 0) return false;
         off += static_cast<size_t>(n);
     }
+    return true;
 }
 
 std::string to_lower(std::string_view v) {
@@ -90,6 +96,23 @@ std::string header_bearer(std::string_view req) {
         return {};
     val = val.substr(kBearer.size());
     while (!val.empty() && val.back() == ' ') val.remove_suffix(1);
+    return std::string(val);
+}
+
+// Value of the header named `lname` (already lowercase), trimmed, or "".
+std::string header_value(std::string_view req, std::string_view lname) {
+    const std::string lower = to_lower(req);
+    std::string needle = "\r\n";
+    needle += lname;
+    needle += ':';
+    const size_t pos = lower.find(needle);
+    if (pos == std::string::npos) return {};
+    const size_t vstart = pos + needle.size();
+    const size_t eol = req.find("\r\n", vstart);
+    std::string_view val =
+        req.substr(vstart, (eol == std::string_view::npos ? req.size() : eol) - vstart);
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
+    while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.remove_suffix(1);
     return std::string(val);
 }
 
@@ -168,6 +191,8 @@ void DiagServer::set_control(std::string token, ControlFn fn) {
 
 void DiagServer::set_metrics(BodyProvider fn) { metrics_ = std::move(fn); }
 
+void DiagServer::set_tail(TailProvider fn) { tail_ = std::move(fn); }
+
 void DiagServer::stop() {
     const bool had_socket = listen_sock_ != ~uintptr_t{0};
     if (!had_socket && !thread_.joinable()) return;
@@ -177,6 +202,16 @@ void DiagServer::stop() {
         listen_sock_ = ~uintptr_t{0};
     }
     if (thread_.joinable()) thread_.join();
+    // Tear down live SSE streams: closing each socket unblocks a stalled
+    // send/sleep so the thread sees stop_ and returns; then join. run_stream
+    // never closes its own socket, so each is closed exactly once here.
+    {
+        std::lock_guard<std::mutex> lk(streams_mu_);
+        for (auto& st : streams_) ::closesocket(static_cast<SOCKET>(st->sock));
+        for (auto& st : streams_)
+            if (st->th.joinable()) st->th.join();
+        streams_.clear();
+    }
     if (had_socket) WSACleanup();
 }
 
@@ -260,6 +295,40 @@ void DiagServer::serve(uintptr_t client) {
         return;
     }
 
+    if (path == "/events") {
+        if (!tail_) {
+            send_all(s, http_response(404, "Not Found", "text/plain", "events disabled\n"));
+            ::closesocket(s);
+            return;
+        }
+        // Resume point: Last-Event-ID header (EventSource reconnect) or ?since=,
+        // else 0 (recent tail). Hand the socket to a stream thread and return to
+        // accept() immediately so control/diag stay responsive.
+        uint64_t start = 0;
+        std::string resume = header_value(req, "last-event-id");
+        if (resume.empty()) resume = query_param(target, "since");
+        if (!resume.empty()) {
+            try { start = std::stoull(resume); } catch (...) { start = 0; }
+        }
+        std::lock_guard<std::mutex> lk(streams_mu_);
+        reap_streams();
+        if (streams_.size() >= kMaxStreams) {
+            send_all(s, http_response(503, "Service Unavailable", "text/plain",
+                                      "too many event streams\n"));
+            ::closesocket(s);
+            return;
+        }
+        auto st = std::make_unique<Stream>();
+        st->sock = client;
+        Stream* raw = st.get();
+        st->th = std::thread([this, raw, start] {
+            run_stream(raw->sock, start);
+            raw->done.store(true, std::memory_order_release);
+        });
+        streams_.push_back(std::move(st));
+        return;   // stream thread owns the socket now (do NOT close here)
+    }
+
     if (path == "/diag") {
         send_all(s, http_response(200, "OK", "application/json", diag_ ? diag_() : "{}"));
     } else if (path == "/metrics") {
@@ -283,6 +352,50 @@ void DiagServer::serve(uintptr_t client) {
         send_all(s, http_response(404, "Not Found", "text/plain", "not found\n"));
     }
     ::closesocket(s);
+}
+
+// Stream an SSE log tail until the client leaves or the server stops. Runs on a
+// dedicated per-stream thread; never touches streams_mu_ (stop()/reap own the
+// socket lifecycle) so it can't deadlock with a concurrent stop().
+void DiagServer::run_stream(uintptr_t client, uint64_t start_cursor) {
+    const SOCKET s = static_cast<SOCKET>(client);
+    const std::string head =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "X-Accel-Buffering: no\r\n\r\n"
+        "retry: 3000\n\n";   // browser reconnect backoff
+    if (!send_all(s, head)) return;
+
+    uint64_t cursor = start_cursor;
+    int idle = 0;
+    while (!stop_.load(std::memory_order_relaxed)) {
+        std::string payload = tail_ ? tail_(cursor) : std::string();
+        if (!payload.empty()) {
+            if (!send_all(s, payload)) return;   // client gone
+            idle = 0;
+        } else if (++idle >= 20) {               // ~10 s: comment keeps proxies open
+            if (!send_all(s, ": keepalive\n\n")) return;
+            idle = 0;
+        }
+        // ~500 ms cadence, but wake often so stop() is noticed promptly.
+        for (int i = 0; i < 5 && !stop_.load(std::memory_order_relaxed); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// Join and drop streams whose thread has finished. Caller holds streams_mu_.
+void DiagServer::reap_streams() {
+    for (auto it = streams_.begin(); it != streams_.end();) {
+        if ((*it)->done.load(std::memory_order_acquire)) {
+            if ((*it)->th.joinable()) (*it)->th.join();
+            ::closesocket(static_cast<SOCKET>((*it)->sock));
+            it = streams_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace tt::ui

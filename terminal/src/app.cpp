@@ -176,24 +176,41 @@ document.getElementById('killbtn').onclick=async()=>{
   alert(r.ok?('Kill sent — '+t):('FAILED: HTTP '+r.status+' '+t));
  }catch(e){alert('Error: '+e);}
 };
-// incremental log tail: poll /logs?since=cursor and append only new lines.
+// Live log tail: prefer the SSE stream (/events, sub-second) and fall back to
+// polling /logs if EventSource is unavailable or never connects. Both share
+// logCursor, and the stream stamps events with id:=cursor, so a fallback or an
+// EventSource reconnect resumes with no gap or duplicate dump.
 let logCursor=0;const logEl=document.getElementById('log');
+function stat(t){const st=document.getElementById('logstat');if(st)st.textContent=t;}
+function appendLog(text,cls){
+ const atBottom=logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<40;
+ const div=document.createElement('div');if(cls)div.className=cls;div.textContent=text;logEl.appendChild(div);
+ while(logEl.childNodes.length>1500)logEl.removeChild(logEl.firstChild);
+ if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+}
+let pollTimer=null;
 async function logTick(){
  try{
   const sep=q?'&':'?';
   const r=await fetch('/logs'+q+sep+'since='+logCursor,{cache:'no-store'});
   if(!r.ok)return;
   const d=await r.json();
-  const atBottom=logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<40;
-  if(d.dropped){const m=document.createElement('div');m.className='muted';m.textContent='… older lines dropped';logEl.appendChild(m);}
-  for(const ln of d.lines){const div=document.createElement('div');div.textContent=ln;logEl.appendChild(div);}
-  logCursor=d.next;
-  while(logEl.childNodes.length>1500)logEl.removeChild(logEl.firstChild);
-  const st=document.getElementById('logstat');if(st)st.textContent='#'+logCursor;
-  if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+  if(d.dropped)appendLog('… older lines dropped','muted');
+  for(const ln of d.lines)appendLog(ln);
+  logCursor=d.next;stat('#'+logCursor+' (poll)');
  }catch(e){}
 }
-logTick();setInterval(logTick,1500);
+function startPoll(){if(pollTimer)return;logTick();pollTimer=setInterval(logTick,1500);}
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+if(window.EventSource){
+ let opened=false;
+ const es=new EventSource('/events'+q);
+ es.onopen=()=>{opened=true;stopPoll();stat('live');};
+ es.onmessage=(e)=>{if(e.lastEventId)logCursor=+e.lastEventId;for(const ln of e.data.split('\n'))appendLog(ln);};
+ es.addEventListener('dropped',()=>appendLog('… older lines dropped','muted'));
+ es.onerror=()=>{if(!opened)startPoll();};        // never connected -> poll; else EventSource auto-retries
+ setTimeout(()=>{if(!opened)startPoll();},4000);   // backstop if onerror never fires
+}else{startPoll();}
 </script>
 </body></html>
 )HTML";
@@ -1268,6 +1285,7 @@ void App::start_diag_server() {
     metrics_text_ = build_metrics();  // seed /metrics too
     diag_srv_.set_metrics(
         [this] { std::lock_guard<std::mutex> g(diag_mu_); return metrics_text_; });
+    diag_srv_.set_tail([this](uint64_t& cursor) { return build_logs_sse(cursor); });
     const bool ok = diag_srv_.start(
         cfg_.diag_bind, port, cfg_.diag_token,
         [this] { std::lock_guard<std::mutex> g(diag_mu_); return diag_json_; },
@@ -1530,6 +1548,28 @@ std::string App::build_logs_json(uint64_t since) {
     j["dropped"] = sl.dropped;
     j["lines"] = sl.lines;
     return j.dump();
+}
+
+// SSE framing of the log tail (GET /events). Runs on a per-stream server thread;
+// LogConsole::slice_since is mutex-guarded. Each new line is its own data:
+// field and the batch is stamped id:<next>, so an EventSource reconnect resumes
+// via Last-Event-ID with no gap or duplication. "" = nothing new (the server
+// sends a keepalive comment instead).
+std::string App::build_logs_sse(uint64_t& cursor) {
+    const LogConsole::Slice sl = log_.slice_since(cursor);
+    cursor = sl.next_id;
+    if (sl.lines.empty() && !sl.dropped) return {};
+    std::string out;
+    if (sl.dropped) out += "event: dropped\ndata: older lines dropped\n\n";
+    if (!sl.lines.empty()) {
+        for (const std::string& ln : sl.lines) {
+            out += "data: ";
+            for (char ch : ln) out += (ch == '\r' || ch == '\n') ? ' ' : ch;  // one line
+            out += '\n';
+        }
+        out += "id: " + std::to_string(sl.next_id) + "\n\n";
+    }
+    return out;
 }
 
 void App::draw() {
