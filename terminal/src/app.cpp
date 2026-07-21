@@ -21,11 +21,25 @@
 #include <fstream>
 #include <limits>
 #include <random>
+#include <thread>
 #include <utility>
 
 namespace tt::ui {
 
 namespace {
+// Destroy a broker adapter off the render thread. TWS's connect call is a
+// blocking, uninterruptible network call (see tws_broker.cpp); if the old I/O
+// thread is mid-(re)connect, its destructor's join can take arbitrarily long.
+// The render thread must never wait on that — so hand the object to a
+// detached thread and return immediately. The caller's pointer is moved-from
+// (null) before this returns, so nothing on the render thread can observe or
+// touch the old object again regardless of how long its real teardown takes.
+template <class T>
+void reap_async(std::unique_ptr<T> obj) {
+    if (!obj) return;
+    std::thread([o = std::move(obj)]() mutable { o.reset(); }).detach();
+}
+
 // Fill-sim order latency: once the live broker has logged at least this many
 // acks, backtest/optimizer/replay use the measured median + spread; until then
 // they use the realistic VPS default (~75 ms), not the 250 us ExecParams toy.
@@ -1988,14 +2002,21 @@ void App::draw() {
                             if (!ap_.syms.empty())
                                 log_.add("autopilot: armed for " +
                                          std::to_string(ap_.syms.size()) + " symbol(s)");
-                            // Previous session's thread was joined inside
-                            // start_live, so replacing the old broker is safe.
+                            // The engine's live thread was joined inside start_live,
+                            // so it's safe to drop whatever the previous session left
+                            // here — but normally safe_stop_live() has already reaped
+                            // these (see reap_async), so this is just defense in depth
+                            // (e.g. Start clicked again without an intervening Stop).
+                            // TWS's connect call is blocking, so any of these COULD be
+                            // mid-reconnect; never destroy them synchronously here.
+                            reap_async(std::move(ibkr_));
+                            reap_async(std::move(tws_));
                             ibkr_ = std::move(ibkr_broker);
                             tws_ = std::move(tws_broker);
-                            polygon_feed_.reset();   // previous session's feeds
-                            finnhub_feed_.reset();
-                            ibkr_feed_.reset();
-                            tws_feed_.reset();
+                            reap_async(std::move(polygon_feed_));   // previous session's feeds
+                            reap_async(std::move(finnhub_feed_));
+                            reap_async(std::move(ibkr_feed_));
+                            reap_async(std::move(tws_feed_));
                             rt_feed_active_.store(false, std::memory_order_relaxed);
                             const auto sink = [this](const EngineEvent& ev) {
                                 return engine_.push_feed_event(ev);
@@ -2146,7 +2167,15 @@ void App::request_quit() {
 void App::safe_stop_live() {
     if (!engine_.live_running()) return;
     engine_.kill_switch();   // cancel all + flatten + halt strategy
-    engine_.stop_live();     // graceful stop, joins the live thread
+    engine_.stop_live();     // graceful stop, joins the live thread — after this,
+                             // nothing still references cfg.broker, so tearing
+                             // the broker down below can never race the engine.
+    // Actually disconnect: leaving the broker connected after "Stop" holds its
+    // TWS client_id at the gateway, so a quick Start can collide with it
+    // (error 326) and stall retrying — reaped async so a stuck reconnect on
+    // the OLD broker can never freeze this click (see reap_async).
+    reap_async(std::move(tws_));
+    reap_async(std::move(ibkr_));
     log_.add("account: stopped live trading (kill switch)");
 }
 
