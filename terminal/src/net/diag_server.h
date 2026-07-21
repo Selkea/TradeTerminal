@@ -8,9 +8,10 @@
 // the minimum on the Winsock stack the app already links (see engine net_ws.h
 // for the same low-level socket style).
 //
-// Routes: GET /diag -> JSON body from the diag provider (auth required),
-//         GET /     -> HTML shell from the root provider (no auth: no secrets,
-//                      its JS forwards the URL's ?token= to /diag).
+// Routes: GET /diag       -> JSON body from the diag provider (auth required),
+//         GET /logs?since=N-> incremental log lines from the logs provider (auth),
+//         GET /           -> HTML shell from the root provider (no auth: no
+//                            secrets, its JS forwards the URL's ?token= onward).
 // Auth accepts either "Authorization: Bearer <token>" or a ?token=<token> query
 // param, so both curl and a browser work; the token is high-entropy and the hop
 // never leaves the encrypted tailnet.
@@ -32,6 +33,8 @@ class DiagServer {
 public:
     // Returns the current body for a route (called on the server thread).
     using BodyProvider = std::function<std::string()>;
+    // /logs body for everything after cursor `since` (called on the server thread).
+    using LogsProvider = std::function<std::string(uint64_t since)>;
     using LogFn = std::function<void(std::string)>;
 
     DiagServer() = default;
@@ -44,7 +47,8 @@ public:
     // /diag and / bodies. on_log (optional) receives one-line status/errors.
     // Returns false (after logging) if the socket cannot bind.
     bool start(const std::string& host, uint16_t port, std::string token,
-               BodyProvider diag, BodyProvider root, LogFn on_log = {});
+               BodyProvider diag, LogsProvider logs, BodyProvider root,
+               LogFn on_log = {});
     void stop();   // idempotent; unblocks and joins the accept thread
     bool running() const { return running_.load(std::memory_order_acquire); }
 
@@ -53,6 +57,7 @@ private:
     void serve(uintptr_t client);
 
     BodyProvider diag_, root_;
+    LogsProvider logs_;
     LogFn log_;
     std::string token_;
     uintptr_t listen_sock_ = ~uintptr_t{0};   // INVALID_SOCKET

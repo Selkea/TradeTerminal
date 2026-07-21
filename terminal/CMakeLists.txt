@@ -72,3 +72,13 @@ endif()
 # panel, so the attached console was just a blank window. Under a debugger,
 # stdout/stderr are captured by the IDE regardless of subsystem.
 set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
+
+# Terminal-side unit tests. LogConsole pulls in imgui (its filter widget), so
+# this can't live in the engine test harness; it links imgui like the app does.
+add_executable(tt_terminal_tests
+    tests/test_log_console.cpp
+    src/panels/log_console.cpp
+)
+target_include_directories(tt_terminal_tests PRIVATE src)
+target_link_libraries(tt_terminal_tests PRIVATE imgui doctest)
+add_test(NAME terminal_tests COMMAND tt_terminal_tests)

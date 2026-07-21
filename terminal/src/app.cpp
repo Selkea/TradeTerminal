@@ -108,6 +108,8 @@ const char* diag_html() {
 <table id="pos"><thead><tr><th>Symbol</th><th>Pos</th><th>Avg</th><th>Last</th><th>uPnL</th><th>Strategy</th><th>Guard</th></tr></thead><tbody></tbody></table>
 <h1>Recent rejects</h1>
 <table id="rej"><thead><tr><th>Id</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th></tr></thead><tbody></tbody></table>
+<h1>Log <span class="muted" id="logstat"></span></h1>
+<pre id="log"></pre>
 <h1 class="muted">Raw /diag</h1>
 <pre id="raw"></pre>
 <script>
@@ -146,6 +148,24 @@ async function tick(){
  }catch(e){document.getElementById('err').textContent=String(e);}
 }
 tick();setInterval(tick,2000);
+// incremental log tail: poll /logs?since=cursor and append only new lines.
+let logCursor=0;const logEl=document.getElementById('log');
+async function logTick(){
+ try{
+  const sep=q?'&':'?';
+  const r=await fetch('/logs'+q+sep+'since='+logCursor,{cache:'no-store'});
+  if(!r.ok)return;
+  const d=await r.json();
+  const atBottom=logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<40;
+  if(d.dropped){const m=document.createElement('div');m.className='muted';m.textContent='… older lines dropped';logEl.appendChild(m);}
+  for(const ln of d.lines){const div=document.createElement('div');div.textContent=ln;logEl.appendChild(div);}
+  logCursor=d.next;
+  while(logEl.childNodes.length>1500)logEl.removeChild(logEl.firstChild);
+  const st=document.getElementById('logstat');if(st)st.textContent='#'+logCursor;
+  if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+ }catch(e){}
+}
+logTick();setInterval(logTick,1500);
 </script>
 </body></html>
 )HTML";
@@ -1195,6 +1215,7 @@ void App::start_diag_server() {
     const bool ok = diag_srv_.start(
         cfg_.diag_bind, port, cfg_.diag_token,
         [this] { std::lock_guard<std::mutex> g(diag_mu_); return diag_json_; },
+        [this](uint64_t since) { return build_logs_json(since); },
         [] { return std::string(diag_html()); },
         [this](std::string l) { log_.add(std::move(l)); });
     if (ok)
@@ -1321,6 +1342,18 @@ std::string App::build_diag_json() {
     j["latency"] = std::move(lat);
 
     return j.dump(2);
+}
+
+// Incremental log tail for GET /logs. Runs on the server thread — safe because
+// LogConsole::slice_since is mutex-guarded. The client passes back `next` as the
+// next ?since=, and `dropped` flags a gap (it fell behind the 5000-line ring).
+std::string App::build_logs_json(uint64_t since) {
+    const LogConsole::Slice sl = log_.slice_since(since);
+    nlohmann::json j;
+    j["next"] = sl.next_id;
+    j["dropped"] = sl.dropped;
+    j["lines"] = sl.lines;
+    return j.dump();
 }
 
 void App::draw() {

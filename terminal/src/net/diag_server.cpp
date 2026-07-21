@@ -93,8 +93,8 @@ std::string header_bearer(std::string_view req) {
     return std::string(val);
 }
 
-// Value of ?token=<x> (or &token=) in the request target, or "".
-std::string query_token(std::string_view target) {
+// Value of ?<key>=<x> (or &<key>=) in the request target, or "".
+std::string query_param(std::string_view target, std::string_view key) {
     const size_t q = target.find('?');
     if (q == std::string_view::npos) return {};
     std::string_view qs = target.substr(q + 1);
@@ -102,7 +102,7 @@ std::string query_token(std::string_view target) {
         const size_t amp = qs.find('&', i);
         std::string_view kv = qs.substr(i, amp == std::string_view::npos ? std::string_view::npos : amp - i);
         const size_t eq = kv.find('=');
-        if (eq != std::string_view::npos && kv.substr(0, eq) == "token")
+        if (eq != std::string_view::npos && kv.substr(0, eq) == key)
             return std::string(kv.substr(eq + 1));
         if (amp == std::string_view::npos) break;
         i = amp + 1;
@@ -115,10 +115,12 @@ std::string query_token(std::string_view target) {
 DiagServer::~DiagServer() { stop(); }
 
 bool DiagServer::start(const std::string& host, uint16_t port, std::string token,
-                       BodyProvider diag, BodyProvider root, LogFn on_log) {
+                       BodyProvider diag, LogsProvider logs, BodyProvider root,
+                       LogFn on_log) {
     if (running()) return true;
     token_ = std::move(token);
     diag_ = std::move(diag);
+    logs_ = std::move(logs);
     root_ = std::move(root);
     log_ = std::move(on_log);
     stop_.store(false, std::memory_order_relaxed);
@@ -223,8 +225,8 @@ void DiagServer::serve(uintptr_t client) {
         return;
     }
 
-    const bool authed =
-        !token_.empty() && (header_bearer(req) == token_ || query_token(target) == token_);
+    const bool authed = !token_.empty() && (header_bearer(req) == token_ ||
+                                             query_param(target, "token") == token_);
     if (!authed) {
         send_all(s, http_response(401, "Unauthorized", "application/json",
                                   "{\"error\":\"unauthorized\"}"));
@@ -234,6 +236,16 @@ void DiagServer::serve(uintptr_t client) {
 
     if (path == "/diag") {
         send_all(s, http_response(200, "OK", "application/json", diag_ ? diag_() : "{}"));
+    } else if (path == "/logs") {
+        uint64_t since = 0;
+        try {
+            const std::string v = query_param(target, "since");
+            if (!v.empty()) since = std::stoull(v);
+        } catch (...) {
+            since = 0;   // malformed cursor -> treat as first poll
+        }
+        send_all(s, http_response(200, "OK", "application/json",
+                                  logs_ ? logs_(since) : "{}"));
     } else {
         send_all(s, http_response(404, "Not Found", "text/plain", "not found\n"));
     }

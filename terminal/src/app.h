@@ -76,6 +76,7 @@ private:
     void start_diag_server();
     void pump_diag();
     std::string build_diag_json();
+    std::string build_logs_json(uint64_t since);   // server thread (LogConsole is thread-safe)
     void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
     void setup_default_layout(ImGuiID dockspace_id);
