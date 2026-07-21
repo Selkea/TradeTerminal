@@ -60,6 +60,10 @@ public:
     // Measured order-path latency (submit -> first ack), for the fill sim.
     AckSummary ack_latency() const { return ack_lat_.summary(); }
 
+    // Orders submitted but not acked within the stuck threshold (half-open):
+    // surfaced in /diag as an alert; the adapter takes no automatic action.
+    int stuck_order_count() const { return stuck_count_.load(std::memory_order_relaxed); }
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -104,6 +108,7 @@ private:
     std::unordered_map<uint64_t, RejectReason> reject_reasons_;
 
     AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
+    std::atomic<int> stuck_count_{0};   // I/O thread writes, UI thread reads
 
     std::thread io_thread_;
 };

@@ -147,6 +147,7 @@ async function tick(){
   if(d.live_running&&d.risk&&d.risk.nearest_halt!=='none'){const f=d.risk.nearest_halt_frac;c+=card('Halt room',Math.max(0,Math.round((1-f)*100))+'% ('+d.risk.nearest_halt+')',f>0.8?'bad':f>0.5?'warn':'good');}
   c+=card('Rejects',d.reject_count,d.reject_count>0?'warn':'good');
   c+=card('Feed stale',(d.feed_stale_ms<0?'—':d.feed_stale_ms+' ms'),d.feed_stale_ms>10000?'warn':'');
+  if(d.stuck_orders>0)c+=card('Half-open',d.stuck_orders,'warn');
   c+=card('Dropped ticks',d.dropped_ticks,d.dropped_ticks>0?'warn':'');
   c+=card('Ack p50',fmt(d.latency.ack_p50_ms)+' ms');
   c+=card('Ack p90',fmt(d.latency.ack_p90_ms)+' ms');
@@ -1360,6 +1361,7 @@ std::string App::build_diag_json() {
     j["ticks"] = s.ticks;
     j["dropped_ticks"] = s.dropped_ticks;
     j["feed_stale_ms"] = s.last_tick_ts_ms > 0 ? (now_ms - s.last_tick_ts_ms) : -1;
+    j["stuck_orders"] = tws_ ? tws_->stuck_order_count() : 0;   // half-open (TWS route)
 
     auto strat_for = [&](const std::string& sym) -> const TradeSymbol* {
         for (const auto& ts : cfg_.trade_symbols)
@@ -1512,6 +1514,8 @@ std::string App::build_metrics() {
     g("tt_reject_count", "orders rejected this session", reject_count);
     g("tt_feed_stale_ms", "ms since the last tick (-1 = none yet)",
       s.last_tick_ts_ms > 0 ? static_cast<double>(now_ms - s.last_tick_ts_ms) : -1);
+    g("tt_stuck_orders", "orders unacked past the half-open threshold (TWS)",
+      tws_ ? tws_->stuck_order_count() : 0);
     g("tt_ack_latency_p50_ms", "order submit->ack p50", ack.base_ns / 1'000'000.0);
     g("tt_ack_latency_p90_ms", "order submit->ack p90",
       (ack.base_ns + ack.jitter_ns) / 1'000'000.0);
@@ -2306,10 +2310,11 @@ void App::draw_data_menu() {
 // Info = fills (webhook only, no beep — they can be frequent).
 void App::alert_scan(const std::string& l) {
     auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
-    if (has("KILL SWITCH") || has("RISK HALT") || has("WATCHDOG"))
+    if (has("KILL SWITCH") || has("RISK HALT") || has("WATCHDOG") ||
+        has("PROTECTIVE STOP REJECTED"))
         alerts_.notify(AlertNotifier::Critical, l);
     else if (has("rejected") || has("stream lost") || has("auth failed") ||
-             has("(drops!)"))
+             has("(drops!)") || has("half-open"))
         alerts_.notify(AlertNotifier::Warning, l);
     else if (has("live: fill"))
         alerts_.notify(AlertNotifier::Info, l);

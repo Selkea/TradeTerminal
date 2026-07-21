@@ -60,6 +60,8 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unordered_set<uint64_t> done;                // filled/cancelled locals
     std::unordered_map<uint64_t, uint32_t> sid_by_local;
     std::unordered_set<uint64_t> protective;          // stop-loss leg locals
+    std::unordered_set<uint64_t> stuck_warned;        // logged-once half-open orders
+    Clock::time_point last_stuck_check{};
 
     // Executions wait (briefly) for their commissionReport so the fee rides
     // the fill event; flushed with fee 0 if the report never shows.
@@ -213,6 +215,28 @@ struct TwsBroker::Io final : DefaultEWrapper {
         it->second.ev.u.fill.fee = report.commission;
         b.push_ev(it->second.ev);
         pending_execs.erase(it);
+    }
+
+    // Half-open orders: a submit with no first orderStatus/ack after a while
+    // (the ~27s TWS ack outliers). Alert-only — count them for /diag and log
+    // each once; the engine/user decides what to do. Throttled to ~1/s.
+    void check_stuck() {
+        static constexpr int64_t kStuckAckMs = 15'000;
+        const auto now = Clock::now();
+        if (now - last_stuck_check < std::chrono::seconds(1)) return;
+        last_stuck_check = now;
+        int cnt = 0;
+        for (const auto& [local, t] : submit_t) {
+            if (acked.count(local) || done.count(local)) continue;
+            const auto age_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count();
+            if (age_ms < kStuckAckMs) continue;
+            ++cnt;
+            if (stuck_warned.insert(local).second)
+                b.log("order #" + std::to_string(local) + " not acked after " +
+                      std::to_string(age_ms / 1000) + "s — possible half-open order");
+        }
+        b.stuck_count_.store(cnt, std::memory_order_relaxed);
     }
 
     // Executions whose commission report never arrived still become fills.
@@ -503,6 +527,7 @@ void TwsBroker::io_loop() {
         Cmd c;
         while (cmd_ring_->try_pop(c)) io.handle_cmd(c);
         io.flush_stale_execs();
+        io.check_stuck();
     }
 
     wake_.store(nullptr, std::memory_order_release);
