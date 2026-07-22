@@ -9,7 +9,6 @@
 #include "engine/finnhub_feed.h"
 #include "engine/tws_broker.h"
 #include "engine/tws_feed.h"
-#include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
 #include "tt/strategy_registry.h"

@@ -1,10 +1,10 @@
 #include "doctest.h"
 
 #include "engine/broker.h"
-#include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/exec_sim.h"
 #include "engine/portfolio.h"
+#include "tt/strategy_registry.h"
 
 #include <chrono>
 #include <cmath>
@@ -118,8 +118,13 @@ BacktestResult run_backtest_blocking(Engine& eng, const BacktestConfig& cfg, ISt
 } // namespace
 
 TEST_CASE("backtest: SMA trades on synthetic data and reruns are bit-identical") {
+    // sma_crossover.cpp is compiled into this test binary as a static-link
+    // source (see engine/CMakeLists.txt) -- the same implementation
+    // tt_terminal's "" built-in resolves to (see App::acquire_strategy).
+    const StaticStrategyEntry* e = find_static_strategy("sma_crossover.cpp");
+    REQUIRE(e != nullptr);
     Engine eng;
-    SmaCrossover sma;
+    IStrategy* sma = e->create();
 
     BacktestConfig cfg;
     cfg.symbol = "TEST";
@@ -127,13 +132,13 @@ TEST_CASE("backtest: SMA trades on synthetic data and reruns are bit-identical")
     cfg.initial_cash = 100'000.0;
     cfg.params = {{"fast", 5}, {"slow", 20}, {"qty", 100}};
 
-    const BacktestResult a = run_backtest_blocking(eng, cfg, &sma);
+    const BacktestResult a = run_backtest_blocking(eng, cfg, sma);
     CHECK(a.trades > 4);                       // regime changes force crossovers
     CHECK(a.events == cfg.bars.size() * 5 + 1); // 4 ticks + 1 bar each, + End
     CHECK(a.final_equity > 0.0);
     CHECK(a.lat_count == static_cast<uint64_t>(a.trades));
 
-    const BacktestResult b = run_backtest_blocking(eng, cfg, &sma);
+    const BacktestResult b = run_backtest_blocking(eng, cfg, sma);
     CHECK(a.trades == b.trades);
     CHECK(a.final_equity == b.final_equity);   // bit-identical, not Approx
     CHECK(a.total_return == b.total_return);
@@ -144,6 +149,7 @@ TEST_CASE("backtest: SMA trades on synthetic data and reruns are bit-identical")
         CHECK(a.fills[i].price == b.fills[i].price);
         CHECK(a.fills[i].qty == b.fills[i].qty);
     }
+    sma->destroy();
 }
 
 // run_live calls broker->take_reject() for every Rejected event and stores

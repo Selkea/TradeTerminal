@@ -1,9 +1,9 @@
 // .ttk round-trip and deterministic replay.
 #include "doctest.h"
 
-#include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/tick_log.h"
+#include "tt/strategy_registry.h"
 
 #include <chrono>
 #include <cmath>
@@ -41,15 +41,22 @@ TickLog make_log() {
 }
 
 BacktestResult replay_once(Engine& eng, const TickLog& log) {
+    // sma_crossover.cpp is compiled into this test binary as a static-link
+    // source (see engine/CMakeLists.txt) -- the same implementation
+    // tt_terminal's "" built-in resolves to (see App::acquire_strategy).
+    const StaticStrategyEntry* e = find_static_strategy("sma_crossover.cpp");
+    REQUIRE(e != nullptr);
+    IStrategy* strat = e->create();
+
     ReplayConfig cfg;
     cfg.name = "replay:test";
     cfg.log = log;
     cfg.params = {{"fast", 5.0}, {"slow", 20.0}};
-    SmaCrossover strat;
-    REQUIRE(eng.start_replay(std::move(cfg), &strat));
+    REQUIRE(eng.start_replay(std::move(cfg), strat));
     while (eng.running()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     BacktestResult res;
     REQUIRE(eng.take_result(res));
+    strat->destroy();
     return res;
 }
 

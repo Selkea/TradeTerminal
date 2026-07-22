@@ -556,12 +556,14 @@ void App::queue_backtest(const std::string& key, const std::string& sym,
     data_.request_candles(sym, ivl, rng);
 }
 
-// "" = a fresh built-in SMA; a promoted (statically-linked) key = the
-// registry's factory; otherwise an instance from a hot-loaded DLL module.
+// "" is an alias for the promoted sma_crossover.cpp -- one implementation,
+// not a separately hand-maintained "built-in" class that could drift from it
+// (see terminal/CMakeLists.txt's TT_PROMOTED_STRATEGIES). Any other promoted
+// key resolves the same way; otherwise an instance from a hot-loaded DLL module.
 IStrategy* App::acquire_strategy(const std::string& key) {
-    if (key.empty()) return new SmaCrossover();
-    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(key)) return e->create();
-    return host_.create_instance(key);
+    const std::string& k = key.empty() ? kBuiltinStrategyKey : key;
+    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(k)) return e->create();
+    return host_.create_instance(k);
 }
 
 void App::release_strategy(const StrategyLease& lease) {

@@ -15,13 +15,13 @@ StrategyManagerPanel::StrategyManagerPanel(StrategyHost& host, Engine& eng,
                                            std::string strategies_dir)
     : host_(host), eng_(eng), dir_(std::move(strategies_dir)) {
     host_.sweep_stale();
-    param_vals_[""] = {{"fast", 10, 1, 500, 10},
-                       {"slow", 30, 2, 1000, 30},
-                       {"qty", 100, 1, 100000, 100}};
     for (const auto& e : tt::static_strategy_registry())
         if (!static_keys_.insert(e.key).second)
             console("WARNING: duplicate promoted-strategy key '" + std::string(e.key) +
                     "' -- check terminal/CMakeLists.txt's TT_PROMOTED_STRATEGIES");
+    // "" is an alias for kBuiltinStrategyKey (see info_for) -- seed its param
+    // editor from there so the two can never drift apart.
+    adopt_params("");
     refresh_files();
 }
 
@@ -31,7 +31,8 @@ bool StrategyManagerPanel::is_static(const std::string& key) const {
 
 bool StrategyManagerPanel::info_for(const std::string& key,
                                     std::vector<StrategyHost::Param>& out) const {
-    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(key)) {
+    const std::string& k = key.empty() ? kBuiltinStrategyKey : key;
+    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(k)) {
         out.clear();
         for (uint32_t i = 0; i < e->info->param_count; ++i) {
             const ParamDesc& p = e->info->params[i];
@@ -40,7 +41,7 @@ bool StrategyManagerPanel::info_for(const std::string& key,
         return true;
     }
     StrategyHost::ModuleView mv;
-    if (!host_.info(key, mv)) return false;
+    if (!host_.info(k, mv)) return false;
     out = std::move(mv.params);
     return true;
 }
@@ -137,12 +138,12 @@ void StrategyManagerPanel::pump() {
 }
 
 std::string StrategyManagerPanel::display_name(const std::string& key) const {
-    if (key.empty()) return "SMA Crossover";
-    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(key))
-        return e->info->name ? e->info->name : key;
+    const std::string& k = key.empty() ? kBuiltinStrategyKey : key;
+    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(k))
+        return e->info->name ? e->info->name : k;
     StrategyHost::ModuleView mv;
-    if (host_.info(key, mv)) return mv.name;
-    return key;
+    if (host_.info(k, mv)) return mv.name;
+    return k;
 }
 
 std::map<std::string, double> StrategyManagerPanel::param_values(
@@ -175,7 +176,11 @@ std::vector<StrategyManagerPanel::ParamSpec> StrategyManagerPanel::param_specs(
 
 std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
     std::vector<std::string> out;
-    for (const auto& e : tt::static_strategy_registry()) out.push_back(e.key);
+    for (const auto& e : tt::static_strategy_registry())
+        // kBuiltinStrategyKey is already offered as "" wherever callers list
+        // strategies -- listing it again under its own key would show the
+        // same strategy twice.
+        if (e.key != kBuiltinStrategyKey) out.push_back(e.key);
     for (const auto& m : host_.modules())
         if (!is_static(m.key)) out.push_back(m.key);   // a rebuilt-but-inert DLL: hidden
     return out;
@@ -185,7 +190,8 @@ std::map<std::string, std::map<std::string, double>>
 StrategyManagerPanel::all_param_values() const {
     std::map<std::string, std::map<std::string, double>> out;
     out[""] = param_values("");
-    for (const auto& e : tt::static_strategy_registry()) out[e.key] = param_values(e.key);
+    for (const auto& e : tt::static_strategy_registry())
+        if (e.key != kBuiltinStrategyKey) out[e.key] = param_values(e.key);
     for (const auto& m : host_.modules())
         if (!is_static(m.key)) out[m.key] = param_values(m.key);
     return out;
@@ -203,11 +209,13 @@ void StrategyManagerPanel::restore_state(
             if (it != b->second.end()) p.value = it->second;
         }
     // Promoted strategies have declared params available immediately (no
-    // build needed, unlike "" they aren't pre-seeded in the ctor) -- seed them
-    // now so saved values apply without waiting for the panel to touch this
-    // key first (which is what the "" branch above and adopt_params do for
-    // the built-in and for a freshly-(re)loaded DLL respectively).
-    for (const std::string& key : static_keys_) adopt_params(key);
+    // build needed) -- seed them now so saved values apply without waiting
+    // for the panel to touch this key first. "" (kBuiltinStrategyKey) is
+    // already seeded by the ctor, via the "" branch above; skip it here so
+    // it doesn't also get a redundant, unused param_vals_ entry under its
+    // own key (nothing reads that key directly -- see loaded_keys()).
+    for (const std::string& key : static_keys_)
+        if (key != kBuiltinStrategyKey) adopt_params(key);
     // Rebuild + hot-load each saved DLL strategy; adopt_params applies its
     // saved params once the module is up. No-ops for "" and promoted keys
     // (loaded_fresh is already true for both).
@@ -331,6 +339,9 @@ void StrategyManagerPanel::draw(bool* open) {
         // Promoted strategies: compiled in, nothing to build/unload -- same
         // shape as the built-in's tab (mod = nullptr), no close button.
         for (const auto& e : tt::static_strategy_registry()) {
+            // kBuiltinStrategyKey already has its own tab above, under "" --
+            // "" and this key are the same strategy (see App::acquire_strategy).
+            if (e.key == kBuiltinStrategyKey) continue;
             const std::string name = e.info->name ? e.info->name : e.key;
             const std::string label = name + "###" + e.key;
             const ImGuiTabItemFlags msel =
@@ -368,6 +379,7 @@ void StrategyManagerPanel::draw(bool* open) {
                 want_tab_set_ = true;
             }
             for (const auto& e : tt::static_strategy_registry()) {
+                if (e.key == kBuiltinStrategyKey) continue;   // already listed above, as ""
                 const std::string name = e.info->name ? e.info->name : e.key;
                 if (ImGui::Selectable(name.c_str())) {
                     want_tab_ = e.key;

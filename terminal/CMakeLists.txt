@@ -62,12 +62,18 @@ endif()
 # ODR violation (wrong strategy logic quietly runs under one of the keys, no
 # compiler/linker diagnostic), not a build error. Guarded below at configure
 # time.
+# sma_crossover.cpp is included here too: it's the app's "" built-in (see
+# App::acquire_strategy) -- promoting it lets "" resolve to this ONE
+# implementation instead of a separately-hand-maintained duplicate class
+# (engine/include/engine/builtin_sma.h, removed -- it had drifted from this
+# file: no in-flight order-id guard, no buying-power cap).
 set(TT_PROMOTED_STRATEGIES
     ${CMAKE_SOURCE_DIR}/strategies/orb_breakout.cpp
     ${CMAKE_SOURCE_DIR}/strategies/donchian_trend.cpp
     ${CMAKE_SOURCE_DIR}/strategies/rsi2_pullback.cpp
     ${CMAKE_SOURCE_DIR}/strategies/bollinger_reversion.cpp
     ${CMAKE_SOURCE_DIR}/strategies/scalper_burst.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp
 )
 target_sources(tt_terminal PRIVATE ${TT_PROMOTED_STRATEGIES})
 set(_tt_promoted_classes)

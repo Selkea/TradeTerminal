@@ -16,6 +16,11 @@
 
 namespace tt::ui {
 
+// The app's "" strategy key is an alias for this promoted strategy -- one
+// implementation, not a separately hand-maintained "built-in" class (see
+// App::acquire_strategy and StrategyManagerPanel::info_for/display_name).
+inline constexpr const char* kBuiltinStrategyKey = "sma_crossover.cpp";
+
 // Lists strategies/*.cpp, builds them with g++ (worker thread, output
 // streamed into an in-panel console), hot-loads DLLs side by side, tracks
 // which strategy is "active" (used by live/replay/trade), and edits each
