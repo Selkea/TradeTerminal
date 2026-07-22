@@ -5,12 +5,13 @@
 #   .\vps_bootstrap.ps1
 #
 # Installs the toolchain (Git, Python, MSYS2 + UCRT64 packages), clones and
-# builds TradeTerminal (release), and applies trading-box tuning (power plan,
-# clock sync, core-pinning env vars). Re-runnable: every step is idempotent.
+# builds TradeTerminal (release), sets up Tailscale for remote access, and
+# applies trading-box tuning (power plan, clock sync, core-pinning env vars).
+# Re-runnable: every step is idempotent.
 #
 # Note: Windows Server images often lack winget; when it is missing the script
-# falls back to direct silent installers (Git, Python, MSYS2, Temurin, Chrome)
-# automatically.
+# falls back to direct silent installers (Git, Python, MSYS2, Temurin, Chrome,
+# Tailscale) automatically.
 
 param(
     [string]$RepoUrl = "https://github.com/Selkea/TradeTerminal.git",
@@ -20,7 +21,12 @@ param(
     # The app needs OpenGL 3.3; a GPU-less VPS over RDP only offers 1.1, so by
     # default Mesa's software renderer is deployed next to the exe. Skip on a
     # box with a real GPU driver (Mesa in the app dir would override it).
-    [switch]$SkipSoftwareGL
+    [switch]$SkipSoftwareGL,
+    # Optional: join the tailnet unattended (Settings > Keys in the Tailscale
+    # admin console; use a reusable key for repeat provisioning). Left blank,
+    # Tailscale installs but `tailscale up` is a manual one-time step (it
+    # needs interactive browser auth without a key).
+    [string]$TailscaleAuthKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -259,6 +265,33 @@ $sc.Description = "TradeTerminal"
 $sc.Save()
 Write-Host "  $lnk"
 
+# --- 2e. Tailscale (remote diagnostics/SSH; never expose the dashboard/RDP publicly) --
+Step "Tailscale"
+$tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+if (Test-Path $tailscaleExe) {
+    Write-Host "  tailscale present"
+} elseif ($haveWinget) {
+    Install-ViaWinget "Tailscale.Tailscale"
+} else {
+    $exe = Join-Path $env:TEMP "tailscale-setup.exe"
+    Get-File "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" $exe
+    Start-Process $exe -ArgumentList "/quiet" -Wait
+}
+if (Test-Path $tailscaleExe) {
+    if ($TailscaleAuthKey) {
+        # No --ssh flag: Tailscale SSH's server side isn't available on
+        # Windows (client-only) -- remote shell access needs Windows' own
+        # OpenSSH Server instead, set up separately if you want it.
+        & $tailscaleExe up --authkey=$TailscaleAuthKey --hostname=$env:COMPUTERNAME
+        if ($LASTEXITCODE -ne 0) { Write-Host "  WARNING: 'tailscale up' failed - run it manually" -ForegroundColor Yellow }
+        else { Write-Host "  joined the tailnet as $env:COMPUTERNAME" }
+    } else {
+        Write-Host "  installed - run 'tailscale up' once (interactive browser login) to join the tailnet"
+    }
+} else {
+    Write-Host "  WARNING: tailscale install did not complete - install manually from https://tailscale.com/download" -ForegroundColor Yellow
+}
+
 # --- 3. trading-box tuning ----------------------------------------------------
 Step "Power plan: High performance (no core parking / frequency scaling)"
 powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
@@ -294,6 +327,8 @@ Next steps (manual):
   3. Data feed keys (optional): Data menu > Add Feed for Finnhub/Polygon.
   4. Set Windows Update active hours to cover the trading day.
   5. When leaving RDP, CLOSE the window (disconnect) - do not sign out.
-  6. For remote monitoring, install Tailscale; do NOT open dashboard/RDP
-     ports to the public internet.
+  6. If -TailscaleAuthKey wasn't passed above, run 'tailscale up' once
+     (interactive browser login) to join the tailnet. Do NOT open
+     dashboard/RDP ports to the public internet - reach this box over
+     Tailscale only.
 "@
