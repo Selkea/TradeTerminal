@@ -12,6 +12,7 @@
 #include "engine/builtin_sma.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
+#include "tt/strategy_registry.h"
 #include "journal.h"
 #include "market_data.h"
 #include "net/diag_server.h"

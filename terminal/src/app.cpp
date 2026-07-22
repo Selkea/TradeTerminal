@@ -556,14 +556,16 @@ void App::queue_backtest(const std::string& key, const std::string& sym,
     data_.request_candles(sym, ivl, rng);
 }
 
-// "" = a fresh built-in SMA; otherwise an instance from the module's factory.
+// "" = a fresh built-in SMA; a promoted (statically-linked) key = the
+// registry's factory; otherwise an instance from a hot-loaded DLL module.
 IStrategy* App::acquire_strategy(const std::string& key) {
     if (key.empty()) return new SmaCrossover();
+    if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(key)) return e->create();
     return host_.create_instance(key);
 }
 
 void App::release_strategy(const StrategyLease& lease) {
-    if (lease.key.empty())
+    if (lease.key.empty() || tt::find_static_strategy(lease.key))
         lease.inst->destroy();
     else
         host_.destroy_instance(lease.inst);

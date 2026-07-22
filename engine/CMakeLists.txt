@@ -32,16 +32,26 @@ add_executable(tt_engine_tests
     tests/test_spsc_ring.cpp
     tests/test_engine.cpp
     tests/test_strategy_host.cpp
+    tests/test_strategy_registry.cpp
     tests/test_tick_log.cpp
     tests/test_exec_brackets.cpp
     tests/test_price_tick.cpp
     tests/test_ack_latency.cpp
+    # Compiled a SECOND time here (see below), statically-linked instead of as
+    # a DLL -- test_strategy_registry.cpp's regression guard for the
+    # TT_STRATEGY_STATIC_LINK path (terminal/CMakeLists.txt's real usage:
+    # TT_PROMOTED_STRATEGIES). The DLL-mode tests above build the same file at
+    # runtime via StrategyHost::compile() (TT_TEST_STRATEGY_SRC) -- one source,
+    # both mechanisms exercised.
+    ${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp
 )
 target_link_libraries(tt_engine_tests PRIVATE tt_engine doctest)
 target_compile_definitions(tt_engine_tests PRIVATE
     TT_TEST_SDK_INCLUDE="${CMAKE_SOURCE_DIR}/sdk/include"
     TT_TEST_STRATEGY_SRC="${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp"
 )
+set_source_files_properties(${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp PROPERTIES
+    COMPILE_DEFINITIONS "TT_STRATEGY_STATIC_LINK;TT_STRATEGY_STATIC_KEY=\"sma_crossover.cpp\"")
 add_test(NAME engine_tests COMMAND tt_engine_tests)
 
 add_executable(tt_ibkr_tests tests/test_ibkr_parse.cpp)

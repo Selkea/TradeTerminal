@@ -3,11 +3,13 @@
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
 #include "tt/strategy_api.h"
+#include "tt/strategy_registry.h"
 
 #include <atomic>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -76,13 +78,25 @@ private:
 
     void refresh_files();
     // One strategy's tab body: rebuild/unload controls + param editor.
-    // mod is null for the built-in.
+    // mod is null for the built-in and for a promoted (statically-linked)
+    // strategy -- neither has a DLL module to show rebuild/unload controls for.
     void draw_strategy_tab(const std::string& key, const StrategyHost::ModuleView* mod);
     void start_build(const std::string& src);
-    // Seed/merge the param editor values from a module's declared params.
+    // Seed/merge the param editor values from a strategy's declared params
+    // (static registry or a loaded module, via info_for).
     void adopt_params(const std::string& key);
     void console(std::string line);
     std::vector<ParamValue>* editor_params(const std::string& key);
+
+    // True if `key` is a promoted (statically-linked) strategy, as opposed to
+    // a hot-loaded DLL or "" (the built-in). Backed by static_keys_, a
+    // snapshot of tt::static_strategy_registry() taken once in the ctor
+    // (the registry itself never changes after static init).
+    bool is_static(const std::string& key) const;
+    // Declared params for `key`, from whichever source backs it (the static
+    // registry takes priority; falls back to a loaded DLL module). False if
+    // neither has it.
+    bool info_for(const std::string& key, std::vector<StrategyHost::Param>& out) const;
 
     StrategyHost& host_;
     Engine& eng_;
@@ -109,6 +123,8 @@ private:
     std::map<std::string, std::vector<ParamValue>> param_vals_;
     // Saved values from the last session, applied by adopt_params on (re)load.
     std::map<std::string, std::map<std::string, double>> saved_params_;
+    // Promoted (statically-linked) strategy keys, snapshotted once in the ctor.
+    std::set<std::string> static_keys_;
 };
 
 } // namespace tt::ui

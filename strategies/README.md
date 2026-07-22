@@ -15,6 +15,28 @@ backtest, without restarting the app.
 | `rsi2_pullback.cpp` | pullback (Connors) | RSI(2) dip in uptrend / close > exit SMA | regime filter + small fixed allocation |
 | `scalper_burst.cpp` | scalping (tick-driven) | burst_bps move within window_s of prints / TP-SL bracket | manual OCO + time-stop + cooldown; validate via tick Replay, never candle backtests |
 
+## Promoted (built-in) strategies
+
+`orb_breakout.cpp`, `donchian_trend.cpp`, `rsi2_pullback.cpp`,
+`bollinger_reversion.cpp`, and `scalper_burst.cpp` are also compiled directly
+into `tt_terminal` ("promoted") — see `TT_PROMOTED_STRATEGIES` in
+`terminal/CMakeLists.txt`. This is a **build-only** change: the `.cpp` files
+above are byte-for-byte identical either way and still hot-rebuild via the
+Strategy panel's Build button same as any other file here (a rebuilt DLL for
+a promoted key is just inert — the terminal always prefers the compiled-in
+version). Promotion exists so the live-trading process on the VPS doesn't
+depend on the MSYS2/g++ toolchain or this directory being present at runtime.
+
+Promoting a strategy is purely a CMakeLists.txt edit — add its path to
+`TT_PROMOTED_STRATEGIES`, nothing in the `.cpp` changes. One rule that only
+applies to promoted strategies: **a promoted strategy's class name must be
+unique across every other promoted strategy.** Hot-loaded DLLs never collide
+(each is its own binary), but promoted strategies share `tt_terminal`'s one
+link unit — a duplicate class name there is a silent ODR violation (wrong
+strategy logic quietly running under one of the keys, no compiler/linker
+diagnostic), not a build error. `terminal/CMakeLists.txt` fails configure on
+a detected duplicate as a guard, but keep names distinct regardless.
+
 Patterns worth copying from them: protective stops are **resting Stop orders
 the strategy owns** (id known → cancellable → trailable), never bracket legs
 (`take_profit`/`stop_loss` spawn engine-side orders whose ids the strategy

@@ -47,6 +47,50 @@ if(WIN32)
     set_source_files_properties(resources/app.rc PROPERTIES OBJECT_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico)
 endif()
+
+# Strategies compiled directly into tt_terminal instead of hot-loaded as DLLs
+# ("promoted"). Same .cpp as strategies/*.cpp, byte-for-byte unmodified --
+# TT_STRATEGY_STATIC_LINK switches TT_STRATEGY (sdk/include/tt/strategy_api.h)
+# to self-registration instead of dllexport. TT_STRATEGY_STATIC_KEY must match
+# the source's basename exactly (the string StrategyHost would key it under if
+# hot-built) -- every other integration point (config.json, autopilot, panel
+# dropdowns) treats that string as the strategy's identity.
+#
+# CAUTION: a promoted strategy's C++ class name must be globally unique across
+# every OTHER promoted strategy (see strategies/README.md) -- unlike DLLs,
+# promoted strategies share one link unit, and a name collision is a silent
+# ODR violation (wrong strategy logic quietly runs under one of the keys, no
+# compiler/linker diagnostic), not a build error. Guarded below at configure
+# time.
+set(TT_PROMOTED_STRATEGIES
+    ${CMAKE_SOURCE_DIR}/strategies/orb_breakout.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/donchian_trend.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/rsi2_pullback.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/bollinger_reversion.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/scalper_burst.cpp
+)
+target_sources(tt_terminal PRIVATE ${TT_PROMOTED_STRATEGIES})
+set(_tt_promoted_classes)
+foreach(_src ${TT_PROMOTED_STRATEGIES})
+    get_filename_component(_key ${_src} NAME)
+    set_source_files_properties(${_src} PROPERTIES
+        COMPILE_DEFINITIONS "TT_STRATEGY_STATIC_LINK;TT_STRATEGY_STATIC_KEY=\"${_key}\"")
+
+    file(STRINGS ${_src} _class_line REGEX "^class [A-Za-z_][A-Za-z0-9_]* " LIMIT_COUNT 1)
+    if(_class_line)
+        string(REGEX MATCH "^class ([A-Za-z_][A-Za-z0-9_]*)" _unused "${_class_line}")
+        set(_cls ${CMAKE_MATCH_1})
+        list(FIND _tt_promoted_classes ${_cls} _idx)
+        if(NOT _idx EQUAL -1)
+            message(FATAL_ERROR "Promoted strategy class name collision: '${_cls}' "
+                "(from ${_src}) is already used by another TT_PROMOTED_STRATEGIES source. "
+                "Promoted strategies share one link unit, so this is a silent ODR "
+                "violation, not a build error -- rename one of the classes.")
+        endif()
+        list(APPEND _tt_promoted_classes ${_cls})
+    endif()
+endforeach()
+
 add_dependencies(tt_terminal tt_build_info)   # generate build_info.h before compiling
 target_include_directories(tt_terminal PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 # Debug-only features (Debug menu, tick simulator) compile out of release.

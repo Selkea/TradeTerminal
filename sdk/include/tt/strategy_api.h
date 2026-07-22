@@ -85,6 +85,45 @@ struct StrategyInfo {
 } // namespace tt
 
 // Every strategy .cpp ends with: TT_STRATEGY(MyClass, "Display Name", params_array)
+//
+// Two backends, selected by the BUILD, never by the .cpp itself:
+//  - default: extern "C" dllexport factory functions, hot-loaded at runtime
+//    by StrategyHost from a compiled DLL (strategies/*.cpp via the Strategy
+//    panel's Build button).
+//  - TT_STRATEGY_STATIC_LINK: self-registers into tt::static_strategy_registry()
+//    at static-init time instead, for a strategy compiled directly into
+//    tt_terminal ("promoted"). Set ONLY via a per-source CMake compile
+//    definition alongside TT_STRATEGY_STATIC_KEY (see terminal/CMakeLists.txt)
+//    — the DLL path derives its key from the loaded file's path at runtime;
+//    the static path has no runtime path to inspect, so CMake supplies the
+//    identical string up front.
+#ifdef TT_STRATEGY_STATIC_LINK
+
+#include "tt/strategy_registry.h"
+
+#ifndef TT_STRATEGY_STATIC_KEY
+#error "TT_STRATEGY_STATIC_LINK requires TT_STRATEGY_STATIC_KEY (set alongside it via CMake)"
+#endif
+
+// Wrapped in an anonymous namespace for true internal linkage: two promoted
+// strategies can never collide at link time even if they reused these names
+// (unlike the DLL path's extern "C" factory names, which are global).
+#define TT_STRATEGY(CLS, NAME, PARAMS)                                                  \
+    namespace {                                                                         \
+    const tt::StrategyInfo& tt_static_info_##CLS() {                                    \
+        static const tt::StrategyInfo info{TT_SDK_VERSION, NAME, PARAMS,                \
+                                           sizeof(PARAMS) / sizeof(PARAMS[0])};          \
+        return info;                                                                    \
+    }                                                                                    \
+    tt::IStrategy* tt_static_create_##CLS() { return new CLS(); }                       \
+    [[maybe_unused]] const bool tt_static_registered_##CLS =                            \
+        tt::detail::register_static_strategy(TT_STRATEGY_STATIC_KEY,                    \
+                                             &tt_static_info_##CLS(),                    \
+                                             &tt_static_create_##CLS);                   \
+    } // namespace
+
+#else
+
 #define TT_STRATEGY(CLS, NAME, PARAMS)                                                   \
     extern "C" __declspec(dllexport) uint32_t tt_sdk_version() { return TT_SDK_VERSION; } \
     extern "C" __declspec(dllexport) const tt::StrategyInfo* tt_strategy_info() {         \
@@ -93,3 +132,5 @@ struct StrategyInfo {
         return &info;                                                                     \
     }                                                                                     \
     extern "C" __declspec(dllexport) tt::IStrategy* tt_create_strategy() { return new CLS(); }
+
+#endif
