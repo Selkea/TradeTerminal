@@ -332,7 +332,7 @@ void StrategyManagerPanel::draw(bool* open) {
         // shape as the built-in's tab (mod = nullptr), no close button.
         for (const auto& e : tt::static_strategy_registry()) {
             const std::string name = e.info->name ? e.info->name : e.key;
-            const std::string label = name + " (built-in)###" + e.key;
+            const std::string label = name + "###" + e.key;
             const ImGuiTabItemFlags msel =
                 want_tab_set_ && want_tab_ == e.key ? ImGuiTabItemFlags_SetSelected : 0;
             if (ImGui::BeginTabItem(label.c_str(), nullptr, msel)) {
@@ -369,7 +369,7 @@ void StrategyManagerPanel::draw(bool* open) {
             }
             for (const auto& e : tt::static_strategy_registry()) {
                 const std::string name = e.info->name ? e.info->name : e.key;
-                if (ImGui::Selectable((name + " (built-in)").c_str())) {
+                if (ImGui::Selectable(name.c_str())) {
                     want_tab_ = e.key;
                     want_tab_set_ = true;
                 }
