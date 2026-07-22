@@ -4,6 +4,7 @@
 #include "imgui_internal.h"   // GetCurrentTabBar: overflow-aware tab-list button
 #include "ui_hints.h"
 
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -87,6 +88,7 @@ void StrategyManagerPanel::refresh_files() {
     for (const auto& e : fs::directory_iterator(dir_, ec))
         if (e.is_regular_file(ec) && e.path().extension() == ".cpp")
             files_.push_back(e.path().filename().string());
+    std::sort(files_.begin(), files_.end());   // directory_iterator order is unspecified
     if (build_sel_ >= static_cast<int>(files_.size())) build_sel_ = 0;
 }
 
@@ -185,6 +187,11 @@ std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
         if (std::string(e.key) != kBuiltinStrategyKey) out.push_back(e.key);
     for (const auto& m : host_.modules())
         if (!is_static(m.key)) out.push_back(m.key);   // a rebuilt-but-inert DLL: hidden
+    // Alphabetical by what the dropdowns actually show (the display name),
+    // not the internal key -- registry/module iteration order isn't meaningful.
+    std::sort(out.begin(), out.end(), [this](const std::string& a, const std::string& b) {
+        return display_name(a) < display_name(b);
+    });
     return out;
 }
 
