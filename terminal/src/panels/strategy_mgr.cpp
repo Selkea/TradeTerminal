@@ -179,8 +179,10 @@ std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
     for (const auto& e : tt::static_strategy_registry())
         // kBuiltinStrategyKey is already offered as "" wherever callers list
         // strategies -- listing it again under its own key would show the
-        // same strategy twice.
-        if (e.key != kBuiltinStrategyKey) out.push_back(e.key);
+        // same strategy twice. std::string(...) compares content, not the
+        // const char* pointers themselves (which live in different TUs and
+        // aren't guaranteed to be the same address even for equal text).
+        if (std::string(e.key) != kBuiltinStrategyKey) out.push_back(e.key);
     for (const auto& m : host_.modules())
         if (!is_static(m.key)) out.push_back(m.key);   // a rebuilt-but-inert DLL: hidden
     return out;
@@ -191,7 +193,7 @@ StrategyManagerPanel::all_param_values() const {
     std::map<std::string, std::map<std::string, double>> out;
     out[""] = param_values("");
     for (const auto& e : tt::static_strategy_registry())
-        if (e.key != kBuiltinStrategyKey) out[e.key] = param_values(e.key);
+        if (std::string(e.key) != kBuiltinStrategyKey) out[e.key] = param_values(e.key);
     for (const auto& m : host_.modules())
         if (!is_static(m.key)) out[m.key] = param_values(m.key);
     return out;
@@ -341,7 +343,8 @@ void StrategyManagerPanel::draw(bool* open) {
         for (const auto& e : tt::static_strategy_registry()) {
             // kBuiltinStrategyKey already has its own tab above, under "" --
             // "" and this key are the same strategy (see App::acquire_strategy).
-            if (e.key == kBuiltinStrategyKey) continue;
+            // std::string(...): content compare, not the const char* pointers.
+            if (std::string(e.key) == kBuiltinStrategyKey) continue;
             const std::string name = e.info->name ? e.info->name : e.key;
             const std::string label = name + "###" + e.key;
             const ImGuiTabItemFlags msel =
@@ -379,7 +382,8 @@ void StrategyManagerPanel::draw(bool* open) {
                 want_tab_set_ = true;
             }
             for (const auto& e : tt::static_strategy_registry()) {
-                if (e.key == kBuiltinStrategyKey) continue;   // already listed above, as ""
+                // content compare, not the const char* pointers (see loaded_keys()).
+                if (std::string(e.key) == kBuiltinStrategyKey) continue;   // already listed, as ""
                 const std::string name = e.info->name ? e.info->name : e.key;
                 if (ImGui::Selectable(name.c_str())) {
                     want_tab_ = e.key;
