@@ -137,7 +137,7 @@ void StrategyManagerPanel::pump() {
 }
 
 std::string StrategyManagerPanel::display_name(const std::string& key) const {
-    if (key.empty()) return "SMA Crossover (built-in)";
+    if (key.empty()) return "SMA Crossover";
     if (const tt::StaticStrategyEntry* e = tt::find_static_strategy(key))
         return e->info->name ? e->info->name : key;
     StrategyHost::ModuleView mv;
@@ -324,7 +324,7 @@ void StrategyManagerPanel::draw(bool* open) {
         }
         const ImGuiTabItemFlags bsel =
             want_tab_set_ && want_tab_.empty() ? ImGuiTabItemFlags_SetSelected : 0;
-        if (ImGui::BeginTabItem("SMA (built-in)###builtin", nullptr, bsel)) {
+        if (ImGui::BeginTabItem("SMA###builtin", nullptr, bsel)) {
             draw_strategy_tab("", nullptr);
             ImGui::EndTabItem();
         }
@@ -363,7 +363,7 @@ void StrategyManagerPanel::draw(bool* open) {
         }
         want_tab_set_ = false;   // consumed
         if (ImGui::BeginPopup("##stratlist")) {
-            if (ImGui::Selectable("SMA Crossover (built-in)")) {
+            if (ImGui::Selectable("SMA Crossover")) {
                 want_tab_.clear();
                 want_tab_set_ = true;
             }

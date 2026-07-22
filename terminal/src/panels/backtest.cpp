@@ -61,7 +61,7 @@ void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
     ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
 
     // Strategy dropdown: Run builds + loads the pick if it isn't loaded yet.
-    constexpr const char* kBuiltin = "SMA Crossover (built-in)";
+    constexpr const char* kBuiltin = "SMA Crossover";
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("##btstrat",
                           strat_sel_.empty() ? kBuiltin : strat_sel_.c_str())) {
