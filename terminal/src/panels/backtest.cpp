@@ -32,6 +32,7 @@ void BacktestPanel::set_symbol(const std::string& sym) {
 }
 
 void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
+                         const std::function<std::string(const std::string&)>& name,
                          const std::function<bool(const std::string&)>& loaded_fresh,
                          bool activating, bool suppress_result, const RunFn& run) {
     const bool visible = ImGui::Begin("Backtest", open);
@@ -61,13 +62,13 @@ void BacktestPanel::draw(bool* open, const std::vector<std::string>& sources,
     ImGui::InputDouble("cash", &cash_, 0, 0, "%.0f");
 
     // Strategy dropdown: Run builds + loads the pick if it isn't loaded yet.
-    constexpr const char* kBuiltin = "SMA Crossover";
+    // sources is alphabetical by display name and already includes "".
     ImGui::SetNextItemWidth(220);
-    if (ImGui::BeginCombo("##btstrat",
-                          strat_sel_.empty() ? kBuiltin : strat_sel_.c_str())) {
-        if (ImGui::Selectable(kBuiltin, strat_sel_.empty())) strat_sel_.clear();
-        for (const std::string& s : sources)
-            if (ImGui::Selectable(s.c_str(), s == strat_sel_)) strat_sel_ = s;
+    if (ImGui::BeginCombo("##btstrat", name(strat_sel_).c_str())) {
+        for (const std::string& s : sources) {
+            const std::string lbl = name(s) + "###" + s;
+            if (ImGui::Selectable(lbl.c_str(), s == strat_sel_)) strat_sel_ = s;
+        }
         ImGui::EndCombo();
     }
     ImGui::SetItemTooltip("Strategy for the next run; params are edited in "

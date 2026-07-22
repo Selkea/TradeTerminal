@@ -56,9 +56,7 @@ public:
     void set_param_values(const std::string& key,
                           const std::map<std::string, double>& values);
 
-    // ---- strategy selection for other panels (Backtest dropdown) ----
-    // .cpp basenames in the strategies dir.
-    const std::vector<std::string>& sources() const { return files_; }
+    // ---- strategy selection for other panels ----
     // Module loaded and its source unchanged since the build?
     bool loaded_fresh(const std::string& key) const;
     // Ensure `key` has a fresh module: builds + loads if absent or stale
@@ -68,9 +66,14 @@ public:
     bool load_pending() const;
 
     // ---- session persistence (config.json) ----
-    // Currently-loaded module keys, each's param values ("" = built-in), and a
-    // restore that rebuilds them and seeds their saved params.
+    // Currently-loaded (ready-to-run-now) strategy keys, "" included -- for
+    // panels that can't build a strategy themselves (Replay/Sweep/Trade).
+    // Alphabetical by display name, "" sorted in like any other entry.
     std::vector<std::string> loaded_keys() const;
+    // Every available strategy, "" included: loaded_keys() plus any
+    // strategies/*.cpp not yet built -- for panels that CAN kick off a build
+    // (Backtest's Run does). Alphabetical by display name.
+    std::vector<std::string> all_keys() const;
     std::map<std::string, std::map<std::string, double>> all_param_values() const;
     void restore_state(const std::vector<std::string>& loaded,
                        const std::map<std::string, std::map<std::string, double>>& params);
@@ -92,6 +95,8 @@ private:
     void adopt_params(const std::string& key);
     void console(std::string line);
     std::vector<ParamValue>* editor_params(const std::string& key);
+    // Alphabetical by display_name(), for loaded_keys()/all_keys().
+    std::vector<std::string> sorted_by_name(const std::set<std::string>& keys) const;
 
     // True if `key` is a promoted (statically-linked) strategy, as opposed to
     // a hot-loaded DLL or "" (the built-in). Backed by static_keys_, a

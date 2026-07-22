@@ -204,11 +204,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::SetItemTooltip("Capture this symbol's ticks to a .ttk file "
                                           "for replay");
                     // Strategy for this symbol (built-in SMA or a loaded source),
-                    // shown by display name but stored by key.
+                    // shown by display name but stored by key. strat_sources is
+                    // alphabetical by display name and already includes "".
                     ImGui::SetNextItemWidth(220);
                     if (ImGui::BeginCombo("strategy", strat_name(r.strat_key).c_str())) {
-                        if (ImGui::Selectable(strat_name("").c_str(), r.strat_key.empty()))
-                            r.strat_key.clear();
                         for (const std::string& src : strat_sources) {
                             const std::string lbl = strat_name(src) + "###" + src;
                             if (ImGui::Selectable(lbl.c_str(), src == r.strat_key))

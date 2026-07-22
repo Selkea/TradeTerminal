@@ -18,11 +18,15 @@ public:
                                      double)>;
 
     explicit BacktestPanel(Engine& eng) : eng_(eng) {}
-    // sources: the strategy dropdown ("" entry = built-in SMA);
+    // sources: the strategy dropdown (StrategyManagerPanel::all_keys() --
+    // alphabetical by display name, "" = built-in included, plus anything
+    // not yet built -- Run builds it first);
+    // name: resolve a key to its display name;
     // loaded_fresh: whether a pick would run as-is or build first;
     // activating: a build/load kicked off by Run is still in flight.
     // suppress_result: a parameter sweep owns the engine's results right now.
     void draw(bool* open, const std::vector<std::string>& sources,
+              const std::function<std::string(const std::string&)>& name,
               const std::function<bool(const std::string&)>& loaded_fresh,
               bool activating, bool suppress_result, const RunFn& run);
 

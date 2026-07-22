@@ -919,9 +919,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     tourn_.base = std::move(rq);
     tourn_.target_symbol = target_symbol;
     if (candidates.empty()) {
-        tourn_.candidates.push_back("");   // built-in SMA
-        for (const std::string& k : strat_mgr_.loaded_keys())
-            tourn_.candidates.push_back(k);
+        tourn_.candidates = strat_mgr_.loaded_keys();   // "" (built-in) included
     } else {
         tourn_.candidates = std::move(candidates);
     }
@@ -1740,7 +1738,8 @@ void App::draw() {
     pump_leases();
 
     if (show_backtest_)
-        backtest_.draw(&show_backtest_, strat_mgr_.sources(),
+        backtest_.draw(&show_backtest_, strat_mgr_.all_keys(),
+                       [this](const std::string& k) { return strat_mgr_.display_name(k); },
                        [this](const std::string& k) { return strat_mgr_.loaded_fresh(k); },
                        pending_run_.active || strat_mgr_.load_pending(),
                        sweep_.running,

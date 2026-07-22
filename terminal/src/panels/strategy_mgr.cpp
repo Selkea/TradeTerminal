@@ -176,23 +176,40 @@ std::vector<StrategyManagerPanel::ParamSpec> StrategyManagerPanel::param_specs(
     return out;
 }
 
-std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
-    std::vector<std::string> out;
-    for (const auto& e : tt::static_strategy_registry())
-        // kBuiltinStrategyKey is already offered as "" wherever callers list
-        // strategies -- listing it again under its own key would show the
-        // same strategy twice. std::string(...) compares content, not the
-        // const char* pointers themselves (which live in different TUs and
-        // aren't guaranteed to be the same address even for equal text).
-        if (std::string(e.key) != kBuiltinStrategyKey) out.push_back(e.key);
-    for (const auto& m : host_.modules())
-        if (!is_static(m.key)) out.push_back(m.key);   // a rebuilt-but-inert DLL: hidden
-    // Alphabetical by what the dropdowns actually show (the display name),
-    // not the internal key -- registry/module iteration order isn't meaningful.
+std::vector<std::string> StrategyManagerPanel::sorted_by_name(
+    const std::set<std::string>& keys) const {
+    std::vector<std::string> out(keys.begin(), keys.end());
     std::sort(out.begin(), out.end(), [this](const std::string& a, const std::string& b) {
         return display_name(a) < display_name(b);
     });
     return out;
+}
+
+std::vector<std::string> StrategyManagerPanel::loaded_keys() const {
+    // std::set both dedups and gives insertion order that doesn't matter --
+    // sorted_by_name() re-sorts by display name below regardless.
+    std::set<std::string> keys{""};
+    for (const auto& e : tt::static_strategy_registry())
+        // kBuiltinStrategyKey is "" (see App::acquire_strategy) -- already
+        // in the set above; skip it here so it isn't offered twice under two
+        // different keys. std::string(...) compares content, not the const
+        // char* pointers themselves (different TUs, not guaranteed the same
+        // address even for equal text).
+        if (std::string(e.key) != kBuiltinStrategyKey) keys.insert(e.key);
+    for (const auto& m : host_.modules())
+        if (!is_static(m.key)) keys.insert(m.key);   // a rebuilt-but-inert DLL: hidden
+    return sorted_by_name(keys);
+}
+
+std::vector<std::string> StrategyManagerPanel::all_keys() const {
+    std::set<std::string> keys{""};
+    for (const auto& e : tt::static_strategy_registry())
+        if (std::string(e.key) != kBuiltinStrategyKey) keys.insert(e.key);
+    for (const auto& m : host_.modules())
+        if (!is_static(m.key)) keys.insert(m.key);
+    for (const std::string& f : files_)
+        if (f != kBuiltinStrategyKey) keys.insert(f);   // not yet built: Run compiles it
+    return sorted_by_name(keys);
 }
 
 std::map<std::string, std::map<std::string, double>>

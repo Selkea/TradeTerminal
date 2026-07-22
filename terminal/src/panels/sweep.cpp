@@ -49,9 +49,9 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     // Strategy to optimize (loaded modules only; build via the Strategy panel).
     // A pick that isn't loaded right now is kept — the startup restore rebuilds
     // strategies asynchronously.
+    // strat_keys is alphabetical by display name and already includes "".
     ImGui::SetNextItemWidth(220);
     if (ImGui::BeginCombo("strategy", name(strat_key_).c_str())) {
-        if (ImGui::Selectable(name("").c_str(), strat_key_.empty())) strat_key_.clear();
         for (const std::string& k : strat_keys) {
             const std::string lbl = name(k) + "###" + k;
             if (ImGui::Selectable(lbl.c_str(), k == strat_key_)) strat_key_ = k;
