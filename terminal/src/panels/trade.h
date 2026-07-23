@@ -113,7 +113,6 @@ public:
 private:
     Engine& eng_;
     QuoteBook& quotes_;
-    bool prev_in_rth_ = true;   // edge-trigger for auto Outside-RTH at the close
     int data_idx_ = 0;               // DataFeed enum (persisted)
     int route_ = 0;                  // order route: 0 Web API (auto), 1 TWS socket
     int session_broker_ = 0;         // what the running session was started with
@@ -146,8 +145,7 @@ private:
     double def_ap_interval_min_ = 30, def_ap_dd_pct_ = 5;
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
-    double manual_lmt_ = 0.0;          // 0 = market; >0 = limit price
-    bool manual_outside_rth_ = false;  // allow extended-hours fills (needs a limit)
+    double manual_lmt_ = 0.0;   // 0 = auto marketable limit; >0 = that limit price
     int selected_symbol_idx_ = 0;
 
     // Session schedule (persisted: sched_on_ + the two "HH:MM" strings).
