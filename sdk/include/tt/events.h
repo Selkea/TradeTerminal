@@ -28,7 +28,10 @@ struct OrderRequest {
     uint32_t symbol_id;
     Side     side;
     OrdType  type;
-    uint8_t  _pad[2]{};
+    // 1 = allow fills outside regular trading hours (extended-hours). IBKR
+    // requires a Limit order for this; a Market order outside RTH is rejected.
+    // (One byte reclaimed from padding — the struct is still 48 bytes.)
+    uint8_t  outside_rth{};
     double   qty;
     double   limit_price;   // Limit only
     double   stop_price;    // Stop only: trigger price

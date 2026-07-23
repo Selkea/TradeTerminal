@@ -507,10 +507,25 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     ImGui::SameLine();
     const uint32_t manual_sid = static_cast<uint32_t>(selected_symbol_idx_ + 1);
     if (ImGui::Button("Buy"))
-        eng_.submit_manual(manual_sid, true, manual_qty_, manual_tp_, manual_sl_);
+        eng_.submit_manual(manual_sid, true, manual_qty_, manual_tp_, manual_sl_,
+                           manual_lmt_, manual_outside_rth_);
     ImGui::SameLine();
     if (ImGui::Button("Sell"))
-        eng_.submit_manual(manual_sid, false, manual_qty_, manual_tp_, manual_sl_);
+        eng_.submit_manual(manual_sid, false, manual_qty_, manual_tp_, manual_sl_,
+                           manual_lmt_, manual_outside_rth_);
+    ImGui::SetNextItemWidth(70);
+    ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
+    ImGui::SetItemTooltip("Limit price for manual orders (0 = market). Required to fill "
+                          "outside regular hours.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Outside RTH", &manual_outside_rth_);
+    ImGui::SetItemTooltip("Allow fills in extended hours (pre-market / after-hours).\n"
+                          "IBKR needs a limit price for this — a market order outside RTH "
+                          "is rejected. Use it to cover/flatten after 4pm ET.");
+    if (manual_outside_rth_ && manual_lmt_ <= 0.0) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.3f, 1.0f), "(set a limit price)");
+    }
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("TP", &manual_tp_, 0, 0, "%.2f");
     ImGui::SetItemTooltip("Bracket take-profit price for manual orders (0 = off)");

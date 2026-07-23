@@ -215,8 +215,11 @@ public:
     // UI thread: async commands consumed by the engine thread.
     void request_cancel(uint64_t order_id);
     // take_profit/stop_loss > 0: attach bracket exit legs (OCO).
+    // limit_price > 0: a limit order at that price instead of market.
+    // outside_rth: allow fills in extended hours (requires a limit price).
     void submit_manual(uint32_t symbol_id, bool buy, double qty,
-                       double take_profit = 0, double stop_loss = 0);
+                       double take_profit = 0, double stop_loss = 0,
+                       double limit_price = 0, bool outside_rth = false);
     void kill_switch();                     // cancel all + flatten + halt strategy
     LiveSnapshot live_snapshot() const;
 
@@ -240,6 +243,8 @@ private:
         double qty = 0;
         uint32_t symbol_id = 0;
         double take_profit = 0, stop_loss = 0;   // Manual bracket legs
+        double limit_price = 0;    // Manual: >0 = limit order (else market)
+        uint8_t outside_rth = 0;   // Manual: 1 = allow fills outside RTH
     };
     void run(BacktestConfig cfg, IStrategy* strategy);
     void run_replay(ReplayConfig cfg, IStrategy* strategy);

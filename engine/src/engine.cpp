@@ -561,9 +561,18 @@ void Engine::request_cancel(uint64_t order_id) {
 }
 
 void Engine::submit_manual(uint32_t symbol_id, bool buy, double qty,
-                           double take_profit, double stop_loss) {
-    cmd_ring_->try_push(LiveCmd{LiveCmd::Manual, static_cast<uint8_t>(buy), 0, qty,
-                                symbol_id, take_profit, stop_loss});
+                           double take_profit, double stop_loss,
+                           double limit_price, bool outside_rth) {
+    LiveCmd c{};
+    c.type = LiveCmd::Manual;
+    c.buy = buy ? 1 : 0;
+    c.qty = qty;
+    c.symbol_id = symbol_id;
+    c.take_profit = take_profit;
+    c.stop_loss = stop_loss;
+    c.limit_price = limit_price;
+    c.outside_rth = outside_rth ? 1 : 0;
+    cmd_ring_->try_push(c);
 }
 
 void Engine::kill_switch() {
@@ -1039,14 +1048,19 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     push_log("live: manual order rejected (no market data yet)");
                     break;
                 }
-                OrderRequest r{sid, c.buy ? Side::Buy : Side::Sell, OrdType::Market,
-                               {}, c.qty, 0.0, 0.0, c.take_profit, c.stop_loss};
+                const bool lmt = c.limit_price > 0.0;
+                OrderRequest r{sid, c.buy ? Side::Buy : Side::Sell,
+                               lmt ? OrdType::Limit : OrdType::Market,
+                               c.outside_rth, c.qty, lmt ? c.limit_price : 0.0,
+                               0.0, c.take_profit, c.stop_loss};
                 next_is_manual = true;
                 const uint64_t id = ctx.submit_order(r);
                 next_is_manual = false;
                 push_log(id ? "live: manual " + std::string(c.buy ? "BUY " : "SELL ") +
                                   std::to_string(static_cast<long long>(c.qty)) +
-                                  " " + symbol_name(sid) + " submitted (#" +
+                                  " " + symbol_name(sid) +
+                                  (lmt ? " @ " + std::to_string(c.limit_price) : " (mkt)") +
+                                  (c.outside_rth ? " [outside RTH]" : "") + " submitted (#" +
                                   std::to_string(id) + ")"
                             : "live: manual order rejected");
                 break;

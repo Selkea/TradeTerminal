@@ -301,6 +301,7 @@ struct IbkrBroker::Io {
                {"side", r.side == Side::Buy ? "BUY" : "SELL"},
                {"quantity", r.qty},
                {"tif", "DAY"}};
+        if (r.outside_rth) o["outsideRTH"] = true;   // extended-hours fill
         switch (r.type) {
         case OrdType::Limit:
             o["orderType"] = "LMT";

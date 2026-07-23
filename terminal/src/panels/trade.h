@@ -143,6 +143,8 @@ private:
     double def_ap_interval_min_ = 30, def_ap_dd_pct_ = 5;
     double manual_qty_ = 10.0;
     double manual_tp_ = 0.0, manual_sl_ = 0.0;
+    double manual_lmt_ = 0.0;          // 0 = market; >0 = limit price
+    bool manual_outside_rth_ = false;  // allow extended-hours fills (needs a limit)
     int selected_symbol_idx_ = 0;
 
     // Session schedule (persisted: sched_on_ + the two "HH:MM" strings).

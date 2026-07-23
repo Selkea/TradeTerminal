@@ -427,6 +427,10 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (cmd.req.type == OrdType::Limit) parent.lmtPrice = snap_to_tick(cmd.req.limit_price);
         if (cmd.req.type == OrdType::Stop) parent.auxPrice = snap_to_tick(cmd.req.stop_price);
         parent.tif = "DAY";
+        // Extended-hours fill (e.g. covering a short after 4pm ET). IBKR only
+        // honors this on non-market orders, which is why the manual path forces
+        // a limit when it's set.
+        parent.outsideRth = cmd.req.outside_rth != 0;
         parent.account = account_for(sid);
         parent.transmit = !bracket;   // brackets transmit on the last child
         const long parent_tws = place(cmd.local_id, sid, parent, c);
