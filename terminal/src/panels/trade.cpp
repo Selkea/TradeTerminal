@@ -143,6 +143,9 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
 
         // ---- per-symbol tabs: each symbol its own cash / bar size / record ----
         int remove_at = -1;
+        // Each row's ImGui tab id, captured in the tab-bar id scope so we can
+        // read the user's drag-reordered order back out below.
+        std::vector<ImGuiID> row_tab_id(pending_.size());
         if (!pending_.empty() &&
             ImGui::BeginTabBar("##symtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
                                                 ImGuiTabBarFlags_Reorderable |
@@ -170,6 +173,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                 bool open = true;
                 // Tab id = symbol (unique, stable across add/remove); the tab's
                 // close button removes it. want_tab_ selects it from the button.
+                // Same hash ImGui gives the tab (label id in the tab-bar scope).
+                row_tab_id[i] = ImGui::GetID(r.symbol.c_str());
                 const ImGuiTabItemFlags sel =
                     want_tab_ == static_cast<int>(i) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem(r.symbol.c_str(), &open, sel)) {
@@ -298,6 +303,36 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::EndTabItem();
                 }
                 if (!open) remove_at = static_cast<int>(i);
+            }
+            // Persist drag-reordered tabs: ImGui reorders its own Tabs array in
+            // place, but our pending_ (what symbols_config() saves) doesn't
+            // follow unless we sync it -- so the new order was lost on restart.
+            // Rebuild pending_ in the tab bar's current visual order. Skipped on
+            // a removal frame (tab count is about to change below).
+            if (remove_at < 0) {
+                if (const ImGuiTabBar* tbm = ImGui::GetCurrentTabBar()) {
+                    std::vector<size_t> perm;
+                    perm.reserve(pending_.size());
+                    for (const ImGuiTabItem& t : tbm->Tabs)
+                        for (size_t i = 0; i < pending_.size(); ++i)
+                            if (row_tab_id[i] == t.ID) {   // non-symbol tabs (the
+                                perm.push_back(i);          // list button) match none
+                                break;
+                            }
+                    bool changed = perm.size() == pending_.size();
+                    if (changed) {
+                        changed = false;
+                        for (size_t i = 0; i < perm.size(); ++i)
+                            if (perm[i] != i) { changed = true; break; }
+                    }
+                    if (changed) {
+                        std::vector<SymRow> reordered;
+                        reordered.reserve(pending_.size());
+                        for (size_t idx : perm)
+                            reordered.push_back(std::move(pending_[idx]));
+                        pending_ = std::move(reordered);
+                    }
+                }
             }
             want_tab_ = -1;   // consumed by the SetSelected above
             if (ImGui::BeginPopup("##symtablist")) {
