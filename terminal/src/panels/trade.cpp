@@ -506,25 +506,84 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     ImGui::InputDouble("##mqty", &manual_qty_, 0, 0, "%.0f");
     ImGui::SameLine();
     const uint32_t manual_sid = static_cast<uint32_t>(selected_symbol_idx_ + 1);
-    if (ImGui::Button("Buy"))
-        eng_.submit_manual(manual_sid, true, manual_qty_, manual_tp_, manual_sl_,
-                           manual_lmt_, manual_outside_rth_);
+    const std::string& msym = s.symbols[selected_symbol_idx_].symbol;
+
+    // Market-hours awareness (local clock = the trading box's exchange clock).
+    // Outside regular US hours a market order won't fill, so manual orders are
+    // auto-routed as outside-RTH limits. RTH = weekday 09:30–16:00; the extended
+    // session (04:00–20:00) can still fill a limit; otherwise the order just
+    // queues for the next open.
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    const int now_min = tm.tm_hour * 60 + tm.tm_min;
+    const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
+    const bool in_rth = weekday && now_min >= 9 * 60 + 30 && now_min < 16 * 60;
+    const bool ext_session = weekday && !in_rth && now_min >= 4 * 60 && now_min < 20 * 60;
+    // Auto-enable Outside RTH the moment the market closes (edge-triggered, so it
+    // can still be overridden within a given session state).
+    if (in_rth != prev_in_rth_) {
+        manual_outside_rth_ = !in_rth;
+        prev_in_rth_ = in_rth;
+    }
+
+    Quote q{};
+    const bool has_q = quotes_.get(msym, q);
+    // Marketable limit for the `buy` side: buy at the ask, sell at the bid,
+    // nudged ~10 bps through to clear a thin book (broker snaps to venue tick).
+    // Falls back to last; 0 when no price is known.
+    auto marketable = [&](bool buy) -> double {
+        const double ref = buy ? (q.ask > 0 ? q.ask : q.price)
+                               : (q.bid > 0 ? q.bid : q.price);
+        return ref > 0 ? (buy ? ref * 1.001 : ref * 0.999) : 0.0;
+    };
+    auto submit = [&](bool buy) {
+        const bool want_orth = manual_outside_rth_ || !in_rth;   // auto after hours
+        double lmt = manual_lmt_;
+        if (want_orth && lmt <= 0.0) lmt = marketable(buy);      // compute one if none
+        // Outside-RTH needs a limit; if we couldn't derive one, fall back to a
+        // plain order rather than send a market order IBKR rejects outside RTH.
+        const bool orth = want_orth && lmt > 0.0;
+        eng_.submit_manual(manual_sid, buy, manual_qty_, manual_tp_, manual_sl_, lmt, orth);
+    };
+    if (ImGui::Button("Buy")) submit(true);
     ImGui::SameLine();
-    if (ImGui::Button("Sell"))
-        eng_.submit_manual(manual_sid, false, manual_qty_, manual_tp_, manual_sl_,
-                           manual_lmt_, manual_outside_rth_);
+    if (ImGui::Button("Sell")) submit(false);
+
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
-    ImGui::SetItemTooltip("Limit price for manual orders (0 = market). Required to fill "
-                          "outside regular hours.");
+    ImGui::SetItemTooltip("Limit price (0 = market). Outside regular hours an order needs a "
+                          "limit — leave 0 and Buy/Sell fills a marketable one from the quote.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Calc")) {
+        // Fill Lmt with a marketable price to CLOSE the current position: buy the
+        // ask to cover a short, sell the bid to exit a long.
+        const LiveSnapshot snap = eng_.live_snapshot();
+        const double pos = manual_sid >= 1 && manual_sid <= snap.symbols.size()
+                               ? snap.symbols[manual_sid - 1].position.qty : 0.0;
+        manual_lmt_ = marketable(pos < 0.0);
+    }
+    ImGui::SetItemTooltip("Fill Lmt with a marketable price to close the current position "
+                          "(buy the ask to cover a short, sell the bid to exit a long).");
     ImGui::SameLine();
     ImGui::Checkbox("Outside RTH", &manual_outside_rth_);
-    ImGui::SetItemTooltip("Allow fills in extended hours (pre-market / after-hours).\n"
-                          "IBKR needs a limit price for this — a market order outside RTH "
-                          "is rejected. Use it to cover/flatten after 4pm ET.");
-    if (manual_outside_rth_ && manual_lmt_ <= 0.0) {
+    ImGui::SetItemTooltip("Allow fills in extended hours. Auto-enabled when the market is "
+                          "closed; needs a limit (Buy/Sell computes one if Lmt is 0).");
+
+    if (in_rth)
+        ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.50f, 1), "Regular hours");
+    else if (ext_session)
+        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.30f, 1),
+                           "After-hours — orders route as outside-RTH limits");
+    else
+        ImGui::TextColored(ImVec4(0.95f, 0.50f, 0.35f, 1),
+                           "Market closed — an order will queue for the next open");
+    if (has_q) {
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.3f, 1.0f), "(set a limit price)");
+        if (q.bid > 0 && q.ask > 0)
+            ImGui::Text("   bid %.2f / ask %.2f / last %.2f", q.bid, q.ask, q.price);
+        else
+            ImGui::Text("   last %.2f", q.price);
     }
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("TP", &manual_tp_, 0, 0, "%.2f");

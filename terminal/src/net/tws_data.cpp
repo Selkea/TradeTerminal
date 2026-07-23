@@ -31,6 +31,8 @@ constexpr int64_t kHistTimeoutMs = 20'000;
 constexpr auto kHistResetCooldown = std::chrono::seconds(60);
 
 // TickType ids on the reqMktData stream (live + delayed variants).
+constexpr int kTickBid = 1, kTickDelayedBid = 66;
+constexpr int kTickAsk = 2, kTickDelayedAsk = 67;
 constexpr int kTickLast = 4, kTickDelayedLast = 68;
 constexpr int kTickVolume = 8, kTickDelayedVolume = 74;
 
@@ -331,11 +333,17 @@ struct TwsData::Io final : DefaultEWrapper {
 
     void tickPrice(TickerId tickerId, TickType field, double price,
                    const TickAttrib&) override {
+        if (price <= 0.0) return;
         const int ft = static_cast<int>(field);
-        if ((ft != kTickLast && ft != kTickDelayedLast) || price <= 0.0) return;
+        const bool last = ft == kTickLast || ft == kTickDelayedLast;
+        const bool bid = ft == kTickBid || ft == kTickDelayedBid;
+        const bool ask = ft == kTickAsk || ft == kTickDelayedAsk;
+        if (!last && !bid && !ask) return;
         for (auto& [sym, st] : streams) {
             if (st.req_id != static_cast<int>(tickerId)) continue;
-            st.q.price = price;
+            if (last) st.q.price = price;
+            else if (bid) st.q.bid = price;
+            else st.q.ask = price;
             st.q.ts_ms = now_ms();
             if (d.cbs_.on_tick) d.cbs_.on_tick(sym, st.q);
             break;

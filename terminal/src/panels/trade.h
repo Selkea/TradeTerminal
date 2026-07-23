@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "engine/engine.h"
+#include "market_data.h"   // QuoteBook (live bid/ask for the marketable-limit calc)
 
 #include <functional>
 #include <map>
@@ -62,7 +63,7 @@ public:
         std::vector<std::string> subaccounts;
     };
 
-    explicit TradePanel(Engine& eng) : eng_(eng) {}
+    TradePanel(Engine& eng, QuoteBook& quotes) : eng_(eng), quotes_(quotes) {}
     // strat_sources: available strategy source basenames ("" built-in is added
     // in the UI). polygon_available / finnhub_available: a key for that vendor
     // exists right now. ibkr_ready: the IBKR gateway is connected, so orders
@@ -111,6 +112,8 @@ public:
 
 private:
     Engine& eng_;
+    QuoteBook& quotes_;
+    bool prev_in_rth_ = true;   // edge-trigger for auto Outside-RTH at the close
     int data_idx_ = 0;               // DataFeed enum (persisted)
     int route_ = 0;                  // order route: 0 Web API (auto), 1 TWS socket
     int session_broker_ = 0;         // what the running session was started with

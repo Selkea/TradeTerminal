@@ -19,7 +19,9 @@ struct Candle {
 static_assert(sizeof(Candle) == 48, "must match CandleRecord wire layout");
 
 struct Quote {
-    double price = 0.0;
+    double price = 0.0;   // last trade
+    double bid = 0.0;     // 0 = not available (e.g. some feeds / illiquid names)
+    double ask = 0.0;
     int64_t ts_ms = 0;
     double day_volume = 0.0;
 };

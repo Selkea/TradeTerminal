@@ -381,7 +381,7 @@ App::App(std::string gateway_url)
       backtest_(engine_),
       replay_(engine_, sessions_dir()),
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
-      trade_(engine_),
+      trade_(engine_, quotes_),
       blotter_(engine_),
       positions_(engine_),
       sweep_panel_(engine_),
