@@ -39,6 +39,12 @@ public:
     uint64_t connection_generation() const override {
         return conn_gen_.load(std::memory_order_relaxed);
     }
+    int pending_history() const override {
+        return pending_hist_.load(std::memory_order_relaxed);
+    }
+    int oldest_history_age_ms() const override {
+        return oldest_hist_ms_.load(std::memory_order_relaxed);
+    }
 
     uint32_t request_candles(const std::string& symbol, const std::string& interval,
                              const std::string& range) override;
@@ -77,6 +83,13 @@ private:
     std::atomic<uint64_t> conn_gen_{0};
     std::atomic<uint32_t> next_id_{1};
     std::atomic<void*> wake_{nullptr};   // EReaderOSSignal* while I/O thread runs
+
+    // Published by the I/O thread each loop for /diag: in-flight history
+    // fetches and the oldest one's age (ms). A half-open data session (socket
+    // up, reqHistoricalData answers silently dropped — e.g. after the nightly
+    // gateway restart) shows oldest_hist_ms_ climbing without bound.
+    std::atomic<int> pending_hist_{0};
+    std::atomic<int> oldest_hist_ms_{0};
 
     std::atomic<AccountKind> account_kind_{AccountKind::Unknown};
 

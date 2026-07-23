@@ -20,6 +20,16 @@ namespace {
 // the public next_id_ values) so the two spaces can never collide.
 constexpr int kQuoteBase = 500'000;
 
+// A history fetch outstanding longer than this means the data session has gone
+// half-open: the socket is up and streaming quotes keep flowing ("data
+// maintained"), but reqHistoricalData answers are silently dropped — the state
+// the nightly IB Gateway restart (error 1100 -> 1102) can leave behind. A
+// normal 1y/1h fetch answers in a few seconds, so 20s is unambiguous. On this
+// we force a data-session reconnect to clear it; the cooldown stops a genuinely
+// unrecoverable failure from thrashing the quotes that share the session.
+constexpr int64_t kHistTimeoutMs = 20'000;
+constexpr auto kHistResetCooldown = std::chrono::seconds(60);
+
 // TickType ids on the reqMktData stream (live + delayed variants).
 constexpr int kTickLast = 4, kTickDelayedLast = 68;
 constexpr int kTickVolume = 8, kTickDelayedVolume = 74;
@@ -99,8 +109,22 @@ struct TwsData::Io final : DefaultEWrapper {
     struct Pending {
         std::string symbol, interval;
         std::vector<Candle> candles;
+        std::chrono::steady_clock::time_point sent;   // when reqHistoricalData went out
     };
     std::unordered_map<int, Pending> hist;
+
+    // Age of the longest-outstanding history fetch, in ms (0 when none). Steady
+    // clock so a wall-clock/NTP jump around a gateway restart can't distort it.
+    int oldest_hist_ms(std::chrono::steady_clock::time_point now) const {
+        int oldest = 0;
+        for (const auto& [id, p] : hist) {
+            const int age = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - p.sent)
+                    .count());
+            if (age > oldest) oldest = age;
+        }
+        return oldest;
+    }
 
     // Active quote streams: symbol -> tickerId + last known quote state.
     struct Stream {
@@ -185,7 +209,8 @@ struct TwsData::Io final : DefaultEWrapper {
                       kDurs[cap].dur);
                 di = cap;
             }
-            hist[static_cast<int>(r.id)] = {r.symbol, r.interval, {}};
+            hist[static_cast<int>(r.id)] = {r.symbol, r.interval, {},
+                                            std::chrono::steady_clock::now()};
             client->reqHistoricalData(static_cast<TickerId>(r.id), stock(r.symbol),
                                       "", kDurs[di].dur, bar, "TRADES",
                                       /*useRTH=*/1, /*formatDate=*/2,
@@ -428,6 +453,7 @@ void TwsData::io_loop() {
     wake_.store(&io.signal, std::memory_order_release);
 
     auto last_connect = std::chrono::steady_clock::time_point{};
+    auto last_hist_reset = std::chrono::steady_clock::time_point{};
     int64_t last_nag_ms = 0;
     while (running_.load(std::memory_order_acquire)) {
         if (!io.client || !io.client->isConnected()) {
@@ -450,19 +476,37 @@ void TwsData::io_loop() {
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
+            const auto now = std::chrono::steady_clock::now();
             // Half-open guard: socket up but no nextValidId within 10s.
-            const bool stalled =
-                !connected_.load(std::memory_order_acquire) &&
-                std::chrono::steady_clock::now() - last_connect > std::chrono::seconds(10);
-            if (io.reset_conn || stalled) {
-                if (stalled && !io.reset_conn)
+            const bool stalled = !connected_.load(std::memory_order_acquire) &&
+                                 now - last_connect > std::chrono::seconds(10);
+            // Half-open *data* guard: connected, streaming fine, but a history
+            // request has gone unanswered far past its normal turnaround.
+            const bool hist_stalled = connected_.load(std::memory_order_acquire) &&
+                                      io.oldest_hist_ms(now) > kHistTimeoutMs &&
+                                      now - last_hist_reset > kHistResetCooldown;
+            if (io.reset_conn || stalled || hist_stalled) {
+                if (io.reset_conn) {
+                    // handshake-reject path already logged by the setter
+                } else if (stalled) {
                     log("no API handshake within 10s - reconnecting");
+                } else {
+                    log("history request unanswered for >" +
+                        std::to_string(kHistTimeoutMs / 1000) +
+                        "s - reconnecting data session (half-open)");
+                    last_hist_reset = now;
+                }
                 io.reset_conn = false;
                 io.drop_connection();
                 last_connect = std::chrono::steady_clock::now();   // full backoff
             }
             io.pump_requests();
         }
+        // Publish history-fetch state for /diag (I/O thread owns io.hist).
+        pending_hist_.store(static_cast<int>(io.hist.size()),
+                            std::memory_order_relaxed);
+        oldest_hist_ms_.store(io.oldest_hist_ms(std::chrono::steady_clock::now()),
+                              std::memory_order_relaxed);
     }
 
     wake_.store(nullptr, std::memory_order_release);

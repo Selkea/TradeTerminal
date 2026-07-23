@@ -45,6 +45,14 @@ public:
     // Bumped on every (re)connect; lets panels re-request what they show.
     virtual uint64_t connection_generation() const = 0;
 
+    // Diagnostics: how many candle (historical) fetches are outstanding, and
+    // the age of the oldest in milliseconds (0 when none). A source whose
+    // socket stays up but silently stops answering history requests shows a
+    // steadily climbing oldest age here. Default 0 for sources that don't
+    // track it (only TwsData does today).
+    virtual int pending_history() const { return 0; }
+    virtual int oldest_history_age_ms() const { return 0; }
+
     // Thread-safe; return the request id used (0 if not running).
     virtual uint32_t request_candles(const std::string& symbol,
                                      const std::string& interval,

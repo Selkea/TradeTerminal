@@ -974,7 +974,15 @@ void App::pump_tournament() {
         if (sweep_.running) {
             tourn_.phase = Tournament::Phase::Running;
         } else if (now - tourn_.stamp_s > 60.0) {
-            // Candle fetch / strategy load failed (details in the log).
+            // The sweep never started: the candle fetch never came back (a
+            // silent half-open data session is the usual cause) or the strategy
+            // failed to load. Name it — otherwise this only shows as a generic
+            // "no candidate produced a result" downstream.
+            log_.add("tournament: " + tourn_.base.symbol + " candle fetch timed out (" +
+                     (data_.connected()
+                          ? "data session connected but no bars in 60s"
+                          : "data session disconnected") +
+                     ") - skipping " + strat_mgr_.display_name(tourn_.candidates[tourn_.idx]));
             Tournament::Entry e;
             e.key = tourn_.candidates[tourn_.idx];
             advance(std::move(e));
@@ -1378,6 +1386,20 @@ std::string App::build_diag_json() {
     j["dropped_ticks"] = s.dropped_ticks;
     j["feed_stale_ms"] = s.last_tick_ts_ms > 0 ? (now_ms - s.last_tick_ts_ms) : -1;
     j["stuck_orders"] = tws_ ? tws_->stuck_order_count() : 0;   // half-open (TWS route)
+
+    // ---- market-data source (candles for chart/backtest/optimizer + quotes) ----
+    // Distinct from broker_connected/feed_stale_ms above (live order + tick
+    // path): this is the historical-candle session the tournament/optimizer
+    // depends on. oldest_history_age_ms climbing while connected is a half-open
+    // data session — requests issued, answers silently dropped.
+    {
+        json d;
+        d["source"] = use_tws_data_ ? "tws" : "ibkr_web";
+        d["connected"] = data_.connected();
+        d["pending_history"] = data_.pending_history();
+        d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
+        j["data"] = std::move(d);
+    }
 
     auto strat_for = [&](const std::string& sym) -> const TradeSymbol* {
         for (const auto& ts : cfg_.trade_symbols)
