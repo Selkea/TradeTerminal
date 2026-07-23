@@ -496,6 +496,10 @@ App::App(std::string gateway_url)
 
     session_start_ = std::time(nullptr);
     start_diag_server();
+    // Poll GitHub in the background for a newer main than this build; the update
+    // panel only appears once available() flips true (no-op if the build has no
+    // git commit baked in).
+    update_.start(TT_REPO_SLUG, TT_GIT_COMMIT);
 }
 
 // IPC thread: if this candle batch is the one a queued backtest is waiting
@@ -1731,6 +1735,7 @@ void App::draw() {
     draw_account_modal();
     draw_data_modal();
     draw_trading_guards();
+    draw_update_panel();
     if (show_chart_) {
         // Overlay fills for the charted symbol: last backtest + live session.
         std::vector<FillMarker> fills;
@@ -2258,6 +2263,86 @@ void App::draw_trading_guards() {
         }
         ImGui::EndPopup();
     }
+}
+
+// A small window that surfaces only when the background check finds origin/main
+// ahead of this build. "Restart & Update" runs the same flatten+stop safeguard
+// as quitting, then hands off to the updater (pull + rebuild + relaunch).
+void App::draw_update_panel() {
+    const std::string remote = update_.remote_commit();
+    const bool show = update_.available() && !remote.empty() &&
+                      remote != update_dismissed_commit_;
+    if (show && !pending_update_) {
+        ImGui::SetNextWindowSize(ImVec2(390, 0), ImGuiCond_Appearing);
+        if (ImGui::Begin("Update available", nullptr, ImGuiWindowFlags_NoCollapse |
+                                                          ImGuiWindowFlags_NoDocking)) {
+            ImGui::TextWrapped("A newer build is on GitHub (origin/main).");
+            ImGui::Spacing();
+            ImGui::Text("Running:   %s", update_.current_commit().c_str());
+            ImGui::Text("Available: %s", remote.c_str());
+            ImGui::Spacing();
+            if (engine_.live_running()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
+                ImGui::TextWrapped("A live session is running. Updating will cancel open "
+                                   "orders, flatten positions, and stop it first.");
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+            }
+            if (ImGui::Button("Restart & Update"))
+                pending_update_ = true;
+            ImGui::SameLine();
+            if (ImGui::Button("Later"))
+                update_dismissed_commit_ = remote;   // reappears when main moves again
+        }
+        ImGui::End();
+    }
+
+    if (pending_update_ && !ImGui::IsPopupOpen("Confirm update"))
+        ImGui::OpenPopup("Confirm update");
+    if (ImGui::BeginPopupModal("Confirm update", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (engine_.live_running())
+            ImGui::TextWrapped("This will cancel open orders, flatten positions, and stop "
+                               "the live session, then pull + rebuild and relaunch the app.");
+        else
+            ImGui::TextWrapped("This will pull the latest main, rebuild, and relaunch the app.");
+        ImGui::Spacing();
+        if (ImGui::Button("Update & restart")) {
+            safe_stop_live();   // no-op if flat/idle; flattens + stops if live
+            launch_updater();
+            should_quit_ = true;
+            pending_update_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            pending_update_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// Detach the updater script: it waits for THIS process to exit (releasing the
+// single-instance mutex + any file locks), then git pull + cmake --build the
+// release preset + relaunch this exe. Fire-and-forget; we quit right after.
+void App::launch_updater() {
+#ifdef _WIN32
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const std::string extra = "-WaitPid " + std::to_string(GetCurrentProcessId()) +
+                              " -Exe \"" + std::string(exe) + "\"" +
+                              " -Preset ucrt64-release";
+    const std::string args = ps_args("Update-And-Restart.ps1", /*hidden=*/true, extra);
+    if (args.empty()) {
+        log_.add("update: updater script missing (scripts\\Update-And-Restart.ps1)");
+        return;
+    }
+    run_hidden(args);   // detached: keeps running after we exit
+    log_.add("update: launched updater (pull + rebuild + relaunch); quitting");
+#else
+    log_.add("update: self-update is Windows-only");
+#endif
 }
 
 void App::draw_account_menu() {

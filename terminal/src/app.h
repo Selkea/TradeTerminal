@@ -17,6 +17,7 @@
 #include "net/diag_server.h"
 #include "net/gateway_data.h"
 #include "net/tws_data.h"
+#include "update_check.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/replay.h"
@@ -66,6 +67,8 @@ private:
     void draw_account_modal();         // broker sign-in / switch dialog
     void draw_data_modal();            // data-feed sign-in dialog
     void draw_trading_guards();        // Sign Out / quit confirm dialogs
+    void draw_update_panel();          // "update available" panel + confirm
+    void launch_updater();             // hand off to Update-And-Restart.ps1, then quit
     void safe_stop_live();            // kill switch + graceful stop, if live
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
     void save_config();              // panel state -> cfg_ -> config.json
@@ -244,6 +247,7 @@ private:
     std::unique_ptr<TwsFeed> tws_feed_;
     std::atomic<bool> rt_feed_active_{false};   // worker thread: skip snapshot ticks
     AlertNotifier alerts_;
+    UpdateChecker update_;   // polls GitHub for a newer main than this build
     ChartPanel chart_;
     WatchlistPanel watchlist_;
     BacktestPanel backtest_;
@@ -331,6 +335,8 @@ private:
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm
     bool pending_signout_ = false;    // sign-out awaiting the "live trading" confirm
+    bool pending_update_ = false;     // update awaiting the confirm dialog
+    std::string update_dismissed_commit_;   // "Later"-ed commit: hide until main moves again
 
     bool had_ini_ = false;
     bool layout_checked_ = false;

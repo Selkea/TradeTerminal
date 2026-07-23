@@ -23,6 +23,7 @@ add_executable(tt_terminal
     src/alerts.cpp
     src/app.cpp
     src/config.cpp
+    src/update_check.cpp
     src/journal.cpp
     src/panels/journal_panel.cpp
     src/candle_plot.cpp

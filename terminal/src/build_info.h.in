@@ -6,3 +6,5 @@
 #define TT_GIT_COMMIT "@TT_GIT_COMMIT@"
 #define TT_GIT_DIRTY @TT_GIT_DIRTY@
 #define TT_BUILD_DATE "@TT_BUILD_DATE@"
+// owner/repo of origin, for the GitHub "update available" check.
+#define TT_REPO_SLUG "@TT_REPO_SLUG@"
