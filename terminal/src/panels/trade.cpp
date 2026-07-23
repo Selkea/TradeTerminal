@@ -542,31 +542,14 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     if (ImGui::Button("Buy")) submit(true);
     ImGui::SameLine();
     if (ImGui::Button("Sell")) submit(false);
-
-    ImGui::SetNextItemWidth(70);
-    ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
-    ImGui::SetItemTooltip("Limit price. 0 = a marketable limit auto-computed from the quote "
-                          "(buy the ask, sell the bid). Every manual order routes as an "
-                          "outside-RTH limit, so it fills in regular AND extended hours.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Calc")) {
-        // Fill Lmt with a marketable price to CLOSE the current position: buy the
-        // ask to cover a short, sell the bid to exit a long.
-        const LiveSnapshot snap = eng_.live_snapshot();
-        const double pos = manual_sid >= 1 && manual_sid <= snap.symbols.size()
-                               ? snap.symbols[manual_sid - 1].position.qty : 0.0;
-        manual_lmt_ = marketable(pos < 0.0);
+    // Only flag the non-regular sessions; regular hours is the default (no label).
+    if (!in_rth) {
+        ImGui::SameLine();
+        if (ext_session)
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.30f, 1), "Extended hours");
+        else
+            ImGui::TextColored(ImVec4(0.95f, 0.50f, 0.35f, 1), "Market closed");
     }
-    ImGui::SetItemTooltip("Fill Lmt with a marketable price to close the current position "
-                          "(buy the ask to cover a short, sell the bid to exit a long).");
-
-    if (in_rth)
-        ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.50f, 1), "Regular hours");
-    else if (ext_session)
-        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.30f, 1), "Extended hours");
-    else
-        ImGui::TextColored(ImVec4(0.95f, 0.50f, 0.35f, 1),
-                           "Market closed — an order will queue for the next open");
     if (has_q) {
         ImGui::SameLine();
         if (q.bid > 0 && q.ask > 0)
@@ -574,6 +557,13 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         else
             ImGui::Text("   last %.2f", q.price);
     }
+
+    ImGui::SetNextItemWidth(70);
+    ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
+    ImGui::SetItemTooltip("Limit price. 0 = a marketable limit auto-computed from the quote "
+                          "(buy the ask, sell the bid). Every manual order routes as an "
+                          "outside-RTH limit, so it fills in regular AND extended hours.");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("TP", &manual_tp_, 0, 0, "%.2f");
     ImGui::SetItemTooltip("Bracket take-profit price for manual orders (0 = off)");
