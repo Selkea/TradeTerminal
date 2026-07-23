@@ -69,7 +69,10 @@ private:
     void draw_trading_guards();        // Sign Out / quit confirm dialogs
     void draw_update_panel();          // "update available" panel + confirm
     void launch_updater();             // hand off to Update-And-Restart.ps1, then quit
-    void safe_stop_live();            // kill switch + graceful stop, if live
+    // Graceful stop of a live session. keep_positions: on the reconciling (TWS)
+    // route, skip the flatten so open positions + resting orders stay at the
+    // broker to be re-adopted on restart; ignored (flattens) on other routes.
+    void safe_stop_live(bool keep_positions = false);
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
     void save_config();              // panel state -> cfg_ -> config.json
     // Read-only diagnostics endpoint (net/diag_server.h). start_diag_server()

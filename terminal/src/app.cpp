@@ -2194,9 +2194,15 @@ void App::request_quit() {
     else should_quit_ = true;
 }
 
-void App::safe_stop_live() {
+void App::safe_stop_live(bool keep_positions) {
     if (!engine_.live_running()) return;
-    engine_.kill_switch();   // cancel all + flatten + halt strategy
+    // keep_positions only makes sense on a route that re-adopts them on the next
+    // start (TWS reconciles()); on any other route a restart comes back flat and
+    // blind, so flatten. When keeping, we skip the kill switch entirely: the
+    // positions and their resting stop/TP orders stay live at the broker and are
+    // adopted + held on restart (see run_live's reconciliation gate).
+    const bool keep = keep_positions && tws_ && tws_->reconciles();
+    if (!keep) engine_.kill_switch();   // cancel all + flatten + halt strategy
     engine_.stop_live();     // graceful stop, joins the live thread — after this,
                              // nothing still references cfg.broker, so tearing
                              // the broker down below can never race the engine.
@@ -2206,7 +2212,8 @@ void App::safe_stop_live() {
     // the OLD broker can never freeze this click (see reap_async).
     reap_async(std::move(tws_));
     reap_async(std::move(ibkr_));
-    log_.add("account: stopped live trading (kill switch)");
+    log_.add(keep ? "account: stopped live trading (positions kept for restart)"
+                  : "account: stopped live trading (kill switch)");
 }
 
 void App::do_ibkr_signout() {
@@ -2272,6 +2279,10 @@ void App::draw_update_panel() {
     const std::string remote = update_.remote_commit();
     const bool show = update_.available() && !remote.empty() &&
                       remote != update_dismissed_commit_;
+    // On the reconciling (TWS) route we can restart WITHOUT flattening: positions
+    // + resting orders stay at the broker and are re-adopted on restart. Any
+    // other route (or no broker) comes back flat, so we flatten first.
+    const bool keep_positions = engine_.live_running() && tws_ && tws_->reconciles();
     if (show && !pending_update_) {
         ImGui::SetNextWindowSize(ImVec2(390, 0), ImGuiCond_Appearing);
         if (ImGui::Begin("Update available", nullptr, ImGuiWindowFlags_NoCollapse |
@@ -2283,8 +2294,12 @@ void App::draw_update_panel() {
             ImGui::Spacing();
             if (engine_.live_running()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
-                ImGui::TextWrapped("A live session is running. Updating will cancel open "
-                                   "orders, flatten positions, and stop it first.");
+                if (keep_positions)
+                    ImGui::TextWrapped("A live session is running. Open positions stay at the "
+                                       "broker and are re-adopted on restart; the session stops.");
+                else
+                    ImGui::TextWrapped("A live session is running. Updating will cancel open "
+                                       "orders, flatten positions, and stop it first.");
                 ImGui::PopStyleColor();
                 ImGui::Spacing();
             }
@@ -2301,14 +2316,21 @@ void App::draw_update_panel() {
         ImGui::OpenPopup("Confirm update");
     if (ImGui::BeginPopupModal("Confirm update", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (engine_.live_running())
+        if (keep_positions)
+            ImGui::TextWrapped("Open positions stay at the broker — protected only by their "
+                               "resting stop/TP orders — while the app rebuilds (a few "
+                               "minutes), then are re-adopted and held until flat on restart. "
+                               "The live session stops, then it pulls + rebuilds and relaunches.\n\n"
+                               "Note: if your IB Gateway is set to cancel orders on disconnect, "
+                               "the position is unprotected while the app is down.");
+        else if (engine_.live_running())
             ImGui::TextWrapped("This will cancel open orders, flatten positions, and stop "
                                "the live session, then pull + rebuild and relaunch the app.");
         else
             ImGui::TextWrapped("This will pull the latest main, rebuild, and relaunch the app.");
         ImGui::Spacing();
         if (ImGui::Button("Update & restart")) {
-            safe_stop_live();   // no-op if flat/idle; flattens + stops if live
+            safe_stop_live(keep_positions);   // keeps positions on the TWS route
             launch_updater();
             should_quit_ = true;
             pending_update_ = false;
