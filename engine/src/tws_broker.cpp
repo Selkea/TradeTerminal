@@ -14,9 +14,11 @@
 #include "Execution.h"
 #include "Order.h"
 #include "OrderCancel.h"
+#include "OrderState.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -63,6 +65,14 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unordered_set<uint64_t> stuck_warned;        // logged-once half-open orders
     Clock::time_point last_stuck_check{};
 
+    // Connect-time reconciliation: replay positions/orders/cash exactly once
+    // (recon_ever guards against re-adopting on a mid-session reconnect), ending
+    // with a ReconcileEnd event when all three streams have finished.
+    static constexpr int kAcctReqId = 9001;   // our reqAccountSummary request id
+    bool recon_ever = false;
+    bool recon_active = false;
+    bool recon_pos_done = false, recon_ord_done = false, recon_acct_done = false;
+
     // Executions wait (briefly) for their commissionReport so the fee rides
     // the fill event; flushed with fee 0 if the report never shows.
     struct PendingExec {
@@ -105,6 +115,10 @@ struct TwsBroker::Io final : DefaultEWrapper {
         next_tws_id = orderId;
         b.ready_.store(true, std::memory_order_release);
         b.log("connected (socket API), orders ready");
+        // Adopt existing account state on the FIRST connect of the session only;
+        // a later reconnect must not re-seed a position the engine now tracks
+        // from its own fills.
+        if (!recon_ever) start_reconcile();
     }
 
     void connectionClosed() override {
@@ -215,6 +229,116 @@ struct TwsBroker::Io final : DefaultEWrapper {
         it->second.ev.u.fill.fee = report.commission;
         b.push_ev(it->second.ev);
         pending_execs.erase(it);
+    }
+
+    // ---- connect-time reconciliation ---------------------------------------
+    uint32_t sid_for(const std::string& sym) const {
+        for (size_t i = 0; i < b.cfg_.symbols.size(); ++i)
+            if (b.cfg_.symbols[i] == sym) return static_cast<uint32_t>(i + 1);
+        return 0;
+    }
+
+    void start_reconcile() {
+        if (!client) return;
+        recon_ever = true;
+        recon_active = true;
+        recon_pos_done = recon_ord_done = recon_acct_done = false;
+        client->reqPositions();
+        client->reqAllOpenOrders();
+        client->reqAccountSummary(kAcctReqId, "All", "TotalCashValue");
+        b.log("reconcile: requesting positions, open orders, cash");
+    }
+
+    void maybe_finish_reconcile() {
+        if (!recon_active || !recon_pos_done || !recon_ord_done || !recon_acct_done)
+            return;
+        recon_active = false;
+        EngineEvent ev{};
+        ev.type = static_cast<uint16_t>(EvType::ReconcileEnd);
+        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        b.push_ev(ev);
+        b.log("reconcile: complete");
+    }
+
+    void position(const std::string& /*account*/, const Contract& contract,
+                  Decimal pos, double avgCost) override {
+        if (!recon_active) return;
+        const uint32_t sid = sid_for(contract.symbol);
+        if (sid == 0) return;   // not a session symbol
+        const double qty = DecimalFunctions::decimalToDouble(pos);
+        if (sid <= net_pos.size()) net_pos[sid - 1] = qty;   // seed session net
+        if (qty == 0.0) return;
+        EngineEvent ev{};
+        ev.type = static_cast<uint16_t>(EvType::PosSnap);
+        ev.symbol_id = sid;
+        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        ev.u.pos.qty = qty;
+        ev.u.pos.avg_price = avgCost;
+        b.push_ev(ev);
+        b.log("reconcile: position " + contract.symbol + " " +
+              std::to_string(qty) + " @ " + std::to_string(avgCost));
+    }
+    void positionEnd() override {
+        if (!recon_active) return;
+        if (client) client->cancelPositions();   // one-shot: stop the stream
+        recon_pos_done = true;
+        maybe_finish_reconcile();
+    }
+
+    void openOrder(OrderId orderId, const Contract& contract, const Order& order,
+                   const OrderState& /*state*/) override {
+        if (!recon_active) return;
+        if (local_by_tws.count(orderId)) return;   // already ours this session
+        const uint32_t sid = sid_for(contract.symbol);
+        if (sid == 0) return;
+        const uint64_t local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
+        local_by_tws[orderId] = local;
+        tws_by_local[local] = orderId;
+        sid_by_local[local] = sid;
+        acked.insert(local);   // a resting order is already acked
+        const OrdType type = order.orderType == "LMT" ? OrdType::Limit
+                             : (order.orderType == "STP" ||
+                                order.orderType == "STP LMT") ? OrdType::Stop
+                                                              : OrdType::Market;
+        if (type == OrdType::Stop) protective.insert(local);   // resting stop protects
+        const Side side = order.action == "BUY" ? Side::Buy : Side::Sell;
+        const double qty = DecimalFunctions::decimalToDouble(order.totalQuantity);
+        const double px = type == OrdType::Stop ? order.auxPrice : order.lmtPrice;
+        EngineEvent ev{};
+        ev.type = static_cast<uint16_t>(EvType::OrderNew);
+        ev.symbol_id = sid;
+        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        ev.u.order.order_id = local;
+        ev.u.order.qty = qty;
+        ev.u.order.limit_price = px;
+        ev.u.order.side = static_cast<uint8_t>(side);
+        ev.u.order.ord_type = static_cast<uint8_t>(type);
+        b.push_ev(ev);
+        b.log("reconcile: open order " + contract.symbol + " " + order.orderType +
+              " " + order.action + " " + std::to_string(qty));
+    }
+    void openOrderEnd() override {
+        if (!recon_active) return;
+        recon_ord_done = true;
+        maybe_finish_reconcile();
+    }
+
+    void accountSummary(int reqId, const std::string& /*account*/,
+                        const std::string& tag, const std::string& value,
+                        const std::string& /*currency*/) override {
+        if (!recon_active || reqId != kAcctReqId || tag != "TotalCashValue") return;
+        EngineEvent ev{};
+        ev.type = static_cast<uint16_t>(EvType::AcctSnap);
+        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        ev.u.acct.cash = std::strtod(value.c_str(), nullptr);
+        b.push_ev(ev);
+        b.log("reconcile: cash " + value);
+    }
+    void accountSummaryEnd(int reqId) override {
+        if (!recon_active || reqId != kAcctReqId) return;
+        if (client) client->cancelAccountSummary(reqId);
+        recon_acct_done = true;
+        maybe_finish_reconcile();
     }
 
     // Half-open orders: a submit with no first orderStatus/ack after a while

@@ -63,6 +63,13 @@ public:
 
     // True once the adapter is connected and accepting orders.
     virtual bool ready() const = 0;
+
+    // True if this adapter replays the account's existing positions, resting
+    // orders, and cash on connect (as PosSnap/AcctSnap/OrderNew events followed
+    // by ReconcileEnd) so a restarted session can adopt them instead of starting
+    // flat. Default false: the engine then never gates dispatch on a reconcile
+    // that will never come (paper/sim and the web adapter behave as before).
+    virtual bool reconciles() const { return false; }
 };
 
 } // namespace tt

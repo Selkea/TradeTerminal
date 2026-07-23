@@ -53,6 +53,10 @@ public:
     bool poll_event(EngineEvent& out) override { return ev_ring_->try_pop(out); }
     RejectReason take_reject(uint64_t order_id) override;
     bool ready() const override { return ready_.load(std::memory_order_acquire); }
+    // Replays existing positions, resting orders, and cash once on connect so a
+    // restarted session adopts them (reqPositions/reqAllOpenOrders/account cash
+    // -> PosSnap/OrderNew/AcctSnap, then ReconcileEnd). See the Io reconcile path.
+    bool reconciles() const override { return true; }
 
     // Status/log lines (I/O thread produces, UI drains each frame).
     bool pop_log(std::string& out);

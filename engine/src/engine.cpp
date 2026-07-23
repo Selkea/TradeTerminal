@@ -711,6 +711,20 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     double risk_base_eq = pf.equity();   // equity at session start
     double risk_high_eq = risk_base_eq;  // running session equity high
 
+    // ---- broker reconciliation (a restarted session adopting live positions) ----
+    // A reconciling broker (reconciles()==true) replays its existing positions,
+    // resting orders, and cash on connect and ends with a ReconcileEnd event.
+    // Until then `reconciling` gates ALL strategy dispatch, so nothing trades
+    // against a not-yet-known position. Any symbol that comes back holding a
+    // position is then kept paused via adopt_hold — its adopted broker-side
+    // stop/TP protects and exits it — until it goes flat, at which point its
+    // strategy re-inits and resumes. The 10s failsafe lifts the gate if the
+    // broker never signals (e.g. connect failed) so a stall can't wedge trading.
+    // No-op for non-reconciling brokers (paper/sim/web): the flags never engage.
+    bool reconciling = broker && broker->reconciles();
+    const int64_t reconcile_deadline_ns = rt.now_ns() + 10'000'000'000LL;
+    std::vector<char> adopt_hold(n_sym, 0);
+
     // Percentiles are recomputed only when a new sample landed (orders are
     // rare next to ticks) — publish() itself stays flat.
     uint64_t lat_seen = 0;
@@ -786,7 +800,12 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         push_log(buf);
         push_fill(FillRecord{f.ts_ns, f.order_id, f.symbol_id,
                              static_cast<uint8_t>(f.side), f.qty, f.price, f.fee});
-        if (!halted)
+        // A held (adopted) symbol's fills come from broker-side resting orders
+        // the paused strategy never placed and doesn't know about — don't
+        // dispatch on_fill to it (the resume in the drain handles it going flat).
+        const bool held = f.symbol_id >= 1 && f.symbol_id <= n_sym &&
+                          adopt_hold[f.symbol_id - 1];
+        if (!halted && !held)
             if (IStrategy* s = strat_for(f.symbol_id)) {
                 ctx.set_current_symbol(f.symbol_id);
                 s->on_fill(ctx, f);
@@ -955,7 +974,8 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         const int64_t bn = bar_ns[symbol_id - 1];
         BarAgg& agg = bar_agg[symbol_id - 1];
         if (agg.open && ts >= agg.cur.ts_ns + bn) {
-            if (!halted && !strat_halted[symbol_id - 1])
+            if (!halted && !strat_halted[symbol_id - 1] && !reconciling &&
+                !adopt_hold[symbol_id - 1])
                 if (IStrategy* s = strat_for(symbol_id)) {
                     ctx.set_current_symbol(symbol_id);
                     guarded(symbol_id, [&] { s->on_bar(ctx, symbol_id, agg.cur); });
@@ -977,6 +997,13 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     int idle = 0;
     bool stop = false;
     while (!stop) {
+        // Failsafe: if a reconciling broker never signals completion (connect
+        // failed, gateway wedged), lift the gate after the deadline so dispatch
+        // resumes instead of stalling forever (degrades to no adoption).
+        if (reconciling && rt.now_ns() > reconcile_deadline_ns) {
+            reconciling = false;
+            push_log("live: broker reconciliation timed out — trading normally");
+        }
         // Hot-swaps: one relaxed load per iteration; the work happens only
         // when the autopilot actually queued something.
         if (has_swaps_.load(std::memory_order_acquire)) apply_swaps();
@@ -1041,6 +1068,21 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                                  bev.ts_event_ns ? bev.ts_event_ns : rt.now_ns(),
                                  bev.u.fill.price, bev.u.fill.qty, bev.u.fill.fee};
                     apply_fill(f);
+                    // A held (adopted) symbol whose position just closed — its
+                    // adopted stop/TP filled: re-init its strategy and resume.
+                    const uint32_t fsid = f.symbol_id;
+                    if (fsid >= 1 && fsid <= n_sym && adopt_hold[fsid - 1] &&
+                        pf.position(fsid).qty == 0.0) {
+                        adopt_hold[fsid - 1] = 0;
+                        if (strategies[fsid - 1]) {
+                            strat_halted[fsid - 1] = 0;
+                            ctx.set_current_event_tsc(0);
+                            ctx.set_current_symbol(fsid);
+                            strategies[fsid - 1]->on_init(ctx);
+                        }
+                        push_log("live: " + cfg.symbols[fsid - 1] +
+                                 " adopted position closed — strategy resumed");
+                    }
                 } else if (bev.type == static_cast<uint16_t>(EvType::OrderCancel)) {
                     const bool rejected = (bev.flags & kEvFlagRejected) != 0;
                     // Pull the reason once per event (take_reject erases it), so
@@ -1091,11 +1133,16 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 } else if (bev.type == static_cast<uint16_t>(EvType::PosSnap)) {
                     pf.seed_position(bev.symbol_id, bev.u.pos.qty, bev.u.pos.avg_price);
                     risk_base_eq = risk_high_eq = pf.equity();   // new baseline
-                    char buf[96];
+                    // A nonzero adopted position: pause that symbol's strategy
+                    // until it goes flat (its adopted stop/TP protects + exits it).
+                    const bool hold = bev.u.pos.qty != 0.0 && bev.symbol_id >= 1 &&
+                                      bev.symbol_id <= n_sym;
+                    if (hold) adopt_hold[bev.symbol_id - 1] = 1;
+                    char buf[128];
                     std::snprintf(buf, sizeof(buf),
-                                  "live: adopted broker position %s %+.0f @ %.2f",
+                                  "live: adopted broker position %s %+.0f @ %.2f%s",
                                   symbol_name(bev.symbol_id).c_str(), bev.u.pos.qty,
-                                  bev.u.pos.avg_price);
+                                  bev.u.pos.avg_price, hold ? " — holding until flat" : "");
                     push_log(buf);
                 } else if (bev.type == static_cast<uint16_t>(EvType::AcctSnap)) {
                     pf.set_cash(bev.u.acct.cash);
@@ -1104,6 +1151,26 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     std::snprintf(buf, sizeof(buf), "live: cash reconciled to %.2f",
                                   bev.u.acct.cash);
                     push_log(buf);
+                } else if (bev.type == static_cast<uint16_t>(EvType::OrderNew)) {
+                    // A resting order adopted from the broker at reconnect — book
+                    // it Working so /diag + the blotter show it (and a held symbol
+                    // reads protected, not naked). Its later fill/cancel maps back
+                    // through the adapter's id table like any live order.
+                    const OrderRequest r{bev.symbol_id,
+                                         static_cast<Side>(bev.u.order.side),
+                                         static_cast<OrdType>(bev.u.order.ord_type), {},
+                                         bev.u.order.qty, bev.u.order.limit_price,
+                                         0.0, 0.0, 0.0};
+                    record_order(r, bev.u.order.order_id);
+                    push_log("live: adopted broker order #" +
+                             std::to_string(bev.u.order.order_id) + " (" +
+                             symbol_name(bev.symbol_id) + ")");
+                } else if (bev.type == static_cast<uint16_t>(EvType::ReconcileEnd)) {
+                    reconciling = false;
+                    int held = 0;
+                    for (const char h : adopt_hold) held += h ? 1 : 0;
+                    push_log("live: broker reconciliation complete — " +
+                             std::to_string(held) + " symbol(s) held until flat");
                 }
             }
             if (any) {
@@ -1126,7 +1193,8 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 // indicators continuous, but never fill or mark positions
                 // against stale prices.
                 if (!halted && ev.symbol_id >= 1 && ev.symbol_id <= n_sym &&
-                    !strat_halted[ev.symbol_id - 1]) {
+                    !strat_halted[ev.symbol_id - 1] && !reconciling &&
+                    !adopt_hold[ev.symbol_id - 1]) {
                     ctx.set_current_event_tsc(0);
                     const Bar b{ev.ts_event_ns, ev.u.bar.open, ev.u.bar.high,
                                 ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
@@ -1152,7 +1220,8 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             }
             pf.mark(sid, price);
 
-            if (!halted && sid >= 1 && sid <= n_sym && !strat_halted[sid - 1])
+            if (!halted && sid >= 1 && sid <= n_sym && !strat_halted[sid - 1] &&
+                !reconciling && !adopt_hold[sid - 1])
                 if (IStrategy* s = strat_for(sid)) {
                     Tick t{ev.ts_event_ns, price, ev.u.tick.size, ev.u.tick.bid,
                            ev.u.tick.ask};

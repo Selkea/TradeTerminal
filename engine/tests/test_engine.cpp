@@ -2,12 +2,17 @@
 
 #include "engine/broker.h"
 #include "engine/engine.h"
+#include "engine/events.h"
 #include "engine/exec_sim.h"
 #include "engine/portfolio.h"
+#include "tt/strategy_api.h"
 #include "tt/strategy_registry.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
+#include <mutex>
 #include <thread>
 
 using namespace tt;
@@ -172,4 +177,148 @@ TEST_CASE("broker: default take_reject reports no reason") {
     const RejectReason r = b.take_reject(42);
     CHECK(r.code == 0);
     CHECK(r.message.empty());
+}
+
+// ---- hot-restart reconciliation: gate dispatch, hold adopted positions until
+// flat, then resume. Drives run_live with a scripted broker + injected ticks.
+namespace {
+struct FakeReconcileBroker : IBrokerAdapter {
+    std::mutex mu;
+    std::deque<EngineEvent> q;   // events the engine will drain via poll_event
+
+    void emit(const EngineEvent& e) {
+        std::lock_guard l(mu);
+        q.push_back(e);
+    }
+    uint64_t submit(const OrderRequest&, int64_t) override { return 1; }
+    bool cancel(uint64_t) override { return true; }
+    void cancel_all() override {}
+    void flatten() override {}
+    bool poll_event(EngineEvent& out) override {
+        std::lock_guard l(mu);
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool ready() const override { return true; }
+    bool reconciles() const override { return true; }
+};
+
+// Counts per-instance dispatch + on_init so a test can observe gate/hold/resume.
+struct RecordingStrat : IStrategy {
+    std::atomic<int> inits{0};
+    std::atomic<int> ticks{0};
+    void on_init(IStrategyContext&) noexcept override { ++inits; }
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override { ++ticks; }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+EngineEvent ev_pos(uint32_t sid, double qty, double avg) {
+    EngineEvent e{};
+    e.type = static_cast<uint16_t>(EvType::PosSnap);
+    e.symbol_id = sid;
+    e.u.pos.qty = qty;
+    e.u.pos.avg_price = avg;
+    return e;
+}
+EngineEvent ev_order(uint32_t sid, uint64_t id, double qty, Side side, OrdType t, double px) {
+    EngineEvent e{};
+    e.type = static_cast<uint16_t>(EvType::OrderNew);
+    e.symbol_id = sid;
+    e.u.order.order_id = id;
+    e.u.order.qty = qty;
+    e.u.order.limit_price = px;
+    e.u.order.side = static_cast<uint8_t>(side);
+    e.u.order.ord_type = static_cast<uint8_t>(t);
+    return e;
+}
+EngineEvent ev_acct(double cash) {
+    EngineEvent e{};
+    e.type = static_cast<uint16_t>(EvType::AcctSnap);
+    e.u.acct.cash = cash;
+    return e;
+}
+EngineEvent ev_reconcile_end() {
+    EngineEvent e{};
+    e.type = static_cast<uint16_t>(EvType::ReconcileEnd);
+    return e;
+}
+EngineEvent ev_fill(uint32_t sid, uint64_t id, Side side, double qty, double px) {
+    EngineEvent e{};
+    e.type = static_cast<uint16_t>(EvType::Fill);
+    e.symbol_id = sid;
+    e.u.fill.order_id = id;
+    e.u.fill.qty = qty;
+    e.u.fill.price = px;
+    e.u.fill.side = static_cast<uint8_t>(side);
+    return e;
+}
+
+// Pump a few ticks per poll, waiting up to `ms` for pred() to hold.
+template <class Pred>
+bool pump_until(Engine& eng, Pred pred, int ms = 3000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    for (;;) {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);
+        eng.push_live_tick("BBB", 1, 20.0, 0.0);
+        if (pred()) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return pred();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+} // namespace
+
+TEST_CASE("live reconciliation: gate dispatch, hold until flat, then resume") {
+    Engine eng;
+    FakeReconcileBroker broker;
+    RecordingStrat held;   // AAA (sid 1): comes back holding a position
+    RecordingStrat flat;   // BBB (sid 2): flat, should trade once reconciled
+
+    // Adopt state WITHOUT ending reconciliation yet: AAA long 100 with a resting
+    // protective stop; cash. No PosSnap for BBB (it's flat).
+    broker.emit(ev_pos(1, 100.0, 50.0));
+    broker.emit(ev_order(1, 5001, 100.0, Side::Sell, OrdType::Stop, 45.0));
+    broker.emit(ev_acct(100'000.0));
+
+    LiveConfig cfg;
+    cfg.symbols = {"AAA", "BBB"};
+    cfg.broker = &broker;
+    cfg.bar_seconds = 100'000;   // keep bars from firing; assert on on_tick only
+    REQUIRE(eng.start_live(cfg, {&held, &flat}));
+
+    // Phase A — gated: reconciliation hasn't ended, so NO symbol is dispatched
+    // even as ticks flow. The adopted position is already seeded.
+    REQUIRE(pump_until(eng, [&] {
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0);
+    }));
+    for (int i = 0; i < 50; ++i) {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);
+        eng.push_live_tick("BBB", 1, 20.0, 0.0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(flat.ticks.load() == 0);
+    CHECK(held.ticks.load() == 0);
+
+    // Phase B — reconciliation ends: the flat symbol trades; the symbol holding
+    // an adopted position stays paused.
+    broker.emit(ev_reconcile_end());
+    CHECK(pump_until(eng, [&] { return flat.ticks.load() > 0; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(held.ticks.load() == 0);   // still held — it has a position
+
+    // Phase C — the adopted stop fills, flattening AAA: its strategy re-inits and
+    // resumes. (on_init: 1 at start + 1 on resume.)
+    const int held_inits_before = held.inits.load();
+    broker.emit(ev_fill(1, 5001, Side::Sell, 100.0, 45.0));
+    REQUIRE(pump_until(eng, [&] {
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(0.0);
+    }));
+    CHECK(pump_until(eng, [&] { return held.ticks.load() > 0; }));   // resumed
+    CHECK(held.inits.load() == held_inits_before + 1);
+
+    eng.stop_live();
 }

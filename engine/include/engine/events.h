@@ -8,7 +8,8 @@ namespace tt {
 
 enum class EvType : uint16_t {
     Tick = 1, Bar, OrderNew, OrderCancel, Fill, FeedStatus, End,
-    PosSnap, AcctSnap   // broker reconciliation at session start
+    PosSnap, AcctSnap,   // broker reconciliation at session start
+    ReconcileEnd         // broker finished replaying positions/orders/cash
 };
 
 // EngineEvent.flags bits.
