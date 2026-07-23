@@ -84,7 +84,11 @@ void UpdateChecker::worker() {
                     remote_ = shortsha;
                 }
                 available_.store(shortsha != current_, std::memory_order_release);
+                last_ok_.store(true, std::memory_order_release);
+            } else {
+                last_ok_.store(false, std::memory_order_release);
             }
+            checks_.fetch_add(1, std::memory_order_release);   // signal completion
             next = steady_clock::now() + minutes(60);
         }
         std::this_thread::sleep_for(seconds(1));   // stays responsive to stop_/poke_

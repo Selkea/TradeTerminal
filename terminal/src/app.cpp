@@ -2343,6 +2343,40 @@ void App::draw_update_panel() {
         }
         ImGui::EndPopup();
     }
+
+    // Manual "Check for updates" (Help menu): poke the checker now and show the
+    // result. The auto panel above only appears when an update IS found, so this
+    // popup is the only place the "already up to date" case gets any feedback.
+    if (update_check_click_) {
+        update_check_click_ = false;
+        update_check_wait_ = true;
+        update_check_gen_ = update_.check_count();
+        update_check_started_ = ImGui::GetTime();
+        update_.check_now();
+        ImGui::OpenPopup("Check for updates");
+    }
+    if (update_check_wait_ &&
+        (update_.check_count() != update_check_gen_ ||
+         ImGui::GetTime() - update_check_started_ > 20.0))
+        update_check_wait_ = false;   // the poked check finished (or timed out)
+    if (ImGui::BeginPopupModal("Check for updates", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (update_check_wait_)
+            ImGui::TextUnformatted("Checking GitHub…");
+        else if (!update_.last_ok())
+            ImGui::TextWrapped("Couldn't reach GitHub — check the connection and try again.");
+        else if (update_.available())
+            ImGui::TextWrapped("Update available: %s\nUse the Update panel to install.",
+                               update_.remote_commit().c_str());
+        else
+            ImGui::TextWrapped("You're up to date (running %s).",
+                               update_.current_commit().c_str());
+        ImGui::Spacing();
+        ImGui::BeginDisabled(update_check_wait_);
+        if (ImGui::Button("OK")) ImGui::CloseCurrentPopup();
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
 }
 
 // Detach the updater script: it waits for THIS process to exit (releasing the
@@ -2777,6 +2811,11 @@ void App::draw_menu_bar() {
     }
 #endif
     if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem(update_check_wait_ ? "Checking for updates…"
+                                               : "Check for updates",
+                            nullptr, false, !update_check_wait_))
+            update_check_click_ = true;
+        ImGui::Separator();
         ImGui::MenuItem("ImGui Demo", nullptr, &show_imgui_demo_);
         ImGui::MenuItem("ImPlot Demo", nullptr, &show_implot_demo_);
         ImGui::EndMenu();

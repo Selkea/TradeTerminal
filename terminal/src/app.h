@@ -340,6 +340,10 @@ private:
     bool pending_signout_ = false;    // sign-out awaiting the "live trading" confirm
     bool pending_update_ = false;     // update awaiting the confirm dialog
     std::string update_dismissed_commit_;   // "Later"-ed commit: hide until main moves again
+    bool update_check_click_ = false;   // Help > Check for updates clicked this frame
+    bool update_check_wait_ = false;    // a manual check is in flight
+    uint32_t update_check_gen_ = 0;     // check_count() snapshot when it started
+    double update_check_started_ = 0.0; // GetTime() at start, for a timeout
 
     bool had_ini_ = false;
     bool layout_checked_ = false;

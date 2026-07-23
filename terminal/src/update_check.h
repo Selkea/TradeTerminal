@@ -5,6 +5,7 @@
 // a failed poll leaves the previous state and retries on the next interval.
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,6 +33,11 @@ public:
     const std::string& current_commit() const { return current_; }
     // Poke the worker to poll now instead of waiting for the next interval.
     void check_now() { poke_.store(true, std::memory_order_release); }
+    // Bumps once per completed poll attempt — lets the UI tell when a poked
+    // check has finished (compare against a snapshot taken at check_now()).
+    uint32_t check_count() const { return checks_.load(std::memory_order_acquire); }
+    // True if the most recent poll actually reached GitHub (vs a network error).
+    bool last_ok() const { return last_ok_.load(std::memory_order_acquire); }
 
 private:
     void worker();
@@ -42,6 +48,8 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> poke_{false};
     std::atomic<bool> available_{false};
+    std::atomic<uint32_t> checks_{0};   // completed poll attempts
+    std::atomic<bool> last_ok_{false};  // last poll reached GitHub
     mutable std::mutex mu_;
     std::string remote_;    // guarded by mu_
 };
