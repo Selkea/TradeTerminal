@@ -472,7 +472,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         sched_prev_min_ = now_min;
     }
 
-    // ---- line 1: account + PAPER/LIVE tag (left), data feed (right) ----
+    // ---- line 1: account + PAPER/LIVE tag (left), equity/cash (mid), feed (right) ----
     ImGui::TextUnformatted(account.label.empty() ? "Simulator" : account.label.c_str());
     ImGui::SameLine();
     if (account.kind == 2)
@@ -489,6 +489,12 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.25f, 1), "HALTED");
     }
+    ImGui::SameLine();
+    ImGui::Text("   equity %.2f   cash %.2f", s.equity, s.cash);
+    if (sched_on_) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(auto-stop %s)", sched_stop_);
+    }
     {
         static const char* const kFeed[] = {"IBKR (web)", "Polygon", "Finnhub", "IBKR (TWS)"};
         const char* feed = (data_idx_ >= 0 && data_idx_ < 4) ? kFeed[data_idx_] : "?";
@@ -500,14 +506,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         ImGui::TextDisabled("%s", feed);
     }
 
-    // ---- line 2: equity + cash (was line 3) ----
-    ImGui::Text("equity %.2f   cash %.2f", s.equity, s.cash);
-    if (sched_on_) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(auto-stop %s)", sched_stop_);
-    }
-
-    // ---- line 3: sortable positions table (mirrors the Positions panel).
+    // ---- line 2: sortable positions table (mirrors the Positions panel).
     // Sortable columns persist to imgui.ini; clicking a row loads it on the Chart.
     {
         struct Row { const SymbolState* s; double bid; double ask; };
