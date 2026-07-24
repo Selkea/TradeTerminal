@@ -94,7 +94,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                       const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
                       const AutoPickFn& autopick, bool polygon_available,
                       bool finnhub_available, bool ibkr_ready, const AccountInfo& account,
-                      const StartFn& start) {
+                      const StartFn& start, const SymbolPickFn& chart_pick) {
     const bool visible = ImGui::Begin("Trade", open);
     tab_drag_hint();
     if (!visible) {
@@ -472,41 +472,121 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         sched_prev_min_ = now_min;
     }
 
-    std::string sym_list;
-    for (const SymbolState& sym : s.symbols)
-        sym_list += (sym_list.empty() ? "" : ", ") + sym.symbol;
-    ImGui::Text("%s", sym_list.c_str());
+    // ---- line 1: account + PAPER/LIVE tag (left), data feed (right) ----
+    ImGui::TextUnformatted(account.label.empty() ? "Simulator" : account.label.c_str());
     ImGui::SameLine();
-    if (s.halted)
-        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "HALTED");
-    else if (session_broker_ == 2)
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr tws)");
-    else if (session_broker_ == 1)
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "LIVE (ibkr web)");
+    if (account.kind == 2)
+        ImGui::TextColored(ImVec4(0.95f, 0.30f, 0.25f, 1), "LIVE");
+    else if (account.kind == 1)
+        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "PAPER");
     else
-        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "LIVE (paper)");
+        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1), "SIM");
+    if (account.readonly) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.25f, 1), "read-only");
+    }
+    if (s.halted) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.25f, 1), "HALTED");
+    }
+    {
+        static const char* const kFeed[] = {"IBKR (web)", "Polygon", "Finnhub", "IBKR (TWS)"};
+        const char* feed = (data_idx_ >= 0 && data_idx_ < 4) ? kFeed[data_idx_] : "?";
+        const float fw = ImGui::CalcTextSize(feed).x;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                      ImGui::GetWindowWidth() - fw -
+                                          ImGui::GetStyle().WindowPadding.x - 6.0f));
+        ImGui::TextDisabled("%s", feed);
+    }
+
+    // ---- line 2: equity + cash (was line 3) ----
+    ImGui::Text("equity %.2f   cash %.2f", s.equity, s.cash);
     if (sched_on_) {
         ImGui::SameLine();
         ImGui::TextDisabled("(auto-stop %s)", sched_stop_);
     }
 
-    char tbuf[16] = "--";
-    if (s.last_tick_ts_ms > 0) {
-        const std::time_t t = static_cast<std::time_t>(s.last_tick_ts_ms / 1000);
-        std::tm tm{};
-        localtime_s(&tm, &t);
-        std::snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    // ---- line 3: sortable positions table (mirrors the Positions panel).
+    // Sortable columns persist to imgui.ini; clicking a row loads it on the Chart.
+    {
+        struct Row { const SymbolState* s; double bid; double ask; };
+        std::vector<Row> rows;
+        rows.reserve(s.symbols.size());
+        for (const SymbolState& sym : s.symbols) {
+            Quote rq;
+            const bool has = quotes_.get(sym.symbol, rq);
+            rows.push_back({&sym, has ? rq.bid : 0.0, has ? rq.ask : 0.0});
+        }
+        const ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                       ImGuiTableFlags_SizingStretchProp |
+                                       ImGuiTableFlags_Sortable;
+        if (ImGui::BeginTable("##running_pos", 8, tflags)) {
+            ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_DefaultSort);
+            ImGui::TableSetupColumn("Qty");
+            ImGui::TableSetupColumn("Avg");
+            ImGui::TableSetupColumn("Bid");
+            ImGui::TableSetupColumn("Ask");
+            ImGui::TableSetupColumn("Last");
+            ImGui::TableSetupColumn("Unrealized");
+            ImGui::TableSetupColumn("Realized");
+            ImGui::TableHeadersRow();
+
+            // Live-sort every frame so values re-order as prices/PnL move.
+            if (ImGuiTableSortSpecs* ss = ImGui::TableGetSortSpecs(); ss && ss->SpecsCount > 0) {
+                const ImGuiTableColumnSortSpecs& sp = ss->Specs[0];
+                const bool asc = sp.SortDirection != ImGuiSortDirection_Descending;
+                auto num = [&](const Row& r) -> double {
+                    switch (sp.ColumnIndex) {
+                    case 1: return r.s->position.qty;
+                    case 2: return r.s->position.avg_price;
+                    case 3: return r.bid;
+                    case 4: return r.ask;
+                    case 5: return r.s->last_price;
+                    case 6: return r.s->position.unrealized_pnl;
+                    case 7: return r.s->position.realized_pnl;
+                    default: return 0.0;
+                    }
+                };
+                std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+                    if (sp.ColumnIndex == 0)
+                        return asc ? a.s->symbol < b.s->symbol : a.s->symbol > b.s->symbol;
+                    const double x = num(a), y = num(b);
+                    return asc ? x < y : x > y;
+                });
+                ss->SpecsDirty = false;
+            }
+
+            const ImVec4 up(0.25f, 0.85f, 0.45f, 1), dn(0.9f, 0.35f, 0.3f, 1);
+            for (const Row& r : rows) {
+                const SymbolState& sym = *r.s;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                // Whole row is clickable: load the symbol on the Chart.
+                if (ImGui::Selectable(sym.symbol.c_str(), false,
+                                      ImGuiSelectableFlags_SpanAllColumns) &&
+                    chart_pick)
+                    chart_pick(sym.symbol);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.0f", sym.position.qty);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", sym.position.avg_price);
+                ImGui::TableNextColumn();
+                if (r.bid > 0) ImGui::Text("%.2f", r.bid); else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                if (r.ask > 0) ImGui::Text("%.2f", r.ask); else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", sym.last_price);
+                ImGui::TableNextColumn();
+                ImGui::TextColored(sym.position.unrealized_pnl >= 0 ? up : dn, "%+.2f",
+                                   sym.position.unrealized_pnl);
+                ImGui::TableNextColumn();
+                ImGui::TextColored(sym.position.realized_pnl >= 0 ? up : dn, "%+.2f",
+                                   sym.position.realized_pnl);
+            }
+            ImGui::EndTable();
+        }
     }
-    ImGui::Text("ticks %llu%s   last tick @ %s", static_cast<unsigned long long>(s.ticks),
-                s.dropped_ticks ? " (drops!)" : "", tbuf);
-    if (s.lat_count > 0)
-        ImGui::Text("tick->order p50 %.1f us   p99 %.1f us   max %.1f us   (%llu)",
-                    s.lat_p50 / 1000.0, s.lat_p99 / 1000.0, s.lat_max / 1000.0,
-                    static_cast<unsigned long long>(s.lat_count));
-    ImGui::Text("equity %.2f   cash %.2f", s.equity, s.cash);
-    for (const SymbolState& sym : s.symbols)
-        ImGui::Text("  %s   last %.2f   pos %.0f", sym.symbol.c_str(), sym.last_price,
-                    sym.position.qty);
 
     ImGui::Separator();
     if (selected_symbol_idx_ >= static_cast<int>(s.symbols.size())) selected_symbol_idx_ = 0;

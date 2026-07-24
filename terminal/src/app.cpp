@@ -2127,7 +2127,12 @@ void App::draw() {
                     },
                     !polygon_key().empty(), !finnhub_key().empty(), data_.connected(),
                     trade_account_info(),
-                    [this](const TradePanel::StartOpts& opts) { start_live_session(opts); });
+                    [this](const TradePanel::StartOpts& opts) { start_live_session(opts); },
+                    [this](const std::string& sym) {   // row click -> chart the symbol
+                        chart_.show_symbol(sym);
+                        backtest_.set_symbol(sym);
+                        show_chart_ = true;
+                    });
     // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
     // so start the live session through the exact path the Start button uses.
     if (lineup_autostart_pending_) {

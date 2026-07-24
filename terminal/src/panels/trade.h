@@ -46,6 +46,8 @@ public:
     using StratNameFn = std::function<std::string(const std::string& key)>;
     // Run a strategy tournament for this symbol (auto-pick the champion).
     using AutoPickFn = std::function<void(const std::string& symbol)>;
+    // Load a symbol into the Chart panel (running-session table row click).
+    using SymbolPickFn = std::function<void(const std::string& symbol)>;
     struct StartOpts {
         std::vector<SymbolOpt> symbols;   // one entry per traded symbol
         double session_cash = 100'000.0;  // shared pool (simulator / single account)
@@ -71,7 +73,8 @@ public:
     void draw(bool* open, const std::vector<std::string>& strat_sources,
               const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
               const AutoPickFn& autopick, bool polygon_available, bool finnhub_available,
-              bool ibkr_ready, const AccountInfo& account, const StartFn& start);
+              bool ibkr_ready, const AccountInfo& account, const StartFn& start,
+              const SymbolPickFn& chart_pick);
 
     // Tournament champion: point this symbol's tab at a strategy + its params
     // (adds the tab if the symbol isn't pending yet).
