@@ -383,7 +383,7 @@ App::App(std::string gateway_url)
       strat_mgr_(host_, engine_, std::string(TT_REPO_ROOT) + "/strategies"),
       trade_(engine_, quotes_),
       blotter_(engine_),
-      positions_(engine_),
+      positions_(engine_, quotes_),
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
     net::IMarketData::Callbacks cbs;

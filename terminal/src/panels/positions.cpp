@@ -22,12 +22,14 @@ void PositionsPanel::draw(bool* open) {
     ImGui::Text("equity %.2f   cash %.2f", s.equity, s.cash);
     ImGui::Separator();
 
-    if (ImGui::BeginTable("##pos", 6,
+    if (ImGui::BeginTable("##pos", 8,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                           ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Symbol");
         ImGui::TableSetupColumn("Qty");
         ImGui::TableSetupColumn("Avg");
+        ImGui::TableSetupColumn("Bid");
+        ImGui::TableSetupColumn("Ask");
         ImGui::TableSetupColumn("Last");
         ImGui::TableSetupColumn("Unrealized");
         ImGui::TableSetupColumn("Realized");
@@ -35,6 +37,8 @@ void PositionsPanel::draw(bool* open) {
 
         const ImVec4 up(0.25f, 0.85f, 0.45f, 1), dn(0.9f, 0.35f, 0.3f, 1);
         for (const SymbolState& sym : s.symbols) {
+            Quote q;
+            const bool has_q = quotes_.get(sym.symbol, q);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(sym.symbol.c_str());
@@ -42,6 +46,12 @@ void PositionsPanel::draw(bool* open) {
             ImGui::Text("%.0f", sym.position.qty);
             ImGui::TableNextColumn();
             ImGui::Text("%.2f", sym.position.avg_price);
+            ImGui::TableNextColumn();
+            if (has_q && q.bid > 0) ImGui::Text("%.2f", q.bid);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            if (has_q && q.ask > 0) ImGui::Text("%.2f", q.ask);
+            else ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
             ImGui::Text("%.2f", sym.last_price);
             ImGui::TableNextColumn();

@@ -538,7 +538,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     const bool ext_session = weekday && !in_rth && now_min >= 4 * 60 && now_min < 20 * 60;
 
     Quote q{};
-    const bool has_q = quotes_.get(msym, q);
+    quotes_.get(msym, q);   // feeds the marketable-limit calc; bid/ask/last now
+                            // shown per-symbol in the Positions panel
     // Marketable limit for the `buy` side: buy at the ask, sell at the bid,
     // nudged ~10 bps through to clear the spread (broker snaps to venue tick).
     // Falls back to last; 0 when no price is known.
@@ -568,14 +569,6 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         else
             ImGui::TextColored(ImVec4(0.95f, 0.50f, 0.35f, 1), "Market closed");
     }
-    if (has_q) {
-        ImGui::SameLine();
-        if (q.bid > 0 && q.ask > 0)
-            ImGui::Text("   bid %.2f / ask %.2f / last %.2f", q.bid, q.ask, q.price);
-        else
-            ImGui::Text("   last %.2f", q.price);
-    }
-
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
     ImGui::SetItemTooltip("Limit price. 0 = a marketable limit auto-computed from the quote "
