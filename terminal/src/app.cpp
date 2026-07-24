@@ -2576,9 +2576,12 @@ void App::draw_update_panel() {
                                                           ImGuiWindowFlags_NoDocking)) {
             ImGui::TextWrapped("A newer build is on GitHub (origin/main).");
             ImGui::Spacing();
-            ImGui::Text("Running:   %s", TT_VERSION);
-            ImGui::Text("This build: %s   Latest: %s", update_.current_commit().c_str(),
-                        remote.c_str());
+            ImGui::Text("Running:  %s", TT_VERSION_BASE);
+            const std::string latest = update_.remote_version();
+            if (!latest.empty())
+                ImGui::Text("Latest:   %s", latest.c_str());
+            else
+                ImGui::TextDisabled("Latest:   newer build available");
             ImGui::Spacing();
             if (engine_.live_running()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));

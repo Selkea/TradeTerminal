@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
-project(TradeTerminal VERSION 0.1.0 LANGUAGES CXX)   # bump here to cut a release; build number auto-tracks commits
+# Single source of truth for the semantic version. Bump the VERSION file on
+# every commit: major = full release, minor = moderate change, patch = small.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" TT_VERSION_RAW)
+string(STRIP "${TT_VERSION_RAW}" TT_VERSION_RAW)
+project(TradeTerminal VERSION ${TT_VERSION_RAW} LANGUAGES CXX)
+# Reconfigure when VERSION changes so PROJECT_VERSION (and the stamped
+# TT_VERSION_BASE) stay current without a manual cmake rerun.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 if(WIN32)
     enable_language(RC)
 endif()

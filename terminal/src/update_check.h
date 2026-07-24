@@ -29,6 +29,10 @@ public:
     bool available() const { return available_.load(std::memory_order_acquire); }
     // Short SHA (current-commit length) of origin/main; "" until first success.
     std::string remote_commit() const;
+    // Human semver of origin/main, read from its VERSION file — the "Latest"
+    // shown in the update panel. Fetched only when an update is found; "" until
+    // then (or if the fetch failed).
+    std::string remote_version() const;
     // The commit this binary was built from (fixed after start()).
     const std::string& current_commit() const { return current_; }
     // Poke the worker to poll now instead of waiting for the next interval.
@@ -51,7 +55,8 @@ private:
     std::atomic<uint32_t> checks_{0};   // completed poll attempts
     std::atomic<bool> last_ok_{false};  // last poll reached GitHub
     mutable std::mutex mu_;
-    std::string remote_;    // guarded by mu_
+    std::string remote_;          // guarded by mu_
+    std::string remote_version_;  // guarded by mu_ (origin/main's VERSION file)
 };
 
 } // namespace tt::ui

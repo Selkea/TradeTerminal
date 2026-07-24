@@ -12,5 +12,8 @@
 // truth for the GitHub update check (SHA compare).
 #define TT_VERSION "@TT_VERSION@"
 #define TT_BUILD_NUMBER "@TT_BUILD_NUMBER@"
+// Base semver (from the CMake project() VERSION) and the build number split out,
+// for composing "<base> (<n>)" version strings (e.g. the update panel).
+#define TT_VERSION_BASE "@TT_BASE_VERSION@"
 // owner/repo of origin, for the GitHub "update available" check.
 #define TT_REPO_SLUG "@TT_REPO_SLUG@"

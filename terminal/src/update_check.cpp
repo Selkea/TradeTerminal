@@ -49,6 +49,41 @@ std::string fetch_head_sha(const std::string& slug) {
         if (!std::isxdigit(static_cast<unsigned char>(c))) return {};
     return body;
 }
+
+// origin/main's semantic version, straight from the repo's VERSION file on the
+// raw CDN. Returns "" on any error or if the payload doesn't look like a version.
+std::string fetch_remote_version(const std::string& slug) {
+    CURL* h = curl_easy_init();
+    if (!h) return {};
+    const std::string url =
+        "https://raw.githubusercontent.com/" + slug + "/main/VERSION";
+    std::string body;
+    curl_slist* hdr = nullptr;
+    hdr = curl_slist_append(hdr, "User-Agent: TradeTerminal-update-check");
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
+    curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+    const CURLcode rc = curl_easy_perform(h);
+    long code = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdr);
+    curl_easy_cleanup(h);
+    if (rc != CURLE_OK || code != 200) return {};
+    const size_t b = body.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    const size_t e = body.find_last_not_of(" \t\r\n");
+    body = body.substr(b, e - b + 1);
+    // Sanity: short and starts with a digit (e.g. "0.1.1"); reject error pages.
+    if (body.empty() || body.size() > 32 ||
+        !std::isdigit(static_cast<unsigned char>(body[0])))
+        return {};
+    return body;
+}
 } // namespace
 
 void UpdateChecker::start(std::string slug, std::string current) {
@@ -68,6 +103,11 @@ std::string UpdateChecker::remote_commit() const {
     return remote_;
 }
 
+std::string UpdateChecker::remote_version() const {
+    std::lock_guard lock(mu_);
+    return remote_version_;
+}
+
 void UpdateChecker::worker() {
     curl_global_init(CURL_GLOBAL_DEFAULT);   // idempotent, refcounted
     using namespace std::chrono;
@@ -79,11 +119,17 @@ void UpdateChecker::worker() {
             const std::string sha = fetch_head_sha(slug_);
             if (!sha.empty()) {
                 const std::string shortsha = sha.substr(0, current_.size());
+                const bool avail = shortsha != current_;
+                // The remote VERSION only matters when we're behind — fetch it in
+                // the same poll so the panel has "Latest" the moment it appears.
+                std::string ver;
+                if (avail) ver = fetch_remote_version(slug_);
                 {
                     std::lock_guard lock(mu_);
                     remote_ = shortsha;
+                    remote_version_ = ver;   // "" when up to date or the fetch failed
                 }
-                available_.store(shortsha != current_, std::memory_order_release);
+                available_.store(avail, std::memory_order_release);
                 last_ok_.store(true, std::memory_order_release);
             } else {
                 last_ok_.store(false, std::memory_order_release);
