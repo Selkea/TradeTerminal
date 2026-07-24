@@ -418,6 +418,10 @@ App::App(std::string gateway_url)
                    cfg_.trade_record, cfg_.trade_route);
     trade_.restore_schedule(cfg_.trade_sched_on, cfg_.trade_sched_start,
                             cfg_.trade_sched_stop);
+    if (!cfg_.lineup_build_time.empty() &&
+        cfg_.lineup_build_time.size() < sizeof lineup_build_buf_)
+        std::snprintf(lineup_build_buf_, sizeof lineup_build_buf_, "%s",
+                      cfg_.lineup_build_time.c_str());
     {
         RiskLimits r;
         r.max_order_qty = cfg_.risk_max_order_qty;
@@ -1062,7 +1066,44 @@ void App::finish_tournament() {
 
 // ---- daily auto-lineup ----------------------------------------------------
 
-void App::start_daily_lineup() {
+TradePanel::AccountInfo App::trade_account_info() {
+    TradePanel::AccountInfo a;
+    const auto ib = read_ibkr_accounts();
+    for (const auto& x : ib.accounts)
+        if (x.name == ib.active) { a.label = x.label; break; }
+    a.kind = static_cast<int>(data_.account_kind());
+    a.readonly = ib.active_readonly();
+    a.subaccounts = data_.accounts();
+    return a;
+}
+
+// Fire the daily lineup build on the configured pre-market clock: weekday,
+// once per day, level-triggered inside a short window after the time so a late
+// launch still catches it. On a non-propose-only build the lineup arms its own
+// auto-start when it reaches Done (see pump_daily_lineup / start_live_session).
+void App::pump_lineup_schedule() {
+    if (!cfg_.lineup_enabled) return;
+    // Never interrupt a running session or an in-flight build/optimize.
+    if (lineup_active() || engine_.running() || tourn_.active || sweep_.running) return;
+    int bh = -1, bm = -1;
+    if (std::sscanf(cfg_.lineup_build_time.c_str(), "%d:%d", &bh, &bm) != 2) return;
+    if (bh < 0 || bh > 23 || bm < 0 || bm > 59) return;
+    const int build_min = bh * 60 + bm;
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
+    if (!weekday) return;
+    if (tm.tm_yday == lineup_last_build_day_) return;   // one build per day
+    const int now_min = tm.tm_hour * 60 + tm.tm_min;
+    if (now_min < build_min || now_min > build_min + 30) return;   // in the window
+    lineup_last_build_day_ = tm.tm_yday;
+    log_.add("lineup: scheduled build (" + cfg_.lineup_build_time +
+             (cfg_.lineup_propose_only ? ", propose-only)" : ", auto-start)"));
+    start_daily_lineup(!cfg_.lineup_propose_only);
+}
+
+void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         log_.add("lineup: already building");
         return;
@@ -1084,6 +1125,7 @@ void App::start_daily_lineup() {
         return;
     }
     lineup_ = DailyLineup{};
+    lineup_.autostart = autostart_when_done;
     lineup_.spec.scan_code = cfg_.lineup_scan_code;
     lineup_.spec.location = cfg_.lineup_location;
     lineup_.spec.instrument = "STK";
@@ -1256,6 +1298,10 @@ void App::pump_daily_lineup() {
     case Phase::Done:
         log_.add("lineup: ready - " + std::to_string(lineup_.picks.size()) +
                  " symbols loaded into the Trade tabs");
+        // Arm the auto-start for the draw() call site, which has the account +
+        // data-availability context to build the StartOpts (see start_live_session
+        // wiring). propose_only lineups leave this false and just log the picks.
+        if (lineup_.autostart) lineup_autostart_pending_ = true;
         lineup_.phase = Phase::Idle;
         return;
     }
@@ -1943,6 +1989,7 @@ void App::draw() {
     pump_sweep();   // before the panels: sweep results must not be stolen
     pump_tournament();
     pump_autopilot();
+    pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
     pump_daily_lineup();
 
     draw_menu_bar();
@@ -2078,265 +2125,29 @@ void App::draw() {
                         start_tournament(rq, sym);
                     },
                     !polygon_key().empty(), !finnhub_key().empty(), data_.connected(),
-                    [&] {
-                        TradePanel::AccountInfo a;
-                        const auto ib = read_ibkr_accounts();
-                        for (const auto& x : ib.accounts)
-                            if (x.name == ib.active) { a.label = x.label; break; }
-                        a.kind = static_cast<int>(data_.account_kind());
-                        a.readonly = ib.active_readonly();
-                        a.subaccounts = data_.accounts();
-                        return a;
-                    }(),
-                    [this](const TradePanel::StartOpts& opts) {
-                        std::vector<std::string> syms;
-                        std::vector<int> sym_bars;
-                        std::vector<std::string> sym_accts;
-                        std::vector<RiskLimits> sym_risk;
-                        bool any_record = false;
-                        // Session-level equity/stale halts run on one portfolio, so
-                        // drive them from the tightest (min non-zero) per-symbol value.
-                        RiskLimits session_risk{};
-                        session_risk.daily_max_loss = 0;
-                        session_risk.max_drawdown_pct = 0;
-                        session_risk.stale_feed_sec = 0;
-                        auto tight = [](double cur, double v) {
-                            return v > 0 && (cur == 0 || v < cur) ? v : cur;
-                        };
-                        for (const auto& so : opts.symbols) {
-                            syms.push_back(so.symbol);
-                            sym_bars.push_back(so.bar_seconds);
-                            sym_accts.push_back(so.account);
-                            sym_risk.push_back(so.risk);
-                            any_record = any_record || so.record;
-                            session_risk.daily_max_loss =
-                                tight(session_risk.daily_max_loss, so.risk.daily_max_loss);
-                            session_risk.max_drawdown_pct = tight(
-                                session_risk.max_drawdown_pct, so.risk.max_drawdown_pct);
-                            if (so.risk.stale_feed_sec > 0 &&
-                                (session_risk.stale_feed_sec == 0 ||
-                                 so.risk.stale_feed_sec < session_risk.stale_feed_sec))
-                                session_risk.stale_feed_sec = so.risk.stale_feed_sec;
-                        }
-                        // Session default bar size (feed gap-backfill granularity);
-                        // each symbol still aggregates at its own size below.
-                        const int session_bar =
-                            opts.symbols.empty() ? 60 : opts.symbols.front().bar_seconds;
-                        LiveConfig cfg;
-                        cfg.symbols = syms;
-                        cfg.initial_cash = opts.session_cash;
-                        // Session-level params stay empty: every symbol carries its
-                        // own map in symbol_params (ctx.param resolves per symbol).
-                        cfg.bar_seconds = session_bar;
-                        cfg.symbol_bar_seconds = sym_bars;
-                        cfg.risk = session_risk;
-                        cfg.symbol_risk = sym_risk;
-                        // Every data source is real-time now => spin the engine
-                        // thread; ticks are handled in ns, not after Sleep(5).
-                        cfg.busy_spin = true;
-                        // Optional core pinning (TT_PIN_ENGINE / TT_PIN_FEED =
-                        // core index): kills scheduler-migration jitter.
-                        if (const char* pin = std::getenv("TT_PIN_ENGINE"))
-                            cfg.pin_core = std::atoi(pin);
-                        // Simulator fills model the real IBKR order path: the
-                        // live-measured submit->ack latency once enough acks are
-                        // in, else the VPS default (~15 ms RTT + gateway/backend
-                        // processing => ~75 ms). Matters for scalping; negligible
-                        // for bar-scale strategies.
-                        {
-                            const auto [lat, jit] = sim_exec_latency(cfg_);
-                            cfg.exec.latency_ns = lat;
-                            cfg.exec.latency_jitter_ns = jit;
-                        }
-                        // Per-strategy callback watchdog (huge headroom over the
-                        // µs a normal callback takes; catches runaways only).
-                        cfg.watchdog_ms = 250;
-                        if (const char* w = std::getenv("TT_WATCHDOG_MS"))
-                            cfg.watchdog_ms = std::atoi(w);
-                        if (any_record) {
-                            std::error_code ec;
-                            std::filesystem::create_directories(sessions_dir(), ec);
-                            char name[32];
-                            const std::time_t now = std::time(nullptr);
-                            std::tm tm{};
-                            localtime_s(&tm, &now);
-                            std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
-                            cfg.capture_path = sessions_dir() + "\\" + name;
-                        }
-                        std::unique_ptr<IbkrBroker> ibkr_broker;
-                        std::unique_ptr<TwsBroker> tws_broker;
-                        if (opts.broker == TradePanel::Broker::Ibkr) {
-                            IbkrConfig ic;
-                            if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
-                                ic.gateway_url = gw;
-                            ic.symbols = syms;
-                            ic.symbol_accounts = sym_accts;   // per-symbol sub-account routing
-                            ic.read_only = read_ibkr_accounts().active_readonly();
-                            ibkr_broker = std::make_unique<IbkrBroker>(std::move(ic));
-                            cfg.broker = ibkr_broker.get();
-                            log_.add(ic.read_only
-                                         ? "live: IBKR account is READ-ONLY — orders blocked"
-                                         : "live: routing orders to IBKR gateway");
-                        } else if (opts.broker == TradePanel::Broker::Tws) {
-                            TwsConfig tc;
-                            tc.port = tws_api_port();
-                            tc.symbols = syms;
-                            tc.symbol_accounts = sym_accts;
-                            tc.read_only = read_ibkr_accounts().active_readonly();
-                            const int port = tc.port;
-                            tws_broker = std::make_unique<TwsBroker>(std::move(tc));
-                            cfg.broker = tws_broker.get();
-                            log_.add("live: routing orders via TWS socket (port " +
-                                     std::to_string(port) + ")");
-                        }
-                        // Each symbol needs its strategy built + loaded first.
-                        std::string unbuilt;
-                        for (const auto& so : opts.symbols)
-                            if (!so.strat_key.empty() &&
-                                !strat_mgr_.loaded_fresh(so.strat_key)) {
-                                strat_mgr_.request_load(so.strat_key);
-                                unbuilt += (unbuilt.empty() ? "" : ", ") + so.strat_key;
-                            }
-                        if (!unbuilt.empty()) {
-                            log_.add("live: building strategies (" + unbuilt +
-                                     ") — click Start Trading again");
-                            return;
-                        }
-                        // One strategy instance + param set per symbol.
-                        std::vector<IStrategy*> strategies;
-                        std::vector<StrategyLease> new_leases;
-                        bool acq_ok = true;
-                        for (const auto& so : opts.symbols) {
-                            IStrategy* inst = acquire_strategy(so.strat_key);
-                            if (!inst) {
-                                log_.add("live: strategy '" +
-                                         strat_mgr_.display_name(so.strat_key) +
-                                         "' failed to load");
-                                acq_ok = false;
-                                break;
-                            }
-                            strategies.push_back(inst);
-                            cfg.symbol_params.push_back(
-                                so.params.empty() ? strat_mgr_.param_values(so.strat_key)
-                                                   : so.params);
-                            new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
-                        }
-                        if (!acq_ok) {
-                            for (const auto& l : new_leases) release_strategy(l);
-                            return;
-                        }
-                        if (engine_.start_live(std::move(cfg), std::move(strategies))) {
-                            for (const auto& l : new_leases) leases_.push_back(l);
-                            // Arm the autopilot for symbols that asked for it.
-                            ap_ = Autopilot{};
-                            for (size_t i = 0; i < opts.symbols.size(); ++i) {
-                                const auto& so = opts.symbols[i];
-                                if (so.ap_mode <= 0) continue;
-                                Autopilot::Sym aps;
-                                aps.symbol = so.symbol;
-                                aps.sid = static_cast<uint32_t>(i + 1);
-                                aps.mode = so.ap_mode;
-                                aps.trigger = so.ap_trigger;
-                                aps.interval_min = so.ap_interval_min;
-                                aps.dd_pct = so.ap_dd_pct;
-                                aps.key = so.strat_key;
-                                aps.last_cycle_s = ImGui::GetTime();
-                                ap_.syms.push_back(std::move(aps));
-                            }
-                            if (!ap_.syms.empty())
-                                log_.add("autopilot: armed for " +
-                                         std::to_string(ap_.syms.size()) + " symbol(s)");
-                            // The engine's live thread was joined inside start_live,
-                            // so it's safe to drop whatever the previous session left
-                            // here — but normally safe_stop_live() has already reaped
-                            // these (see reap_async), so this is just defense in depth
-                            // (e.g. Start clicked again without an intervening Stop).
-                            // TWS's connect call is blocking, so any of these COULD be
-                            // mid-reconnect; never destroy them synchronously here.
-                            reap_async(std::move(ibkr_));
-                            reap_async(std::move(tws_));
-                            ibkr_ = std::move(ibkr_broker);
-                            tws_ = std::move(tws_broker);
-                            reap_async(std::move(polygon_feed_));   // previous session's feeds
-                            reap_async(std::move(finnhub_feed_));
-                            reap_async(std::move(ibkr_feed_));
-                            reap_async(std::move(tws_feed_));
-                            rt_feed_active_.store(false, std::memory_order_relaxed);
-                            const auto sink = [this](const EngineEvent& ev) {
-                                return engine_.push_feed_event(ev);
-                            };
-                            if (opts.data == TradePanel::DataFeed::Polygon &&
-                                !polygon_key().empty()) {
-                                PolygonFeedConfig pc;
-                                pc.api_key = polygon_key();
-                                // e.g. wss://delayed.polygon.io/stocks to test the
-                                // adapter on the $29 delayed tier (same protocol).
-                                if (const char* ws = std::getenv("TT_POLYGON_WS"))
-                                    pc.stream_url = ws;
-                                pc.symbols = syms;
-                                pc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
-                                if (const char* pin = std::getenv("TT_PIN_FEED"))
-                                    pc.pin_core = std::atoi(pin);
-                                pc.bar_seconds = session_bar;
-                                polygon_feed_ =
-                                    std::make_unique<PolygonFeed>(std::move(pc), sink);
-                                polygon_feed_->start();
-                                rt_feed_active_.store(true, std::memory_order_relaxed);
-                            } else if (opts.data == TradePanel::DataFeed::Tws) {
-                                TwsFeedConfig fc;
-                                fc.port = tws_api_port();
-                                fc.symbols = syms;
-                                tws_feed_ =
-                                    std::make_unique<TwsFeed>(std::move(fc), sink);
-                                tws_feed_->start();
-                                rt_feed_active_.store(true, std::memory_order_relaxed);
-                            } else if (opts.data == TradePanel::DataFeed::Finnhub &&
-                                       !finnhub_key().empty()) {
-                                FinnhubFeedConfig fc;
-                                fc.api_key = finnhub_key();
-                                if (const char* ws = std::getenv("TT_FINNHUB_WS"))
-                                    fc.stream_url = ws;
-                                fc.symbols = syms;
-                                fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
-                                if (const char* pin = std::getenv("TT_PIN_FEED"))
-                                    fc.pin_core = std::atoi(pin);
-                                fc.bar_seconds = session_bar;
-                                finnhub_feed_ =
-                                    std::make_unique<FinnhubFeed>(std::move(fc), sink);
-                                finnhub_feed_->start();
-                                rt_feed_active_.store(true, std::memory_order_relaxed);
-                            } else if (opts.data == TradePanel::DataFeed::Ibkr) {
-                                IbkrFeedConfig fc;
-                                if (const char* gw = std::getenv("TT_IBKR_GATEWAY")) {
-                                    fc.gateway_url = gw;
-                                    // wss://host/v1/api/ws mirrors the REST base.
-                                    std::string ws = fc.gateway_url;
-                                    if (ws.rfind("https://", 0) == 0)
-                                        ws.replace(0, 8, "wss://");
-                                    fc.ws_url = ws + "/ws";
-                                }
-                                fc.symbols = syms;
-                                fc.bar_seconds = session_bar;
-                                if (const char* pin = std::getenv("TT_PIN_FEED"))
-                                    fc.pin_core = std::atoi(pin);
-                                ibkr_feed_ =
-                                    std::make_unique<IbkrFeed>(std::move(fc), sink);
-                                ibkr_feed_->start();
-                                rt_feed_active_.store(true, std::memory_order_relaxed);
-                            }
-                            for (const std::string& sym : syms)
-                                watchlist_.ensure(sym);  // quote subscription feeds the engine
-                            // Log each symbol with the strategy it runs.
-                            std::string joined;
-                            for (const auto& so : opts.symbols)
-                                joined += (joined.empty() ? "" : ", ") + so.symbol + ":" +
-                                          strat_mgr_.display_name(so.strat_key);
-                            log_.add("live: session queued for " + joined);
-                        } else {
-                            for (const auto& l : new_leases) release_strategy(l);
-                            log_.add("live: cannot start (engine busy)");
-                        }
-                    });
+                    trade_account_info(),
+                    [this](const TradePanel::StartOpts& opts) { start_live_session(opts); });
+    // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
+    // so start the live session through the exact path the Start button uses.
+    if (lineup_autostart_pending_) {
+        lineup_autostart_pending_ = false;
+        if (engine_.live_running()) {
+            log_.add("lineup: a session is already running - skipping auto-start");
+        } else if (!trade_.has_symbols()) {
+            log_.add("lineup: no symbols to auto-start");
+        } else {
+            log_.add("lineup: auto-starting the live session");
+            start_live_session(trade_.build_start_opts(
+                trade_account_info(),
+                [this](const std::string& k) {
+                    std::vector<TradePanel::StratParam> out;
+                    for (const auto& s : strat_mgr_.param_specs(k))
+                        out.push_back({s.name, s.value, s.min, s.max});
+                    return out;
+                },
+                !polygon_key().empty(), !finnhub_key().empty(), data_.connected()));
+        }
+    }
     if (show_blotter_) blotter_.draw(&show_blotter_);
     if (show_positions_) positions_.draw(&show_positions_);
     if (show_journal_) journal_panel_.draw(&show_journal_);
@@ -2401,6 +2212,256 @@ void App::draw() {
     }
     if (show_imgui_demo_) ImGui::ShowDemoWindow(&show_imgui_demo_);
     if (show_implot_demo_) ImPlot::ShowDemoWindow(&show_implot_demo_);
+}
+
+void App::start_live_session(const TradePanel::StartOpts& opts) {
+    std::vector<std::string> syms;
+    std::vector<int> sym_bars;
+    std::vector<std::string> sym_accts;
+    std::vector<RiskLimits> sym_risk;
+    bool any_record = false;
+    // Session-level equity/stale halts run on one portfolio, so
+    // drive them from the tightest (min non-zero) per-symbol value.
+    RiskLimits session_risk{};
+    session_risk.daily_max_loss = 0;
+    session_risk.max_drawdown_pct = 0;
+    session_risk.stale_feed_sec = 0;
+    auto tight = [](double cur, double v) {
+        return v > 0 && (cur == 0 || v < cur) ? v : cur;
+    };
+    for (const auto& so : opts.symbols) {
+        syms.push_back(so.symbol);
+        sym_bars.push_back(so.bar_seconds);
+        sym_accts.push_back(so.account);
+        sym_risk.push_back(so.risk);
+        any_record = any_record || so.record;
+        session_risk.daily_max_loss =
+            tight(session_risk.daily_max_loss, so.risk.daily_max_loss);
+        session_risk.max_drawdown_pct = tight(
+            session_risk.max_drawdown_pct, so.risk.max_drawdown_pct);
+        if (so.risk.stale_feed_sec > 0 &&
+            (session_risk.stale_feed_sec == 0 ||
+             so.risk.stale_feed_sec < session_risk.stale_feed_sec))
+            session_risk.stale_feed_sec = so.risk.stale_feed_sec;
+    }
+    // Session default bar size (feed gap-backfill granularity);
+    // each symbol still aggregates at its own size below.
+    const int session_bar =
+        opts.symbols.empty() ? 60 : opts.symbols.front().bar_seconds;
+    LiveConfig cfg;
+    cfg.symbols = syms;
+    cfg.initial_cash = opts.session_cash;
+    // Session-level params stay empty: every symbol carries its
+    // own map in symbol_params (ctx.param resolves per symbol).
+    cfg.bar_seconds = session_bar;
+    cfg.symbol_bar_seconds = sym_bars;
+    cfg.risk = session_risk;
+    cfg.symbol_risk = sym_risk;
+    // Every data source is real-time now => spin the engine
+    // thread; ticks are handled in ns, not after Sleep(5).
+    cfg.busy_spin = true;
+    // Optional core pinning (TT_PIN_ENGINE / TT_PIN_FEED =
+    // core index): kills scheduler-migration jitter.
+    if (const char* pin = std::getenv("TT_PIN_ENGINE"))
+        cfg.pin_core = std::atoi(pin);
+    // Simulator fills model the real IBKR order path: the
+    // live-measured submit->ack latency once enough acks are
+    // in, else the VPS default (~15 ms RTT + gateway/backend
+    // processing => ~75 ms). Matters for scalping; negligible
+    // for bar-scale strategies.
+    {
+        const auto [lat, jit] = sim_exec_latency(cfg_);
+        cfg.exec.latency_ns = lat;
+        cfg.exec.latency_jitter_ns = jit;
+    }
+    // Per-strategy callback watchdog (huge headroom over the
+    // µs a normal callback takes; catches runaways only).
+    cfg.watchdog_ms = 250;
+    if (const char* w = std::getenv("TT_WATCHDOG_MS"))
+        cfg.watchdog_ms = std::atoi(w);
+    if (any_record) {
+        std::error_code ec;
+        std::filesystem::create_directories(sessions_dir(), ec);
+        char name[32];
+        const std::time_t now = std::time(nullptr);
+        std::tm tm{};
+        localtime_s(&tm, &now);
+        std::strftime(name, sizeof name, "%Y%m%d_%H%M%S.ttk", &tm);
+        cfg.capture_path = sessions_dir() + "\\" + name;
+    }
+    std::unique_ptr<IbkrBroker> ibkr_broker;
+    std::unique_ptr<TwsBroker> tws_broker;
+    if (opts.broker == TradePanel::Broker::Ibkr) {
+        IbkrConfig ic;
+        if (const char* gw = std::getenv("TT_IBKR_GATEWAY"))
+            ic.gateway_url = gw;
+        ic.symbols = syms;
+        ic.symbol_accounts = sym_accts;   // per-symbol sub-account routing
+        ic.read_only = read_ibkr_accounts().active_readonly();
+        ibkr_broker = std::make_unique<IbkrBroker>(std::move(ic));
+        cfg.broker = ibkr_broker.get();
+        log_.add(ic.read_only
+                     ? "live: IBKR account is READ-ONLY — orders blocked"
+                     : "live: routing orders to IBKR gateway");
+    } else if (opts.broker == TradePanel::Broker::Tws) {
+        TwsConfig tc;
+        tc.port = tws_api_port();
+        tc.symbols = syms;
+        tc.symbol_accounts = sym_accts;
+        tc.read_only = read_ibkr_accounts().active_readonly();
+        const int port = tc.port;
+        tws_broker = std::make_unique<TwsBroker>(std::move(tc));
+        cfg.broker = tws_broker.get();
+        log_.add("live: routing orders via TWS socket (port " +
+                 std::to_string(port) + ")");
+    }
+    // Each symbol needs its strategy built + loaded first.
+    std::string unbuilt;
+    for (const auto& so : opts.symbols)
+        if (!so.strat_key.empty() &&
+            !strat_mgr_.loaded_fresh(so.strat_key)) {
+            strat_mgr_.request_load(so.strat_key);
+            unbuilt += (unbuilt.empty() ? "" : ", ") + so.strat_key;
+        }
+    if (!unbuilt.empty()) {
+        log_.add("live: building strategies (" + unbuilt +
+                 ") — click Start Trading again");
+        return;
+    }
+    // One strategy instance + param set per symbol.
+    std::vector<IStrategy*> strategies;
+    std::vector<StrategyLease> new_leases;
+    bool acq_ok = true;
+    for (const auto& so : opts.symbols) {
+        IStrategy* inst = acquire_strategy(so.strat_key);
+        if (!inst) {
+            log_.add("live: strategy '" +
+                     strat_mgr_.display_name(so.strat_key) +
+                     "' failed to load");
+            acq_ok = false;
+            break;
+        }
+        strategies.push_back(inst);
+        cfg.symbol_params.push_back(
+            so.params.empty() ? strat_mgr_.param_values(so.strat_key)
+                               : so.params);
+        new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
+    }
+    if (!acq_ok) {
+        for (const auto& l : new_leases) release_strategy(l);
+        return;
+    }
+    if (engine_.start_live(std::move(cfg), std::move(strategies))) {
+        for (const auto& l : new_leases) leases_.push_back(l);
+        // Arm the autopilot for symbols that asked for it.
+        ap_ = Autopilot{};
+        for (size_t i = 0; i < opts.symbols.size(); ++i) {
+            const auto& so = opts.symbols[i];
+            if (so.ap_mode <= 0) continue;
+            Autopilot::Sym aps;
+            aps.symbol = so.symbol;
+            aps.sid = static_cast<uint32_t>(i + 1);
+            aps.mode = so.ap_mode;
+            aps.trigger = so.ap_trigger;
+            aps.interval_min = so.ap_interval_min;
+            aps.dd_pct = so.ap_dd_pct;
+            aps.key = so.strat_key;
+            aps.last_cycle_s = ImGui::GetTime();
+            ap_.syms.push_back(std::move(aps));
+        }
+        if (!ap_.syms.empty())
+            log_.add("autopilot: armed for " +
+                     std::to_string(ap_.syms.size()) + " symbol(s)");
+        // The engine's live thread was joined inside start_live,
+        // so it's safe to drop whatever the previous session left
+        // here — but normally safe_stop_live() has already reaped
+        // these (see reap_async), so this is just defense in depth
+        // (e.g. Start clicked again without an intervening Stop).
+        // TWS's connect call is blocking, so any of these COULD be
+        // mid-reconnect; never destroy them synchronously here.
+        reap_async(std::move(ibkr_));
+        reap_async(std::move(tws_));
+        ibkr_ = std::move(ibkr_broker);
+        tws_ = std::move(tws_broker);
+        reap_async(std::move(polygon_feed_));   // previous session's feeds
+        reap_async(std::move(finnhub_feed_));
+        reap_async(std::move(ibkr_feed_));
+        reap_async(std::move(tws_feed_));
+        rt_feed_active_.store(false, std::memory_order_relaxed);
+        const auto sink = [this](const EngineEvent& ev) {
+            return engine_.push_feed_event(ev);
+        };
+        if (opts.data == TradePanel::DataFeed::Polygon &&
+            !polygon_key().empty()) {
+            PolygonFeedConfig pc;
+            pc.api_key = polygon_key();
+            // e.g. wss://delayed.polygon.io/stocks to test the
+            // adapter on the $29 delayed tier (same protocol).
+            if (const char* ws = std::getenv("TT_POLYGON_WS"))
+                pc.stream_url = ws;
+            pc.symbols = syms;
+            pc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
+            if (const char* pin = std::getenv("TT_PIN_FEED"))
+                pc.pin_core = std::atoi(pin);
+            pc.bar_seconds = session_bar;
+            polygon_feed_ =
+                std::make_unique<PolygonFeed>(std::move(pc), sink);
+            polygon_feed_->start();
+            rt_feed_active_.store(true, std::memory_order_relaxed);
+        } else if (opts.data == TradePanel::DataFeed::Tws) {
+            TwsFeedConfig fc;
+            fc.port = tws_api_port();
+            fc.symbols = syms;
+            tws_feed_ =
+                std::make_unique<TwsFeed>(std::move(fc), sink);
+            tws_feed_->start();
+            rt_feed_active_.store(true, std::memory_order_relaxed);
+        } else if (opts.data == TradePanel::DataFeed::Finnhub &&
+                   !finnhub_key().empty()) {
+            FinnhubFeedConfig fc;
+            fc.api_key = finnhub_key();
+            if (const char* ws = std::getenv("TT_FINNHUB_WS"))
+                fc.stream_url = ws;
+            fc.symbols = syms;
+            fc.busy_poll = std::getenv("TT_FEED_SPIN") != nullptr;
+            if (const char* pin = std::getenv("TT_PIN_FEED"))
+                fc.pin_core = std::atoi(pin);
+            fc.bar_seconds = session_bar;
+            finnhub_feed_ =
+                std::make_unique<FinnhubFeed>(std::move(fc), sink);
+            finnhub_feed_->start();
+            rt_feed_active_.store(true, std::memory_order_relaxed);
+        } else if (opts.data == TradePanel::DataFeed::Ibkr) {
+            IbkrFeedConfig fc;
+            if (const char* gw = std::getenv("TT_IBKR_GATEWAY")) {
+                fc.gateway_url = gw;
+                // wss://host/v1/api/ws mirrors the REST base.
+                std::string ws = fc.gateway_url;
+                if (ws.rfind("https://", 0) == 0)
+                    ws.replace(0, 8, "wss://");
+                fc.ws_url = ws + "/ws";
+            }
+            fc.symbols = syms;
+            fc.bar_seconds = session_bar;
+            if (const char* pin = std::getenv("TT_PIN_FEED"))
+                fc.pin_core = std::atoi(pin);
+            ibkr_feed_ =
+                std::make_unique<IbkrFeed>(std::move(fc), sink);
+            ibkr_feed_->start();
+            rt_feed_active_.store(true, std::memory_order_relaxed);
+        }
+        for (const std::string& sym : syms)
+            watchlist_.ensure(sym);  // quote subscription feeds the engine
+        // Log each symbol with the strategy it runs.
+        std::string joined;
+        for (const auto& so : opts.symbols)
+            joined += (joined.empty() ? "" : ", ") + so.symbol + ":" +
+                      strat_mgr_.display_name(so.strat_key);
+        log_.add("live: session queued for " + joined);
+    } else {
+        for (const auto& l : new_leases) release_strategy(l);
+        log_.add("live: cannot start (engine busy)");
+    }
 }
 
 void App::request_quit() {
@@ -3003,6 +3064,25 @@ void App::draw_menu_bar() {
             "Scan IBKR for high-volatility movers, rank by ATR%%, run the strategy "
             "tournament on the top picks, and load them into the Trade tabs.\n"
             "Requires the IBKR (TWS) data route with no live session running.");
+
+        ImGui::Separator();
+        ImGui::MenuItem("Auto-build daily", nullptr, &cfg_.lineup_enabled);
+        ImGui::SetItemTooltip(
+            "Run the lineup build automatically each weekday at the time below.\n"
+            "It won't interrupt a running session or an in-flight build.");
+        ImGui::BeginDisabled(!cfg_.lineup_enabled);
+        ImGui::SetNextItemWidth(52);
+        if (ImGui::InputText("build time", lineup_build_buf_, sizeof lineup_build_buf_))
+            cfg_.lineup_build_time = lineup_build_buf_;
+        ImGui::SetItemTooltip("Local clock, HH:MM (24h). 09:35 gives the open a few\n"
+                              "minutes so the volatility ranking sees real range.");
+        bool autostart = !cfg_.lineup_propose_only;
+        if (ImGui::MenuItem("Auto-start the session", nullptr, &autostart))
+            cfg_.lineup_propose_only = !autostart;
+        ImGui::SetItemTooltip(
+            "On: after the daily build, start trading the picks automatically.\n"
+            "Off (default): build + log the picks only — you start the session.");
+        ImGui::EndDisabled();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {

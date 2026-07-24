@@ -219,6 +219,7 @@ private:
         std::set<std::string> awaiting;      // pool syms whose bars aren't in yet
         std::vector<std::string> picks;      // ranked winners (installed as tabs)
         std::size_t tourn_idx = 0;           // next pick to run a tournament for
+        bool autostart = false;              // on Done, start the live session
     };
     DailyLineup lineup_;
     // The scanner delivers hits on the I/O thread; hand them to the UI thread
@@ -231,10 +232,23 @@ private:
     // the UI-thread DailyLineup directly.
     std::set<std::string> lineup_want_bars_;
     std::vector<std::pair<std::string, std::vector<tt::RankBar>>> lineup_bar_inbox_;
-    void start_daily_lineup();                     // kick off (Trade menu / schedule)
+    void start_daily_lineup(bool autostart_when_done = false);  // Trade menu / schedule
     void pump_daily_lineup();                      // UI thread, per frame
     void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
     bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
+    // One live-start path shared by the Trade panel's Start button and the
+    // daily-lineup scheduler (extracted from the panel start callback so the
+    // scheduler can't drift from the manual path).
+    void start_live_session(const TradePanel::StartOpts& opts);
+    // The active-account snapshot the Trade panel header shows; also feeds the
+    // scheduler's auto-start so it routes to the same broker/sub-accounts.
+    TradePanel::AccountInfo trade_account_info();
+    // Fire start_daily_lineup on the configured pre-market clock (weekday,
+    // once/day); on Done, auto-start unless lineup_propose_only.
+    void pump_lineup_schedule();
+    int lineup_last_build_day_ = -1;         // tm_yday guard: one scheduled build/day
+    bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
+    char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {

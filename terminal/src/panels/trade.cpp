@@ -55,6 +55,41 @@ void TradePanel::set_lineup(const std::vector<std::string>& symbols) {
     want_tab_ = 0;
 }
 
+TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
+                                                   const ParamSpecsFn& strat_params,
+                                                   bool polygon_available,
+                                                   bool finnhub_available, bool ibkr_ready) {
+    // TWS route is explicit; web route follows the sign-in (else sim).
+    session_broker_ = route_ == 1 ? 2 : (ibkr_ready ? 1 : 0);
+    StartOpts opts;
+    opts.broker = static_cast<Broker>(session_broker_);
+    int data = data_idx_;
+    if (data == 1 && !polygon_available)
+        data = 0;   // no Polygon key: fall back to gateway data
+    if (data == 2 && !finnhub_available)
+        data = 0;   // no Finnhub key: fall back to gateway data
+    opts.data = static_cast<DataFeed>(data);
+    opts.session_cash = session_cash_;
+    for (const SymRow& r : pending_) {
+        const std::string acct =
+            account.subaccounts.size() > 1 &&
+                    r.account_idx < static_cast<int>(account.subaccounts.size())
+                ? account.subaccounts[r.account_idx] : std::string();
+        RiskLimits rk = r.risk;
+        rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
+        // This symbol's params for its current strategy (edited value or the
+        // strategy's current value); other strategies' edits ignored.
+        std::map<std::string, double> p;
+        for (const StratParam& sp : strat_params(r.strat_key)) {
+            const auto it = r.params.find(sp.name);
+            p[sp.name] = it != r.params.end() ? it->second : sp.value;
+        }
+        opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, r.strat_key, p, rk,
+                                r.ap_mode, r.ap_trigger, r.ap_interval_min, r.ap_dd_pct});
+    }
+    return opts;
+}
+
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                       const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
                       const AutoPickFn& autopick, bool polygon_available,
@@ -369,36 +404,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         }
 
         auto do_start = [&] {
-            // TWS route is explicit; web route follows the sign-in (else sim).
-            session_broker_ = route_ == 1 ? 2 : (ibkr_ready ? 1 : 0);
-            StartOpts opts;
-            opts.broker = static_cast<Broker>(session_broker_);
-            int data = data_idx_;
-            if (data == 1 && !polygon_available)
-                data = 0;   // no Polygon key: fall back to gateway data
-            if (data == 2 && !finnhub_available)
-                data = 0;   // no Finnhub key: fall back to gateway data
-            opts.data = static_cast<DataFeed>(data);
-            opts.session_cash = session_cash_;
-            for (const SymRow& r : pending_) {
-                const std::string acct =
-                    account.subaccounts.size() > 1 &&
-                            r.account_idx < static_cast<int>(account.subaccounts.size())
-                        ? account.subaccounts[r.account_idx] : std::string();
-                RiskLimits rk = r.risk;
-                rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
-                // This symbol's params for its current strategy (edited value or
-                // the strategy's current value); other strategies' edits ignored.
-                std::map<std::string, double> p;
-                for (const StratParam& sp : strat_params(r.strat_key)) {
-                    const auto it = r.params.find(sp.name);
-                    p[sp.name] = it != r.params.end() ? it->second : sp.value;
-                }
-                opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, r.strat_key,
-                                        p, rk, r.ap_mode, r.ap_trigger,
-                                        r.ap_interval_min, r.ap_dd_pct});
-            }
-            start(opts);
+            start(build_start_opts(account, strat_params, polygon_available,
+                                   finnhub_available, ibkr_ready));
         };
 
         ImGui::BeginDisabled(eng_.running());   // not while a backtest runs

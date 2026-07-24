@@ -84,6 +84,16 @@ public:
     // (keeps the current tabs rather than leaving the panel symbol-less).
     void set_lineup(const std::vector<std::string>& symbols);
 
+    // Build the StartOpts the "Start Trading" button would send, from the
+    // current tabs + panel settings (also latches session_broker_ for the
+    // running-session header). Exposed so the daily-lineup scheduler auto-starts
+    // through the exact same construction — one start path, no duplication.
+    StartOpts build_start_opts(const AccountInfo& account,
+                               const ParamSpecsFn& strat_params, bool polygon_available,
+                               bool finnhub_available, bool ibkr_ready);
+    // Whether any symbol tab exists (the scheduler won't auto-start an empty set).
+    bool has_symbols() const { return !pending_.empty(); }
+
     // Persisted: the shared cash pool + per-symbol defaults for new cards.
     double cash() const { return session_cash_; }
     int bar_sec() const { return def_bar_sec_; }
