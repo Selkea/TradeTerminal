@@ -21,7 +21,11 @@ public:
     ChartPanel(net::IMarketData& ipc, SeriesStore& store) : ipc_(ipc), store_(store) {}
 
     // fills: markers for the currently charted symbol (App matches symbols).
-    void draw(bool* open, const std::vector<FillMarker>& fills = {});
+    // live_price/live_ts_sec: the charted symbol's latest live price and tick
+    // time (0 = none). When present and intraday, the newest bar is refined /
+    // extended in real time without re-fetching (see approach B).
+    void draw(bool* open, const std::vector<FillMarker>& fills = {},
+              double live_price = 0.0, double live_ts_sec = 0.0);
     void show_symbol(const std::string& symbol);  // e.g. watchlist row clicked
 
     // Session persistence.
@@ -48,6 +52,10 @@ private:
 
     std::vector<double> xs_, opens_, highs_, lows_, closes_, vols_;
     double width_sec_ = 0.0;
+    // Live-tail state: ts of the last fetched (historical) bar, and the bucket of
+    // the live bar currently appended past it. Reset on every store rebuild.
+    double hist_last_ts_ = 0.0;
+    double live_tail_bucket_ = 0.0;
 };
 
 } // namespace tt::ui

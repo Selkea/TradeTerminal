@@ -8,12 +8,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 
 namespace tt::ui {
 
 namespace {
 constexpr const char* kIntervals[] = {"1m", "5m", "15m", "1h", "1d"};
+constexpr double kIntervalSec[] = {60, 300, 900, 3600, 86400};   // matches kIntervals
 constexpr const char* kRanges[] = {"1d", "5d", "1mo", "6mo", "1y", "5y", "max"};
 
 // Yahoo limits intraday history; clamp the range so requests don't 4xx.
@@ -69,9 +71,13 @@ void ChartPanel::rebuild_plot_arrays(const SeriesStore::Series& s) {
     }
     from_cache_ = s.cached;
     fit_next_ = true;
+    // The live tail restarts from the fresh historical data every rebuild.
+    hist_last_ts_ = n ? xs_[n - 1] : 0.0;
+    live_tail_bucket_ = 0.0;
 }
 
-void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills) {
+void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
+                      double live_price, double live_ts_sec) {
     const bool visible = ImGui::Begin("Chart", open);
     tab_drag_hint();
     if (!visible) {
@@ -107,6 +113,35 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills) {
     SeriesStore::Series series;
     if (store_.copy_if_newer(sym_, kIntervals[interval_idx_], seen_rev_, series))
         rebuild_plot_arrays(series);
+
+    // Live tail (approach B): refine the newest bar, or roll a new one, from the
+    // session's latest price — real-time updates without a historical re-fetch.
+    // Bucketing off the tick time means a stale feed simply stops extending it.
+    // Intraday only (daily-bar timestamps aren't reliably interval-aligned).
+    if (live_price > 0.0 && live_ts_sec > 0.0 && interval_idx_ < 4 && !xs_.empty()) {
+        const double ivl = kIntervalSec[interval_idx_];
+        const double bucket = std::floor(live_ts_sec / ivl) * ivl;
+        auto refine_back = [&] {
+            highs_.back() = std::max(highs_.back(), live_price);
+            lows_.back() = std::min(lows_.back(), live_price);
+            closes_.back() = live_price;
+        };
+        if (bucket == hist_last_ts_) {
+            refine_back();   // update the current (partially-fetched) bar
+        } else if (bucket > hist_last_ts_) {
+            if (bucket == live_tail_bucket_) {
+                refine_back();   // same live bar, still forming
+            } else {             // a new interval started: append a fresh bar
+                xs_.push_back(bucket);
+                opens_.push_back(live_price);
+                highs_.push_back(live_price);
+                lows_.push_back(live_price);
+                closes_.push_back(live_price);
+                vols_.push_back(0.0);
+                live_tail_bucket_ = bucket;
+            }
+        }
+    }
 
     const int n = static_cast<int>(xs_.size());
     static float ratios[] = {3.0f, 1.0f};

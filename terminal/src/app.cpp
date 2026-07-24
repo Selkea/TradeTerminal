@@ -2006,14 +2006,22 @@ void App::draw() {
             for (const TradeRow& t : r->fills)
                 fills.push_back({static_cast<double>(t.ts_ns) / 1e9, t.price,
                                  t.side == static_cast<uint8_t>(Side::Buy)});
+        double chart_live_px = 0.0, chart_live_ts = 0.0;
         if (engine_.live_running()) {
             const LiveSnapshot s = engine_.live_snapshot();
             for (const OrderRecord& o : s.orders)
                 if (o.status == OrderStatus::Filled && o.symbol == chart_sym)
                     fills.push_back({static_cast<double>(o.ts_ns) / 1e9, o.fill_price,
                                      o.side == static_cast<uint8_t>(Side::Buy)});
+            // Live tail for the charted symbol: its latest price + last tick time.
+            for (const SymbolState& ss : s.symbols)
+                if (ss.symbol == chart_sym && ss.last_price > 0.0) {
+                    chart_live_px = ss.last_price;
+                    chart_live_ts = static_cast<double>(s.last_tick_ts_ms) / 1000.0;
+                    break;
+                }
         }
-        chart_.draw(&show_chart_, fills);
+        chart_.draw(&show_chart_, fills, chart_live_px, chart_live_ts);
     }
     if (show_watchlist_)
         watchlist_.draw(&show_watchlist_, [this](const std::string& sym) {
