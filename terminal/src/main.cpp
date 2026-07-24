@@ -108,6 +108,10 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    // Create hidden so the dark-titlebar attribute can be applied before the
+    // window is first shown (see below) — otherwise Windows paints the titlebar
+    // white and won't repaint it until a size/restore.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     GLFWwindow* window =
         glfwCreateWindow(1600, 900, "TradeTerminal " TT_VERSION, nullptr, nullptr);
@@ -140,13 +144,19 @@ int main() {
     glfwSetWindowIcon(window, tt::ui::kAppIconCount, icon_images);
 
 #ifdef _WIN32
-    // Match the OS-drawn titlebar to the app's dark ImGui theme.
+    // Match the OS-drawn titlebar to the app's dark ImGui theme. Applied while
+    // the window is still hidden so the non-client area paints dark on its first
+    // show — setting it on an already-visible window leaves a white titlebar
+    // until a minimize/restore forces the repaint.
     {
         const BOOL dark = TRUE;
         DwmSetWindowAttribute(glfwGetWin32Window(window), DWMWA_USE_IMMERSIVE_DARK_MODE,
                               &dark, sizeof(dark));
     }
 #endif
+    // The window stays hidden (GLFW_VISIBLE=FALSE) until the first frame is
+    // painted below, so it appears already dark + rendered — no white-titlebar
+    // or unpainted flash on launch.
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -192,6 +202,7 @@ int main() {
     app.log().add(std::string("ImGui ") + IMGUI_VERSION + " (docking) + ImPlot " + IMPLOT_VERSION);
     app.log().add("Runtime data: " + data_dir.string());
 
+    bool window_shown = false;
     while (!app.should_quit()) {
         glfwPollEvents();
         // The window X only requests a close; the app quits immediately when
@@ -220,6 +231,10 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
+        if (!window_shown) {   // reveal only once a full frame is on screen
+            glfwShowWindow(window);
+            window_shown = true;
+        }
     }
 
 #ifdef _WIN32
