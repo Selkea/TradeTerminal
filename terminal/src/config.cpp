@@ -32,6 +32,16 @@ AppConfig AppConfig::load(const std::string& path) {
     c.trade_sched_on = j.value("trade_sched_on", c.trade_sched_on);
     c.trade_sched_start = j.value("trade_sched_start", c.trade_sched_start);
     c.trade_sched_stop = j.value("trade_sched_stop", c.trade_sched_stop);
+    c.lineup_enabled = j.value("lineup_enabled", c.lineup_enabled);
+    c.lineup_build_time = j.value("lineup_build_time", c.lineup_build_time);
+    c.lineup_propose_only = j.value("lineup_propose_only", c.lineup_propose_only);
+    c.lineup_scan_code = j.value("lineup_scan_code", c.lineup_scan_code);
+    c.lineup_location = j.value("lineup_location", c.lineup_location);
+    c.lineup_rows = j.value("lineup_rows", c.lineup_rows);
+    c.lineup_min_price = j.value("lineup_min_price", c.lineup_min_price);
+    c.lineup_min_dollar_vol = j.value("lineup_min_dollar_vol", c.lineup_min_dollar_vol);
+    c.lineup_top_n = j.value("lineup_top_n", c.lineup_top_n);
+    c.lineup_atr_len = j.value("lineup_atr_len", c.lineup_atr_len);
     c.alert_webhook = j.value("alert_webhook", c.alert_webhook);
     c.ibkr_gateway_cmd = j.value("ibkr_gateway_cmd", c.ibkr_gateway_cmd);
     c.risk_max_order_qty = j.value("risk_max_order_qty", c.risk_max_order_qty);
@@ -118,6 +128,16 @@ void AppConfig::save(const std::string& path) const {
         {"trade_sched_on", trade_sched_on},
         {"trade_sched_start", trade_sched_start},
         {"trade_sched_stop", trade_sched_stop},
+        {"lineup_enabled", lineup_enabled},
+        {"lineup_build_time", lineup_build_time},
+        {"lineup_propose_only", lineup_propose_only},
+        {"lineup_scan_code", lineup_scan_code},
+        {"lineup_location", lineup_location},
+        {"lineup_rows", lineup_rows},
+        {"lineup_min_price", lineup_min_price},
+        {"lineup_min_dollar_vol", lineup_min_dollar_vol},
+        {"lineup_top_n", lineup_top_n},
+        {"lineup_atr_len", lineup_atr_len},
         {"alert_webhook", alert_webhook},
         {"ibkr_gateway_cmd", ibkr_gateway_cmd},
         {"risk_max_order_qty", risk_max_order_qty},

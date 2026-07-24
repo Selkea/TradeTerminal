@@ -47,6 +47,21 @@ struct AppConfig {
     bool trade_sched_on = false;
     std::string trade_sched_start = "09:25";
     std::string trade_sched_stop = "15:55";
+
+    // Daily auto-lineup (IBKR scan -> volatility rank -> tournament). The scan
+    // and rank knobs feed the manual "Build today's lineup"; the schedule
+    // fields drive the automated pre-market build (stage 3 wiring).
+    bool lineup_enabled = false;              // auto-build on the session schedule
+    std::string lineup_build_time = "09:35";  // HH:MM local; after the open so the
+                                              // volatility ranking sees real range
+    bool lineup_propose_only = true;          // build + log picks, do NOT auto-start
+    std::string lineup_scan_code = "MOST_ACTIVE";
+    std::string lineup_location = "STK.US.MAJOR";
+    int lineup_rows = 30;                     // scan candidate pool size
+    double lineup_min_price = 5.0;            // price gate (last close)
+    double lineup_min_dollar_vol = 20e6;      // liquidity gate ($/day)
+    int lineup_top_n = 6;                     // how many symbols to trade
+    int lineup_atr_len = 14;                  // ATR window for the vol ranking
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;

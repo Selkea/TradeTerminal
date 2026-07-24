@@ -1084,15 +1084,17 @@ void App::start_daily_lineup() {
         return;
     }
     lineup_ = DailyLineup{};
-    lineup_.spec.scan_code = "MOST_ACTIVE";
-    lineup_.spec.location = "STK.US.MAJOR";
+    lineup_.spec.scan_code = cfg_.lineup_scan_code;
+    lineup_.spec.location = cfg_.lineup_location;
     lineup_.spec.instrument = "STK";
-    lineup_.spec.rows = 30;
-    lineup_.spec.price_above = 5.0;
-    lineup_.rank.atr_len = 14;
-    lineup_.rank.min_price = 5.0;
-    lineup_.rank.min_dollar_vol = 20e6;
-    lineup_.rank.top_n = 6;
+    lineup_.spec.rows = cfg_.lineup_rows > 0 ? cfg_.lineup_rows : 30;
+    lineup_.spec.price_above = cfg_.lineup_min_price;
+    lineup_.rank.atr_len = cfg_.lineup_atr_len > 0 ? cfg_.lineup_atr_len : 14;
+    lineup_.rank.min_price = cfg_.lineup_min_price;
+    lineup_.rank.min_dollar_vol = cfg_.lineup_min_dollar_vol;
+    lineup_.rank.top_n = cfg_.lineup_top_n > 0
+                             ? static_cast<std::size_t>(cfg_.lineup_top_n)
+                             : 6;
     {
         std::lock_guard<std::mutex> g(lineup_mu_);
         lineup_hits_.clear();
