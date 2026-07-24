@@ -405,6 +405,7 @@ App::App(std::string gateway_url)
                  std::to_string(b.candles.size()) + (b.cached ? " (cache)" : ""));
         start_pending_backtest(b);
         stash_pending_sweep(b);
+        collect_lineup_bars(b);   // before the move: needs b.candles
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
     };
 
@@ -1057,6 +1058,205 @@ void App::finish_tournament() {
                   kSweepMetrics[tourn_.base.metric], c.score,
                   c.holdout ? " on holdout" : "", tourn_.target_symbol.c_str());
     log_.add(buf);
+}
+
+// ---- daily auto-lineup ----------------------------------------------------
+
+void App::start_daily_lineup() {
+    if (lineup_.phase != DailyLineup::Phase::Idle) {
+        log_.add("lineup: already building");
+        return;
+    }
+    if (!use_tws_data_) {
+        log_.add("lineup: requires the IBKR (TWS) data route");
+        return;
+    }
+    if (!data_.connected()) {
+        log_.add("lineup: data session not connected");
+        return;
+    }
+    if (engine_.running()) {
+        log_.add("lineup: stop the live session first");
+        return;
+    }
+    if (tourn_.active || sweep_.running) {
+        log_.add("lineup: optimizer busy, try again");
+        return;
+    }
+    lineup_ = DailyLineup{};
+    lineup_.spec.scan_code = "MOST_ACTIVE";
+    lineup_.spec.location = "STK.US.MAJOR";
+    lineup_.spec.instrument = "STK";
+    lineup_.spec.rows = 30;
+    lineup_.spec.price_above = 5.0;
+    lineup_.rank.atr_len = 14;
+    lineup_.rank.min_price = 5.0;
+    lineup_.rank.min_dollar_vol = 20e6;
+    lineup_.rank.top_n = 6;
+    {
+        std::lock_guard<std::mutex> g(lineup_mu_);
+        lineup_hits_.clear();
+        lineup_hits_ready_ = false;
+        lineup_want_bars_.clear();
+        lineup_bar_inbox_.clear();
+    }
+    tws_data_.request_scan(lineup_.spec, [this](std::vector<net::ScanHit> hits) {
+        std::lock_guard<std::mutex> g(lineup_mu_);
+        lineup_hits_ = std::move(hits);
+        lineup_hits_ready_ = true;
+    });
+    lineup_.phase = DailyLineup::Phase::Scanning;
+    lineup_.stamp_s = ImGui::GetTime();
+    log_.add("lineup: scanning IBKR for high-volatility movers...");
+}
+
+// I/O thread (on_candles): stage a pool symbol's daily bars for the UI thread.
+void App::collect_lineup_bars(net::CandleBatch& b) {
+    if (b.interval != "1d") return;   // the lineup fetches daily bars only
+    std::lock_guard<std::mutex> g(lineup_mu_);
+    if (lineup_want_bars_.count(b.symbol) == 0) return;
+    std::vector<tt::RankBar> bars;
+    bars.reserve(b.candles.size());
+    for (const auto& c : b.candles)
+        bars.push_back({c.high, c.low, c.close, c.volume});
+    lineup_bar_inbox_.emplace_back(b.symbol, std::move(bars));
+}
+
+void App::pump_daily_lineup() {
+    using Phase = DailyLineup::Phase;
+    const double now = ImGui::GetTime();
+    switch (lineup_.phase) {
+    case Phase::Idle:
+        return;
+
+    case Phase::Scanning: {
+        std::vector<net::ScanHit> hits;
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            if (lineup_hits_ready_) {
+                hits = std::move(lineup_hits_);
+                lineup_hits_.clear();
+                lineup_hits_ready_ = false;
+                ready = true;
+            }
+        }
+        if (!ready) {
+            if (now - lineup_.stamp_s > 30.0) {
+                log_.add("lineup: scan timed out");
+                lineup_.phase = Phase::Idle;
+            }
+            return;
+        }
+        std::set<std::string> seen;
+        for (const auto& h : hits) {
+            if (h.symbol.empty() || seen.count(h.symbol)) continue;
+            seen.insert(h.symbol);
+            lineup_.pool.push_back(h.symbol);
+        }
+        if (lineup_.pool.empty()) {
+            log_.add("lineup: scan returned no candidates");
+            lineup_.phase = Phase::Idle;
+            return;
+        }
+        log_.add("lineup: " + std::to_string(lineup_.pool.size()) +
+                 " candidates - fetching daily bars to rank");
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            lineup_want_bars_ = {lineup_.pool.begin(), lineup_.pool.end()};
+            lineup_bar_inbox_.clear();
+        }
+        lineup_.awaiting = {lineup_.pool.begin(), lineup_.pool.end()};
+        lineup_.bars.clear();
+        for (const std::string& sym : lineup_.pool)
+            data_.request_candles(sym, "1d", "1mo");
+        lineup_.phase = Phase::FetchingBars;
+        lineup_.stamp_s = now;
+        return;
+    }
+
+    case Phase::FetchingBars: {
+        std::vector<std::pair<std::string, std::vector<tt::RankBar>>> arrived;
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            arrived.swap(lineup_bar_inbox_);
+        }
+        for (auto& [sym, bars] : arrived) {
+            lineup_.bars[sym] = std::move(bars);
+            lineup_.awaiting.erase(sym);
+        }
+        if (!arrived.empty()) lineup_.stamp_s = now;   // reset the quiet timer
+        // Proceed once every symbol answered, or after a quiet stretch — some
+        // history requests error out and their bars never arrive.
+        const bool quiet = now - lineup_.stamp_s > 15.0;
+        if (!lineup_.awaiting.empty() && !quiet) return;
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            lineup_want_bars_.clear();
+        }
+        lineup_.phase = Phase::Ranking;
+        lineup_.stamp_s = now;
+        return;
+    }
+
+    case Phase::Ranking: {
+        std::vector<tt::RankCandidate> cands;
+        cands.reserve(lineup_.bars.size());
+        for (auto& [sym, bars] : lineup_.bars)
+            cands.push_back({sym, std::move(bars)});
+        const auto ranked = tt::rank_by_volatility(cands, lineup_.rank);
+        lineup_.picks.clear();
+        for (const auto& r : ranked) lineup_.picks.push_back(r.symbol);
+        if (lineup_.picks.empty()) {
+            log_.add("lineup: no candidate cleared the price/liquidity gates");
+            lineup_.phase = Phase::Idle;
+            return;
+        }
+        std::string msg = "lineup: picks -";
+        for (const auto& r : ranked) {
+            char b[48];
+            std::snprintf(b, sizeof b, " %s(%.1f%%)", r.symbol.c_str(),
+                          r.atr_pct * 100.0);
+            msg += b;
+        }
+        log_.add(msg);
+        trade_.set_lineup(lineup_.picks);
+        show_trade_ = true;   // surface the freshly built tabs
+        lineup_.tourn_idx = 0;
+        lineup_.phase = Phase::Tournaments;
+        lineup_.stamp_s = now;
+        return;
+    }
+
+    case Phase::Tournaments: {
+        if (tourn_.active || sweep_.running) return;   // let the current one finish
+        if (lineup_.tourn_idx >= lineup_.picks.size()) {
+            lineup_.phase = Phase::Done;
+            return;
+        }
+        const SweepPanel::Settings st = sweep_panel_.settings();
+        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
+        static constexpr const char* kRng[] = {"1mo", "6mo", "1y", "2y", "5y", "max"};
+        const std::string sym = lineup_.picks[lineup_.tourn_idx++];
+        SweepPanel::Request rq;
+        rq.symbol = sym;
+        rq.interval = kIvl[std::clamp(st.interval_idx, 0, 2)];
+        rq.range = kRng[std::clamp(st.range_idx, 0, 5)];
+        rq.cash = st.cash;
+        rq.metric = st.metric;
+        rq.holdout_pct = st.holdout ? st.holdout_pct : 25.0;
+        log_.add("lineup: tournament " + std::to_string(lineup_.tourn_idx) + "/" +
+                 std::to_string(lineup_.picks.size()) + " - " + sym);
+        start_tournament(rq, sym);
+        return;
+    }
+
+    case Phase::Done:
+        log_.add("lineup: ready - " + std::to_string(lineup_.picks.size()) +
+                 " symbols loaded into the Trade tabs");
+        lineup_.phase = Phase::Idle;
+        return;
+    }
 }
 
 namespace {
@@ -1741,6 +1941,7 @@ void App::draw() {
     pump_sweep();   // before the panels: sweep results must not be stolen
     pump_tournament();
     pump_autopilot();
+    pump_daily_lineup();
 
     draw_menu_bar();
     draw_account_modal();
@@ -2789,6 +2990,19 @@ void App::draw_menu_bar() {
     if (!ImGui::BeginMainMenuBar()) return;
     draw_account_menu();
     draw_data_menu();
+    if (ImGui::BeginMenu("Trade")) {
+        const bool busy = lineup_active();
+        const bool ok = use_tws_data_ && data_.connected() && !engine_.running() &&
+                        !tourn_.active && !sweep_.running;
+        if (ImGui::MenuItem(busy ? "Building lineup…" : "Build today's lineup",
+                            nullptr, false, ok && !busy))
+            start_daily_lineup();
+        ImGui::SetItemTooltip(
+            "Scan IBKR for high-volatility movers, rank by ATR%%, run the strategy "
+            "tournament on the top picks, and load them into the Trade tabs.\n"
+            "Requires the IBKR (TWS) data route with no live session running.");
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Chart", nullptr, &show_chart_);
         ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);

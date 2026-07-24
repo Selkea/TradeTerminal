@@ -44,6 +44,17 @@ void TradePanel::set_symbol_strategy(const std::string& symbol, const std::strin
                         def_ap_interval_min_, def_ap_dd_pct_});
 }
 
+void TradePanel::set_lineup(const std::vector<std::string>& symbols) {
+    if (symbols.empty()) return;   // don't strip the panel down to no tabs
+    pending_.clear();
+    for (const std::string& sym : symbols)
+        pending_.push_back({sym, def_bar_sec_, def_record_, 0, def_risk_,
+                            def_risk_dd_pct_, def_strat_key_, {}, def_ap_mode_,
+                            def_ap_trigger_, def_ap_interval_min_, def_ap_dd_pct_});
+    selected_symbol_idx_ = 0;
+    want_tab_ = 0;
+}
+
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                       const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
                       const AutoPickFn& autopick, bool polygon_available,

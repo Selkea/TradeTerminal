@@ -11,6 +11,7 @@
 #include "engine/tws_feed.h"
 #include "engine/engine.h"
 #include "engine/strategy_host.h"
+#include "engine/symbol_rank.h"
 #include "tt/strategy_registry.h"
 #include "journal.h"
 #include "market_data.h"
@@ -36,8 +37,10 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace tt::ui {
 
@@ -198,6 +201,40 @@ private:
     Autopilot ap_;
     void pump_autopilot();       // UI thread, per frame
     void autopilot_evaluate();   // consume a finished cycle's tournament result
+
+    // ---- daily auto-lineup: scan -> rank -> tournament -> populate tabs ----
+    // Builds the day's symbol set from an IBKR market scan (high-volatility
+    // movers) then runs the strategy tournament on each pick, landing the
+    // winners in the Trade tabs. Manual for now (Trade menu); stage 3 wires it
+    // into the session schedule. Sequential and driven per frame like the
+    // tournament/autopilot pumps.
+    struct DailyLineup {
+        enum class Phase { Idle, Scanning, FetchingBars, Ranking, Tournaments, Done };
+        Phase phase = Phase::Idle;
+        double stamp_s = 0;                  // phase-entry time, for timeouts
+        net::ScanSpec spec;                  // the scan that seeds the pool
+        tt::RankParams rank;                 // gates + top_n for the ranking
+        std::vector<std::string> pool;       // scan-hit symbols (UI-thread copy)
+        std::map<std::string, std::vector<tt::RankBar>> bars;  // fetched, per pool sym
+        std::set<std::string> awaiting;      // pool syms whose bars aren't in yet
+        std::vector<std::string> picks;      // ranked winners (installed as tabs)
+        std::size_t tourn_idx = 0;           // next pick to run a tournament for
+    };
+    DailyLineup lineup_;
+    // The scanner delivers hits on the I/O thread; hand them to the UI thread
+    // under this lock (mirrors the pending-candle handoff pattern).
+    std::mutex lineup_mu_;
+    std::vector<net::ScanHit> lineup_hits_;
+    bool lineup_hits_ready_ = false;
+    // Symbols the FetchingBars phase is collecting, and the I/O thread's inbox
+    // of arrived bars — both guarded by lineup_mu_ so on_candles never touches
+    // the UI-thread DailyLineup directly.
+    std::set<std::string> lineup_want_bars_;
+    std::vector<std::pair<std::string, std::vector<tt::RankBar>>> lineup_bar_inbox_;
+    void start_daily_lineup();                     // kick off (Trade menu / schedule)
+    void pump_daily_lineup();                      // UI thread, per frame
+    void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
+    bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
 
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {

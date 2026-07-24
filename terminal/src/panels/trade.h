@@ -78,6 +78,12 @@ public:
     void set_symbol_strategy(const std::string& symbol, const std::string& key,
                              const std::map<std::string, double>& params);
 
+    // Replace all pending tabs with exactly `symbols`, each a fresh tab seeded
+    // from the panel's per-symbol defaults (built-in strategy until a
+    // tournament assigns one). Used by the daily auto-lineup. No-op if empty
+    // (keeps the current tabs rather than leaving the panel symbol-less).
+    void set_lineup(const std::vector<std::string>& symbols);
+
     // Persisted: the shared cash pool + per-symbol defaults for new cards.
     double cash() const { return session_cash_; }
     int bar_sec() const { return def_bar_sec_; }
