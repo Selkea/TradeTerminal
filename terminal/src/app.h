@@ -288,6 +288,10 @@ private:
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<IbkrBroker> ibkr_;
     std::unique_ptr<TwsBroker> tws_;   // same ordering contract as ibkr_
+    // Rotates the TWS broker/feed API client ids across session starts so a quick
+    // stop->start never reuses an id the just-reaped connection is still releasing
+    // at the gateway (error 326: "client id already in use").
+    int tws_client_seq_ = 0;
     // Same reasoning: the host destroys any leftover per-run strategy
     // instances and unloads their DLLs, which must happen only after the
     // engine's threads are joined.

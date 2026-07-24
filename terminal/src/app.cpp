@@ -2310,11 +2310,16 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         tc.symbols = syms;
         tc.symbol_accounts = sym_accts;
         tc.read_only = read_ibkr_accounts().active_readonly();
+        // Rotate the client id each start (20-39) so a quick restart never
+        // collides with the just-reaped broker still releasing its id at the
+        // gateway (error 326). Disjoint from the feed (40-59) and data (9).
+        tc.client_id = 20 + (tws_client_seq_++ % 20);
         const int port = tc.port;
+        const int cid = tc.client_id;
         tws_broker = std::make_unique<TwsBroker>(std::move(tc));
         cfg.broker = tws_broker.get();
-        log_.add("live: routing orders via TWS socket (port " +
-                 std::to_string(port) + ")");
+        log_.add("live: routing orders via TWS socket (port " + std::to_string(port) +
+                 ", client " + std::to_string(cid) + ")");
     }
     // Each symbol needs its strategy built + loaded first.
     std::string unbuilt;
@@ -2413,6 +2418,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
             TwsFeedConfig fc;
             fc.port = tws_api_port();
             fc.symbols = syms;
+            fc.client_id = 40 + (tws_client_seq_++ % 20);   // rotate; disjoint from broker (20-39) + data (9)
             tws_feed_ =
                 std::make_unique<TwsFeed>(std::move(fc), sink);
             tws_feed_->start();
