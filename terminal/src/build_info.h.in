@@ -6,5 +6,11 @@
 #define TT_GIT_COMMIT "@TT_GIT_COMMIT@"
 #define TT_GIT_DIRTY @TT_GIT_DIRTY@
 #define TT_BUILD_DATE "@TT_BUILD_DATE@"
+// Human-readable version: "<base> (build <commit-count>)", e.g.
+// "0.1.0 (build 412)". The base comes from the CMake project() VERSION; the
+// build number is the branch's commit count. TT_GIT_COMMIT stays the source of
+// truth for the GitHub update check (SHA compare).
+#define TT_VERSION "@TT_VERSION@"
+#define TT_BUILD_NUMBER "@TT_BUILD_NUMBER@"
 // owner/repo of origin, for the GitHub "update available" check.
 #define TT_REPO_SLUG "@TT_REPO_SLUG@"

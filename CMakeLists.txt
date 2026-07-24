@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TradeTerminal LANGUAGES CXX)
+project(TradeTerminal VERSION 0.1.0 LANGUAGES CXX)   # bump here to cut a release; build number auto-tracks commits
 if(WIN32)
     enable_language(RC)
 endif()

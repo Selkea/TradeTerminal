@@ -1,5 +1,6 @@
 #include "app.h"
 #include "app_icon.h"
+#include "build_info.h"   // TT_VERSION (readable build version)
 #include "dev_paths.h"
 
 #include "engine/version.h"
@@ -108,7 +109,8 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(1600, 900, "TradeTerminal", nullptr, nullptr);
+    GLFWwindow* window =
+        glfwCreateWindow(1600, 900, "TradeTerminal " TT_VERSION, nullptr, nullptr);
     if (!window) {
         fatal_startup_error(
             "Could not create an OpenGL 3.3 window:\n\n" + g_glfw_error +
@@ -185,7 +187,8 @@ int main() {
 
     tt::ui::App app(gateway_url);
     app.set_had_ini(had_ini);
-    app.log().add(std::string("TradeTerminal engine ") + tt::engine_version());
+    app.log().add(std::string("TradeTerminal ") + TT_VERSION + "  (engine " +
+                  tt::engine_version() + ")");
     app.log().add(std::string("ImGui ") + IMGUI_VERSION + " (docking) + ImPlot " + IMPLOT_VERSION);
     app.log().add("Runtime data: " + data_dir.string());
 

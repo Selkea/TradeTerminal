@@ -1628,6 +1628,7 @@ std::string App::build_diag_json() {
 
     json j;
     // ---- build / session identity ----
+    j["version"] = TT_VERSION;   // readable, e.g. "0.1.0 (build 412)"
     j["engine_version"] = engine_version();
     j["git_commit"] = TT_GIT_COMMIT;
     j["git_dirty"] = TT_GIT_DIRTY;
@@ -2564,8 +2565,9 @@ void App::draw_update_panel() {
                                                           ImGuiWindowFlags_NoDocking)) {
             ImGui::TextWrapped("A newer build is on GitHub (origin/main).");
             ImGui::Spacing();
-            ImGui::Text("Running:   %s", update_.current_commit().c_str());
-            ImGui::Text("Available: %s", remote.c_str());
+            ImGui::Text("Running:   %s", TT_VERSION);
+            ImGui::Text("This build: %s   Latest: %s", update_.current_commit().c_str(),
+                        remote.c_str());
             ImGui::Spacing();
             if (engine_.live_running()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
@@ -2619,38 +2621,32 @@ void App::draw_update_panel() {
         ImGui::EndPopup();
     }
 
-    // Manual "Check for updates" (Help menu): poke the checker now and show the
-    // result. The auto panel above only appears when an update IS found, so this
-    // popup is the only place the "already up to date" case gets any feedback.
+    // Manual "Check for updates" (Help menu): poke the checker and let the
+    // result surface directly — a newer build opens the Update panel above; the
+    // up-to-date / error outcomes report to the log. No intermediary popup.
     if (update_check_click_) {
         update_check_click_ = false;
         update_check_wait_ = true;
         update_check_gen_ = update_.check_count();
         update_check_started_ = ImGui::GetTime();
+        update_dismissed_commit_.clear();   // an explicit check re-shows a dismissed update
         update_.check_now();
-        ImGui::OpenPopup("Check for updates");
     }
-    if (update_check_wait_ &&
-        (update_.check_count() != update_check_gen_ ||
-         ImGui::GetTime() - update_check_started_ > 20.0))
-        update_check_wait_ = false;   // the poked check finished (or timed out)
-    if (ImGui::BeginPopupModal("Check for updates", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (update_check_wait_)
-            ImGui::TextUnformatted("Checking GitHub…");
-        else if (!update_.last_ok())
-            ImGui::TextWrapped("Couldn't reach GitHub — check the connection and try again.");
-        else if (update_.available())
-            ImGui::TextWrapped("Update available: %s\nUse the Update panel to install.",
-                               update_.remote_commit().c_str());
-        else
-            ImGui::TextWrapped("You're up to date (running %s).",
-                               update_.current_commit().c_str());
-        ImGui::Spacing();
-        ImGui::BeginDisabled(update_check_wait_);
-        if (ImGui::Button("OK")) ImGui::CloseCurrentPopup();
-        ImGui::EndDisabled();
-        ImGui::EndPopup();
+    if (update_check_wait_) {
+        const bool done = update_.check_count() != update_check_gen_;
+        const bool timed_out = ImGui::GetTime() - update_check_started_ > 20.0;
+        if (done || timed_out) {
+            update_check_wait_ = false;
+            if (!done)
+                log_.add("update: check timed out — try again");
+            else if (!update_.last_ok())
+                log_.add("update: couldn't reach GitHub — check the connection");
+            else if (update_.available())
+                log_.add("update: a newer build is available (" + update_.remote_commit() +
+                         ") — see the Update panel");
+            else
+                log_.add(std::string("update: up to date (") + TT_VERSION + ")");
+        }
     }
 }
 

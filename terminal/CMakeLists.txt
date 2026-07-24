@@ -13,6 +13,7 @@ add_custom_target(tt_build_info
         -DIN=${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.h.in
         -DOUT=${TT_BUILD_INFO}
         -DGIT_SRC=${TT_REPO_ROOT}
+        -DTT_BASE_VERSION=${PROJECT_VERSION}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_commit.cmake
     COMMENT "Stamping git commit into build_info.h"
     VERBATIM)
