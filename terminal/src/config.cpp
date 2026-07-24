@@ -97,6 +97,9 @@ AppConfig AppConfig::load(const std::string& path) {
             if (pv.is_object())
                 for (const auto& [k, v] : pv.items())
                     if (v.is_number()) c.strategy_params[key][k] = v.get<double>();
+    if (j.contains("strategy_tourn_excluded") && j["strategy_tourn_excluded"].is_array())
+        for (const auto& s : j["strategy_tourn_excluded"])
+            if (s.is_string()) c.strategy_tourn_excluded.push_back(s.get<std::string>());
     return c;
 }
 
@@ -165,6 +168,7 @@ void AppConfig::save(const std::string& path) const {
     j["panels"] = panels;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;
+    j["strategy_tourn_excluded"] = strategy_tourn_excluded;
 
     std::ofstream f(path);
     if (f) f << j.dump(2);

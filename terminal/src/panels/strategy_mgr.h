@@ -76,7 +76,20 @@ public:
     std::vector<std::string> all_keys() const;
     std::map<std::string, std::map<std::string, double>> all_param_values() const;
     void restore_state(const std::vector<std::string>& loaded,
-                       const std::map<std::string, std::map<std::string, double>>& params);
+                       const std::map<std::string, std::map<std::string, double>>& params,
+                       const std::vector<std::string>& tourn_excluded = {});
+
+    // ---- tournament exclusion ----
+    // Strategies the user has flagged to sit out tournaments / auto-pick. The
+    // App filters these from the default (all-loaded) candidate set; an
+    // explicitly-listed candidate is still honored (e.g. autopilot's incumbent).
+    bool tournament_excluded(const std::string& key) const {
+        return tourn_excluded_.count(key) != 0;
+    }
+    // Excluded keys, for persistence (config.json). Order is unspecified.
+    std::vector<std::string> tournament_excluded_keys() const {
+        return {tourn_excluded_.begin(), tourn_excluded_.end()};
+    }
 
 private:
     struct ParamValue {
@@ -135,6 +148,9 @@ private:
     std::map<std::string, std::map<std::string, double>> saved_params_;
     // Promoted (statically-linked) strategy keys, snapshotted once in the ctor.
     std::set<std::string> static_keys_;
+    // Strategy keys ("" = built-in) the user has excluded from tournaments.
+    // UI thread only; persisted to config.json across sessions.
+    std::set<std::string> tourn_excluded_;
 };
 
 } // namespace tt::ui

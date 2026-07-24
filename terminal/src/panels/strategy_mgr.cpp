@@ -225,8 +225,10 @@ StrategyManagerPanel::all_param_values() const {
 
 void StrategyManagerPanel::restore_state(
     const std::vector<std::string>& loaded,
-    const std::map<std::string, std::map<std::string, double>>& params) {
+    const std::map<std::string, std::map<std::string, double>>& params,
+    const std::vector<std::string>& tourn_excluded) {
     saved_params_ = params;
+    tourn_excluded_ = {tourn_excluded.begin(), tourn_excluded.end()};
     // Apply saved values to the built-in (already seeded with descriptors).
     const auto b = saved_params_.find("");
     if (b != saved_params_.end())
@@ -428,6 +430,18 @@ void StrategyManagerPanel::draw(bool* open) {
 
 void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
                                              const StrategyHost::ModuleView* mod) {
+    // Let the user keep a strategy out of tournaments / auto-pick without
+    // unloading it — it stays available for manual backtests and live tabs.
+    bool excluded = tourn_excluded_.count(key) != 0;
+    if (ImGui::Checkbox("Exclude from tournaments", &excluded)) {
+        if (excluded) tourn_excluded_.insert(key);
+        else tourn_excluded_.erase(key);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Skip this strategy when a tournament / auto-pick / autopilot "
+                          "chooses the best strategy for a symbol.");
+    ImGui::Separator();
+
     if (mod) {
         ImGui::TextDisabled("(%s)", mod->key.c_str());
         if (mod->instances > 0) {

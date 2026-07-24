@@ -451,7 +451,8 @@ App::App(std::string gateway_url)
         vis("log", show_log_);
     }
     // Rebuild last session's strategies and their params.
-    strat_mgr_.restore_state(cfg_.strategy_loaded, cfg_.strategy_params);
+    strat_mgr_.restore_state(cfg_.strategy_loaded, cfg_.strategy_params,
+                             cfg_.strategy_tourn_excluded);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
     if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
@@ -923,7 +924,16 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     tourn_.base = std::move(rq);
     tourn_.target_symbol = target_symbol;
     if (candidates.empty()) {
-        tourn_.candidates = strat_mgr_.loaded_keys();   // "" (built-in) included
+        // Default field: every loaded strategy ("" built-in included) EXCEPT
+        // ones the user flagged out in the Strategies panel.
+        for (const auto& k : strat_mgr_.loaded_keys())
+            if (!strat_mgr_.tournament_excluded(k)) tourn_.candidates.push_back(k);
+        if (tourn_.candidates.empty()) {
+            log_.add("tournament: every loaded strategy is excluded — enable at "
+                     "least one in the Strategies panel");
+            tourn_ = Tournament{};   // unwind: clears active
+            return;
+        }
     } else {
         tourn_.candidates = std::move(candidates);
     }
@@ -1267,6 +1277,7 @@ void App::save_config() {
                    {"log", show_log_}};
     cfg_.strategy_loaded = strat_mgr_.loaded_keys();
     cfg_.strategy_params = strat_mgr_.all_param_values();
+    cfg_.strategy_tourn_excluded = strat_mgr_.tournament_excluded_keys();
     // Capture the live broker's order-path latency so the optimizer models the
     // real venue instead of the 250 us default (consumed by sim_exec_latency).
     AckSummary ack{};

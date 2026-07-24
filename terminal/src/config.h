@@ -105,6 +105,10 @@ struct AppConfig {
     // parameter values — restored (rebuilt) on startup.
     std::vector<std::string> strategy_loaded;       // .cpp basenames to reload
     std::map<std::string, std::map<std::string, double>> strategy_params;
+    // Strategies the user has excluded from tournaments / auto-pick (keys;
+    // "" = built-in). A tournament skips these when it uses the default
+    // (all-loaded) candidate set.
+    std::vector<std::string> strategy_tourn_excluded;
 
     static AppConfig load(const std::string& path);
     void save(const std::string& path) const;
