@@ -6,6 +6,7 @@ add_library(tt_engine STATIC
     src/engine.cpp
     src/strategy_host.cpp
     src/tick_log.cpp
+    src/symbol_rank.cpp
 )
 target_include_directories(tt_engine PUBLIC
     include
@@ -37,6 +38,7 @@ add_executable(tt_engine_tests
     tests/test_exec_brackets.cpp
     tests/test_price_tick.cpp
     tests/test_ack_latency.cpp
+    tests/test_symbol_rank.cpp
     # Compiled a SECOND time here (see below), statically-linked instead of as
     # a DLL -- test_strategy_registry.cpp's regression guard for the
     # TT_STRATEGY_STATIC_LINK path (terminal/CMakeLists.txt's real usage:

@@ -14,12 +14,34 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace tt::net {
+
+// A market-scanner request (IBKR reqScannerSubscription). Defaults ask for the
+// most-active US stocks; the daily auto-lineup re-ranks the returned pool by
+// realized volatility itself, so the scan just needs to be a liquid, tradeable
+// candidate set rather than the final ordering.
+struct ScanSpec {
+    std::string scan_code = "MOST_ACTIVE";    // IBKR scanCode
+    std::string location = "STK.US.MAJOR";    // locationCode
+    std::string instrument = "STK";
+    int rows = 30;                            // numberOfRows
+    double price_above = 0;                   // abovePrice filter (0 = unset)
+    double volume_above = 0;                  // aboveVolume filter (0 = unset)
+};
+
+// One scanner result row: the qualified contract's symbol + primary exchange
+// and its rank in the scan (0 = top).
+struct ScanHit {
+    std::string symbol;
+    std::string exchange;
+    int rank = 0;
+};
 
 class TwsData final : public IMarketData {
 public:
@@ -51,6 +73,13 @@ public:
     uint32_t subscribe_quotes(const std::vector<std::string>& symbols,
                               int poll_s) override;
     void unsubscribe(uint32_t sub_id) override;
+
+    // One-shot market scan. `cb` fires once on the I/O thread with the ranked
+    // hits (empty if the scan failed or the session dropped) and must be
+    // thread-safe. Only one scan runs at a time; a new request supersedes any
+    // in flight. Returns the request id, or 0 if the source isn't running.
+    using ScanCb = std::function<void(std::vector<ScanHit>)>;
+    uint32_t request_scan(const ScanSpec& spec, ScanCb cb);
 
     std::string account() const override;
     std::vector<std::string> accounts() const override;
@@ -100,6 +129,17 @@ private:
     std::vector<std::string> want_syms_;   // desired quote-stream set
     bool want_dirty_ = false;
     uint32_t quote_sub_ = 0;               // last subscribe_quotes id
+
+    // Pending scan request + its callback (UI thread sets, I/O thread drains).
+    // Only the newest is kept; a second request before the first is pumped
+    // replaces it.
+    struct ScanReq {
+        uint32_t id = 0;
+        ScanSpec spec;
+        ScanCb cb;
+    };
+    bool scan_pending_ = false;
+    ScanReq scan_req_;
 };
 
 } // namespace tt::net

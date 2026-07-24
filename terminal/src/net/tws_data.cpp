@@ -1,11 +1,12 @@
 #include "net/tws_data.h"
 
-#include "Contract.h"
+#include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
 #include "DefaultEWrapper.h"
 #include "EClientSocket.h"
 #include "EReader.h"
 #include "EReaderOSSignal.h"
+#include "ScannerSubscription.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,11 @@ namespace {
 // Streaming quote tickerIds live far above the candle request ids (which are
 // the public next_id_ values) so the two spaces can never collide.
 constexpr int kQuoteBase = 500'000;
+
+// One-shot market scans use a single fixed tickerId (only one scan runs at a
+// time), between the candle id space and the quote base so it collides with
+// neither.
+constexpr int kScanReqId = 400'000;
 
 // A history fetch outstanding longer than this means the data session has gone
 // half-open: the socket is up and streaming quotes keep flowing ("data
@@ -137,6 +143,15 @@ struct TwsData::Io final : DefaultEWrapper {
     std::unordered_map<std::string, Stream> streams;
     int next_quote_req = kQuoteBase;
 
+    // The one in-flight market scan. Streaming subscriptions keep updating, so
+    // scannerDataEnd cancels it to take a single snapshot; cb then fires once.
+    struct ActiveScan {
+        bool running = false;
+        TwsData::ScanCb cb;
+        std::vector<ScanHit> hits;
+    };
+    ActiveScan scan;
+
     // Handshake rejected (e.g. paper disclaimer not accepted yet): the socket
     // stays open but no session will come; io_loop tears down and retries.
     // Set inside EWrapper callbacks, where destroying the reader is unsafe.
@@ -168,6 +183,13 @@ struct TwsData::Io final : DefaultEWrapper {
                 d.cbs_.on_error(static_cast<uint32_t>(id), "tws",
                                 "connection lost fetching " + p.symbol);
         hist.clear();
+        // An in-flight scan will never complete; deliver empty so the caller
+        // (which is waiting on its callback) isn't left hanging.
+        if (scan.running) {
+            auto cb = std::move(scan.cb);
+            scan = ActiveScan{};
+            if (cb) cb({});
+        }
         streams.clear();   // re-established on reconnect via want_dirty_
     }
 
@@ -186,6 +208,8 @@ struct TwsData::Io final : DefaultEWrapper {
         std::vector<CandleReq> reqs;
         std::vector<std::string> want;
         bool dirty = false;
+        ScanReq scan_req;
+        bool have_scan = false;
         {
             std::lock_guard lock(d.mu_);
             reqs.swap(d.reqs_);
@@ -193,6 +217,11 @@ struct TwsData::Io final : DefaultEWrapper {
                 want = d.want_syms_;
                 d.want_dirty_ = false;
                 dirty = true;
+            }
+            if (d.scan_pending_) {
+                scan_req = std::move(d.scan_req_);
+                d.scan_pending_ = false;
+                have_scan = true;
             }
         }
         for (const CandleReq& r : reqs) {
@@ -235,6 +264,24 @@ struct TwsData::Io final : DefaultEWrapper {
                 client->reqMktData(st.req_id, stock(s), "", false, false,
                                    TagValueListSPtr());
             }
+        }
+        if (have_scan) {
+            if (scan.running) client->cancelScannerSubscription(kScanReqId);
+            ScannerSubscription sub;
+            sub.instrument = scan_req.spec.instrument;
+            sub.locationCode = scan_req.spec.location;
+            sub.scanCode = scan_req.spec.scan_code;
+            sub.numberOfRows = scan_req.spec.rows;
+            if (scan_req.spec.price_above > 0) sub.abovePrice = scan_req.spec.price_above;
+            if (scan_req.spec.volume_above > 0)
+                sub.aboveVolume = static_cast<int>(scan_req.spec.volume_above);
+            scan.running = true;
+            scan.cb = std::move(scan_req.cb);
+            scan.hits.clear();
+            client->reqScannerSubscription(kScanReqId, sub, TagValueListSPtr(),
+                                           TagValueListSPtr());
+            d.log("scan: " + scan_req.spec.scan_code + " on " +
+                  scan_req.spec.location);
         }
     }
 
@@ -298,6 +345,15 @@ struct TwsData::Io final : DefaultEWrapper {
                 d.cbs_.on_error(static_cast<uint32_t>(id), "tws",
                                 it->second.symbol + ": " + errorString);
             hist.erase(it);
+            return;
+        }
+        if (scan.running && id == kScanReqId) {
+            // Scan rejected (bad scanCode, no scanner entitlement, etc.):
+            // deliver empty so the caller stops waiting.
+            d.log("scan failed: " + errorString);
+            auto cb = std::move(scan.cb);
+            scan = ActiveScan{};
+            if (cb) cb({});
             return;
         }
         d.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
@@ -376,6 +432,31 @@ struct TwsData::Io final : DefaultEWrapper {
             break;
         }
     }
+
+    void scannerData(int reqId, int rank, const ContractDetails& cd,
+                     const std::string& /*distance*/, const std::string& /*benchmark*/,
+                     const std::string& /*projection*/,
+                     const std::string& /*legsStr*/) override {
+        if (!scan.running || reqId != kScanReqId) return;
+        ScanHit h;
+        h.symbol = cd.contract.symbol;
+        h.exchange = !cd.contract.primaryExchange.empty() ? cd.contract.primaryExchange
+                                                          : cd.contract.exchange;
+        h.rank = rank;
+        scan.hits.push_back(std::move(h));
+    }
+
+    void scannerDataEnd(int reqId) override {
+        if (!scan.running || reqId != kScanReqId) return;
+        // Snapshot taken: cancel the (streaming) subscription and hand results
+        // to the waiting caller exactly once.
+        if (client) client->cancelScannerSubscription(kScanReqId);
+        auto cb = std::move(scan.cb);
+        auto hits = std::move(scan.hits);
+        scan = ActiveScan{};
+        d.log("scan: " + std::to_string(hits.size()) + " hits");
+        if (cb) cb(std::move(hits));
+    }
 };
 
 // ---- adapter -------------------------------------------------------------
@@ -435,6 +516,18 @@ void TwsData::unsubscribe(uint32_t sub_id) {
     if (sub_id != quote_sub_) return;   // superseded subscriptions are gone
     want_syms_.clear();
     want_dirty_ = true;
+}
+
+uint32_t TwsData::request_scan(const ScanSpec& spec, ScanCb cb) {
+    if (!running_.load(std::memory_order_acquire)) return 0;
+    const uint32_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(mu_);
+        scan_req_ = {id, spec, std::move(cb)};
+        scan_pending_ = true;
+    }
+    wake();
+    return id;
 }
 
 std::string TwsData::account() const {
