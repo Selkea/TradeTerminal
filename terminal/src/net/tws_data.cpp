@@ -43,6 +43,7 @@ constexpr int kTickLast = 4, kTickDelayedLast = 68;
 constexpr int kTickVolume = 8, kTickDelayedVolume = 74;
 
 const char* tws_bar_size(const std::string& interval) {
+    if (interval == "1s") return "1 secs";
     if (interval == "1m") return "1 min";
     if (interval == "2m") return "2 mins";
     if (interval == "5m") return "5 mins";
@@ -71,6 +72,7 @@ int dur_idx(const std::string& range) {
 // IB caps how much history one request may span per bar size; clamp so a
 // "1m x 5y" chart still shows the most recent stretch instead of erroring.
 int max_dur_idx(const std::string& interval) {
+    if (interval == "1s") return 0;                        // 1-sec: sub-day (see below)
     if (interval == "1m" || interval == "2m") return 2;    // <= 1 M
     if (interval == "5m" || interval == "15m" || interval == "30m")
         return 3;                                          // <= 6 M
@@ -240,10 +242,13 @@ struct TwsData::Io final : DefaultEWrapper {
                       kDurs[cap].dur);
                 di = cap;
             }
+            // IB caps 1-sec bars at ~2000 bars/request; a whole "1 D" is rejected.
+            // Fetch the last 30 min of seconds; the live tail extends it forward.
+            std::string dur = (r.interval == "1s") ? "1800 S" : kDurs[di].dur;
             hist[static_cast<int>(r.id)] = {r.symbol, r.interval, {},
                                             std::chrono::steady_clock::now()};
             client->reqHistoricalData(static_cast<TickerId>(r.id), stock(r.symbol),
-                                      "", kDurs[di].dur, bar, "TRADES",
+                                      "", dur, bar, "TRADES",
                                       /*useRTH=*/1, /*formatDate=*/2,
                                       /*keepUpToDate=*/false, TagValueListSPtr());
         }

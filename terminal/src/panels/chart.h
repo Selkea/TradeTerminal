@@ -42,7 +42,7 @@ private:
     SeriesStore& store_;
 
     char sym_[16] = "AAPL";
-    int interval_idx_ = 1;
+    int interval_idx_ = 2;   // default "5m" (index shifts if kIntervals changes)
     int range_idx_ = 1;
     bool requested_once_ = false;
     uint64_t seen_rev_ = 0;

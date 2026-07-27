@@ -14,20 +14,19 @@
 namespace tt::ui {
 
 namespace {
-constexpr const char* kIntervals[] = {"1m", "5m", "15m", "1h", "1d"};
-constexpr double kIntervalSec[] = {60, 300, 900, 3600, 86400};   // matches kIntervals
+constexpr const char* kIntervals[] = {"1s", "1m", "5m", "15m", "1h", "1d"};
+constexpr double kIntervalSec[] = {1, 60, 300, 900, 3600, 86400};   // matches kIntervals
 constexpr const char* kRanges[] = {"1d", "5d", "1mo", "6mo", "1y", "5y", "max"};
 
-// Yahoo limits intraday history; clamp the range so requests don't 4xx.
-// (1m ≈ last 7 days, other intraday ≈ 60 days, 1h ≈ 2 years.)
+// Providers limit intraday history; clamp the range so requests don't error.
+// Keyed off the interval's seconds so it's robust to reordering kIntervals.
 int max_range_idx(int interval_idx) {
-    switch (interval_idx) {
-    case 0: return 1;   // 1m  -> up to 5d
-    case 1:             // 5m
-    case 2: return 2;   // 15m -> up to 1mo
-    case 3: return 4;   // 1h  -> up to 1y
-    default: return 6;  // 1d  -> anything
-    }
+    const double s = kIntervalSec[interval_idx];
+    if (s <= 1) return 0;      // 1s  -> intraday only (IB caps ~30 min/req)
+    if (s <= 60) return 1;     // 1m  -> up to 5d
+    if (s <= 900) return 2;    // 5m/15m -> up to 1mo
+    if (s <= 3600) return 4;   // 1h  -> up to 1y
+    return 6;                  // 1d  -> anything
 }
 } // namespace
 
@@ -118,7 +117,8 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
     // session's latest price — real-time updates without a historical re-fetch.
     // Bucketing off the tick time means a stale feed simply stops extending it.
     // Intraday only (daily-bar timestamps aren't reliably interval-aligned).
-    if (live_price > 0.0 && live_ts_sec > 0.0 && interval_idx_ < 4 && !xs_.empty()) {
+    if (live_price > 0.0 && live_ts_sec > 0.0 &&
+        kIntervalSec[interval_idx_] < 86400.0 && !xs_.empty()) {
         const double ivl = kIntervalSec[interval_idx_];
         const double bucket = std::floor(live_ts_sec / ivl) * ivl;
         auto refine_back = [&] {
