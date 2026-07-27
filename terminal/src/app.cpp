@@ -1632,7 +1632,7 @@ std::string App::build_diag_json() {
 
     json j;
     // ---- build / session identity ----
-    j["version"] = TT_VERSION;   // readable, e.g. "0.1.0 (build 412)"
+    j["version"] = TT_VERSION;   // clean semver, e.g. "0.1.5"
     j["engine_version"] = engine_version();
     j["git_commit"] = TT_GIT_COMMIT;
     j["git_dirty"] = TT_GIT_DIRTY;

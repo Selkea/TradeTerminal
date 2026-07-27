@@ -24,9 +24,11 @@ else()
     set(TT_GIT_DIRTY "false")
 endif()
 
-# Monotonic build number = commit count on the current branch. Gives a readable,
-# always-increasing version (e.g. "0.1.0 (build 412)") without needing tags, and
-# lets you tell at a glance whether the VPS build is behind the local one.
+# Monotonic build number = commit count on the current branch. Still stamped
+# into build_info.h (TT_BUILD_NUMBER) for reference, but deliberately kept OUT
+# of the displayed version — TT_VERSION is just the semver from the VERSION file
+# (e.g. "0.1.5"), so it stays clean and readable and never depends on git being
+# reachable at build time.
 execute_process(
     COMMAND git -C "${GIT_SRC}" rev-list --count HEAD
     OUTPUT_VARIABLE TT_BUILD_NUMBER
@@ -39,9 +41,9 @@ if(NOT TT_BASE_VERSION)
     set(TT_BASE_VERSION "0.0.0")   # standalone `cmake -P` without the target's -D
 endif()
 if(_dirty)
-    set(TT_VERSION "${TT_BASE_VERSION} (build ${TT_BUILD_NUMBER}, modified)")
+    set(TT_VERSION "${TT_BASE_VERSION} (modified)")   # uncommitted local build
 else()
-    set(TT_VERSION "${TT_BASE_VERSION} (build ${TT_BUILD_NUMBER})")
+    set(TT_VERSION "${TT_BASE_VERSION}")
 endif()
 
 string(TIMESTAMP TT_BUILD_DATE "%Y-%m-%dT%H:%M:%SZ" UTC)
