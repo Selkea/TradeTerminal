@@ -52,6 +52,8 @@ private:
 
     std::vector<double> xs_, opens_, highs_, lows_, closes_, vols_;
     double width_sec_ = 0.0;
+    bool follow_live_ = true;   // keep the newest live bar in view (scroll with it)
+    double view_span_ = 0.0;    // width of the fetched window; the follow window size
     // Live-tail state: ts of the last fetched (historical) bar, and the bucket of
     // the live bar currently appended past it. Reset on every store rebuild.
     double hist_last_ts_ = 0.0;
