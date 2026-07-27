@@ -161,8 +161,7 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
     // Follow mode: after the initial fit, slide the X view each frame so the
     // newest live bar stays on screen (otherwise the live tail scrolls off the
     // right edge and the chart looks frozen). Y auto-fits to the framed data.
-    const bool follow = follow_live_ && live_active && view_span_ > 0.0 &&
-                        !fit_next_ && n > 0;
+    const bool follow = follow_live_ && live_active && view_span_ > 0.0 && n > 0;
     const double x_hi = n > 0 ? xs_.back() : 0.0;
     const auto follow_x = [&] {
         if (follow)
@@ -174,7 +173,7 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
     static float ratios[] = {3.0f, 1.0f};
     if (ImPlot::BeginSubplots("##ohlcv", 2, 1, ImVec2(-1, -1),
                               ImPlotSubplotFlags_LinkCols, ratios)) {
-        if (fit_next_) ImPlot::SetNextAxesToFit();
+        if (fit_next_ && !follow) ImPlot::SetNextAxesToFit();  // follow owns the view while live
         if (ImPlot::BeginPlot("##price", ImVec2(), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
             ImPlot::SetupAxes(nullptr, "price", ImPlotAxisFlags_NoLabel, y_flags);
@@ -206,7 +205,7 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
             }
             ImPlot::EndPlot();
         }
-        if (fit_next_) ImPlot::SetNextAxesToFit();
+        if (fit_next_ && !follow) ImPlot::SetNextAxesToFit();  // follow owns the view while live
         if (ImPlot::BeginPlot("##volume", ImVec2(), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
             ImPlot::SetupAxes(nullptr, "vol", ImPlotAxisFlags_NoLabel, y_flags);
