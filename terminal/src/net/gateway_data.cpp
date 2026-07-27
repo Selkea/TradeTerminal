@@ -64,6 +64,11 @@ const char* bar_for(const std::string& interval) {
 }
 
 const char* period_for(const std::string& range) {
+    if (range == "1m") return "1min";     // minutes: CP API uses "min" (vs "m"=month)
+    if (range == "5m") return "5min";
+    if (range == "15m") return "15min";
+    if (range == "30m") return "30min";
+    if (range == "1h") return "1h";
     if (range == "1d") return "1d";
     if (range == "5d") return "1w";
     if (range == "1mo") return "1m";

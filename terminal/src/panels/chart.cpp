@@ -16,17 +16,24 @@ namespace tt::ui {
 namespace {
 constexpr const char* kIntervals[] = {"1s", "1m", "5m", "15m", "1h", "1d"};
 constexpr double kIntervalSec[] = {1, 60, 300, 900, 3600, 86400};   // matches kIntervals
-constexpr const char* kRanges[] = {"1d", "5d", "1mo", "6mo", "1y", "5y", "max"};
+constexpr const char* kRanges[] = {"1m", "5m", "15m", "30m", "1h",
+                                   "1d", "5d", "1mo", "6mo", "1y", "5y", "max"};
+
+int range_idx_of(const char* r) {
+    for (int i = 0; i < IM_ARRAYSIZE(kRanges); ++i)
+        if (std::strcmp(kRanges[i], r) == 0) return i;
+    return IM_ARRAYSIZE(kRanges) - 1;
+}
 
 // Providers limit intraday history; clamp the range so requests don't error.
-// Keyed off the interval's seconds so it's robust to reordering kIntervals.
+// Keyed off the interval's seconds (and range names) so it survives reordering.
 int max_range_idx(int interval_idx) {
     const double s = kIntervalSec[interval_idx];
-    if (s <= 1) return 0;      // 1s  -> intraday only (IB caps ~30 min/req)
-    if (s <= 60) return 1;     // 1m  -> up to 5d
-    if (s <= 900) return 2;    // 5m/15m -> up to 1mo
-    if (s <= 3600) return 4;   // 1h  -> up to 1y
-    return 6;                  // 1d  -> anything
+    if (s <= 1) return range_idx_of("30m");    // 1s  -> IB caps ~30 min/req
+    if (s <= 60) return range_idx_of("5d");    // 1m  -> up to 5d
+    if (s <= 900) return range_idx_of("1mo");  // 5m/15m -> up to 1mo
+    if (s <= 3600) return range_idx_of("1y");  // 1h  -> up to 1y
+    return range_idx_of("max");                // 1d  -> anything
 }
 } // namespace
 

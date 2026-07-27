@@ -59,9 +59,11 @@ struct Dur {
     const char* range;
     const char* dur;
 };
-constexpr Dur kDurs[] = {{"1d", "1 D"}, {"5d", "5 D"},  {"1mo", "1 M"},
-                         {"6mo", "6 M"}, {"1y", "1 Y"},  {"2y", "2 Y"},
-                         {"5y", "5 Y"},  {"max", "15 Y"}};
+constexpr Dur kDurs[] = {{"1m", "60 S"},   {"5m", "300 S"}, {"15m", "900 S"},
+                         {"30m", "1800 S"}, {"1h", "3600 S"},
+                         {"1d", "1 D"},    {"5d", "5 D"},   {"1mo", "1 M"},
+                         {"6mo", "6 M"},   {"1y", "1 Y"},   {"2y", "2 Y"},
+                         {"5y", "5 Y"},    {"max", "15 Y"}};
 
 int dur_idx(const std::string& range) {
     for (int i = 0; i < static_cast<int>(std::size(kDurs)); ++i)
@@ -72,11 +74,11 @@ int dur_idx(const std::string& range) {
 // IB caps how much history one request may span per bar size; clamp so a
 // "1m x 5y" chart still shows the most recent stretch instead of erroring.
 int max_dur_idx(const std::string& interval) {
-    if (interval == "1s") return 0;                        // 1-sec: sub-day (see below)
-    if (interval == "1m" || interval == "2m") return 2;    // <= 1 M
+    if (interval == "1s") return dur_idx("30m");           // ~1800 1-sec bars
+    if (interval == "1m" || interval == "2m") return dur_idx("1mo");
     if (interval == "5m" || interval == "15m" || interval == "30m")
-        return 3;                                          // <= 6 M
-    if (interval == "1h") return 5;                        // <= 2 Y
+        return dur_idx("6mo");
+    if (interval == "1h") return dur_idx("2y");
     return static_cast<int>(std::size(kDurs)) - 1;         // daily: anything
 }
 
@@ -242,9 +244,9 @@ struct TwsData::Io final : DefaultEWrapper {
                       kDurs[cap].dur);
                 di = cap;
             }
-            // IB caps 1-sec bars at ~2000 bars/request; a whole "1 D" is rejected.
-            // Fetch the last 30 min of seconds; the live tail extends it forward.
-            std::string dur = (r.interval == "1s") ? "1800 S" : kDurs[di].dur;
+            // di is clamped above (e.g. 1-sec bars cap at "30m" = 1800 bars,
+            // the most IB returns per request); the live tail extends it forward.
+            const char* dur = kDurs[di].dur;
             hist[static_cast<int>(r.id)] = {r.symbol, r.interval, {},
                                             std::chrono::steady_clock::now()};
             client->reqHistoricalData(static_cast<TickerId>(r.id), stock(r.symbol),
