@@ -170,55 +170,39 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
     };
     const ImPlotAxisFlags y_flags =
         ImPlotAxisFlags_Opposite | (follow ? ImPlotAxisFlags_AutoFit : 0);
-    static float ratios[] = {3.0f, 1.0f};
-    if (ImPlot::BeginSubplots("##ohlcv", 2, 1, ImVec2(-1, -1),
-                              ImPlotSubplotFlags_LinkCols, ratios)) {
-        if (fit_next_ && !follow) ImPlot::SetNextAxesToFit();  // follow owns the view while live
-        if (ImPlot::BeginPlot("##price", ImVec2(), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
-            ImPlot::SetupAxes(nullptr, "price", ImPlotAxisFlags_NoLabel, y_flags);
-            follow_x();
-            if (n > 0)
-                PlotCandlestick(sym_, xs_.data(), opens_.data(), highs_.data(),
-                                lows_.data(), closes_.data(), n, width_sec_);
-            if (!fills.empty()) {
-                // Session/backtest fills on top of the candles.
-                std::vector<double> bx, by, sx, sy;
-                for (const FillMarker& f : fills) {
-                    (f.buy ? bx : sx).push_back(f.ts_sec);
-                    (f.buy ? by : sy).push_back(f.price);
-                }
-                if (!bx.empty()) {
-                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Up, 6.0f,
-                                               ImVec4(0.2f, 0.9f, 0.4f, 1.0f), 1.0f,
-                                               ImVec4(0.05f, 0.35f, 0.15f, 1.0f));
-                    ImPlot::PlotScatter("##buys", bx.data(), by.data(),
-                                        static_cast<int>(bx.size()));
-                }
-                if (!sx.empty()) {
-                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Down, 6.0f,
-                                               ImVec4(0.95f, 0.35f, 0.3f, 1.0f), 1.0f,
-                                               ImVec4(0.4f, 0.1f, 0.08f, 1.0f));
-                    ImPlot::PlotScatter("##sells", sx.data(), sy.data(),
-                                        static_cast<int>(sx.size()));
-                }
+    if (fit_next_ && !follow) ImPlot::SetNextAxesToFit();  // follow owns the view while live
+    if (ImPlot::BeginPlot("##price", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
+        ImPlot::SetupAxes(nullptr, "price", ImPlotAxisFlags_NoLabel, y_flags);
+        follow_x();
+        if (n > 0)
+            PlotCandlestick(sym_, xs_.data(), opens_.data(), highs_.data(),
+                            lows_.data(), closes_.data(), n, width_sec_);
+        if (!fills.empty()) {
+            // Session/backtest fills on top of the candles.
+            std::vector<double> bx, by, sx, sy;
+            for (const FillMarker& f : fills) {
+                (f.buy ? bx : sx).push_back(f.ts_sec);
+                (f.buy ? by : sy).push_back(f.price);
             }
-            ImPlot::EndPlot();
-        }
-        if (fit_next_ && !follow) ImPlot::SetNextAxesToFit();  // follow owns the view while live
-        if (ImPlot::BeginPlot("##volume", ImVec2(), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
-            ImPlot::SetupAxes(nullptr, "vol", ImPlotAxisFlags_NoLabel, y_flags);
-            follow_x();
-            if (n > 0) {
-                ImPlot::SetNextFillStyle(ImVec4(0.35f, 0.55f, 0.85f, 0.6f));
-                ImPlot::PlotBars("##vol", xs_.data(), vols_.data(), n, width_sec_);
+            if (!bx.empty()) {
+                ImPlot::SetNextMarkerStyle(ImPlotMarker_Up, 6.0f,
+                                           ImVec4(0.2f, 0.9f, 0.4f, 1.0f), 1.0f,
+                                           ImVec4(0.05f, 0.35f, 0.15f, 1.0f));
+                ImPlot::PlotScatter("##buys", bx.data(), by.data(),
+                                    static_cast<int>(bx.size()));
             }
-            ImPlot::EndPlot();
+            if (!sx.empty()) {
+                ImPlot::SetNextMarkerStyle(ImPlotMarker_Down, 6.0f,
+                                           ImVec4(0.95f, 0.35f, 0.3f, 1.0f), 1.0f,
+                                           ImVec4(0.4f, 0.1f, 0.08f, 1.0f));
+                ImPlot::PlotScatter("##sells", sx.data(), sy.data(),
+                                    static_cast<int>(sx.size()));
+            }
         }
-        fit_next_ = false;
-        ImPlot::EndSubplots();
+        ImPlot::EndPlot();
     }
+    fit_next_ = false;
     ImGui::End();
 }
 
