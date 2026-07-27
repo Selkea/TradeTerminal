@@ -2588,10 +2588,10 @@ void App::draw_update_panel() {
                                                           ImGuiWindowFlags_NoDocking)) {
             ImGui::TextWrapped("A newer build is on GitHub (origin/main).");
             ImGui::Spacing();
-            ImGui::Text("Running:  %s", TT_VERSION_BASE);
+            ImGui::Text("Running:  v%s", TT_VERSION_BASE);
             const std::string latest = update_.remote_version();
             if (!latest.empty())
-                ImGui::Text("Latest:   %s", latest.c_str());
+                ImGui::Text("Latest:   v%s", latest.c_str());
             else
                 ImGui::TextDisabled("Latest:   newer build available");
             ImGui::Spacing();

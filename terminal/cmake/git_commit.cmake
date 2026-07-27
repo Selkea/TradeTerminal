@@ -41,9 +41,9 @@ if(NOT TT_BASE_VERSION)
     set(TT_BASE_VERSION "0.0.0")   # standalone `cmake -P` without the target's -D
 endif()
 if(_dirty)
-    set(TT_VERSION "${TT_BASE_VERSION} (modified)")   # uncommitted local build
+    set(TT_VERSION "v${TT_BASE_VERSION} (modified)")   # uncommitted local build
 else()
-    set(TT_VERSION "${TT_BASE_VERSION}")
+    set(TT_VERSION "v${TT_BASE_VERSION}")
 endif()
 
 string(TIMESTAMP TT_BUILD_DATE "%Y-%m-%dT%H:%M:%SZ" UTC)
