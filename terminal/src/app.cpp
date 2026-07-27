@@ -503,9 +503,9 @@ App::App(std::string gateway_url)
     session_start_ = std::time(nullptr);
     start_diag_server();
     // Poll GitHub in the background for a newer main than this build; the update
-    // panel only appears once available() flips true (no-op if the build has no
-    // git commit baked in).
-    update_.start(TT_REPO_SLUG, TT_GIT_COMMIT);
+    // panel only appears once available() flips true. Falls back to VERSION-file
+    // comparison when the build has no git commit, so it still works then.
+    update_.start(TT_REPO_SLUG, TT_GIT_COMMIT, TT_VERSION_BASE);
 }
 
 // IPC thread: if this candle batch is the one a queued backtest is waiting

@@ -86,10 +86,15 @@ std::string fetch_remote_version(const std::string& slug) {
 }
 } // namespace
 
-void UpdateChecker::start(std::string slug, std::string current) {
+void UpdateChecker::start(std::string slug, std::string current,
+                          std::string version) {
     slug_ = std::move(slug);
     current_ = std::move(current);
-    if (slug_.empty() || current_.empty() || current_ == "unknown") return;
+    current_version_ = std::move(version);
+    // Need the repo, plus at least one way to tell "are we behind": the build
+    // commit, or (when git info is missing) the semver from the VERSION file.
+    const bool have_commit = !current_.empty() && current_ != "unknown";
+    if (slug_.empty() || (!have_commit && current_version_.empty())) return;
     th_ = std::thread([this] { worker(); });
 }
 
@@ -116,24 +121,41 @@ void UpdateChecker::worker() {
     auto next = steady_clock::now() + seconds(15);
     while (!stop_.load(std::memory_order_acquire)) {
         if (poke_.exchange(false) || steady_clock::now() >= next) {
+            const bool have_commit = !current_.empty() && current_ != "unknown";
             const std::string sha = fetch_head_sha(slug_);
-            if (!sha.empty()) {
-                const std::string shortsha = sha.substr(0, current_.size());
-                const bool avail = shortsha != current_;
-                // The remote VERSION only matters when we're behind — fetch it in
-                // the same poll so the panel has "Latest" the moment it appears.
-                std::string ver;
-                if (avail) ver = fetch_remote_version(slug_);
+            // origin/main's short SHA for the panel (independent of our commit).
+            const std::string shortsha =
+                sha.empty() ? std::string()
+                            : sha.substr(0, have_commit ? current_.size() : 12);
+            bool ok = false, avail = false;
+            std::string ver;
+            if (have_commit) {
+                if (!sha.empty()) {
+                    ok = true;
+                    avail = shortsha != current_;
+                    // Remote VERSION only matters when behind — fetch it in the
+                    // same poll so the panel has "Latest" the moment it appears.
+                    if (avail) ver = fetch_remote_version(slug_);
+                }
+            } else {
+                // No usable build commit: fall back to comparing the VERSION
+                // file, so a build with no git info can still see updates.
+                const std::string rv = fetch_remote_version(slug_);
+                if (!rv.empty()) {
+                    ok = true;
+                    avail = rv != current_version_;
+                    if (avail) ver = rv;
+                }
+            }
+            if (ok) {
                 {
                     std::lock_guard lock(mu_);
-                    remote_ = shortsha;
-                    remote_version_ = ver;   // "" when up to date or the fetch failed
+                    if (!shortsha.empty()) remote_ = shortsha;
+                    remote_version_ = ver;   // "" when up to date or fetch failed
                 }
                 available_.store(avail, std::memory_order_release);
-                last_ok_.store(true, std::memory_order_release);
-            } else {
-                last_ok_.store(false, std::memory_order_release);
             }
+            last_ok_.store(ok, std::memory_order_release);
             checks_.fetch_add(1, std::memory_order_release);   // signal completion
             next = steady_clock::now() + minutes(60);
         }

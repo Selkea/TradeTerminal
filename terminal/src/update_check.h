@@ -20,10 +20,15 @@ public:
     UpdateChecker(const UpdateChecker&) = delete;
     UpdateChecker& operator=(const UpdateChecker&) = delete;
 
-    // slug e.g. "Selkea/TradeTerminal"; current = the short commit this binary
-    // was built from (TT_GIT_COMMIT). No-op (never flags an update) if either is
-    // empty or current is "unknown" (a build with no git info).
-    void start(std::string repo_slug, std::string current_commit);
+    // slug e.g. "Selkea/TradeTerminal"; current_commit = the short commit this
+    // binary was built from (TT_GIT_COMMIT); current_version = its semver
+    // (TT_VERSION_BASE). When the commit is present we compare against
+    // origin/main's HEAD; when it's missing/"unknown" (a build with no git
+    // info) we fall back to comparing the VERSION file, so a bad git stamp can't
+    // disable the checker. No-op only if the slug is empty or we have neither a
+    // usable commit nor a version.
+    void start(std::string repo_slug, std::string current_commit,
+               std::string current_version);
 
     // origin/main is a different commit than the running binary.
     bool available() const { return available_.load(std::memory_order_acquire); }
@@ -47,7 +52,8 @@ private:
     void worker();
 
     std::string slug_;
-    std::string current_;   // set before the thread starts; read-only after
+    std::string current_;          // build commit; set before thread starts, read-only
+    std::string current_version_;  // build semver, for the no-commit fallback path
     std::thread th_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> poke_{false};
