@@ -796,14 +796,18 @@ void App::pump_sweep() {
                 opt_ = AutoOpt{};
                 opt_.key = sweep_setup_.key;
                 // Sizing knobs are not signal: optimizing them just maximizes
-                // leverage (the sim would happily oblige), so they keep their
-                // manual values and only signal params are swept.
-                auto is_sizing = [](const std::string& n) {
+                // leverage (the sim would happily oblige). The time-of-day entry
+                // window is a policy choice, not a signal: sweeping it overfits
+                // to a narrow backtest-lucky slice (e.g. enter_until_h -> ~9 on
+                // hourly bars) that then barely trades on the live intraday feed.
+                // Both keep their manual values; only signal params are swept.
+                auto is_fixed = [](const std::string& n) {
                     return n == "qty" || n == "max_qty" || n == "alloc_pct" ||
-                           n == "risk_pct";
+                           n == "risk_pct" || n == "enter_from_h" ||
+                           n == "enter_until_h";
                 };
                 for (const auto& s : strat_mgr_.param_specs(opt_.key))
-                    if (s.max > s.min && !is_sizing(s.name))
+                    if (s.max > s.min && !is_fixed(s.name))
                         opt_.params.push_back({s.name, s.min, s.max});
                 opt_.best = sweep_base_.params;
 
