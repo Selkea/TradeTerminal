@@ -175,9 +175,22 @@ void ChartPanel::draw(bool* open, const std::vector<FillMarker>& fills,
         ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
         ImPlot::SetupAxes(nullptr, "price", ImPlotAxisFlags_NoLabel, y_flags);
         follow_x();
-        if (n > 0)
-            PlotCandlestick(sym_, xs_.data(), opens_.data(), highs_.data(),
-                            lows_.data(), closes_.data(), n, width_sec_);
+        if (n > 0) {
+            // Direction-coloured close line (matches the backtest look): green
+            // where it rises, red where it falls. Two series with NaN gaps so
+            // each colour draws only its own segments, sharing the turn points.
+            up_.assign(n, NAN);
+            dn_.assign(n, NAN);
+            for (int i = 1; i < n; ++i) {
+                std::vector<double>& tgt = closes_[i] >= closes_[i - 1] ? up_ : dn_;
+                tgt[i - 1] = closes_[i - 1];
+                tgt[i] = closes_[i];
+            }
+            ImPlot::SetNextLineStyle(ImVec4(0.20f, 0.85f, 0.45f, 1.0f), 2.0f);
+            ImPlot::PlotLine("##up", xs_.data(), up_.data(), n);
+            ImPlot::SetNextLineStyle(ImVec4(0.95f, 0.35f, 0.30f, 1.0f), 2.0f);
+            ImPlot::PlotLine("##dn", xs_.data(), dn_.data(), n);
+        }
         if (!fills.empty()) {
             // Session/backtest fills on top of the candles.
             std::vector<double> bx, by, sx, sy;
