@@ -96,11 +96,21 @@ public:
         symbols_ = symbols;
     }
 
-    uint64_t submit_order(const OrderRequest& r) noexcept override {
-        if (r.qty <= 0.0 || r.symbol_id == 0 || r.symbol_id > symbols_.size())
+    uint64_t submit_order(const OrderRequest& in) noexcept override {
+        if (in.qty <= 0.0 || in.symbol_id == 0 || in.symbol_id > symbols_.size())
             return 0;
-        if ((risk_ || symbol_risk_) && !risk_ok(r)) {
-            if (on_order_) on_order_(r, 0);   // recorded as Rejected
+        if ((risk_ || symbol_risk_) && !risk_ok(in)) {
+            if (on_order_) on_order_(in, 0);   // recorded as Rejected
+            return 0;
+        }
+        // Down-size a position-increasing order to the notional cap (see
+        // clamp_to_notional). Reduce/close orders come back unchanged; an order
+        // that can't add a single share (already at the cap) comes back qty 0.
+        OrderRequest r = in;
+        clamp_to_notional(r);
+        if (r.qty <= 0.0) {
+            eng_.push_log("risk: position at notional cap, order rejected");
+            if (on_order_) on_order_(in, 0);
             return 0;
         }
         // Buying power (simulator only — a real broker enforces its own
@@ -177,11 +187,45 @@ public:
     }
 
 private:
+    // Per-symbol limits when provided, else the session-level fallback.
+    const RiskLimits* resolve_risk(uint32_t symbol_id) const noexcept {
+        if (symbol_risk_ && symbol_id >= 1 && symbol_id <= symbol_risk_->size())
+            return &(*symbol_risk_)[symbol_id - 1];
+        return risk_;
+    }
+
+    // Best price to value an order at: its own limit/stop, else the last trade.
+    double price_for(const OrderRequest& r) const noexcept {
+        double px = r.type == OrdType::Limit  ? r.limit_price
+                    : r.type == OrdType::Stop ? r.stop_price
+                                              : 0.0;
+        if (px <= 0.0 && r.symbol_id >= 1 && r.symbol_id <= last_price_.size())
+            px = last_price_[r.symbol_id - 1];
+        return px;
+    }
+
+    // Enforce max_position_notional by shrinking (never rejecting) a position-
+    // INCREASING order so the resulting position's dollar size fits the cap.
+    // Strategies size their protective bracket off the actual fill qty and their
+    // exits off the live position, so a smaller fill stays fully protected. Sets
+    // r.qty to 0 when the position is already at the cap (caller rejects).
+    void clamp_to_notional(OrderRequest& r) noexcept {
+        const RiskLimits* rl = resolve_risk(r.symbol_id);
+        if (!rl || rl->max_position_notional <= 0.0) return;
+        const double pos = pf_.position(r.symbol_id).qty;
+        const double dir = r.side == Side::Buy ? 1.0 : -1.0;
+        const double after = pos + dir * r.qty;
+        if (std::abs(after) <= std::abs(pos)) return;   // reducing/closing: leave it
+        const double px = price_for(r);
+        if (px <= 0.0) return;   // no price to size against; equity halts still catch it
+        const double max_abs = rl->max_position_notional / px;   // shares the cap allows
+        if (std::abs(after) <= max_abs) return;                  // already within budget
+        const double allowed_add = std::floor(max_abs - std::abs(pos));
+        r.qty = allowed_add > 0.0 ? allowed_add : 0.0;
+    }
+
     bool risk_ok(const OrderRequest& r) noexcept {
-        // Per-symbol limits when provided, else the session-level fallback.
-        const RiskLimits* rl = risk_;
-        if (symbol_risk_ && r.symbol_id >= 1 && r.symbol_id <= symbol_risk_->size())
-            rl = &(*symbol_risk_)[r.symbol_id - 1];
+        const RiskLimits* rl = resolve_risk(r.symbol_id);
         if (!rl) return true;
         if (r.qty > rl->max_order_qty) {
             eng_.push_log("risk: order qty exceeds limit, rejected");

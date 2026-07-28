@@ -322,3 +322,48 @@ TEST_CASE("live reconciliation: gate dispatch, hold until flat, then resume") {
 
     eng.stop_live();
 }
+
+namespace {
+// Submits one oversized market buy on its second tick (so the engine already
+// has a last price to size the notional cap against), then stays quiet.
+struct OversizedBuyStrat : IStrategy {
+    double qty;
+    int seen = 0;
+    bool sent = false;
+    explicit OversizedBuyStrat(double q) : qty(q) {}
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        if (sent || ++seen < 2) return;
+        ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, qty, 0, 0, 0, 0});
+        sent = true;
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("live risk: notional cap down-sizes an oversized entry to fit the budget") {
+    Engine eng;
+    OversizedBuyStrat strat(1'000.0);   // wants 1000 sh; the cap allows far fewer
+
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;               // no bars fire; assert on on_tick path
+    cfg.risk.max_order_qty = 100'000;        // keep the share caps out of the way
+    cfg.risk.max_position_qty = 100'000;
+    cfg.risk.max_position_notional = 5'000;  // @ price 50 -> 100 shares
+    REQUIRE(eng.start_live(cfg, {&strat}));
+
+    // pump_until feeds AAA @ 50, so the 1000-share buy is clamped to 5000/50 = 100.
+    REQUIRE(pump_until(eng, [&] {
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0);
+    }));
+    // And it holds there — a notional-capped position never overshoots or re-adds.
+    for (int i = 0; i < 30; ++i) eng.push_live_tick("AAA", 1, 50.0, 0.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0));
+
+    eng.stop_live();
+}

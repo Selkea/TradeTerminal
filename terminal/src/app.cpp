@@ -2262,6 +2262,20 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
              so.risk.stale_feed_sec < session_risk.stale_feed_sec))
             session_risk.stale_feed_sec = so.risk.stale_feed_sec;
     }
+    // Per-trade notional guardrail: cap each position's dollar size so one
+    // adverse move can't spend the whole day's loss budget in a single trade.
+    // Strategies size off the ~$1M paper equity (risk_pct * cash), which dwarfs
+    // the loss limit; the share caps are notional-blind and miss it. We can't
+    // see a strategy's stop at order time, so bound exposure assuming a
+    // worst-case excursion: a $N position loses ~N*move against us, so keep
+    // N*move within a slice of the budget. Only when a daily-loss halt is armed
+    // and no explicit cap was set; the engine down-sizes orders to fit.
+    constexpr double kAdverseMove = 0.10;     // assume up to a 10% move against us
+    constexpr double kLossBudgetFrac = 0.5;   // one trade risks <= half the budget
+    for (RiskLimits& rl : sym_risk)
+        if (rl.max_position_notional <= 0.0 && rl.daily_max_loss > 0.0)
+            rl.max_position_notional = kLossBudgetFrac * rl.daily_max_loss / kAdverseMove;
+
     // Session default bar size (feed gap-backfill granularity);
     // each symbol still aggregates at its own size below.
     const int session_bar =

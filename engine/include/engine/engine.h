@@ -60,6 +60,12 @@ struct BacktestResult {
 struct RiskLimits {
     double max_order_qty = 1'000;
     double max_position_qty = 5'000;
+    // Dollar cap on a position's size (|qty|*price). A position-INCREASING order
+    // that would breach it is DOWN-SIZED to fit (not rejected), so one trade can
+    // never risk more than a slice of the daily-loss budget on an adverse move —
+    // the share caps above are notional-blind and miss this. Reduce/close orders
+    // are never touched. 0 = disabled. Usually derived from daily_max_loss.
+    double max_position_notional = 0;
     double price_band_pct = 0.20;   // limit orders within ±20% of last trade
 
     // Automated halts — the engine pulls the kill switch itself (cancel all,
