@@ -2412,9 +2412,13 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
             break;
         }
         strategies.push_back(inst);
-        cfg.symbol_params.push_back(
-            so.params.empty() ? strat_mgr_.param_values(so.strat_key)
-                               : so.params);
+        std::map<std::string, double> sp =
+            so.params.empty() ? strat_mgr_.param_values(so.strat_key) : so.params;
+        // "hold — don't halt" mode: tell hold-aware strategies not to force-flatten
+        // an underwater position in their EOD/new-day housekeeping (they read
+        // ctx.param("__hold_losers")). Live-only overlay — backtests behave normally.
+        if (so.risk.disable_auto_halt) sp["__hold_losers"] = 1.0;
+        cfg.symbol_params.push_back(std::move(sp));
         new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
     }
     if (!acq_ok) {

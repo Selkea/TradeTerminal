@@ -49,6 +49,9 @@ public:
         eod_min_ = ctx.param("eod_min", 5);
         allow_short_ = ctx.param("allow_short", 0) >= 0.5;
         max_qty_ = ctx.param("max_qty", 5000);
+        // Risk overlay injected by the app in "hold — don't halt" mode: don't let
+        // the EOD / new-day housekeeping flatten an underwater position.
+        hold_losers_ = ctx.param("__hold_losers", 0) >= 0.5;
 
         sym_ = 0;
         bar_sec_ = 0;
@@ -77,14 +80,21 @@ public:
         if (day != day_) {
             // New session. Leftovers from yesterday (resting orders, an
             // unflattened position) must not leak into today.
+            const Position p = ctx.position(sym_);
+            const bool hold_loser = hold_losers_ && p.qty != 0.0 && p.unrealized_pnl < 0.0;
             cancel_all(ctx);
-            const double pos = ctx.position(sym_).qty;
-            if (pos != 0.0 && flatten_id_ == 0)
-                flatten_id_ = ctx.submit_order({sym_, pos > 0 ? Side::Sell : Side::Buy,
-                                                OrdType::Market, {}, std::abs(pos),
+            if (!hold_loser && p.qty != 0.0 && flatten_id_ == 0)
+                flatten_id_ = ctx.submit_order({sym_, p.qty > 0 ? Side::Sell : Side::Buy,
+                                                OrdType::Market, {}, std::abs(p.qty),
                                                 0.0, 0.0, 0.0, 0.0});
             day_ = day;
             reset_session();
+            if (hold_loser) {
+                // Hold the underwater position (no stop) until it recovers; don't
+                // arm a new breakout on top of it this session.
+                entered_ = true;
+                ctx.log(1, "hold mode: keeping underwater position, no re-entry today");
+            }
         }
         ++bars_today_;
 
@@ -95,13 +105,17 @@ public:
                 if (!eod_done_) {
                     eod_done_ = true;
                     entered_ = true;  // no re-arming today
+                    const Position p = ctx.position(sym_);
+                    const bool hold_loser =
+                        hold_losers_ && p.qty != 0.0 && p.unrealized_pnl < 0.0;
                     cancel_all(ctx);
-                    const double pos = ctx.position(sym_).qty;
-                    if (pos != 0.0 && flatten_id_ == 0) {
+                    if (!hold_loser && p.qty != 0.0 && flatten_id_ == 0) {
                         flatten_id_ = ctx.submit_order(
-                            {sym_, pos > 0 ? Side::Sell : Side::Buy, OrdType::Market,
-                             {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0});
+                            {sym_, p.qty > 0 ? Side::Sell : Side::Buy, OrdType::Market,
+                             {}, std::abs(p.qty), 0.0, 0.0, 0.0, 0.0});
                         ctx.log(1, "EOD flatten");
+                    } else if (hold_loser) {
+                        ctx.log(1, "hold mode: keeping underwater position overnight");
                     }
                 }
                 return;
@@ -207,6 +221,7 @@ private:
     double range_min_ = 15, tp_r_ = 2.0, risk_pct_ = 1.0;
     double session_min_ = 390, eod_min_ = 5, max_qty_ = 5000;
     bool allow_short_ = false;
+    bool hold_losers_ = false;   // hold-mode overlay: keep underwater positions
 
     uint32_t sym_ = 0;
     int bar_sec_ = 0;
