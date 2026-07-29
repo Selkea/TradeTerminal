@@ -344,6 +344,12 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                               "long while a position is open. 0 = off");
                         r.risk.stale_feed_sec = std::max(0, r.risk.stale_feed_sec);
                         r.risk_dd_pct = std::clamp(r.risk_dd_pct, 0.0, 99.0);
+                        ImGui::Checkbox("hold — don't halt", &r.risk.disable_auto_halt);
+                        ImGui::SetItemTooltip("Don't auto-flatten on the daily-loss / drawdown "
+                                              "limits — hold positions until the strategy "
+                                              "exits or they recover. The size cap and "
+                                              "stale-feed guard still apply. Removes the "
+                                              "session's daily-loss safety net.");
                     }
                     ImGui::PopID();
                     ImGui::EndTabItem();
@@ -688,6 +694,7 @@ std::vector<TradeSymbol> TradePanel::symbols_config() const {
         ts.risk_daily_max_loss = r.risk.daily_max_loss;
         ts.risk_stale_feed_sec = r.risk.stale_feed_sec;
         ts.risk_dd_pct = r.risk_dd_pct;
+        ts.risk_disable_halt = r.risk.disable_auto_halt;
         ts.params = r.params;
         ts.ap_mode = r.ap_mode;
         ts.ap_trigger = r.ap_trigger;
@@ -713,6 +720,7 @@ void TradePanel::restore_symbols(const std::vector<TradeSymbol>& syms) {
         r.risk.daily_max_loss = ts.risk_daily_max_loss;
         r.risk.stale_feed_sec = ts.risk_stale_feed_sec;
         r.risk_dd_pct = ts.risk_dd_pct;
+        r.risk.disable_auto_halt = ts.risk_disable_halt;
         r.params = ts.params;
         r.ap_mode = ts.ap_mode;
         r.ap_trigger = ts.ap_trigger;

@@ -49,6 +49,7 @@ AppConfig AppConfig::load(const std::string& path) {
     c.risk_daily_max_loss = j.value("risk_daily_max_loss", c.risk_daily_max_loss);
     c.risk_max_drawdown_pct = j.value("risk_max_drawdown_pct", c.risk_max_drawdown_pct);
     c.risk_stale_feed_sec = j.value("risk_stale_feed_sec", c.risk_stale_feed_sec);
+    c.risk_disable_halt = j.value("risk_disable_halt", c.risk_disable_halt);
 
     if (j.contains("trade_symbols") && j["trade_symbols"].is_array())
         for (const auto& s : j["trade_symbols"]) {
@@ -66,6 +67,7 @@ AppConfig AppConfig::load(const std::string& path) {
             ts.risk_daily_max_loss = s.value("risk_daily_max_loss", ts.risk_daily_max_loss);
             ts.risk_stale_feed_sec = s.value("risk_stale_feed_sec", ts.risk_stale_feed_sec);
             ts.risk_dd_pct = s.value("risk_dd_pct", ts.risk_dd_pct);
+            ts.risk_disable_halt = s.value("risk_disable_halt", ts.risk_disable_halt);
             ts.ap_mode = s.value("ap_mode", ts.ap_mode);
             ts.ap_trigger = s.value("ap_trigger", ts.ap_trigger);
             ts.ap_interval_min = s.value("ap_interval_min", ts.ap_interval_min);
@@ -145,6 +147,7 @@ void AppConfig::save(const std::string& path) const {
         {"risk_daily_max_loss", risk_daily_max_loss},
         {"risk_max_drawdown_pct", risk_max_drawdown_pct},
         {"risk_stale_feed_sec", risk_stale_feed_sec},
+        {"risk_disable_halt", risk_disable_halt},
     };
     json syms = json::array();
     for (const auto& ts : trade_symbols)
@@ -158,6 +161,7 @@ void AppConfig::save(const std::string& path) const {
                         {"risk_daily_max_loss", ts.risk_daily_max_loss},
                         {"risk_stale_feed_sec", ts.risk_stale_feed_sec},
                         {"risk_dd_pct", ts.risk_dd_pct},
+                        {"risk_disable_halt", ts.risk_disable_halt},
                         {"params", ts.params},
                         {"ap_mode", ts.ap_mode},
                         {"ap_trigger", ts.ap_trigger},

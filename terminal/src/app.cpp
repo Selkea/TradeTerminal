@@ -428,6 +428,7 @@ App::App(std::string gateway_url)
         r.max_position_qty = cfg_.risk_max_position_qty;
         r.daily_max_loss = cfg_.risk_daily_max_loss;
         r.stale_feed_sec = cfg_.risk_stale_feed_sec;
+        r.disable_auto_halt = cfg_.risk_disable_halt;
         trade_.restore_risk(r, cfg_.risk_max_drawdown_pct);
     }
     trade_.restore_symbols(cfg_.trade_symbols);
@@ -2253,10 +2254,16 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         sym_accts.push_back(so.account);
         sym_risk.push_back(so.risk);
         any_record = any_record || so.record;
-        session_risk.daily_max_loss =
-            tight(session_risk.daily_max_loss, so.risk.daily_max_loss);
-        session_risk.max_drawdown_pct = tight(
-            session_risk.max_drawdown_pct, so.risk.max_drawdown_pct);
+        // A "hold — don't halt" symbol is left out of the equity-halt
+        // aggregation, so its loss can't arm the session's auto-flatten; its
+        // positions ride until the strategy exits or they recover. The notional
+        // cap (below) and the stale-feed guard still apply.
+        if (!so.risk.disable_auto_halt) {
+            session_risk.daily_max_loss =
+                tight(session_risk.daily_max_loss, so.risk.daily_max_loss);
+            session_risk.max_drawdown_pct = tight(
+                session_risk.max_drawdown_pct, so.risk.max_drawdown_pct);
+        }
         if (so.risk.stale_feed_sec > 0 &&
             (session_risk.stale_feed_sec == 0 ||
              so.risk.stale_feed_sec < session_risk.stale_feed_sec))

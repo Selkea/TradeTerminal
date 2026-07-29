@@ -23,6 +23,7 @@ struct TradeSymbol {
     double risk_daily_max_loss = 0;
     int risk_stale_feed_sec = 0;
     double risk_dd_pct = 0;         // percent, as shown in the UI
+    bool risk_disable_halt = false; // hold positions instead of halting on equity limits
     std::map<std::string, double> params;   // this symbol's strategy params
     // Autopilot (re-optimize while trading): mode 0 off / 1 params / 2 full;
     // trigger 0 timer / 1 drawdown / 2 both.
@@ -75,6 +76,7 @@ struct AppConfig {
     double risk_daily_max_loss = 0;
     double risk_max_drawdown_pct = 0;   // percent, as shown in the UI
     int risk_stale_feed_sec = 0;
+    bool risk_disable_halt = false;     // default for new symbols: hold, don't halt
 
     // Trade panel: the symbol tabs from last session (empty = default AAPL).
     std::vector<TradeSymbol> trade_symbols;

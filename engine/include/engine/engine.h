@@ -73,6 +73,12 @@ struct RiskLimits {
     double daily_max_loss = 0;      // $ of equity lost since session start
     double max_drawdown_pct = 0;    // fraction lost from the session equity high
     int stale_feed_sec = 0;         // no ticks this long with a position open
+    // App-honored preference (the engine ignores it): when set, this symbol does
+    // NOT arm the session's equity halts (daily-loss / drawdown) — positions are
+    // held instead of force-flattened at the limit, to be closed by the strategy
+    // or when they recover. The notional cap and stale-feed halt still apply. App
+    // implements it by dropping the symbol from the halt aggregation.
+    bool disable_auto_halt = false;
 };
 
 class IBrokerAdapter;
