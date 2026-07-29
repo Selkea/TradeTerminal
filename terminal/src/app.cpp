@@ -2270,7 +2270,10 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     // worst-case excursion: a $N position loses ~N*move against us, so keep
     // N*move within a slice of the budget. Only when a daily-loss halt is armed
     // and no explicit cap was set; the engine down-sizes orders to fit.
-    constexpr double kAdverseMove = 0.10;     // assume up to a 10% move against us
+    // 20% adverse move: these thin low-float names routinely swing that far
+    // intraday (a 10% assumption let SNDU lose the whole day's budget on one
+    // 20% drop, 2026-07-29).
+    constexpr double kAdverseMove = 0.20;     // assume up to a 20% move against us
     constexpr double kLossBudgetFrac = 0.5;   // one trade risks <= half the budget
     for (RiskLimits& rl : sym_risk)
         if (rl.max_position_notional <= 0.0 && rl.daily_max_loss > 0.0)
