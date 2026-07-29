@@ -387,7 +387,7 @@ App::App(std::string gateway_url)
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
     net::IMarketData::Callbacks cbs;
-    cbs.on_log = [this](std::string line) { log_.add(std::move(line)); };
+    cbs.on_log = [this](std::string line) { route(std::move(line)); };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
         // When the real-time feed owns the session, delayed sidecar quotes
@@ -396,12 +396,12 @@ App::App(std::string gateway_url)
             engine_.push_live_tick(sym, q.ts_ms, q.price, q.day_volume);
     };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
-        log_.add("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
+        route("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
         std::lock_guard lock(pending_bt_mu_);
         pending_bt_.active = false;  // data never arrives; don't wedge the panel
     };
     cbs.on_candles = [this](net::CandleBatch&& b) {
-        log_.add("candles: " + b.symbol + " " + b.interval + " x" +
+        route("candles: " + b.symbol + " " + b.interval + " x" +
                  std::to_string(b.candles.size()) + (b.cached ? " (cache)" : ""));
         start_pending_backtest(b);
         stash_pending_sweep(b);
@@ -411,6 +411,7 @@ App::App(std::string gateway_url)
 
     // Session persistence (cfg_ is loaded in the init list) + file logging.
     log_.set_log_file((data_dir() / "logs" / "terminal.log").string());
+    opt_log_.set_log_file((data_dir() / "logs" / "optimizer.log").string());
     watchlist_.set_symbols(cfg_.watchlist);
     chart_.restore(cfg_.chart_symbol, cfg_.chart_interval_idx, cfg_.chart_range_idx);
     backtest_.set_cash(cfg_.backtest_cash);
@@ -455,16 +456,17 @@ App::App(std::string gateway_url)
         vis("positions", show_positions_);
         vis("journal", show_journal_);
         vis("log", show_log_);
+        vis("optlog", show_opt_log_);
     }
     // Rebuild last session's strategies and their params.
     strat_mgr_.restore_state(cfg_.strategy_loaded, cfg_.strategy_params,
                              cfg_.strategy_tourn_excluded);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
-    if (alerts_.has_webhook()) log_.add("alerts: webhook configured");
+    if (alerts_.has_webhook()) route("alerts: webhook configured");
 
     if (!journal_.open((data_dir() / "journal.db").string()))
-        log_.add("journal: could not open journal.db — history disabled");
+        route("journal: could not open journal.db — history disabled");
 
 #ifdef TT_DEBUG
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
@@ -473,7 +475,7 @@ App::App(std::string gateway_url)
     if (use_tws_data_) {
         tws_data_.set_endpoint("127.0.0.1", tws_api_port());
         tws_data_.start(std::move(cbs));
-        log_.add("data: TWS route - charts/watchlist/backtests ride IB Gateway; "
+        route("data: TWS route - charts/watchlist/backtests ride IB Gateway; "
                  "CP web gateway stays down (one brokerage session per username)");
     } else {
         gw_.start(std::move(cbs));
@@ -493,7 +495,7 @@ App::App(std::string gateway_url)
             if (!args.empty()) {
                 run_hidden(args);
                 gateway_starting_until_ = 90.0;   // show INITIALIZING until it connects
-                log_.add(use_tws_data_
+                route(use_tws_data_
                              ? "account: starting IB Gateway (TWS route)"
                              : "account: starting IBKR gateway + auto-login (tied to app)");
             }
@@ -520,7 +522,7 @@ void App::start_pending_backtest(net::CandleBatch& batch) {
         return;
     pending_bt_.active = false;   // GC-safe: engine start happens under the lock
     if (batch.candles.size() < 3) {
-        log_.add("backtest: not enough data for " + batch.symbol);
+        route("backtest: not enough data for " + batch.symbol);
         return;
     }
     BacktestConfig cfg;
@@ -536,14 +538,14 @@ void App::start_pending_backtest(net::CandleBatch& batch) {
     const auto [bt_lat, bt_jit] = sim_exec_latency(cfg_);
     cfg.exec.latency_ns = bt_lat;
     cfg.exec.latency_jitter_ns = bt_jit;
-    log_.add(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
+    route(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
                  ? "backtest fill latency: measured " +
                        std::to_string(bt_lat / 1'000'000) + "+/-" +
                        std::to_string(bt_jit / 1'000'000) + " ms (" +
                        std::to_string(cfg_.measured_lat_count) + " live acks)"
                  : "backtest fill latency: default 75 ms (no live acks yet)");
     if (!engine_.start_backtest(std::move(cfg), pending_bt_.strategy))
-        log_.add("backtest: engine busy, try again");
+        route("backtest: engine busy, try again");
 }
 
 // UI thread: lease a fresh instance of `key`, capture params, fetch data.
@@ -551,12 +553,12 @@ void App::queue_backtest(const std::string& key, const std::string& sym,
                          const std::string& ivl, const std::string& rng,
                          double cash) {
     if (!data_.connected()) {
-        log_.add("backtest: feed is down, cannot fetch data");
+        route("backtest: feed is down, cannot fetch data");
         return;
     }
     IStrategy* inst = acquire_strategy(key);
     if (!inst) {
-        log_.add("backtest: strategy '" + key + "' is not loaded");
+        route("backtest: strategy '" + key + "' is not loaded");
         return;
     }
     leases_.push_back({inst, key, StrategyLease::Backtest});
@@ -640,7 +642,7 @@ void App::queue_backtest_as(const std::string& src, const std::string& sym,
     }
     pending_run_ = {true, src, sym, ivl, rng, cash};
     strat_mgr_.request_load(src);
-    log_.add("backtest: building " + src + " first");
+    route("backtest: building " + src + " first");
 }
 
 // UI thread, per frame: fire the deferred backtest once the module is
@@ -654,7 +656,7 @@ void App::pump_pending_run() {
                        pending_run_.cash);
     } else if (!strat_mgr_.load_pending()) {
         pending_run_.active = false;
-        log_.add("backtest: strategy build failed — see the Strategy panel");
+        route("backtest: strategy build failed — see the Strategy panel");
     }
 }
 
@@ -663,17 +665,17 @@ void App::pump_pending_run() {
 // UI thread: capture the request + strategy and fetch the data.
 void App::queue_sweep(const SweepPanel::Request& rq) {
     if (!data_.connected()) {
-        log_.add("sweep: feed is down, cannot fetch data");
+        route("sweep: feed is down, cannot fetch data");
         return;
     }
     if (sweep_.running || engine_.running()) {
-        log_.add("sweep: engine busy, try again");
+        route("sweep: engine busy, try again");
         return;
     }
     const std::string key = rq.strat_key;
     IStrategy* inst = acquire_strategy(key);
     if (!inst) {
-        log_.add("sweep: strategy '" + strat_mgr_.display_name(key) + "' is not loaded");
+        route("sweep: strategy '" + strat_mgr_.display_name(key) + "' is not loaded");
         return;
     }
     leases_.push_back({inst, key, StrategyLease::Sweep});
@@ -713,7 +715,7 @@ void App::start_sweep_cell() {
     cfg.params[opt_.params[static_cast<size_t>(opt_.pi)].name] =
         sweep_.xs[static_cast<size_t>(opt_.step)];
     if (!engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
-        log_.add("optimizer: engine busy, aborted");
+        route("optimizer: engine busy, aborted");
         sweep_.running = false;
     }
 }
@@ -751,7 +753,7 @@ void App::pump_sweep() {
             sweep_setup_.ready = false;
             const SweepPanel::Request& rq = sweep_setup_.req;
             if (sweep_setup_.bars.size() < 3) {
-                log_.add("sweep: not enough data for " + rq.symbol);
+                route("sweep: not enough data for " + rq.symbol);
             } else {
                 sweep_base_ = BacktestConfig{};
                 sweep_base_.symbol = rq.symbol;
@@ -764,7 +766,7 @@ void App::pump_sweep() {
                     const auto [sw_lat, sw_jit] = sim_exec_latency(cfg_);
                     sweep_base_.exec.latency_ns = sw_lat;
                     sweep_base_.exec.latency_jitter_ns = sw_jit;
-                    log_.add(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
+                    route(static_cast<uint64_t>(cfg_.measured_lat_count) >= kMinLatSamples
                                  ? "optimizer fill latency: measured " +
                                        std::to_string(sw_lat / 1'000'000) + "+/-" +
                                        std::to_string(sw_jit / 1'000'000) + " ms (" +
@@ -788,7 +790,7 @@ void App::pump_sweep() {
                         sweep_base_.bars.resize(n_train);
                     } else {
                         holdout = 0;
-                        log_.add("sweep: too little data for a holdout, skipped");
+                        route("sweep: too little data for a holdout, skipped");
                     }
                 }
 
@@ -818,7 +820,7 @@ void App::pump_sweep() {
                 sweep_.label = rq.symbol + " " + rq.interval + " " + rq.range + " — " +
                                strat_mgr_.display_name(sweep_setup_.key);
                 if (opt_.params.empty()) {
-                    log_.add("optimizer: no tunable parameters");
+                    route("optimizer: no tunable parameters");
                 } else {
                     sweep_.running = true;
                     sweep_.n_passes = kSweepPasses;
@@ -845,7 +847,7 @@ void App::pump_sweep() {
         std::snprintf(buf, sizeof buf, "optimizer: holdout %s %.4g (last %.0f%%, unseen)",
                       kSweepMetrics[sweep_.metric], sweep_.holdout_val,
                       sweep_.holdout_pct);
-        log_.add(buf);
+        route(buf);
         return;
     }
 
@@ -898,7 +900,7 @@ void App::pump_sweep() {
         std::snprintf(kv, sizeof kv, "%s%s=%.4g", bests.empty() ? "" : " ", k.c_str(), v);
         bests += kv;
     }
-    log_.add("optimizer: finished " + std::to_string(sweep_.done) + " backtests (" +
+    route("optimizer: finished " + std::to_string(sweep_.done) + " backtests (" +
              sweep_.label + ") — applied " + bests);
 
     if (sweep_.holdout_pct <= 0 || sweep_test_bars_.empty()) {
@@ -912,7 +914,7 @@ void App::pump_sweep() {
     if (engine_.start_backtest(std::move(cfg), sweep_strategy_)) {
         sweep_holdout_phase_ = true;
     } else {
-        log_.add("optimizer: holdout run could not start (engine busy)");
+        route("optimizer: holdout run could not start (engine busy)");
         sweep_.running = false;
     }
 }
@@ -924,7 +926,7 @@ void App::pump_sweep() {
 void App::start_tournament(SweepPanel::Request rq, const std::string& target_symbol,
                            std::vector<std::string> candidates) {
     if (tourn_.active || sweep_.running || engine_.running()) {
-        log_.add("tournament: optimizer busy, try again");
+        route("tournament: optimizer busy, try again");
         return;
     }
     // Champion selection needs unseen-data scoring; force a holdout.
@@ -939,7 +941,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
         for (const auto& k : strat_mgr_.loaded_keys())
             if (!strat_mgr_.tournament_excluded(k)) tourn_.candidates.push_back(k);
         if (tourn_.candidates.empty()) {
-            log_.add("tournament: every loaded strategy is excluded — enable at "
+            route("tournament: every loaded strategy is excluded — enable at "
                      "least one in the Strategies panel");
             tourn_ = Tournament{};   // unwind: clears active
             return;
@@ -953,7 +955,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     sweep_.tourney.active = true;
     sweep_.tourney.total = static_cast<int>(tourn_.candidates.size());
     sweep_.tourney.symbol = tourn_.base.symbol;
-    log_.add("tournament: " + std::to_string(tourn_.candidates.size()) +
+    route("tournament: " + std::to_string(tourn_.candidates.size()) +
              " candidates on " + tourn_.base.symbol + " " + tourn_.base.interval + " " +
              tourn_.base.range);
 }
@@ -985,7 +987,7 @@ void App::pump_tournament() {
             tourn_.phase = Tournament::Phase::Queued;
             tourn_.stamp_s = now;
         } else if (now - tourn_.stamp_s > 120.0) {
-            log_.add("tournament: engine stayed busy, aborting");
+            route("tournament: engine stayed busy, aborting");
             tourn_.active = false;
             sweep_.tourney.active = false;
         }
@@ -1002,7 +1004,7 @@ void App::pump_tournament() {
             // silent half-open data session is the usual cause) or the strategy
             // failed to load. Name it — otherwise this only shows as a generic
             // "no candidate produced a result" downstream.
-            log_.add("tournament: " + tourn_.base.symbol + " candle fetch timed out (" +
+            route("tournament: " + tourn_.base.symbol + " candle fetch timed out (" +
                      (data_.connected()
                           ? "data session connected but no bars in 60s"
                           : "data session disconnected") +
@@ -1054,7 +1056,7 @@ void App::finish_tournament() {
     }
 
     if (champ < 0) {
-        log_.add("tournament: no candidate produced a result");
+        route("tournament: no candidate produced a result");
         return;
     }
     const auto& c = tourn_.results[static_cast<size_t>(champ)];
@@ -1066,7 +1068,7 @@ void App::finish_tournament() {
                   strat_mgr_.display_name(c.key).c_str(),
                   kSweepMetrics[tourn_.base.metric], c.score,
                   c.holdout ? " on holdout" : "", tourn_.target_symbol.c_str());
-    log_.add(buf);
+    route(buf);
 }
 
 // ---- daily auto-lineup ----------------------------------------------------
@@ -1103,30 +1105,30 @@ void App::pump_lineup_schedule() {
     const int now_min = tm.tm_hour * 60 + tm.tm_min;
     if (now_min < build_min || now_min > build_min + 30) return;   // in the window
     lineup_last_build_day_ = tm.tm_yday;
-    log_.add("lineup: scheduled build (" + cfg_.lineup_build_time +
+    route("lineup: scheduled build (" + cfg_.lineup_build_time +
              (cfg_.lineup_propose_only ? ", propose-only)" : ", auto-start)"));
     start_daily_lineup(!cfg_.lineup_propose_only);
 }
 
 void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
-        log_.add("lineup: already building");
+        route("lineup: already building");
         return;
     }
     if (!use_tws_data_) {
-        log_.add("lineup: requires the IBKR (TWS) data route");
+        route("lineup: requires the IBKR (TWS) data route");
         return;
     }
     if (!data_.connected()) {
-        log_.add("lineup: data session not connected");
+        route("lineup: data session not connected");
         return;
     }
     if (engine_.running()) {
-        log_.add("lineup: stop the live session first");
+        route("lineup: stop the live session first");
         return;
     }
     if (tourn_.active || sweep_.running) {
-        log_.add("lineup: optimizer busy, try again");
+        route("lineup: optimizer busy, try again");
         return;
     }
     lineup_ = DailyLineup{};
@@ -1156,7 +1158,7 @@ void App::start_daily_lineup(bool autostart_when_done) {
     });
     lineup_.phase = DailyLineup::Phase::Scanning;
     lineup_.stamp_s = ImGui::GetTime();
-    log_.add("lineup: scanning IBKR for high-volatility movers...");
+    route("lineup: scanning IBKR for high-volatility movers...");
 }
 
 // I/O thread (on_candles): stage a pool symbol's daily bars for the UI thread.
@@ -1192,7 +1194,7 @@ void App::pump_daily_lineup() {
         }
         if (!ready) {
             if (now - lineup_.stamp_s > 30.0) {
-                log_.add("lineup: scan timed out");
+                route("lineup: scan timed out");
                 lineup_.phase = Phase::Idle;
             }
             return;
@@ -1204,11 +1206,11 @@ void App::pump_daily_lineup() {
             lineup_.pool.push_back(h.symbol);
         }
         if (lineup_.pool.empty()) {
-            log_.add("lineup: scan returned no candidates");
+            route("lineup: scan returned no candidates");
             lineup_.phase = Phase::Idle;
             return;
         }
-        log_.add("lineup: " + std::to_string(lineup_.pool.size()) +
+        route("lineup: " + std::to_string(lineup_.pool.size()) +
                  " candidates - fetching daily bars to rank");
         {
             std::lock_guard<std::mutex> g(lineup_mu_);
@@ -1257,7 +1259,7 @@ void App::pump_daily_lineup() {
         lineup_.picks.clear();
         for (const auto& r : ranked) lineup_.picks.push_back(r.symbol);
         if (lineup_.picks.empty()) {
-            log_.add("lineup: no candidate cleared the price/liquidity gates");
+            route("lineup: no candidate cleared the price/liquidity gates");
             lineup_.phase = Phase::Idle;
             return;
         }
@@ -1268,7 +1270,7 @@ void App::pump_daily_lineup() {
                           r.atr_pct * 100.0);
             msg += b;
         }
-        log_.add(msg);
+        route(msg);
         trade_.set_lineup(lineup_.picks);
         show_trade_ = true;   // surface the freshly built tabs
         lineup_.tourn_idx = 0;
@@ -1294,14 +1296,14 @@ void App::pump_daily_lineup() {
         rq.cash = st.cash;
         rq.metric = st.metric;
         rq.holdout_pct = st.holdout ? st.holdout_pct : 25.0;
-        log_.add("lineup: tournament " + std::to_string(lineup_.tourn_idx) + "/" +
+        route("lineup: tournament " + std::to_string(lineup_.tourn_idx) + "/" +
                  std::to_string(lineup_.picks.size()) + " - " + sym);
         start_tournament(rq, sym);
         return;
     }
 
     case Phase::Done:
-        log_.add("lineup: ready - " + std::to_string(lineup_.picks.size()) +
+        route("lineup: ready - " + std::to_string(lineup_.picks.size()) +
                  " symbols loaded into the Trade tabs");
         // Arm the auto-start for the draw() call site, which has the account +
         // data-availability context to build the StartOpts (see start_live_session
@@ -1376,7 +1378,7 @@ void App::pump_autopilot() {
         ap_.in_flight = i;
         S.last_cycle_s = now;
         if (dd_due) ap_.last_dd_cycle_s = now;
-        log_.add("autopilot: " + S.symbol + " cycle started (" +
+        route("autopilot: " + S.symbol + " cycle started (" +
                  (S.mode == 1 ? "params" : "full") +
                  (dd_due ? ", drawdown trigger)" : ", timer)"));
         return;
@@ -1395,7 +1397,7 @@ void App::autopilot_evaluate() {
              (minimize ? e.score < champ->score : e.score > champ->score)))
             champ = &e;
     if (!champ) {
-        log_.add("autopilot: " + S.symbol + " cycle produced no result");
+        route("autopilot: " + S.symbol + " cycle produced no result");
         return;
     }
 
@@ -1410,9 +1412,9 @@ void App::autopilot_evaluate() {
             std::snprintf(buf, sizeof buf,
                           "autopilot: %s params queued (%s %.4g, applies when flat)",
                           S.symbol.c_str(), kSweepMetrics[ap_.metric], champ->score);
-            log_.add(buf);
+            route(buf);
         } else {
-            log_.add("autopilot: " + S.symbol + " kept (no improvement)");
+            route("autopilot: " + S.symbol + " kept (no improvement)");
         }
         S.challenger.clear();
         S.streak = 0;
@@ -1422,7 +1424,7 @@ void App::autopilot_evaluate() {
     // A different strategy won (full mode): swap only after it beats the
     // incumbent decisively twice in a row.
     if (S.has_score && !ap_better(ap_.metric, champ->score, S.incumbent_score)) {
-        log_.add("autopilot: " + S.symbol + " challenger " +
+        route("autopilot: " + S.symbol + " challenger " +
                  strat_mgr_.display_name(champ->key) + " not decisive, kept " +
                  strat_mgr_.display_name(S.key));
         S.challenger.clear();
@@ -1432,13 +1434,13 @@ void App::autopilot_evaluate() {
     if (S.challenger != champ->key) {
         S.challenger = champ->key;
         S.streak = 1;
-        log_.add("autopilot: " + S.symbol + " challenger " +
+        route("autopilot: " + S.symbol + " challenger " +
                  strat_mgr_.display_name(champ->key) + " (win 1/2)");
         return;
     }
     IStrategy* inst = acquire_strategy(champ->key);
     if (!inst) {
-        log_.add("autopilot: " + S.symbol + " swap failed (strategy not loaded)");
+        route("autopilot: " + S.symbol + " swap failed (strategy not loaded)");
         return;
     }
     leases_.push_back({inst, champ->key, StrategyLease::Live});
@@ -1449,7 +1451,7 @@ void App::autopilot_evaluate() {
     S.has_score = true;
     S.challenger.clear();
     S.streak = 0;
-    log_.add("autopilot: " + S.symbol + " strategy swap queued -> " +
+    route("autopilot: " + S.symbol + " strategy swap queued -> " +
              strat_mgr_.display_name(champ->key) + " (applies when flat)");
 }
 
@@ -1527,7 +1529,8 @@ void App::save_config() {
                    {"blotter", show_blotter_},
                    {"positions", show_positions_},
                    {"journal", show_journal_},
-                   {"log", show_log_}};
+                   {"log", show_log_},
+                   {"optlog", show_opt_log_}};
     cfg_.strategy_loaded = strat_mgr_.loaded_keys();
     cfg_.strategy_params = strat_mgr_.all_param_values();
     cfg_.strategy_tourn_excluded = strat_mgr_.tournament_excluded_keys();
@@ -1548,7 +1551,7 @@ void App::save_config() {
 // Called once from the constructor.
 void App::start_diag_server() {
     if (!cfg_.diag_enabled) {
-        log_.add("diag: endpoint disabled (diag_enabled=false in config.json)");
+        route("diag: endpoint disabled (diag_enabled=false in config.json)");
         return;
     }
     if (cfg_.diag_token.empty()) {
@@ -1567,7 +1570,7 @@ void App::start_diag_server() {
         diag_srv_.set_control(cfg_.diag_control_token, [this](const std::string& action) {
             if (action == "kill") {
                 diag_kill_requested_.store(true, std::memory_order_relaxed);
-                log_.add("diag: REMOTE KILL-SWITCH requested via POST /control/kill");
+                route("diag: REMOTE KILL-SWITCH requested via POST /control/kill");
                 return std::string(
                     "{\"status\":\"kill queued\",\"note\":\"watch /diag halted+positions to confirm\"}");
             }
@@ -1584,16 +1587,16 @@ void App::start_diag_server() {
         [this] { std::lock_guard<std::mutex> g(diag_mu_); return diag_json_; },
         [this](uint64_t since) { return build_logs_json(since); },
         [] { return std::string(diag_html()); },
-        [this](std::string l) { log_.add(std::move(l)); });
+        [this](std::string l) { route(std::move(l)); });
     if (ok) {
-        log_.add("diag: read-only endpoint on " + cfg_.diag_bind + ":" +
+        route("diag: read-only endpoint on " + cfg_.diag_bind + ":" +
                  std::to_string(port) + "  —  browse  http://<tailscale-ip>:" +
                  std::to_string(port) + "/?token=" + cfg_.diag_token);
         if (cfg_.diag_control_enabled)
-            log_.add("diag: REMOTE CONTROL ENABLED — POST /control/kill flattens + halts; "
+            route("diag: REMOTE CONTROL ENABLED — POST /control/kill flattens + halts; "
                      "control token is in config.json (diag_control_token)");
     } else
-        log_.add("diag: endpoint failed to start (is port " + std::to_string(port) +
+        route("diag: endpoint failed to start (is port " + std::to_string(port) +
                  " already in use?)");
 }
 
@@ -1606,9 +1609,9 @@ void App::pump_diag() {
     if (diag_kill_requested_.exchange(false, std::memory_order_relaxed)) {
         if (engine_.live_running()) {
             engine_.kill_switch();
-            log_.add("diag: KILL-SWITCH EXECUTED — cancel all + flatten + halt");
+            route("diag: KILL-SWITCH EXECUTED — cancel all + flatten + halt");
         } else {
-            log_.add("diag: kill-switch requested but no live session is running");
+            route("diag: kill-switch requested but no live session is running");
         }
     }
     if (!diag_srv_.running()) return;
@@ -1901,37 +1904,41 @@ void App::draw() {
     std::string line;
     while (engine_.pop_log(line)) {
         alert_scan(line);
-        log_.add(std::move(line));
+        // While a backtest runs, its strategy logs flood in with no prefix —
+        // send them to the optimizer panel. Live engine lines (halts, fills,
+        // "live: …") have no backtest running, so they fall through to route().
+        if (engine_.running()) opt_log_.add(std::move(line));
+        else route(std::move(line));
     }
     if (ibkr_)
         while (ibkr_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     if (tws_)
         while (tws_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     if (tws_feed_)
         while (tws_feed_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     if (polygon_feed_)
         while (polygon_feed_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     if (finnhub_feed_)
         while (finnhub_feed_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     if (ibkr_feed_)
         while (ibkr_feed_->pop_log(line)) {
             alert_scan(line);
-            log_.add(std::move(line));
+            route(std::move(line));
         }
     // Session over: stop streaming (frees the vendor connection slot).
     if ((polygon_feed_ || finnhub_feed_ || ibkr_feed_ || tws_feed_) &&
@@ -1941,7 +1948,7 @@ void App::draw() {
         finnhub_feed_.reset();
         ibkr_feed_.reset();
         tws_feed_.reset();
-        log_.add("live: real-time feed stopped");
+        route("live: real-time feed stopped");
     }
 
     // TT_AUTORUN_BACKTEST=1: fire one AAPL backtest as soon as the feed is up
@@ -1949,7 +1956,7 @@ void App::draw() {
     if (!autorun_bt_done_ && data_.connected() && std::getenv("TT_AUTORUN_BACKTEST")) {
         autorun_bt_done_ = true;
         queue_backtest("", "AAPL", "1d", "2y", 100'000.0);   // built-in SMA
-        log_.add("autorun: queued AAPL 1d 2y backtest (built-in SMA)");
+        route("autorun: queued AAPL 1d 2y backtest (built-in SMA)");
     }
 
     // TT_AUTORUN_SWEEP=1: auto-optimize the built-in SMA — headless
@@ -1963,7 +1970,7 @@ void App::draw() {
         rq.range = "1y";
         rq.holdout_pct = 25;   // exercises the walk-forward phase headlessly
         queue_sweep(rq);
-        log_.add("autorun: queued auto-optimize (built-in SMA)");
+        route("autorun: queued auto-optimize (built-in SMA)");
     }
 
     // Journal: session rows are keyed off the live_running transition (works
@@ -2058,7 +2065,7 @@ void App::draw() {
                          TickLog log;
                          std::string err;
                          if (!tick_log_read(path, log, err)) {
-                             log_.add("replay: " + err);
+                             route("replay: " + err);
                              return;
                          }
                          ReplayConfig cfg;
@@ -2078,17 +2085,17 @@ void App::draw() {
                          cfg.params = strat_mgr_.param_values(strat_key);
                          IStrategy* strat = acquire_strategy(strat_key);
                          if (!strat) {
-                             log_.add("replay: strategy '" + strat_key + "' is not loaded");
+                             route("replay: strategy '" + strat_key + "' is not loaded");
                              return;
                          }
                          if (engine_.start_replay(std::move(cfg), strat)) {
                              // Replay shares the backtest engine slot/flag.
                              leases_.push_back({strat, strat_key, StrategyLease::Backtest});
-                             log_.add("replay: running " + path + " (" +
+                             route("replay: running " + path + " (" +
                                       strat_mgr_.display_name(strat_key) + ")");
                          } else {
                              release_strategy({strat, strat_key, StrategyLease::Backtest});
-                             log_.add("replay: engine busy, try again");
+                             route("replay: engine busy, try again");
                          }
                      });
     if (show_sweep_)
@@ -2106,9 +2113,9 @@ void App::draw() {
                               if (tourn_.active) {
                                   tourn_.active = false;
                                   sweep_.tourney.active = false;
-                                  log_.add("tournament: cancelled");
+                                  route("tournament: cancelled");
                               } else {
-                                  log_.add("sweep: cancelled");
+                                  route("sweep: cancelled");
                               }
                           });
     if (show_strategy_) strat_mgr_.draw(&show_strategy_);
@@ -2151,11 +2158,11 @@ void App::draw() {
     if (lineup_autostart_pending_) {
         lineup_autostart_pending_ = false;
         if (engine_.live_running()) {
-            log_.add("lineup: a session is already running - skipping auto-start");
+            route("lineup: a session is already running - skipping auto-start");
         } else if (!trade_.has_symbols()) {
-            log_.add("lineup: no symbols to auto-start");
+            route("lineup: no symbols to auto-start");
         } else {
-            log_.add("lineup: auto-starting the live session");
+            route("lineup: auto-starting the live session");
             start_live_session(trade_.build_start_opts(
                 trade_account_info(),
                 [this](const std::string& k) {
@@ -2171,6 +2178,7 @@ void App::draw() {
     if (show_positions_) positions_.draw(&show_positions_);
     if (show_journal_) journal_panel_.draw(&show_journal_);
     if (show_log_) log_.draw("Log Console", &show_log_);
+    if (show_opt_log_) opt_log_.draw("Optimizer Log", &show_opt_log_);
 
 #ifdef TT_DEBUG
     // Debug menu (or TT_SIM_TICKS=1): synthesize a 2 Hz random walk for the
@@ -2209,15 +2217,15 @@ void App::draw() {
                 else
                     release_strategy({strat, "", StrategyLease::Live});
             }
-            log_.add("autorun-live: session started");
+            route("autorun-live: session started");
         } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {
             autorun_live_stage_ = 2;
             engine_.submit_manual(1, true, 10);
-            log_.add("autorun-live: manual BUY 10 SIMTEST submitted");
+            route("autorun-live: manual BUY 10 SIMTEST submitted");
         } else if (autorun_live_stage_ == 2 && !s.symbols.empty() &&
                   s.symbols[0].position.qty > 0) {
             autorun_live_stage_ = 3;
-            log_.add("autorun-live: position open, firing kill switch");
+            route("autorun-live: position open, firing kill switch");
             engine_.kill_switch();
         } else if (autorun_live_stage_ == 3 && s.halted) {
             bool all_flat = true;
@@ -2225,12 +2233,27 @@ void App::draw() {
                 if (sym.position.qty != 0) all_flat = false;
             if (all_flat) {
                 autorun_live_stage_ = 4;
-                log_.add("autorun-live: FLAT after kill switch — live path verified");
+                route("autorun-live: FLAT after kill switch — live path verified");
             }
         }
     }
     if (show_imgui_demo_) ImGui::ShowDemoWindow(&show_imgui_demo_);
     if (show_implot_demo_) ImPlot::ShowDemoWindow(&show_implot_demo_);
+}
+
+void App::route(std::string line) {
+    // Send app-emitted optimizer/tournament/lineup/autopilot summaries to the
+    // optimizer panel instead of the live console + /logs ring; everything else
+    // (feed, broker, live, system) stays in the live log. The engine's backtest
+    // strategy-log flood carries no prefix and is routed separately, by
+    // engine_.running(), where it's drained (see pop_log loop).
+    bool opt = false;
+    static constexpr const char* kOpt[] = {"optimizer:", "tournament:", "autopilot:",
+                                           "sweep:", "backtest", "lineup:"};
+    for (const char* p : kOpt)
+        if (line.rfind(p, 0) == 0) { opt = true; break; }
+    LogConsole& sink = opt ? opt_log_ : log_;
+    sink.add(std::move(line));
 }
 
 void App::start_live_session(const TradePanel::StartOpts& opts) {
@@ -2342,7 +2365,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         ic.read_only = read_ibkr_accounts().active_readonly();
         ibkr_broker = std::make_unique<IbkrBroker>(std::move(ic));
         cfg.broker = ibkr_broker.get();
-        log_.add(ic.read_only
+        route(ic.read_only
                      ? "live: IBKR account is READ-ONLY — orders blocked"
                      : "live: routing orders to IBKR gateway");
     } else if (opts.broker == TradePanel::Broker::Tws) {
@@ -2359,7 +2382,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         const int cid = tc.client_id;
         tws_broker = std::make_unique<TwsBroker>(std::move(tc));
         cfg.broker = tws_broker.get();
-        log_.add("live: routing orders via TWS socket (port " + std::to_string(port) +
+        route("live: routing orders via TWS socket (port " + std::to_string(port) +
                  ", client " + std::to_string(cid) + ")");
     }
     // Each symbol needs its strategy built + loaded first.
@@ -2371,7 +2394,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
             unbuilt += (unbuilt.empty() ? "" : ", ") + so.strat_key;
         }
     if (!unbuilt.empty()) {
-        log_.add("live: building strategies (" + unbuilt +
+        route("live: building strategies (" + unbuilt +
                  ") — click Start Trading again");
         return;
     }
@@ -2382,7 +2405,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     for (const auto& so : opts.symbols) {
         IStrategy* inst = acquire_strategy(so.strat_key);
         if (!inst) {
-            log_.add("live: strategy '" +
+            route("live: strategy '" +
                      strat_mgr_.display_name(so.strat_key) +
                      "' failed to load");
             acq_ok = false;
@@ -2417,7 +2440,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
             ap_.syms.push_back(std::move(aps));
         }
         if (!ap_.syms.empty())
-            log_.add("autopilot: armed for " +
+            route("autopilot: armed for " +
                      std::to_string(ap_.syms.size()) + " symbol(s)");
         // The engine's live thread was joined inside start_live,
         // so it's safe to drop whatever the previous session left
@@ -2505,10 +2528,10 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         for (const auto& so : opts.symbols)
             joined += (joined.empty() ? "" : ", ") + so.symbol + ":" +
                       strat_mgr_.display_name(so.strat_key);
-        log_.add("live: session queued for " + joined);
+        route("live: session queued for " + joined);
     } else {
         for (const auto& l : new_leases) release_strategy(l);
-        log_.add("live: cannot start (engine busy)");
+        route("live: cannot start (engine busy)");
     }
 }
 
@@ -2535,7 +2558,7 @@ void App::safe_stop_live(bool keep_positions) {
     // the OLD broker can never freeze this click (see reap_async).
     reap_async(std::move(tws_));
     reap_async(std::move(ibkr_));
-    log_.add(keep ? "account: stopped live trading (positions kept for restart)"
+    route(keep ? "account: stopped live trading (positions kept for restart)"
                   : "account: stopped live trading (kill switch)");
 }
 
@@ -2543,9 +2566,9 @@ void App::do_ibkr_signout() {
     const std::string args = signout_args();
     if (!args.empty()) {
         run_hidden(args);
-        log_.add("account: signing out of IBKR (stopping auto-login, gateway logout)");
+        route("account: signing out of IBKR (stopping auto-login, gateway logout)");
     } else {
-        log_.add("account: sign-out script missing (scripts\\Stop-IbkrLogin.ps1)");
+        route("account: sign-out script missing (scripts\\Stop-IbkrLogin.ps1)");
     }
 }
 
@@ -2688,14 +2711,14 @@ void App::draw_update_panel() {
         if (done || timed_out) {
             update_check_wait_ = false;
             if (!done)
-                log_.add("update: check timed out — try again");
+                route("update: check timed out — try again");
             else if (!update_.last_ok())
-                log_.add("update: couldn't reach GitHub — check the connection");
+                route("update: couldn't reach GitHub — check the connection");
             else if (update_.available())
-                log_.add("update: a newer build is available (" + update_.remote_commit() +
+                route("update: a newer build is available (" + update_.remote_commit() +
                          ") — see the Update panel");
             else
-                log_.add(std::string("update: up to date (") + TT_VERSION + ")");
+                route(std::string("update: up to date (") + TT_VERSION + ")");
         }
     }
 }
@@ -2712,13 +2735,13 @@ void App::launch_updater() {
                               " -Preset ucrt64-release";
     const std::string args = ps_args("Update-And-Restart.ps1", /*hidden=*/true, extra);
     if (args.empty()) {
-        log_.add("update: updater script missing (scripts\\Update-And-Restart.ps1)");
+        route("update: updater script missing (scripts\\Update-And-Restart.ps1)");
         return;
     }
     run_hidden(args);   // detached: keeps running after we exit
-    log_.add("update: launched updater (pull + rebuild + relaunch); quitting");
+    route("update: launched updater (pull + rebuild + relaunch); quitting");
 #else
-    log_.add("update: self-update is Windows-only");
+    route("update: self-update is Windows-only");
 #endif
 }
 
@@ -2772,7 +2795,7 @@ void App::draw_account_menu() {
                                                  "-Account \"" + acc.name + "\"");
                 if (!args.empty()) {
                     run_hidden(args);
-                    log_.add("account: removing IBKR '" + acc.name + "'");
+                    route("account: removing IBKR '" + acc.name + "'");
                 }
             }
         }
@@ -2797,11 +2820,11 @@ void App::draw_data_menu() {
     if (ImGui::BeginMenu("Sign Out", !poly.empty() || !finn.empty())) {
         if (!poly.empty() && ImGui::MenuItem(("polygon: " + poly).c_str())) {
             accounts_.sign_out("polygon");
-            log_.add("account: signed out of polygon");
+            route("account: signed out of polygon");
         }
         if (!finn.empty() && ImGui::MenuItem(("finnhub: " + finn).c_str())) {
             accounts_.sign_out("finnhub");
-            log_.add("account: signed out of finnhub");
+            route("account: signed out of finnhub");
         }
         ImGui::EndMenu();
     }
@@ -2813,7 +2836,7 @@ void App::draw_data_menu() {
             const std::string label = e.name + "  (" + e.provider + ")";
             if (ImGui::MenuItem(label.c_str())) {
                 accounts_.remove(e.name);
-                log_.add("account: removed '" + e.name + "'");
+                route("account: removed '" + e.name + "'");
             }
         }
         ImGui::EndMenu();
@@ -2889,7 +2912,7 @@ void App::draw_account_modal() {
     // gateway — switching means re-logging IB Gateway, done via script.
     auto do_switch = [&](const std::string& name) {
         if (use_tws_data_) {
-            log_.add("account: TWS route - switch with scripts\\Start-IbGateway.ps1 "
+            route("account: TWS route - switch with scripts\\Start-IbGateway.ps1 "
                      "-Stop, then Start-IbGateway.ps1 -Account \"" + name + "\"");
             return;
         }
@@ -2897,7 +2920,7 @@ void App::draw_account_modal() {
         if (args.empty()) return;
         run_hidden(args);
         gateway_starting_until_ = ImGui::GetTime() + 90.0;
-        log_.add(std::string("account: ") +
+        route(std::string("account: ") +
                  (up ? "switching to IBKR '" : "signing in to IBKR '") + name + "'");
     };
 
@@ -2976,9 +2999,9 @@ void App::draw_account_modal() {
         if (!args.empty()) {
             ShellExecuteA(nullptr, "open", "powershell.exe", args.c_str(),
                           nullptr, SW_SHOWNORMAL);   // visible: prompts for credentials
-            log_.add("account: add IBKR account (enter credentials in the console)");
+            route("account: add IBKR account (enter credentials in the console)");
         } else {
-            log_.add("account: Save-IbkrCred.ps1 not found");
+            route("account: Save-IbkrCred.ps1 not found");
         }
     }
     ImGui::EndPopup();
@@ -3024,7 +3047,7 @@ void App::draw_data_modal() {
             std::lock_guard lock(signin_.mu);
             detail = signin_.detail;
         }
-        log_.add("account: signed in to " + a.provider + " as '" + a.name + "' (" +
+        route("account: signed in to " + a.provider + " as '" + a.name + "' (" +
                  detail + ")");
         signin_.status.store(0);
         signin_.secret[0] = '\0';   // no plaintext left in the UI buffer
@@ -3080,7 +3103,7 @@ void App::draw_data_modal() {
     if (ImGui::Button("Save without verifying")) {
         const Account a = make_account();
         accounts_.upsert(a, /*make_active=*/true);
-        log_.add("account: saved " + a.provider + " '" + a.name + "' (not verified)");
+        route("account: saved " + a.provider + " '" + a.name + "' (not verified)");
         signin_.secret[0] = '\0';
         ImGui::CloseCurrentPopup();
     }
@@ -3144,6 +3167,7 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Positions", nullptr, &show_positions_);
         ImGui::MenuItem("Journal", nullptr, &show_journal_);
         ImGui::MenuItem("Log Console", nullptr, &show_log_);
+        ImGui::MenuItem("Optimizer Log", nullptr, &show_opt_log_);
         ImGui::Separator();
         bool alerts_on = !alerts_.muted();
         if (ImGui::MenuItem("Alerts", nullptr, &alerts_on)) alerts_.set_muted(!alerts_on);

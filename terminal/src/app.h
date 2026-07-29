@@ -273,6 +273,11 @@ private:
     AppConfig cfg_;
 
     LogConsole log_;
+    LogConsole opt_log_;   // optimizer/backtest output; kept out of the live log + /logs
+    bool show_opt_log_ = false;
+    // Send a log line to the optimizer panel (backtest/optimizer/tournament
+    // output) or the main live console, by engine backtest-state + prefix.
+    void route(std::string line);
     SeriesStore series_;
     QuoteBook quotes_;
     net::GatewayData gw_;
