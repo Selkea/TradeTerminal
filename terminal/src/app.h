@@ -252,6 +252,21 @@ private:
     bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
     char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 
+    // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
+    // a session is already running, cycle the session onto the new picks WITHOUT
+    // flattening the symbols that carry over — those are re-adopted + held on the
+    // restart (hold-until-flat). Only positions in symbols leaving the lineup are
+    // closed. Multi-frame: cancel the dropped symbols' resting orders + market-
+    // close their positions, wait until they're confirmed flat (or a deadline),
+    // then safe_stop_live(keep) and restart on the new lineup.
+    enum class SwapStage { None, Flatten, Restart };
+    void begin_lineup_swap(const TradePanel::StartOpts& next);  // kick off the cycle
+    void pump_lineup_swap();                 // UI thread, per frame: drive it
+    SwapStage swap_stage_ = SwapStage::None;
+    double swap_deadline_s_ = 0.0;           // ImGui::GetTime() give-up for the flatten
+    std::vector<uint32_t> swap_flatten_ids_; // dropped symbol_ids being closed
+    TradePanel::StartOpts swap_opts_;        // the new lineup to restart on
+
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {
         struct Param {
