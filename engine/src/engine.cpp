@@ -113,6 +113,11 @@ public:
             if (on_order_) on_order_(in, 0);
             return 0;
         }
+        // Hold-until-profitable: in "hold — don't halt" mode a strategy may not
+        // close a position at a loss. Refused silently (no reject record — a
+        // strategy retries its exit every bar) so the position is held until it
+        // can exit in profit. Manual orders + the kill switch use other paths.
+        if (hold_blocks_loss(r)) return 0;
         // Buying power (simulator only — a real broker enforces its own
         // margin): a risk-INCREASING order must be coverable at ~1x. Buys need
         // cash for the full cost; a new/larger short's notional must fit within
@@ -222,6 +227,26 @@ private:
         if (std::abs(after) <= max_abs) return;                  // already within budget
         const double allowed_add = std::floor(max_abs - std::abs(pos));
         r.qty = allowed_add > 0.0 ? allowed_add : 0.0;
+    }
+
+    // "hold — don't halt" mode (RiskLimits::disable_auto_halt): a strategy order
+    // that would CLOSE/REDUCE a position at a loss is held instead — protective
+    // stops, signal exits and EOD flattens don't fire while underwater, so the
+    // position rides until it can exit in profit (bounded by the notional cap and
+    // the stale-feed halt, both still armed). Opening/adding and profitable exits
+    // pass; this is per strategy order, so it covers every strategy uniformly.
+    bool hold_blocks_loss(const OrderRequest& r) noexcept {
+        const RiskLimits* rl = resolve_risk(r.symbol_id);
+        if (!rl || !rl->disable_auto_halt) return false;
+        const auto pos = pf_.position(r.symbol_id);
+        const double dir = r.side == Side::Buy ? 1.0 : -1.0;
+        if (pos.qty == 0.0 || dir * pos.qty >= 0.0) return false;  // opening/adding: allow
+        const double px = price_for(r);
+        if (px <= 0.0 || pos.avg_price <= 0.0) return false;       // no reference: allow
+        const double closed = std::min(r.qty, std::abs(pos.qty));
+        const double pnl = pos.qty > 0.0 ? (px - pos.avg_price) * closed   // long exit
+                                         : (pos.avg_price - px) * closed;  // short exit
+        return pnl < 0.0;   // would realize a loss → hold
     }
 
     bool risk_ok(const OrderRequest& r) noexcept {

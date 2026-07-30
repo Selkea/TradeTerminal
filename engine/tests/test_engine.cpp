@@ -344,6 +344,73 @@ struct OversizedBuyStrat : IStrategy {
 };
 } // namespace
 
+namespace {
+// Buys 100 on its second tick, then on the fill arms a protective stop below
+// entry (a losing exit) and a take-profit above (a winning exit).
+struct BracketStrat : IStrategy {
+    uint32_t sym = 0;
+    int seen = 0;
+    bool sent = false;
+    bool armed = false;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        sym = sid;
+        if (sent || ++seen < 2) return;
+        ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0});
+        sent = true;
+    }
+    void on_fill(IStrategyContext& ctx, const Fill& f) noexcept override {
+        if (f.side == Side::Buy && !armed) {
+            armed = true;
+            ctx.submit_order({sym, Side::Sell, OrdType::Stop, {}, 100, 0, 45.0, 0, 0});
+            ctx.submit_order({sym, Side::Sell, OrdType::Limit, {}, 100, 55.0, 0, 0, 0});
+        }
+    }
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+void push_n(Engine& eng, const char* sym, double px, int n) {
+    for (int i = 0; i < n; ++i) eng.push_live_tick(sym, 1, px, 0.0);
+}
+} // namespace
+
+TEST_CASE("live risk: hold mode refuses a losing exit but allows a winning one") {
+    Engine eng;
+    BracketStrat strat;
+
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.risk.max_order_qty = 100'000;
+    cfg.risk.max_position_qty = 100'000;
+    cfg.risk.disable_auto_halt = true;   // hold — don't sell at a loss
+    REQUIRE(eng.start_live(cfg, {&strat}));
+
+    // Enter long 100 @ 50 (avg 50); on the fill the strategy arms stop@45 + tp@55.
+    REQUIRE(pump_until(eng, [&] {
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0);
+    }));
+
+    // Drive price down THROUGH the 45 stop: the protective stop was refused
+    // (losing exit), so the position is held, not stopped out.
+    for (int i = 0; i < 200; ++i) {
+        push_n(eng, "AAA", 44.0, 5);
+        if (eng.live_snapshot().symbols[0].position.qty != doctest::Approx(100.0)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0));
+
+    // Now up through the 55 take-profit: a winning exit is allowed, so it closes.
+    REQUIRE(pump_until(eng, [&] {
+        push_n(eng, "AAA", 56.0, 3);
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(0.0);
+    }));
+
+    eng.stop_live();
+}
+
 TEST_CASE("live risk: notional cap down-sizes an oversized entry to fit the budget") {
     Engine eng;
     OversizedBuyStrat strat(1'000.0);   // wants 1000 sh; the cap allows far fewer
