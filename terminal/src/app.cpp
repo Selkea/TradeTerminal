@@ -2023,10 +2023,13 @@ void App::draw() {
     std::string line;
     while (engine_.pop_log(line)) {
         alert_scan(line);
-        // While a backtest runs, its strategy logs flood in with no prefix —
-        // send them to the optimizer panel. Live engine lines (halts, fills,
-        // "live: …") have no backtest running, so they fall through to route().
-        if (engine_.running()) opt_log_.add(std::move(line));
+        // While an optimizer/tournament/lineup runs, its backtests' strategy
+        // logs flood in with no prefix — send them to the optimizer panel. Gate
+        // on optimizing() (not engine_.running() alone): a short backtest flips
+        // running_ false before we drain its buffered flood, so the tail would
+        // otherwise leak into the live console. Live engine lines (halts, fills,
+        // "live: …") run with nothing optimizing, so they fall through to route().
+        if (optimizing()) opt_log_.add(std::move(line));
         else route(std::move(line));
     }
     if (ibkr_)
