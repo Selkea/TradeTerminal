@@ -24,6 +24,13 @@ constexpr int kMktDataBase = 3000;
 // TickType ids we care about on the reqMktData fallback path (live + delayed).
 constexpr int kTickBid = 1, kTickAsk = 2, kTickLast = 4;
 constexpr int kTickDelayedBid = 66, kTickDelayedAsk = 67, kTickDelayedLast = 68;
+
+// Steady-clock milliseconds — the watchdog and connect path share this timebase.
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 } // namespace
 
 struct TwsFeed::Io final : DefaultEWrapper {
@@ -47,7 +54,22 @@ struct TwsFeed::Io final : DefaultEWrapper {
 
     bool connect_gateway() {
         client = std::make_unique<EClientSocket>(this, &signal);
-        if (!client->eConnect(f.cfg_.host.c_str(), f.cfg_.port, f.cfg_.client_id)) {
+        // Publish the in-flight socket so the watchdog can abort a handshake that
+        // never completes (see TwsFeed::watchdog_loop). Cleared under the lock
+        // once eConnect returns.
+        {
+            std::lock_guard<std::mutex> lk(f.conn_mu_);
+            f.connecting_ = client.get();
+            f.connect_started_ms_.store(now_ms(), std::memory_order_release);
+        }
+        const bool ok = client->eConnect(f.cfg_.host.c_str(), f.cfg_.port,
+                                         f.cfg_.client_id);
+        {
+            std::lock_guard<std::mutex> lk(f.conn_mu_);
+            f.connecting_ = nullptr;
+            f.connect_started_ms_.store(0, std::memory_order_release);
+        }
+        if (!ok) {   // includes a watchdog-forced abort — retried after backoff
             client.reset();
             return false;
         }
@@ -193,6 +215,7 @@ bool TwsFeed::start() {
     if (io_thread_.joinable()) return false;
     stop_.store(false, std::memory_order_relaxed);
     io_thread_ = std::thread([this] { io_loop(); });
+    watchdog_thread_ = std::thread([this] { watchdog_loop(); });
     return true;
 }
 
@@ -200,8 +223,34 @@ void TwsFeed::stop() {
     stop_.store(true, std::memory_order_release);
     if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
         s->issueSignal();
+    // Unblock a possibly-frozen eConnect so the joins return promptly.
+    abort_inflight_connect("shutdown");
     if (io_thread_.joinable()) io_thread_.join();
+    if (watchdog_thread_.joinable()) watchdog_thread_.join();
     connected_.store(false, std::memory_order_release);
+}
+
+void TwsFeed::abort_inflight_connect(const char* why) {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    if (!connecting_) return;
+    log(std::string("connect ") + why + " - closing socket to unblock eConnect");
+    static_cast<EClientSocket*>(connecting_)->eDisconnect();
+    connect_started_ms_.store(0, std::memory_order_release);   // don't re-abort this attempt
+    connect_aborts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TwsFeed::watchdog_loop() {
+    // See TwsBroker::watchdog_loop — same wedged-eConnect hazard for the feed.
+    constexpr int64_t kConnectTimeoutMs = 30'000;
+    while (!stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (stop_.load(std::memory_order_acquire)) break;
+        const int64_t started = connect_started_ms_.load(std::memory_order_acquire);
+        if (started == 0) continue;                               // no connect in flight
+        if (connected_.load(std::memory_order_acquire)) continue; // handshake completed
+        if (now_ms() - started < kConnectTimeoutMs) continue;
+        abort_inflight_connect("handshake stuck >30s");
+    }
 }
 
 void TwsFeed::request_reconnect() {

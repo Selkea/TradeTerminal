@@ -68,6 +68,11 @@ public:
     // surfaced in /diag as an alert; the adapter takes no automatic action.
     int stuck_order_count() const { return stuck_count_.load(std::memory_order_relaxed); }
 
+    // Times the connect-timeout watchdog force-aborted a stuck handshake
+    // (see watchdog_loop). Nonzero means eConnect wedged and self-healed —
+    // surfaced in /diag so a wedging gateway is visible.
+    int connect_aborts() const { return connect_aborts_.load(std::memory_order_relaxed); }
+
     // Force a one-shot drop + reconnect on the I/O thread (the existing reconnect
     // loop re-establishes + re-handshakes). Used for the scheduled daily refresh
     // that clears IBKR's overnight-reset staleness. Positions are NOT re-adopted
@@ -83,6 +88,12 @@ private:
     struct Io;   // defined in tws_broker.cpp; owns all TWS API state
 
     void io_loop();
+    void watchdog_loop();
+    // Force-abort an in-flight eConnect that hasn't handshaked yet by closing
+    // its socket from off the I/O thread (unblocks the blocking eConnect read).
+    // Used by the watchdog on timeout and by teardown to unblock a frozen
+    // connect. why = short reason for the log line. No-op if nothing is in flight.
+    void abort_inflight_connect(const char* why);
     void push_ev(const EngineEvent& ev);
     // Record a reject reason (I/O thread) then push the Rejected event. code 0
     // and empty msg = no reason available (leaves the reason table untouched).
@@ -121,7 +132,22 @@ private:
     AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
     std::atomic<int> stuck_count_{0};   // I/O thread writes, UI thread reads
 
+    // Connect-timeout watchdog. EClientSocket::eConnect() does a synchronous,
+    // no-timeout handshake read after the TCP connect; a gateway that accepts
+    // the socket but never completes the API handshake (seen during IBKR's
+    // overnight maintenance) freezes the I/O thread indefinitely — the io_loop's
+    // 10s stall guard can't run because the thread is stuck *inside* eConnect.
+    // A separate watchdog thread aborts a connect stuck past the timeout by
+    // closing its socket, which unblocks eConnect so the I/O loop retries.
+    // conn_mu_ guards connecting_ so the watchdog never eDisconnect()s a socket
+    // the I/O thread is concurrently destroying.
+    std::mutex conn_mu_;
+    void* connecting_ = nullptr;                  // EClientSocket* in flight (guarded by conn_mu_)
+    std::atomic<int64_t> connect_started_ms_{0};  // steady-clock ms when eConnect began; 0 = idle
+    std::atomic<int> connect_aborts_{0};          // watchdog force-aborts (I/O + watchdog write)
+
     std::thread io_thread_;
+    std::thread watchdog_thread_;
 };
 
 } // namespace tt

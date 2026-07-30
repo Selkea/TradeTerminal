@@ -27,6 +27,13 @@ namespace tt {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+// Steady-clock milliseconds — the watchdog and connect path share this timebase.
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               Clock::now().time_since_epoch())
+        .count();
+}
+
 // Order-error codes that mean "this order is dead" (vs status noise). Anything
 // else order-scoped is logged but the order's fate comes via orderStatus.
 bool fatal_order_error(int code) {
@@ -91,7 +98,23 @@ struct TwsBroker::Io final : DefaultEWrapper {
     // ---- connection ---------------------------------------------------------
     bool connect_gateway() {
         client = std::make_unique<EClientSocket>(this, &signal);
-        if (!client->eConnect(b.cfg_.host.c_str(), b.cfg_.port, b.cfg_.client_id)) {
+        // Publish the in-flight socket + start time so the watchdog can abort a
+        // handshake that never completes (eConnect below is a blocking, no-timeout
+        // read). Cleared under the same lock once eConnect returns, so the
+        // watchdog never touches the socket after we start tearing it down.
+        {
+            std::lock_guard<std::mutex> lk(b.conn_mu_);
+            b.connecting_ = client.get();
+            b.connect_started_ms_.store(now_ms(), std::memory_order_release);
+        }
+        const bool ok = client->eConnect(b.cfg_.host.c_str(), b.cfg_.port,
+                                          b.cfg_.client_id);
+        {
+            std::lock_guard<std::mutex> lk(b.conn_mu_);
+            b.connecting_ = nullptr;
+            b.connect_started_ms_.store(0, std::memory_order_release);
+        }
+        if (!ok) {   // includes a watchdog-forced abort — retried after backoff
             client.reset();
             return false;
         }
@@ -528,13 +551,46 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
 TwsBroker::TwsBroker(TwsConfig cfg) : cfg_(std::move(cfg)) {
     io_thread_ = std::thread([this] { io_loop(); });
+    watchdog_thread_ = std::thread([this] { watchdog_loop(); });
 }
 
 TwsBroker::~TwsBroker() {
     stop_.store(true, std::memory_order_release);
     if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
         s->issueSignal();
+    // If the I/O thread is frozen inside eConnect, unblock it so the join below
+    // returns promptly instead of waiting out the connect (or forever).
+    abort_inflight_connect("shutdown");
     if (io_thread_.joinable()) io_thread_.join();
+    if (watchdog_thread_.joinable()) watchdog_thread_.join();
+}
+
+void TwsBroker::abort_inflight_connect(const char* why) {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    if (!connecting_) return;   // nothing in flight (or already handed off)
+    log(std::string("connect ") + why + " - closing socket to unblock eConnect");
+    static_cast<EClientSocket*>(connecting_)->eDisconnect();
+    connect_started_ms_.store(0, std::memory_order_release);   // don't re-abort this attempt
+    connect_aborts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TwsBroker::watchdog_loop() {
+    // eConnect()/the initial handshake read blocks with no timeout; if a connect
+    // attempt hasn't reached ready_ within this window the gateway is wedged
+    // (accepted the socket, never handshaked). Force the socket closed so the
+    // blocked eConnect returns and the I/O loop retries after its backoff. 30s
+    // is far longer than a healthy handshake (sub-second), so it never fires on
+    // a good connect; 250ms poll keeps teardown latency low.
+    constexpr int64_t kConnectTimeoutMs = 30'000;
+    while (!stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (stop_.load(std::memory_order_acquire)) break;
+        const int64_t started = connect_started_ms_.load(std::memory_order_acquire);
+        if (started == 0) continue;                            // no connect in flight
+        if (ready_.load(std::memory_order_acquire)) continue;  // handshake completed
+        if (now_ms() - started < kConnectTimeoutMs) continue;
+        abort_inflight_connect("handshake stuck >30s");
+    }
 }
 
 uint64_t TwsBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
