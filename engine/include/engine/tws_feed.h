@@ -48,6 +48,10 @@ public:
     bool connected() const override { return connected_.load(std::memory_order_acquire); }
     uint64_t dropped() const override { return dropped_.load(std::memory_order_relaxed); }
 
+    // Force a one-shot drop + reconnect (scheduled daily refresh); the existing
+    // reconnect loop re-establishes the stream.
+    void request_reconnect();
+
     bool pop_log(std::string& out);
 
 private:
@@ -60,6 +64,7 @@ private:
     Sink sink_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh
     std::atomic<uint64_t> dropped_{0};
     std::atomic<void*> wake_{nullptr};   // EReaderOSSignal* while the I/O thread runs
 

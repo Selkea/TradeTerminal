@@ -63,6 +63,9 @@ struct AppConfig {
     double lineup_min_dollar_vol = 20e6;      // liquidity gate ($/day)
     int lineup_top_n = 6;                     // how many symbols to trade
     int lineup_atr_len = 14;                  // ATR window for the vol ranking
+    // Daily TWS refresh: force the broker + feed to drop & reconnect once a day
+    // (clears IBKR's overnight-reset staleness). "HH:MM" local; empty = off.
+    std::string tws_refresh_time = "02:00";
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;

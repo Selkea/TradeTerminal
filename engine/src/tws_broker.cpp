@@ -585,6 +585,13 @@ bool TwsBroker::push_cmd(const Cmd& c) {
     return true;
 }
 
+void TwsBroker::request_reconnect() {
+    reconnect_req_.store(true, std::memory_order_release);
+    // Wake the I/O thread so it acts on the flag now rather than at the next wait.
+    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
+        s->issueSignal();
+}
+
 void TwsBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
@@ -657,8 +664,10 @@ void TwsBroker::io_loop() {
             // pending...). Without this the connection wedges silently forever.
             const bool stalled = !ready_.load(std::memory_order_acquire) &&
                                  Clock::now() - last_connect > std::chrono::seconds(10);
-            if (io.reset_conn || stalled) {
-                if (stalled && !io.reset_conn)
+            const bool forced = reconnect_req_.exchange(false, std::memory_order_acq_rel);
+            if (io.reset_conn || stalled || forced) {
+                if (forced) log("scheduled refresh - reconnecting to IB Gateway");
+                else if (stalled && !io.reset_conn)
                     log("no API handshake within 10s - reconnecting");
                 io.reset_conn = false;
                 io.drop_connection();

@@ -68,6 +68,12 @@ public:
     // surfaced in /diag as an alert; the adapter takes no automatic action.
     int stuck_order_count() const { return stuck_count_.load(std::memory_order_relaxed); }
 
+    // Force a one-shot drop + reconnect on the I/O thread (the existing reconnect
+    // loop re-establishes + re-handshakes). Used for the scheduled daily refresh
+    // that clears IBKR's overnight-reset staleness. Positions are NOT re-adopted
+    // (adoption is first-connect only), so an open session keeps its state.
+    void request_reconnect();
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -97,6 +103,7 @@ private:
     std::atomic<uint64_t> next_id_{1};
     std::atomic<bool> ready_{false};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh: drop + reconnect
     // The I/O thread's reader signal while it exists (EReaderOSSignal*);
     // push_cmd pokes it so a submitted order is picked up immediately instead
     // of on the next wait timeout.

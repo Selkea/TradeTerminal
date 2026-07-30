@@ -1110,6 +1110,30 @@ void App::pump_lineup_schedule() {
     start_daily_lineup(!cfg_.lineup_propose_only);
 }
 
+// Force the TWS broker + feed to drop & reconnect once a day (default 02:00
+// local) so IBKR's overnight server reset can't leave a stale/zombie socket
+// wedged until the open. Level-triggered inside a 30-min window; only when a
+// TWS-routed connection actually exists. Reconnect re-adopts nothing (adoption
+// is first-connect only), so an open session keeps its positions/orders.
+void App::pump_tws_refresh() {
+    if (!tws_ && !tws_feed_) return;   // only the TWS route has these handles
+    int rh = -1, rm = -1;
+    if (std::sscanf(cfg_.tws_refresh_time.c_str(), "%d:%d", &rh, &rm) != 2) return;
+    if (rh < 0 || rh > 23 || rm < 0 || rm > 59) return;
+    const int refresh_min = rh * 60 + rm;
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    if (tm.tm_yday == tws_refresh_last_day_) return;   // one refresh per day
+    const int now_min = tm.tm_hour * 60 + tm.tm_min;
+    if (now_min < refresh_min || now_min > refresh_min + 30) return;   // in the window
+    tws_refresh_last_day_ = tm.tm_yday;
+    route("tws: scheduled daily refresh (" + cfg_.tws_refresh_time +
+             ") - reconnecting broker + feed");
+    if (tws_) tws_->request_reconnect();
+    if (tws_feed_) tws_feed_->request_reconnect();
+}
+
 void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         route("lineup: already building");
@@ -2003,6 +2027,7 @@ void App::draw() {
     pump_tournament();
     pump_autopilot();
     pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
+    pump_tws_refresh();       // daily forced TWS reconnect (default 02:00 local)
     pump_daily_lineup();
 
     draw_menu_bar();

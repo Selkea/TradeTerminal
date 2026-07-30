@@ -247,6 +247,8 @@ private:
     // once/day); on Done, auto-start unless lineup_propose_only.
     void pump_lineup_schedule();
     int lineup_last_build_day_ = -1;         // tm_yday guard: one scheduled build/day
+    void pump_tws_refresh();                 // daily forced TWS broker+feed reconnect
+    int tws_refresh_last_day_ = -1;          // tm_yday guard: one refresh/day
     bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
     char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 

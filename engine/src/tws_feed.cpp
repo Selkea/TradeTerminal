@@ -204,6 +204,12 @@ void TwsFeed::stop() {
     connected_.store(false, std::memory_order_release);
 }
 
+void TwsFeed::request_reconnect() {
+    reconnect_req_.store(true, std::memory_order_release);
+    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
+        s->issueSignal();
+}
+
 bool TwsFeed::pop_log(std::string& out) {
     std::lock_guard lock(log_mu_);
     if (logs_.empty()) return false;
@@ -242,8 +248,10 @@ void TwsFeed::io_loop() {
             const bool stalled =
                 !connected_.load(std::memory_order_acquire) &&
                 std::chrono::steady_clock::now() - last_connect > std::chrono::seconds(10);
-            if (io.reset_conn || stalled) {
-                if (stalled && !io.reset_conn)
+            const bool forced = reconnect_req_.exchange(false, std::memory_order_acq_rel);
+            if (io.reset_conn || stalled || forced) {
+                if (forced) log("scheduled refresh - reconnecting stream");
+                else if (stalled && !io.reset_conn)
                     log("no API handshake within 10s - reconnecting");
                 io.reset_conn = false;
                 io.drop_connection();
