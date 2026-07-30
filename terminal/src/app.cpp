@@ -15,7 +15,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1134,6 +1137,98 @@ void App::pump_tws_refresh() {
     if (tws_feed_) tws_feed_->request_reconnect();
 }
 
+// Kick off a live "swap onto the new lineup" (see SwapStage). Snapshots the
+// running session, works out which symbols are leaving, cancels their resting
+// orders (so a bracket leg can't re-open after we close), and market-closes
+// their positions. The stop + restart happens in pump_lineup_swap once those
+// drops are confirmed flat — symbols that stay are never touched.
+void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
+    if (swap_stage_ != SwapStage::None) {
+        route("lineup swap: a swap is already in progress - skipping");
+        return;
+    }
+    auto upper = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::toupper((unsigned char)c));
+        return s;
+    };
+    std::vector<std::string> keep;   // symbols the new lineup will trade
+    for (const auto& so : next.symbols) keep.push_back(upper(so.symbol));
+    auto stays = [&](const std::string& s) {
+        return std::find(keep.begin(), keep.end(), s) != keep.end();
+    };
+    const LiveSnapshot snap = engine_.live_snapshot();
+    std::vector<uint32_t> dropped_ids;   // symbols leaving the lineup (any state)
+    swap_flatten_ids_.clear();
+    for (size_t i = 0; i < snap.symbols.size(); ++i) {
+        if (stays(upper(snap.symbols[i].symbol))) continue;   // carried over
+        const uint32_t id = static_cast<uint32_t>(i + 1);     // index 0 = symbol_id 1
+        dropped_ids.push_back(id);
+        if (snap.symbols[i].position.qty != 0.0)
+            swap_flatten_ids_.push_back(id);                  // has a position -> close it
+    }
+    auto is_dropped = [&](uint32_t id) {
+        return std::find(dropped_ids.begin(), dropped_ids.end(), id) != dropped_ids.end();
+    };
+    // Cancel resting orders on the dropped symbols first (engine-direct). Leave
+    // the stayers' resting orders alone — they're re-adopted on the restart.
+    int cancelled = 0;
+    for (const OrderRecord& o : snap.orders)
+        if (o.status == OrderStatus::Working && is_dropped(o.symbol_id)) {
+            engine_.request_cancel(o.id);
+            ++cancelled;
+        }
+    // Market-close the dropped positions. submit_manual bypasses the strategy
+    // order gate, so a losing drop still closes despite hold-until-profitable.
+    for (uint32_t id : swap_flatten_ids_) {
+        const double q = snap.symbols[id - 1].position.qty;
+        engine_.submit_manual(id, q < 0.0, std::fabs(q));
+    }
+    swap_opts_ = next;
+    swap_stage_ = SwapStage::Flatten;
+    swap_deadline_s_ = ImGui::GetTime() + 30.0;   // give the closes 30s to fill
+    route("lineup swap: closing " + std::to_string(swap_flatten_ids_.size()) +
+          " dropped position(s), cancelled " + std::to_string(cancelled) +
+          " resting order(s); keeping the rest");
+}
+
+// Drive an in-progress lineup swap. Once the dropped positions are flat, stop
+// (keeping the carried-over positions) and restart on the new lineup; on the
+// restart, reconciliation re-adopts + holds them. If the closes don't fill
+// before the deadline, fall back to a full flatten so nothing is orphaned.
+void App::pump_lineup_swap() {
+    if (swap_stage_ == SwapStage::None) return;
+    if (swap_stage_ == SwapStage::Flatten) {
+        const LiveSnapshot snap = engine_.live_snapshot();
+        bool all_flat = true;
+        for (uint32_t id : swap_flatten_ids_)
+            if (id >= 1 && id <= snap.symbols.size() &&
+                snap.symbols[id - 1].position.qty != 0.0) {
+                all_flat = false;
+                break;
+            }
+        if (!all_flat && ImGui::GetTime() < swap_deadline_s_) return;   // still closing
+        if (!all_flat)
+            route("lineup swap: dropped positions didn't flatten in time - stopping "
+                  "with a full flatten (kill switch) instead of keeping positions");
+        // Keep the carried-over positions only if the drops are confirmed flat.
+        safe_stop_live(all_flat);
+        swap_flatten_ids_.clear();
+        swap_stage_ = SwapStage::Restart;   // restart next frame (stop_live has joined)
+        return;
+    }
+    if (swap_stage_ == SwapStage::Restart) {
+        swap_stage_ = SwapStage::None;
+        if (engine_.live_running()) {   // stop_live joins, so this shouldn't happen
+            route("lineup swap: engine still live after stop - aborting restart");
+            swap_opts_ = {};
+            return;
+        }
+        route("lineup swap: restarting the live session on the new lineup");
+        start_live_session(swap_opts_);
+        swap_opts_ = {};
+    }
+}
+
 void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         route("lineup: already building");
@@ -2028,6 +2123,7 @@ void App::draw() {
     pump_autopilot();
     pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
     pump_tws_refresh();       // daily forced TWS reconnect (default 02:00 local)
+    pump_lineup_swap();       // drive an in-progress live swap onto new picks
     pump_daily_lineup();
 
     draw_menu_bar();
@@ -2182,13 +2278,10 @@ void App::draw() {
     // so start the live session through the exact path the Start button uses.
     if (lineup_autostart_pending_) {
         lineup_autostart_pending_ = false;
-        if (engine_.live_running()) {
-            route("lineup: a session is already running - skipping auto-start");
-        } else if (!trade_.has_symbols()) {
+        if (!trade_.has_symbols()) {
             route("lineup: no symbols to auto-start");
         } else {
-            route("lineup: auto-starting the live session");
-            start_live_session(trade_.build_start_opts(
+            TradePanel::StartOpts opts = trade_.build_start_opts(
                 trade_account_info(),
                 [this](const std::string& k) {
                     std::vector<TradePanel::StratParam> out;
@@ -2196,7 +2289,15 @@ void App::draw() {
                         out.push_back({s.name, s.value, s.min, s.max});
                     return out;
                 },
-                !polygon_key().empty(), !finnhub_key().empty(), data_.connected()));
+                !polygon_key().empty(), !finnhub_key().empty(), data_.connected());
+            if (engine_.live_running()) {
+                // A session is already live: cycle onto the new picks, keeping
+                // the symbols that carry over (only the drops get flattened).
+                begin_lineup_swap(opts);
+            } else {
+                route("lineup: auto-starting the live session");
+                start_live_session(opts);
+            }
         }
     }
     if (show_blotter_) blotter_.draw(&show_blotter_);
