@@ -236,6 +236,15 @@ private:
     void pump_daily_lineup();                      // UI thread, per frame
     void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
     bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
+    // True while any backtest/optimizer/tournament/lineup work is in flight —
+    // gates the engine's strategy-log flood to the optimizer panel instead of
+    // the live console. Must NOT rely on engine_.running() alone: a short
+    // backtest flips running_ false before the UI drains its buffered flood, so
+    // the tail (often the whole run) would leak into the live log. The outer
+    // sweep/tournament/lineup flags stay set across all the sub-backtests.
+    bool optimizing() const {
+        return engine_.running() || sweep_.running || tourn_.active || lineup_active();
+    }
     // One live-start path shared by the Trade panel's Start button and the
     // daily-lineup scheduler (extracted from the panel start callback so the
     // scheduler can't drift from the manual path).
