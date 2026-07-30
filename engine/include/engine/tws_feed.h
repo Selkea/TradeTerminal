@@ -54,10 +54,19 @@ public:
 
     bool pop_log(std::string& out);
 
+    // Times the connect-timeout watchdog force-aborted a stuck handshake
+    // (see watchdog_loop). Surfaced in /diag alongside the broker's.
+    int connect_aborts() const { return connect_aborts_.load(std::memory_order_relaxed); }
+
 private:
     struct Io;   // defined in tws_feed.cpp; owns all TWS API state
 
     void io_loop();
+    void watchdog_loop();
+    // Force-abort an in-flight eConnect that hasn't handshaked yet by closing
+    // its socket from off the I/O thread (unblocks the blocking eConnect read).
+    // See TwsBroker::abort_inflight_connect — same rationale for the feed.
+    void abort_inflight_connect(const char* why);
     void log(std::string line);
 
     TwsFeedConfig cfg_;
@@ -71,7 +80,16 @@ private:
     std::mutex log_mu_;
     std::deque<std::string> logs_;
 
+    // Connect-timeout watchdog (see TwsBroker for the full rationale): the feed's
+    // eConnect can freeze the same way; a wedged data session during IBKR's
+    // overnight maintenance was part of the same outage.
+    std::mutex conn_mu_;
+    void* connecting_ = nullptr;                  // EClientSocket* in flight (guarded by conn_mu_)
+    std::atomic<int64_t> connect_started_ms_{0};  // steady-clock ms when eConnect began; 0 = idle
+    std::atomic<int> connect_aborts_{0};
+
     std::thread io_thread_;
+    std::thread watchdog_thread_;
 };
 
 } // namespace tt

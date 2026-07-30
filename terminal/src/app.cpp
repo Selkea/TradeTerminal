@@ -1777,6 +1777,10 @@ std::string App::build_diag_json() {
     j["dropped_ticks"] = s.dropped_ticks;
     j["feed_stale_ms"] = s.last_tick_ts_ms > 0 ? (now_ms - s.last_tick_ts_ms) : -1;
     j["stuck_orders"] = tws_ ? tws_->stuck_order_count() : 0;   // half-open (TWS route)
+    // Connect-timeout watchdog force-aborts (broker + feed). Nonzero = a gateway
+    // handshake wedged and self-healed instead of freezing the I/O thread.
+    j["connect_aborts"] = (tws_ ? tws_->connect_aborts() : 0) +
+                          (tws_feed_ ? tws_feed_->connect_aborts() : 0);
 
     // ---- market-data source (candles for chart/backtest/optimizer + quotes) ----
     // Distinct from broker_connected/feed_stale_ms above (live order + tick
@@ -1945,6 +1949,9 @@ std::string App::build_metrics() {
       s.last_tick_ts_ms > 0 ? static_cast<double>(now_ms - s.last_tick_ts_ms) : -1);
     g("tt_stuck_orders", "orders unacked past the half-open threshold (TWS)",
       tws_ ? tws_->stuck_order_count() : 0);
+    g("tt_connect_aborts", "connect-timeout watchdog force-aborts (broker+feed)",
+      (tws_ ? tws_->connect_aborts() : 0) +
+          (tws_feed_ ? tws_feed_->connect_aborts() : 0));
     g("tt_ack_latency_p50_ms", "order submit->ack p50", ack.base_ns / 1'000'000.0);
     g("tt_ack_latency_p90_ms", "order submit->ack p90",
       (ack.base_ns + ack.jitter_ns) / 1'000'000.0);
