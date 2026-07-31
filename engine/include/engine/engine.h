@@ -169,6 +169,12 @@ struct RiskState {
 
 struct LiveSnapshot {
     bool running = false, halted = false;
+    // False on a reconciling (TWS) route until the broker has replayed its
+    // positions/orders/cash (ReconcileEnd) or the 10s failsafe fired; true from
+    // the first publish on non-reconciling routes (sim/ibkr). The journal reads
+    // this to anchor a session's PnL baseline to the *real* account equity
+    // rather than the pre-reconciliation placeholder.
+    bool reconciled = false;
     double cash = 0, equity = 0;
     std::vector<SymbolState> symbols;
     std::vector<OrderRecord> orders;   // newest last, capped

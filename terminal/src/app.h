@@ -359,6 +359,10 @@ private:
     int64_t journal_session_ = 0;          // 0 = no open session row
     std::vector<std::string> journal_syms_;
     bool prev_live_running_ = false;
+    // Set at session start on a reconciling (TWS) route; cleared once the live
+    // snapshot reports reconciled==true and we re-anchor the journal baseline
+    // to the real account equity (see the journal block in the frame loop).
+    bool journal_baseline_pending_ = false;
 
     // Sweep runner. The IPC thread only stashes fetched candles under
     // pending_bt_mu_; everything else runs on the UI thread.

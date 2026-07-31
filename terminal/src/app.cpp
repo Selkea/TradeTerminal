@@ -2101,12 +2101,31 @@ void App::draw() {
         std::string jsyms;
         for (const std::string& sym : journal_syms_)
             jsyms += (jsyms.empty() ? "" : ",") + sym;
-        journal_session_ = journal_.begin_session(
-            jsyms, ibkr_ ? "ibkr" : "sim", engine_.live_snapshot().cash);
+        // Baseline = starting equity. On a reconciling (TWS) route this is only
+        // a placeholder — the broker hasn't replayed the real account yet — so
+        // arm a re-anchor below once reconciliation completes. Otherwise (sim /
+        // ibkr) the starting equity IS the baseline; leave it alone.
+        const LiveSnapshot s0 = engine_.live_snapshot();
+        journal_session_ =
+            journal_.begin_session(jsyms, ibkr_ ? "ibkr" : "sim", s0.equity);
+        journal_baseline_pending_ =
+            (tws_ && tws_->reconciles()) || (ibkr_ && ibkr_->reconciles());
     } else if (prev_live_running_ && !live_now && journal_session_) {
         const LiveSnapshot s = engine_.live_snapshot();
         journal_.end_session(journal_session_, s.equity, s.halted);
         journal_session_ = 0;
+        journal_baseline_pending_ = false;
+    }
+    // Re-anchor the session PnL baseline to the true account equity the instant
+    // broker reconciliation finishes (adopted positions + real cash now loaded),
+    // so per-session/day PnL is the session's actual trading delta, not a
+    // ~$1M account swing measured off a ~$100k placeholder.
+    if (journal_session_ && journal_baseline_pending_) {
+        const LiveSnapshot s = engine_.live_snapshot();
+        if (s.reconciled) {
+            journal_.set_baseline(journal_session_, s.equity);
+            journal_baseline_pending_ = false;
+        }
     }
     prev_live_running_ = live_now;
     Engine::FillRecord fr;

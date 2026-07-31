@@ -129,8 +129,10 @@ set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
 # this can't live in the engine test harness; it links imgui like the app does.
 add_executable(tt_terminal_tests
     tests/test_log_console.cpp
+    tests/test_journal.cpp
     src/panels/log_console.cpp
+    src/journal.cpp
 )
 target_include_directories(tt_terminal_tests PRIVATE src)
-target_link_libraries(tt_terminal_tests PRIVATE imgui doctest)
+target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3)
 add_test(NAME terminal_tests COMMAND tt_terminal_tests)

@@ -25,6 +25,13 @@ public:
     // Returns the session row id (0 on failure).
     int64_t begin_session(const std::string& symbols, const std::string& mode,
                           double initial_cash);
+    // Re-anchor a session's PnL baseline (the `initial_cash` column) to the
+    // real account equity once broker reconciliation completes. begin_session
+    // can only capture a pre-reconciliation placeholder; on the TWS route that
+    // is the ~100k notional, not the real ~1M account, which made per-session
+    // PnL (final_equity - baseline) absurd. Call once, when live reports
+    // reconciled==true.
+    void set_baseline(int64_t session_id, double baseline_equity);
     void add_fill(int64_t session_id, int64_t ts_ns, const std::string& symbol,
                   bool buy, double qty, double price, double fee, uint64_t order_id);
     void end_session(int64_t session_id, double final_equity, bool halted);
