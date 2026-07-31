@@ -117,10 +117,15 @@ std::vector<TradeJournal::DayRow> TradeJournal::days(int limit) const {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(
             db_,
+            // NB: the per-day fills subquery must repeat the date() expression on
+            // the outer table (s) — SQLite does NOT resolve the SELECT-list alias
+            // `d` inside a subquery ("no such column: d"), which silently failed
+            // the whole prepare and left the Day table permanently empty.
             "SELECT date(s.started_utc,'unixepoch','localtime') d, count(DISTINCT s.id), "
             "  (SELECT count(*) FROM fills f WHERE f.session_id IN "
             "     (SELECT id FROM sessions s2 WHERE "
-            "      date(s2.started_utc,'unixepoch','localtime')=d)), "
+            "      date(s2.started_utc,'unixepoch','localtime')="
+            "      date(s.started_utc,'unixepoch','localtime'))), "
             "  sum(COALESCE(s.final_equity - s.initial_cash, 0)) "
             "FROM sessions s GROUP BY d ORDER BY d DESC LIMIT ?",
             -1, &st, nullptr) != SQLITE_OK)
