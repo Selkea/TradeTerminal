@@ -672,9 +672,14 @@ void Engine::swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
     queue_swap(PendingSwap{symbol_id, strategy, std::move(params)});
 }
 
-void Engine::stop_live() {
+void Engine::stop_live(bool keep_broker_orders) {
     if (live_running_.load(std::memory_order_relaxed))
-        while (!cmd_ring_->try_push(LiveCmd{LiveCmd::Stop, 0, 0, 0, 0})) Sleep(1);
+        // Stop reuses the `buy` byte to carry keep_broker_orders (see run_live's
+        // Stop handler + the cancel-on-stop gate).
+        while (!cmd_ring_->try_push(
+            LiveCmd{LiveCmd::Stop, static_cast<uint8_t>(keep_broker_orders ? 1 : 0),
+                    0, 0, 0}))
+            Sleep(1);
     if (live_thread_.joinable()) live_thread_.join();
 }
 
@@ -1075,6 +1080,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     fills.reserve(8);
     int idle = 0;
     bool stop = false;
+    bool keep_broker_orders = false;   // set by a keep-positions Stop command
     while (!stop) {
         // Failsafe: if a reconciling broker never signals completion (connect
         // failed, gateway wedged), lift the gate after the deadline so dispatch
@@ -1094,6 +1100,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             switch (c.type) {
             case LiveCmd::Stop:
                 stop = true;
+                keep_broker_orders = c.buy != 0;   // keep-positions restart
                 break;
             case LiveCmd::Cancel:
                 if (broker) {
@@ -1367,10 +1374,16 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         }
     }
 
-    // Real orders must not outlive the session that's watching them.
-    if (broker) {
+    // Real orders must not outlive the session that's watching them — EXCEPT a
+    // keep-positions restart, which deliberately leaves the position open and
+    // relies on its resting stop/TP surviving to be re-adopted + held on the
+    // next start. Cancelling them here would strand that position naked (no
+    // protective order) and paused (adopt_hold never lifts without a fill).
+    if (broker && !keep_broker_orders) {
         broker->cancel_all();
         push_log("live: cancelled open broker orders on stop");
+    } else if (broker) {
+        push_log("live: keeping open broker orders for restart re-adoption");
     }
 
     if (capture.is_open()) {

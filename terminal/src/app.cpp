@@ -2698,9 +2698,12 @@ void App::safe_stop_live(bool keep_positions) {
     // adopted + held on restart (see run_live's reconciliation gate).
     const bool keep = keep_positions && tws_ && tws_->reconciles();
     if (!keep) engine_.kill_switch();   // cancel all + flatten + halt strategy
-    engine_.stop_live();     // graceful stop, joins the live thread — after this,
-                             // nothing still references cfg.broker, so tearing
-                             // the broker down below can never race the engine.
+    // keep => graceful stop that LEAVES the resting broker orders live so the
+    // restart re-adopts them (otherwise stop_live cancels them; the position
+    // would come back naked + paused). Joins the live thread — after this,
+    // nothing still references cfg.broker, so tearing the broker down below can
+    // never race the engine.
+    engine_.stop_live(keep);
     // Actually disconnect: leaving the broker connected after "Stop" holds its
     // TWS client_id at the gateway, so a quick Start can collide with it
     // (error 326) and stall retrying — reaped async so a stuck reconnect on

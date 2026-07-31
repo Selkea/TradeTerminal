@@ -185,6 +185,7 @@ namespace {
 struct FakeReconcileBroker : IBrokerAdapter {
     std::mutex mu;
     std::deque<EngineEvent> q;   // events the engine will drain via poll_event
+    std::atomic<int> cancel_all_calls{0};
 
     void emit(const EngineEvent& e) {
         std::lock_guard l(mu);
@@ -192,7 +193,7 @@ struct FakeReconcileBroker : IBrokerAdapter {
     }
     uint64_t submit(const OrderRequest&, int64_t) override { return 1; }
     bool cancel(uint64_t) override { return true; }
-    void cancel_all() override {}
+    void cancel_all() override { ++cancel_all_calls; }
     void flatten() override {}
     bool poll_event(EngineEvent& out) override {
         std::lock_guard l(mu);
@@ -321,6 +322,42 @@ TEST_CASE("live reconciliation: gate dispatch, hold until flat, then resume") {
     CHECK(held.inits.load() == held_inits_before + 1);
 
     eng.stop_live();
+}
+
+// stop_live(keep_broker_orders=true) must NOT cancel resting broker orders — the
+// keep-positions restart re-adopts them; cancelling would leave the position
+// naked + paused. Default stop cancels them (nothing should outlive the session).
+TEST_CASE("live stop: keep_broker_orders leaves resting orders for re-adoption") {
+    Engine eng;
+    FakeReconcileBroker broker;
+    RecordingStrat s;
+    broker.emit(ev_acct(100'000.0));
+    broker.emit(ev_reconcile_end());   // flat; reconciliation completes at once
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.broker = &broker;
+    cfg.bar_seconds = 100'000;
+    REQUIRE(eng.start_live(cfg, {&s}));
+    REQUIRE(pump_until(eng, [&] { return eng.live_snapshot().reconciled; }));
+    CHECK(broker.cancel_all_calls.load() == 0);
+    eng.stop_live(/*keep_broker_orders=*/true);
+    CHECK(broker.cancel_all_calls.load() == 0);   // kept, not cancelled
+}
+
+TEST_CASE("live stop: default cancels resting broker orders on stop") {
+    Engine eng;
+    FakeReconcileBroker broker;
+    RecordingStrat s;
+    broker.emit(ev_acct(100'000.0));
+    broker.emit(ev_reconcile_end());
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.broker = &broker;
+    cfg.bar_seconds = 100'000;
+    REQUIRE(eng.start_live(cfg, {&s}));
+    REQUIRE(pump_until(eng, [&] { return eng.live_snapshot().reconciled; }));
+    eng.stop_live();   // default keep_broker_orders=false
+    CHECK(broker.cancel_all_calls.load() >= 1);
 }
 
 namespace {
