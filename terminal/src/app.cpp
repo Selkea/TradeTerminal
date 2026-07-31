@@ -487,14 +487,19 @@ App::App(std::string gateway_url)
 #ifdef _WIN32
     // Tie the broker gateway to this app's lifetime. Web route: CP gateway +
     // IBeam auto-login, stopped again in the destructor. TWS route: IB Gateway
-    // via IBC - started if not already up, and left running on exit so the
-    // login (and any typed 2FA code) survives app restarts.
+    // via IBC, driven by a keepalive daemon (Watch-IbGateway.ps1) that starts it
+    // if needed, re-logs-in if a login fails at a bad moment (e.g. IBKR's
+    // overnight maintenance window - the one-shot launch had no retry), and
+    // exits when THIS app closes (it watches -AppPid). The gateway itself is
+    // left running on exit so the login survives an app restart.
     {
         const auto ib = read_ibkr_accounts();
         if (!ib.accounts.empty() && !ib.active.empty()) {
             const std::string args =
-                use_tws_data_ ? ps_args("Start-IbGateway.ps1")
-                              : ps_args("Start-IbkrLogin.ps1", true, "-Daemon");
+                use_tws_data_
+                    ? ps_args("Watch-IbGateway.ps1", true,
+                              "-AppPid " + std::to_string(GetCurrentProcessId()))
+                    : ps_args("Start-IbkrLogin.ps1", true, "-Daemon");
             if (!args.empty()) {
                 run_hidden(args);
                 gateway_starting_until_ = 90.0;   // show INITIALIZING until it connects
