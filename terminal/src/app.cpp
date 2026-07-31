@@ -2110,7 +2110,20 @@ void App::draw() {
             journal_.begin_session(jsyms, ibkr_ ? "ibkr" : "sim", s0.equity);
         journal_baseline_pending_ =
             (tws_ && tws_->reconciles()) || (ibkr_ && ibkr_->reconciles());
-    } else if (prev_live_running_ && !live_now && journal_session_) {
+    }
+    // Drain fills into the (still-open) session BEFORE the stop transition can
+    // close it below: end_session zeroes journal_session_ and add_fill(0,...) is
+    // a no-op, so draining AFTER the stop would silently drop a session's closing
+    // (flatten / kill-switch) fills — the very trades that realize its PnL.
+    Engine::FillRecord fr;
+    while (engine_.pop_fill(fr)) {
+        const std::string sym = fr.symbol_id >= 1 && fr.symbol_id <= journal_syms_.size()
+                                    ? journal_syms_[fr.symbol_id - 1]
+                                    : "?";
+        journal_.add_fill(journal_session_, fr.ts_ns, sym, fr.side == 1, fr.qty,
+                          fr.price, fr.fee, fr.order_id);
+    }
+    if (prev_live_running_ && !live_now && journal_session_) {
         const LiveSnapshot s = engine_.live_snapshot();
         journal_.end_session(journal_session_, s.equity, s.halted);
         journal_session_ = 0;
@@ -2128,14 +2141,6 @@ void App::draw() {
         }
     }
     prev_live_running_ = live_now;
-    Engine::FillRecord fr;
-    while (engine_.pop_fill(fr)) {
-        const std::string sym = fr.symbol_id >= 1 && fr.symbol_id <= journal_syms_.size()
-                                    ? journal_syms_[fr.symbol_id - 1]
-                                    : "?";
-        journal_.add_fill(journal_session_, fr.ts_ns, sym, fr.side == 1, fr.qty,
-                          fr.price, fr.fee, fr.order_id);
-    }
 
     pump_sweep();   // before the panels: sweep results must not be stolen
     pump_tournament();
