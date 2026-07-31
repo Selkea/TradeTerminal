@@ -805,7 +805,15 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // broker never signals (e.g. connect failed) so a stall can't wedge trading.
     // No-op for non-reconciling brokers (paper/sim/web): the flags never engage.
     bool reconciling = broker && broker->reconciles();
-    const int64_t reconcile_deadline_ns = rt.now_ns() + 10'000'000'000LL;
+    // The failsafe that lifts the reconcile gate is armed only once the broker
+    // reports ready (handshake done, reconciliation about to replay) — NOT at
+    // session start. Anchoring the 10s to session start meant a slow cold-gateway
+    // connect (the connect watchdog allows up to 30s) could blow the deadline
+    // before reconciliation even began: the gate would lift, the strategy would
+    // trade a flat/placeholder book, then a late PosSnap would clobber the
+    // position it had built. 0 = not yet armed. Until the broker is ready there
+    // is nothing to trade against anyway (orders would fail).
+    int64_t reconcile_deadline_ns = 0;
     std::vector<char> adopt_hold(n_sym, 0);
 
     // Percentiles are recomputed only when a new sample landed (orders are
@@ -1105,10 +1113,15 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     bool stop = false;
     bool keep_broker_orders = false;   // set by a keep-positions Stop command
     while (!stop) {
-        // Failsafe: if a reconciling broker never signals completion (connect
-        // failed, gateway wedged), lift the gate after the deadline so dispatch
-        // resumes instead of stalling forever (degrades to no adoption).
-        if (reconciling && rt.now_ns() > reconcile_deadline_ns) {
+        // Failsafe: arm the deadline when the broker first reports ready, then
+        // lift the gate if reconciliation hasn't signalled completion within the
+        // window (connect fine but the replay stalled) so a stall can't wedge
+        // trading (degrades to no adoption). Anchored to ready, not session
+        // start — see reconcile_deadline_ns above.
+        if (reconciling && reconcile_deadline_ns == 0 && broker && broker->ready())
+            reconcile_deadline_ns = rt.now_ns() + 10'000'000'000LL;
+        if (reconciling && reconcile_deadline_ns != 0 &&
+            rt.now_ns() > reconcile_deadline_ns) {
             reconciling = false;
             push_log("live: broker reconciliation timed out — trading normally");
         }
@@ -1245,26 +1258,44 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                         }
                     }
                 } else if (bev.type == static_cast<uint16_t>(EvType::PosSnap)) {
-                    pf.seed_position(bev.symbol_id, bev.u.pos.qty, bev.u.pos.avg_price);
-                    risk_base_eq = risk_high_eq = pf.equity();   // new baseline
-                    // A nonzero adopted position: pause that symbol's strategy
-                    // until it goes flat (its adopted stop/TP protects + exits it).
-                    const bool hold = bev.u.pos.qty != 0.0 && bev.symbol_id >= 1 &&
-                                      bev.symbol_id <= n_sym;
-                    if (hold) adopt_hold[bev.symbol_id - 1] = 1;
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf),
-                                  "live: adopted broker position %s %+.0f @ %.2f%s",
-                                  symbol_name(bev.symbol_id).c_str(), bev.u.pos.qty,
-                                  bev.u.pos.avg_price, hold ? " — holding until flat" : "");
-                    push_log(buf);
+                    // Only adopt while reconciling. A snapshot that lands after
+                    // reconciliation ended (failsafe lifted the gate, or a stray
+                    // late replay) would overwrite a position the strategy has
+                    // since traded and wrongly re-pause it — reconciliation is a
+                    // one-shot at session start.
+                    if (!reconciling) {
+                        push_log("live: ignoring late broker position snapshot for " +
+                                 symbol_name(bev.symbol_id) +
+                                 " (reconciliation already ended)");
+                    } else {
+                        pf.seed_position(bev.symbol_id, bev.u.pos.qty,
+                                         bev.u.pos.avg_price);
+                        risk_base_eq = risk_high_eq = pf.equity();   // new baseline
+                        // A nonzero adopted position: pause that symbol's strategy
+                        // until it goes flat (its adopted stop/TP protects it).
+                        const bool hold = bev.u.pos.qty != 0.0 && bev.symbol_id >= 1 &&
+                                          bev.symbol_id <= n_sym;
+                        if (hold) adopt_hold[bev.symbol_id - 1] = 1;
+                        char buf[128];
+                        std::snprintf(
+                            buf, sizeof(buf),
+                            "live: adopted broker position %s %+.0f @ %.2f%s",
+                            symbol_name(bev.symbol_id).c_str(), bev.u.pos.qty,
+                            bev.u.pos.avg_price, hold ? " — holding until flat" : "");
+                        push_log(buf);
+                    }
                 } else if (bev.type == static_cast<uint16_t>(EvType::AcctSnap)) {
-                    pf.set_cash(bev.u.acct.cash);
-                    risk_base_eq = risk_high_eq = pf.equity();   // new baseline
-                    char buf[64];
-                    std::snprintf(buf, sizeof(buf), "live: cash reconciled to %.2f",
-                                  bev.u.acct.cash);
-                    push_log(buf);
+                    if (!reconciling) {
+                        push_log("live: ignoring late broker cash snapshot "
+                                 "(reconciliation already ended)");
+                    } else {
+                        pf.set_cash(bev.u.acct.cash);
+                        risk_base_eq = risk_high_eq = pf.equity();   // new baseline
+                        char buf[64];
+                        std::snprintf(buf, sizeof(buf), "live: cash reconciled to %.2f",
+                                      bev.u.acct.cash);
+                        push_log(buf);
+                    }
                 } else if (bev.type == static_cast<uint16_t>(EvType::OrderNew)) {
                     // A resting order adopted from the broker at reconnect — book
                     // it Working so /diag + the blotter show it (and a held symbol
