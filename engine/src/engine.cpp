@@ -867,6 +867,10 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         }
     };
 
+    // Per-symbol strategy halt flag (set by the watchdog / protective-reject
+    // safety net below). Declared here so the fill path can refuse to dispatch
+    // on_fill to a halted symbol, same as on_tick/on_bar do.
+    std::vector<char> strat_halted(n_sym, 0);
     // Shared by the sim fill path and the broker event drain.
     auto apply_fill = [&](const Fill& f) {
         pf.apply(f);
@@ -884,12 +888,17 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         push_log(buf);
         push_fill(FillRecord{f.ts_ns, f.order_id, f.symbol_id,
                              static_cast<uint8_t>(f.side), f.qty, f.price, f.fee});
-        // A held (adopted) symbol's fills come from broker-side resting orders
-        // the paused strategy never placed and doesn't know about — don't
-        // dispatch on_fill to it (the resume in the drain handles it going flat).
-        const bool held = f.symbol_id >= 1 && f.symbol_id <= n_sym &&
-                          adopt_hold[f.symbol_id - 1];
-        if (!halted && !held)
+        // Don't dispatch on_fill when the strategy shouldn't be running: a held
+        // (adopted) symbol's fills come from broker-side resting orders the
+        // paused strategy never placed (the drain's resume handles it going
+        // flat); a watchdog/protective-halted symbol has been quarantined; and
+        // during reconciliation no strategy is trading yet. Matches the
+        // on_tick/on_bar dispatch gates so a halted strategy can't re-enter via
+        // on_fill (submit_order has no strat_halted knowledge).
+        const bool in_range = f.symbol_id >= 1 && f.symbol_id <= n_sym;
+        const bool held = in_range && adopt_hold[f.symbol_id - 1];
+        const bool sym_halted = in_range && strat_halted[f.symbol_id - 1];
+        if (!halted && !held && !sym_halted && !reconciling)
             if (IStrategy* s = strat_for(f.symbol_id)) {
                 ctx.set_current_symbol(f.symbol_id);
                 s->on_fill(ctx, f);
@@ -964,14 +973,28 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // symbol (stop dispatching to it) and flatten its position — one slow or
     // runaway strategy must not keep degrading the shared engine thread. Note:
     // this catches callbacks that *return* slowly; a true infinite loop can't be
-    // unwound from this thread (nothing safely can).
+    // unwound from this thread (nothing safely can). (strat_halted is declared
+    // above apply_fill so the fill path can read it too.)
     const int64_t watchdog_ns = static_cast<int64_t>(cfg.watchdog_ms) * 1'000'000;
-    std::vector<char> strat_halted(n_sym, 0);
     // Flatten one symbol's position at market and stop dispatching to its
     // strategy. Shared by the watchdog and the protective-reject safety net.
     auto flatten_halt_symbol = [&](uint32_t sid, const std::string& why) {
         if (sid < 1 || sid > n_sym || strat_halted[sid - 1]) return;
         strat_halted[sid - 1] = 1;
+        // Cancel this symbol's resting orders first. Once halted its strategy
+        // can't manage its own manual OCO (on_tick/on_bar are gated), so an
+        // orphaned exit leg (protective stop / take-profit) left resting could
+        // fill AFTER the flatten and reverse the position into a naked,
+        // unmanaged one. (kill_all does the same via broker/exec cancel_all.)
+        for (auto& o : orders)
+            if (o.symbol_id == sid && o.status == OrderStatus::Working) {
+                if (broker) {
+                    broker->cancel(o.id);   // async: settles on the cancel event
+                } else if (exec.cancel(o.id)) {
+                    o.status = OrderStatus::Cancelled;
+                    orders_dirty = true;
+                }
+            }
         const double pos = pf.position(sid).qty;
         if (pos != 0.0) {
             OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy, OrdType::Market,

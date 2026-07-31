@@ -8,12 +8,14 @@
 #include "tt/strategy_api.h"
 #include "tt/strategy_registry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 using namespace tt;
 
@@ -186,13 +188,18 @@ struct FakeReconcileBroker : IBrokerAdapter {
     std::mutex mu;
     std::deque<EngineEvent> q;   // events the engine will drain via poll_event
     std::atomic<int> cancel_all_calls{0};
+    std::vector<uint64_t> cancelled;   // order ids passed to cancel() (under mu)
 
     void emit(const EngineEvent& e) {
         std::lock_guard l(mu);
         q.push_back(e);
     }
     uint64_t submit(const OrderRequest&, int64_t) override { return 1; }
-    bool cancel(uint64_t) override { return true; }
+    bool cancel(uint64_t id) override {
+        std::lock_guard l(mu);
+        cancelled.push_back(id);
+        return true;
+    }
     void cancel_all() override { ++cancel_all_calls; }
     void flatten() override {}
     bool poll_event(EngineEvent& out) override {
@@ -358,6 +365,48 @@ TEST_CASE("live stop: default cancels resting broker orders on stop") {
     REQUIRE(pump_until(eng, [&] { return eng.live_snapshot().reconciled; }));
     eng.stop_live();   // default keep_broker_orders=false
     CHECK(broker.cancel_all_calls.load() >= 1);
+}
+
+// When a protective stop is rejected, the naked-position safety net flattens +
+// halts that symbol. The halted strategy can no longer manage its manual OCO,
+// so the flatten MUST also cancel the still-resting sibling leg (the take-
+// profit) — otherwise it fills later and reverses the flat book into a naked
+// short.
+TEST_CASE("protective-reject flatten cancels the orphaned sibling exit leg") {
+    Engine eng;
+    FakeReconcileBroker broker;
+    RecordingStrat s;
+    // Adopt AAA long 100 with two resting exits: protective stop #5001, TP #5002.
+    broker.emit(ev_pos(1, 100.0, 50.0));
+    broker.emit(ev_order(1, 5001, 100.0, Side::Sell, OrdType::Stop, 45.0));
+    broker.emit(ev_order(1, 5002, 100.0, Side::Sell, OrdType::Limit, 55.0));
+    broker.emit(ev_acct(100'000.0));
+    broker.emit(ev_reconcile_end());
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.broker = &broker;
+    cfg.bar_seconds = 100'000;
+    REQUIRE(eng.start_live(cfg, {&s}));
+    REQUIRE(pump_until(eng, [&] {
+        return eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0) &&
+               eng.live_snapshot().reconciled;
+    }));
+
+    // The broker rejects the protective stop (#5001) with the protective flag.
+    EngineEvent rej{};
+    rej.type = static_cast<uint16_t>(EvType::OrderCancel);
+    rej.flags = kEvFlagRejected | kEvFlagProtective;
+    rej.symbol_id = 1;
+    rej.u.order.order_id = 5001;
+    broker.emit(rej);
+
+    // The still-Working TP (#5002) must be cancelled by the flatten.
+    REQUIRE(pump_until(eng, [&] {
+        std::lock_guard l(broker.mu);
+        return std::find(broker.cancelled.begin(), broker.cancelled.end(), 5002u) !=
+               broker.cancelled.end();
+    }));
+    eng.stop_live();
 }
 
 namespace {
