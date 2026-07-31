@@ -1113,29 +1113,14 @@ void App::pump_lineup_schedule() {
     start_daily_lineup(!cfg_.lineup_propose_only);
 }
 
-// Force the TWS broker + feed to drop & reconnect once a day (default 02:00
-// local) so IBKR's overnight server reset can't leave a stale/zombie socket
-// wedged until the open. Level-triggered inside a 30-min window; only when a
-// TWS-routed connection actually exists. Reconnect re-adopts nothing (adoption
-// is first-connect only), so an open session keeps its positions/orders.
-void App::pump_tws_refresh() {
-    if (!tws_ && !tws_feed_) return;   // only the TWS route has these handles
-    int rh = -1, rm = -1;
-    if (std::sscanf(cfg_.tws_refresh_time.c_str(), "%d:%d", &rh, &rm) != 2) return;
-    if (rh < 0 || rh > 23 || rm < 0 || rm > 59) return;
-    const int refresh_min = rh * 60 + rm;
-    std::time_t now_tt = std::time(nullptr);
-    std::tm tm{};
-    localtime_s(&tm, &now_tt);
-    if (tm.tm_yday == tws_refresh_last_day_) return;   // one refresh per day
-    const int now_min = tm.tm_hour * 60 + tm.tm_min;
-    if (now_min < refresh_min || now_min > refresh_min + 30) return;   // in the window
-    tws_refresh_last_day_ = tm.tm_yday;
-    route("tws: scheduled daily refresh (" + cfg_.tws_refresh_time +
-             ") - reconnecting broker + feed");
-    if (tws_) tws_->request_reconnect();
-    if (tws_feed_) tws_feed_->request_reconnect();
-}
+// The scheduled daily TWS refresh (force broker+feed to drop & reconnect at a
+// fixed local time, default 02:00) was REMOVED: it caused two multi-hour
+// gateway outages (2026-07-30 froze a healthy connection in the reconnect;
+// 2026-07-31 it reconnected into a gateway that had failed its overnight
+// re-auth and the app-side went silent). IBKR's own overnight reset already
+// self-heals (1100/1102), so the forced reconnect only added risk with no
+// benefit. The adapters keep request_reconnect() for a future manual button;
+// nothing schedules it automatically. See [[tt-tws-reconnect-freeze]].
 
 // Kick off a live "swap onto the new lineup" (see SwapStage). Snapshots the
 // running session, works out which symbols are leaving, cancels their resting
@@ -2132,7 +2117,6 @@ void App::draw() {
     pump_tournament();
     pump_autopilot();
     pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
-    pump_tws_refresh();       // daily forced TWS reconnect (default 02:00 local)
     pump_lineup_swap();       // drive an in-progress live swap onto new picks
     pump_daily_lineup();
 

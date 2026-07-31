@@ -50,7 +50,6 @@ AppConfig AppConfig::load(const std::string& path) {
     c.risk_max_drawdown_pct = j.value("risk_max_drawdown_pct", c.risk_max_drawdown_pct);
     c.risk_stale_feed_sec = j.value("risk_stale_feed_sec", c.risk_stale_feed_sec);
     c.risk_disable_halt = j.value("risk_disable_halt", c.risk_disable_halt);
-    c.tws_refresh_time = j.value("tws_refresh_time", c.tws_refresh_time);
 
     if (j.contains("trade_symbols") && j["trade_symbols"].is_array())
         for (const auto& s : j["trade_symbols"]) {
@@ -149,7 +148,6 @@ void AppConfig::save(const std::string& path) const {
         {"risk_max_drawdown_pct", risk_max_drawdown_pct},
         {"risk_stale_feed_sec", risk_stale_feed_sec},
         {"risk_disable_halt", risk_disable_halt},
-        {"tws_refresh_time", tws_refresh_time},
     };
     json syms = json::array();
     for (const auto& ts : trade_symbols)
