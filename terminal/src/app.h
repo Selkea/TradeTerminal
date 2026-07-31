@@ -259,6 +259,14 @@ private:
     bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
     char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 
+    // Broker-disconnect watchdog: fire a webhook alert when the order path is
+    // down for more than a minute during a live session. STATE-based (not a log
+    // scan), so it catches even a silent freeze where nothing is logged — the
+    // gap that let a gateway outage go unnoticed for hours. See pump_broker_watchdog.
+    void pump_broker_watchdog();
+    double broker_down_since_s_ = 0.0;       // GetTime when the broker first went down (0 = up)
+    double broker_down_last_alert_s_ = 0.0;  // GetTime of the last down-alert (0 = none this episode)
+
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
     // flattening the symbols that carry over — those are re-adopted + held on the
