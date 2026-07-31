@@ -221,21 +221,29 @@ bool TwsFeed::start() {
 
 void TwsFeed::stop() {
     stop_.store(true, std::memory_order_release);
-    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
-        s->issueSignal();
-    // Unblock a possibly-frozen eConnect so the joins return promptly.
+    // Unblock a possibly-frozen eConnect so the joins return promptly. We do NOT
+    // poke the reader signal here (io.signal lives on the I/O thread's stack;
+    // racing its destruction from this thread was a latent UAF) — a connected
+    // I/O thread wakes from waitForSignal within its 1s timeout instead.
     abort_inflight_connect("shutdown");
     if (io_thread_.joinable()) io_thread_.join();
     if (watchdog_thread_.joinable()) watchdog_thread_.join();
     connected_.store(false, std::memory_order_release);
 }
 
-void TwsFeed::abort_inflight_connect(const char* why) {
+void TwsFeed::abort_inflight_connect(const char* why, int64_t only_if_started_ms) {
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!connecting_) return;
+    // Re-validate under the lock that this is still the same in-flight attempt
+    // (see TwsBroker::abort_inflight_connect) so the watchdog can't abort a fresh
+    // connect that started after its unlocked timeout check. 0 = unconditional.
+    if (only_if_started_ms != 0 &&
+        connect_started_ms_.load(std::memory_order_acquire) != only_if_started_ms)
+        return;
     log(std::string("connect ") + why + " - closing socket to unblock eConnect");
     static_cast<EClientSocket*>(connecting_)->eDisconnect();
     connect_started_ms_.store(0, std::memory_order_release);   // don't re-abort this attempt
+    connecting_ = nullptr;   // and don't touch this socket again
     connect_aborts_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -249,7 +257,7 @@ void TwsFeed::watchdog_loop() {
         if (started == 0) continue;                               // no connect in flight
         if (connected_.load(std::memory_order_acquire)) continue; // handshake completed
         if (now_ms() - started < kConnectTimeoutMs) continue;
-        abort_inflight_connect("handshake stuck >30s");
+        abort_inflight_connect("handshake stuck >30s", started);
     }
 }
 

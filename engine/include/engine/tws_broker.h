@@ -93,7 +93,10 @@ private:
     // its socket from off the I/O thread (unblocks the blocking eConnect read).
     // Used by the watchdog on timeout and by teardown to unblock a frozen
     // connect. why = short reason for the log line. No-op if nothing is in flight.
-    void abort_inflight_connect(const char* why);
+    // only_if_started_ms != 0 aborts ONLY if that exact attempt is still in
+    // flight (re-checked under conn_mu_), so the watchdog can't tear down a fresh
+    // connect that started after its unlocked timeout check; 0 = unconditional.
+    void abort_inflight_connect(const char* why, int64_t only_if_started_ms = 0);
     void push_ev(const EngineEvent& ev);
     // Record a reject reason (I/O thread) then push the Rejected event. code 0
     // and empty msg = no reason available (leaves the reason table untouched).
