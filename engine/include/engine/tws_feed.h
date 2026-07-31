@@ -66,7 +66,7 @@ private:
     // Force-abort an in-flight eConnect that hasn't handshaked yet by closing
     // its socket from off the I/O thread (unblocks the blocking eConnect read).
     // See TwsBroker::abort_inflight_connect — same rationale for the feed.
-    void abort_inflight_connect(const char* why);
+    void abort_inflight_connect(const char* why, int64_t only_if_started_ms = 0);
     void log(std::string line);
 
     TwsFeedConfig cfg_;

@@ -367,6 +367,31 @@ TEST_CASE("live stop: default cancels resting broker orders on stop") {
     CHECK(broker.cancel_all_calls.load() >= 1);
 }
 
+// A position snapshot that arrives AFTER reconciliation has ended must be
+// ignored, not applied — otherwise a slow-connect failsafe (or a stray late
+// replay) clobbers a position the strategy has since traded and re-pauses it.
+TEST_CASE("reconciliation: a late position snapshot is ignored, not adopted") {
+    Engine eng;
+    FakeReconcileBroker broker;
+    RecordingStrat s;
+    broker.emit(ev_acct(100'000.0));
+    broker.emit(ev_reconcile_end());   // flat; reconciliation ends immediately
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.broker = &broker;
+    cfg.bar_seconds = 100'000;
+    REQUIRE(eng.start_live(cfg, {&s}));
+    REQUIRE(pump_until(eng, [&] { return eng.live_snapshot().reconciled; }));
+    REQUIRE(eng.live_snapshot().symbols[0].position.qty == doctest::Approx(0.0));
+
+    // Stray late PosSnap: must NOT be adopted (reconciliation is over).
+    broker.emit(ev_pos(1, 500.0, 50.0));
+    for (int i = 0; i < 40; ++i) eng.push_live_tick("AAA", 1, 50.0, 0.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(eng.live_snapshot().symbols[0].position.qty == doctest::Approx(0.0));
+    eng.stop_live();
+}
+
 // When a protective stop is rejected, the naked-position safety net flattens +
 // halts that symbol. The halted strategy can no longer manage its manual OCO,
 // so the flatten MUST also cancel the still-resting sibling leg (the take-

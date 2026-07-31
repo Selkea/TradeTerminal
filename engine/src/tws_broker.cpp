@@ -556,21 +556,31 @@ TwsBroker::TwsBroker(TwsConfig cfg) : cfg_(std::move(cfg)) {
 
 TwsBroker::~TwsBroker() {
     stop_.store(true, std::memory_order_release);
-    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
-        s->issueSignal();
-    // If the I/O thread is frozen inside eConnect, unblock it so the join below
-    // returns promptly instead of waiting out the connect (or forever).
+    // Unblock a frozen eConnect so the join returns promptly. We do NOT poke the
+    // reader signal here: it lives on the I/O thread's stack (io.signal), and
+    // racing this thread's issueSignal() against the I/O thread destroying it on
+    // exit was a latent use-after-free. A connected I/O thread instead wakes from
+    // waitForSignal within its 1s timeout, then sees stop_ and exits.
     abort_inflight_connect("shutdown");
     if (io_thread_.joinable()) io_thread_.join();
     if (watchdog_thread_.joinable()) watchdog_thread_.join();
 }
 
-void TwsBroker::abort_inflight_connect(const char* why) {
+void TwsBroker::abort_inflight_connect(const char* why, int64_t only_if_started_ms) {
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!connecting_) return;   // nothing in flight (or already handed off)
+    // Re-validate under the lock that the attempt we decided to abort is still
+    // the one in flight: a connect can return and a fresh one start between the
+    // watchdog's unlocked timeout check and here, and aborting THAT would kill a
+    // healthy new handshake. 0 = unconditional (teardown).
+    if (only_if_started_ms != 0 &&
+        connect_started_ms_.load(std::memory_order_acquire) != only_if_started_ms)
+        return;
     log(std::string("connect ") + why + " - closing socket to unblock eConnect");
     static_cast<EClientSocket*>(connecting_)->eDisconnect();
     connect_started_ms_.store(0, std::memory_order_release);   // don't re-abort this attempt
+    connecting_ = nullptr;   // and don't touch this socket again — connect_gateway
+                             // reset()s it once its eConnect returns
     connect_aborts_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -589,7 +599,7 @@ void TwsBroker::watchdog_loop() {
         if (started == 0) continue;                            // no connect in flight
         if (ready_.load(std::memory_order_acquire)) continue;  // handshake completed
         if (now_ms() - started < kConnectTimeoutMs) continue;
-        abort_inflight_connect("handshake stuck >30s");
+        abort_inflight_connect("handshake stuck >30s", started);
     }
 }
 
