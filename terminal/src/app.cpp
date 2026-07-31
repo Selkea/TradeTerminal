@@ -2119,6 +2119,7 @@ void App::draw() {
     pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
     pump_lineup_swap();       // drive an in-progress live swap onto new picks
     pump_daily_lineup();
+    pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
 
     draw_menu_bar();
     draw_account_modal();
@@ -2981,6 +2982,46 @@ void App::alert_scan(const std::string& l) {
         alerts_.notify(AlertNotifier::Warning, l);
     else if (has("live: fill"))
         alerts_.notify(AlertNotifier::Info, l);
+}
+
+// Broker-disconnect watchdog. alert_scan above only fires on lines the adapters
+// actually log; a wedged/half-open gateway can go silent (see the overnight
+// outages), so nothing would ever trip it. This checks broker readiness as
+// STATE each frame instead: during a live session on a real broker, if the
+// order path stays not-ready past kBrokerDownAlertSec, raise a critical alert
+// (webhook), and re-raise every kBrokerDownReAlertSec while it's still down so a
+// persistent outage keeps nagging. On recovery, one Warning that it's back.
+void App::pump_broker_watchdog() {
+    static constexpr double kBrokerDownAlertSec = 60.0;
+    static constexpr double kBrokerDownReAlertSec = 600.0;   // re-ping every 10 min while down
+    const bool have_broker = (tws_ != nullptr) || (ibkr_ != nullptr);
+    if (!engine_.live_running() || !have_broker) {   // nothing to guard (idle / sim broker)
+        broker_down_since_s_ = 0.0;
+        broker_down_last_alert_s_ = 0.0;
+        return;
+    }
+    const bool ready = ibkr_ ? ibkr_->ready() : tws_->ready();
+    const double now = ImGui::GetTime();
+    if (ready) {
+        if (broker_down_last_alert_s_ != 0.0)   // we alerted on an outage that's now cleared
+            alerts_.notify(AlertNotifier::Warning, "broker: reconnected to the gateway");
+        broker_down_since_s_ = 0.0;
+        broker_down_last_alert_s_ = 0.0;
+        return;
+    }
+    if (broker_down_since_s_ == 0.0) broker_down_since_s_ = now;   // start of a down episode
+    const double down_s = now - broker_down_since_s_;
+    if (down_s < kBrokerDownAlertSec) return;
+    if (broker_down_last_alert_s_ != 0.0 &&
+        now - broker_down_last_alert_s_ < kBrokerDownReAlertSec)
+        return;
+    broker_down_last_alert_s_ = now;
+    const std::string msg =
+        "WATCHDOG broker disconnected from the gateway for " +
+        std::to_string(static_cast<int>(down_s)) +
+        "s during a live session - check IB Gateway (login/2FA?)";
+    alerts_.notify(AlertNotifier::Critical, msg);
+    route("alert: " + msg);   // console/ /logs visibility; route() does not re-scan
 }
 
 void App::refresh_ibkr_accounts() {
