@@ -208,7 +208,11 @@ public:
     // caller-owned and must outlive the run. A symbol's events route only to
     // its own instance. All instances share one portfolio/cash (design v1).
     bool start_live(LiveConfig cfg, std::vector<IStrategy*> strategies);
-    void stop_live();                       // graceful: on_stop, joins the thread
+    // Graceful stop: on_stop, joins the thread. keep_broker_orders=true leaves
+    // resting broker orders (adopted stop/TP) live at the gateway for a
+    // keep-positions restart to re-adopt — the default cancels them so no order
+    // outlives the session watching it.
+    void stop_live(bool keep_broker_orders = false);
     bool live_running() const { return live_running_.load(std::memory_order_relaxed); }
     std::vector<std::string> live_symbols() const;
     // Exact per-fill records for the journal, drained by the UI each frame
