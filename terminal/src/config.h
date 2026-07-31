@@ -63,13 +63,10 @@ struct AppConfig {
     double lineup_min_dollar_vol = 20e6;      // liquidity gate ($/day)
     int lineup_top_n = 6;                     // how many symbols to trade
     int lineup_atr_len = 14;                  // ATR window for the vol ranking
-    // Daily TWS refresh: force the broker + feed to drop & reconnect once a day.
-    // "HH:MM" local; empty = off (default). DISABLED by default: IBKR's overnight
-    // reset already self-heals via 1100/1102, so forcibly tearing down a healthy
-    // connection at 02:00 gained nothing and — before the connect-timeout
-    // watchdog — froze the I/O thread for hours when it reconnected mid-reset
-    // (2026-07-30 outage). Set an "HH:MM" only if you specifically want it.
-    std::string tws_refresh_time = "";
+    // (The daily TWS refresh / tws_refresh_time setting was removed after it
+    // caused two multi-hour gateway outages; see App::pump_tws_refresh's former
+    // home in app.cpp and [[tt-tws-reconnect-freeze]]. Unknown keys in an older
+    // config.json are ignored on load, so no migration is needed.)
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;
