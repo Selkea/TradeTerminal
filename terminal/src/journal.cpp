@@ -71,6 +71,19 @@ int64_t TradeJournal::begin_session(const std::string& symbols, const std::strin
     return ok ? sqlite3_last_insert_rowid(db_) : 0;
 }
 
+void TradeJournal::set_baseline(int64_t session_id, double baseline_equity) {
+    if (!db_ || session_id == 0) return;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "UPDATE sessions SET initial_cash=? WHERE id=?", -1, &st,
+                           nullptr) != SQLITE_OK)
+        return;
+    sqlite3_bind_double(st, 1, baseline_equity);
+    sqlite3_bind_int64(st, 2, session_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    ++rev_;
+}
+
 void TradeJournal::add_fill(int64_t session_id, int64_t ts_ns, const std::string& symbol,
                             bool buy, double qty, double price, double fee,
                             uint64_t order_id) {

@@ -823,6 +823,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         std::lock_guard lock(snap_mu_);
         snap_.running = true;
         snap_.halted = halted;
+        snap_.reconciled = !reconciling;
         snap_.cash = pf.cash();
         snap_.equity = pf.equity();
         snap_.risk.daily_loss = risk_base_eq - snap_.equity;
