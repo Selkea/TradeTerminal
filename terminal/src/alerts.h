@@ -17,6 +17,31 @@
 
 namespace tt::ui {
 
+namespace detail {
+// ntfy.sh (and any header-based push receiver) serves a request body containing
+// non-ASCII bytes as a downloadable "attachment.txt" instead of an inline
+// message — so an alert whose text has an em-dash (many of ours do, e.g.
+// "RISK HALT (...) — broker cancel-all + flatten...") would reach the phone
+// unreadable. Fold the webhook payload to ASCII: collapse each run of non-ASCII
+// bytes to a single '-'. Only the outbound payload is folded; console/log text
+// keeps its em-dashes.
+inline std::string ascii_fold(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prev_nonascii = false;
+    for (unsigned char c : s) {
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            prev_nonascii = false;
+        } else if (!prev_nonascii) {
+            out.push_back('-');
+            prev_nonascii = true;
+        }
+    }
+    return out;
+}
+} // namespace detail
+
 class AlertNotifier {
 public:
     enum Severity { Info = 0, Warning = 1, Critical = 2 };
