@@ -1757,7 +1757,15 @@ std::string App::build_diag_json() {
     j["now"] = iso_utc(std::time(nullptr));
     j["control"] = cfg_.diag_control_enabled ? "enabled" : "read-only";
     j["route"] = cfg_.trade_route == 1 ? "TWS socket" : "IBKR web";
-    j["broker_connected"] = ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false);
+    // broker_connected reflects whether orders can actually reach IBKR: the
+    // local API socket up (ready) AND, on the TWS route, the gateway's upstream
+    // link to IBKR up (not in an error-1100 state — e.g. an IBKR maintenance /
+    // weekend reset leaves the socket up but the upstream down). broker_upstream
+    // is broken out so a maintenance blip is distinguishable from a socket drop.
+    const bool broker_ready = ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false);
+    const bool broker_upstream = tws_ ? tws_->upstream_connected() : true;
+    j["broker_connected"] = broker_ready && broker_upstream;
+    j["broker_upstream"] = broker_upstream;
 
     // ---- session state ----
     j["live_running"] = s.running;
@@ -1928,8 +1936,10 @@ std::string App::build_metrics() {
     g("tt_up", "1 while the terminal process is serving metrics", 1);
     g("tt_live_running", "1 if a live session is active", s.running ? 1 : 0);
     g("tt_halted", "1 if the session is halted", s.halted ? 1 : 0);
-    g("tt_broker_connected", "1 if the broker is connected",
-      (ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false)) ? 1 : 0);
+    g("tt_broker_connected", "1 if the broker can reach IBKR (socket + upstream)",
+      ((ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false)) &&
+       (tws_ ? tws_->upstream_connected() : true))
+          ? 1 : 0);
     g("tt_equity_dollars", "account equity", s.equity);
     g("tt_cash_dollars", "account cash", s.cash);
     g("tt_ticks_total", "market-data ticks this session", static_cast<double>(s.ticks));
@@ -3030,11 +3040,18 @@ void App::pump_broker_watchdog() {
         broker_down_last_alert_s_ = 0.0;
         return;
     }
-    const bool ready = ibkr_ ? ibkr_->ready() : tws_->ready();
+    // "Up" = the order path can actually reach IBKR: the local API socket is up
+    // AND (TWS route) the gateway's upstream link to IBKR is up. Keying off the
+    // socket alone missed a gateway that's up-but-disconnected-upstream (IBKR
+    // maintenance / weekend reset). A transient nightly 1100->1102 blip clears
+    // well inside the 60s grace, so only a SUSTAINED loss pages.
+    const bool socket_ready = ibkr_ ? ibkr_->ready() : tws_->ready();
+    const bool upstream_ok = tws_ ? tws_->upstream_connected() : true;
+    const bool ready = socket_ready && upstream_ok;
     const double now = ImGui::GetTime();
     if (ready) {
         if (broker_down_last_alert_s_ != 0.0)   // we alerted on an outage that's now cleared
-            alerts_.notify(AlertNotifier::Warning, "broker: reconnected to the gateway");
+            alerts_.notify(AlertNotifier::Warning, "broker: reconnected to IBKR");
         broker_down_since_s_ = 0.0;
         broker_down_last_alert_s_ = 0.0;
         return;
@@ -3046,10 +3063,13 @@ void App::pump_broker_watchdog() {
         now - broker_down_last_alert_s_ < kBrokerDownReAlertSec)
         return;
     broker_down_last_alert_s_ = now;
-    const std::string msg =
-        "WATCHDOG broker disconnected from the gateway for " +
-        std::to_string(static_cast<int>(down_s)) +
-        "s during a live session - check IB Gateway (login/2FA?)";
+    // Distinguish the two failure modes so the alert points at the right thing.
+    const char* what = socket_ready
+                           ? "gateway lost its connection to IBKR (error 1100)"
+                           : "broker disconnected from the gateway";
+    const std::string msg = "WATCHDOG " + std::string(what) + " for " +
+                            std::to_string(static_cast<int>(down_s)) +
+                            "s during a live session - check IB Gateway";
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);   // console/ /logs visibility; route() does not re-scan
 }

@@ -53,6 +53,13 @@ public:
     bool poll_event(EngineEvent& out) override { return ev_ring_->try_pop(out); }
     RejectReason take_reject(uint64_t order_id) override;
     bool ready() const override { return ready_.load(std::memory_order_acquire); }
+    // The LOCAL app<->gateway API socket being up (ready()) does NOT mean the
+    // gateway itself is connected to IBKR: during an IBKR maintenance window /
+    // weekend reset the gateway drops its upstream ("error 1100") while still
+    // accepting our socket. This tracks that upstream link (1100 lost, 1102/1101
+    // restored) so /diag and the watchdog reflect whether orders can ACTUALLY
+    // reach IBKR, not just that the socket is open. True until a 1100 says else.
+    bool upstream_connected() const { return upstream_ok_.load(std::memory_order_acquire); }
     // Replays existing positions, resting orders, and cash once on connect so a
     // restarted session adopts them (reqPositions/reqAllOpenOrders/account cash
     // -> PosSnap/OrderNew/AcctSnap, then ReconcileEnd). See the Io reconcile path.
@@ -116,6 +123,7 @@ private:
 
     std::atomic<uint64_t> next_id_{1};
     std::atomic<bool> ready_{false};
+    std::atomic<bool> upstream_ok_{true};   // gateway<->IBKR link (error 1100/1102)
     std::atomic<bool> stop_{false};
     std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh: drop + reconnect
     // The I/O thread's reader signal while it exists (EReaderOSSignal*);
