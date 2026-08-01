@@ -137,6 +137,9 @@ struct TwsBroker::Io final : DefaultEWrapper {
     void nextValidId(OrderId orderId) override {
         next_tws_id = orderId;
         b.ready_.store(true, std::memory_order_release);
+        // Assume the fresh session has upstream until a 1100 says otherwise (a
+        // gateway that came up disconnected sends one within seconds).
+        b.upstream_ok_.store(true, std::memory_order_release);
         b.log("connected (socket API), orders ready");
         // Adopt existing account state on the FIRST connect of the session only;
         // a later reconnect must not re-seed a position the engine now tracks
@@ -155,6 +158,15 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
     void error(int id, int errorCode, const std::string& errorString,
                const std::string&) override {
+        // Gateway<->IBKR connectivity: 1100 = lost, 1101/1102 = restored. These
+        // are not order-scoped (id -1); track the upstream link so ready() (the
+        // local socket) isn't mistaken for "can trade". See upstream_connected().
+        if (errorCode == 1100) {
+            b.upstream_ok_.store(false, std::memory_order_release);
+            b.log("gateway lost its connection to IBKR (1100) — orders can't reach the market");
+        } else if (errorCode == 1101 || errorCode == 1102) {
+            b.upstream_ok_.store(true, std::memory_order_release);
+        }
         // 21xx = data-farm status noise; 202 = cancel confirmations.
         if (errorCode >= 2100 && errorCode <= 2170) return;
         if (errorCode == 10141) {   // paper disclaimer dialog not clicked yet (IBC lags login)

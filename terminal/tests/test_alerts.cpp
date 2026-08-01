@@ -5,8 +5,11 @@
 // collapses each run of non-ASCII bytes to a single '-'.
 #include "doctest.h"
 
+#include "alert_rules.h"
 #include "alerts.h"
 
+using tt::ui::AlertClass;
+using tt::ui::classify_alert;
 using tt::ui::detail::ascii_fold;
 
 TEST_CASE("ascii_fold: pure-ASCII text is unchanged") {
@@ -31,4 +34,35 @@ TEST_CASE("ascii_fold: result is always pure ASCII") {
 
 TEST_CASE("ascii_fold: empty stays empty") {
     CHECK(ascii_fold("").empty());
+}
+
+TEST_CASE("classify_alert: critical events page as Critical") {
+    CHECK(classify_alert("live: KILL SWITCH — flattening") == AlertClass::Critical);
+    CHECK(classify_alert("live: RISK HALT (daily loss limit) — ...") == AlertClass::Critical);
+    CHECK(classify_alert("WATCHDOG broker disconnected ...") == AlertClass::Critical);
+    CHECK(classify_alert("PROTECTIVE STOP REJECTED on SOXL — naked") == AlertClass::Critical);
+}
+
+TEST_CASE("classify_alert: a routine data-feed reconnect does NOT page") {
+    // The exact line that flapped all weekend and spammed the phone.
+    CHECK(classify_alert(
+              "tws-data: history request unanswered for >20s - reconnecting data "
+              "session (half-open)") == AlertClass::None);
+    CHECK(classify_alert("tws-data: connecting to IB Gateway at 127.0.0.1:4002") ==
+          AlertClass::None);
+    CHECK(classify_alert("feed error (req 27) tws: connection lost fetching SNXX") ==
+          AlertClass::None);
+}
+
+TEST_CASE("classify_alert: a genuine half-open ORDER still pages as Warning") {
+    CHECK(classify_alert("order #123 unacked for 27s — possible half-open order") ==
+          AlertClass::Warning);
+    CHECK(classify_alert("live: order #5 rejected by broker") == AlertClass::Warning);
+    CHECK(classify_alert("tws-feed: stream lost, reconnecting") == AlertClass::Warning);
+}
+
+TEST_CASE("classify_alert: fills are Info, plain lines are None") {
+    CHECK(classify_alert("live: fill #7 BUY 100 @ 12.34") == AlertClass::Info);
+    CHECK(classify_alert("candles: SOXL 5m x9750") == AlertClass::None);
+    CHECK(classify_alert("tws: reconcile: complete") == AlertClass::None);
 }
