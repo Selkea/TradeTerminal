@@ -1,4 +1,5 @@
 #include "app.h"
+#include "alert_rules.h"   // classify_alert: what pages the phone
 #include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
 #include "dev_paths.h"
 
@@ -3005,15 +3006,12 @@ void App::draw_data_menu() {
 // Critical = money is at risk right now; Warning = something needs a look;
 // Info = fills (webhook only, no beep — they can be frequent).
 void App::alert_scan(const std::string& l) {
-    auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
-    if (has("KILL SWITCH") || has("RISK HALT") || has("WATCHDOG") ||
-        has("PROTECTIVE STOP REJECTED"))
-        alerts_.notify(AlertNotifier::Critical, l);
-    else if (has("rejected") || has("stream lost") || has("auth failed") ||
-             has("(drops!)") || has("half-open"))
-        alerts_.notify(AlertNotifier::Warning, l);
-    else if (has("live: fill"))
-        alerts_.notify(AlertNotifier::Info, l);
+    switch (classify_alert(l)) {
+    case AlertClass::Critical: alerts_.notify(AlertNotifier::Critical, l); break;
+    case AlertClass::Warning:  alerts_.notify(AlertNotifier::Warning, l); break;
+    case AlertClass::Info:     alerts_.notify(AlertNotifier::Info, l); break;
+    case AlertClass::None:     break;
+    }
 }
 
 // Broker-disconnect watchdog. alert_scan above only fires on lines the adapters
