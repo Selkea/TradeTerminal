@@ -130,6 +130,7 @@ set_target_properties(tt_terminal PROPERTIES WIN32_EXECUTABLE TRUE)
 add_executable(tt_terminal_tests
     tests/test_log_console.cpp
     tests/test_journal.cpp
+    tests/test_alerts.cpp
     src/panels/log_console.cpp
     src/journal.cpp
 )

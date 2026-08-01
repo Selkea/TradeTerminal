@@ -57,9 +57,10 @@ void AlertNotifier::worker() {
             url = webhook_;
         }
         if (url.empty()) continue;
+        const std::string body = detail::ascii_fold(text);   // inline message, not attachment
         if (CURL* h = curl_easy_init()) {
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
-            curl_easy_setopt(h, CURLOPT_POSTFIELDS, text.c_str());
+            curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.c_str());
             curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
             curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 10000L);
