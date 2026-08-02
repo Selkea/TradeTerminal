@@ -67,3 +67,10 @@ add_test(NAME polygon_tests COMMAND tt_polygon_tests)
 add_executable(tt_finnhub_tests tests/test_finnhub_parse.cpp)
 target_link_libraries(tt_finnhub_tests PRIVATE tt_net doctest)
 add_test(NAME finnhub_tests COMMAND tt_finnhub_tests)
+
+# Proves third_party/twsapi_patch.cmake actually applied: every case here hangs
+# forever against IB's unpatched EReader. Loopback stub only, no gateway.
+add_executable(tt_ereader_tests tests/test_ereader_deadlock.cpp)
+target_link_libraries(tt_ereader_tests PRIVATE tt_net doctest)
+add_test(NAME ereader_tests COMMAND tt_ereader_tests)
+set_tests_properties(ereader_tests PROPERTIES TIMEOUT 60)
