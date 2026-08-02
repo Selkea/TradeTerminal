@@ -44,6 +44,10 @@ FetchContent_Declare(twsapi_src
     URL_HASH SHA256=ea79fa5b4c7b30359458424085e55f918115a2889efc248a2b79319da71a139a
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(twsapi_src)
+# IB's EReader has two deadlocks and a dangling-pointer bug that freeze the
+# order/tick/data sessions. We can't redistribute their source, so we patch the
+# downloaded copy in place; the script aborts the build if an anchor drifts.
+include(${CMAKE_CURRENT_SOURCE_DIR}/twsapi_patch.cmake)
 file(GLOB TWSAPI_SOURCES ${twsapi_src_SOURCE_DIR}/IBJts/source/cppclient/client/*.cpp)
 add_library(twsapi STATIC ${TWSAPI_SOURCES} tws_decimal_shim.cpp)
 target_include_directories(twsapi PUBLIC
