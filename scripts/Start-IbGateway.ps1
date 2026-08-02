@@ -74,6 +74,16 @@ if (-not (Test-Path "C:\IBC\IBC.jar")) { Write-Error "IBC not installed. Run Ins
 $ibcCfgDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'IBC'
 New-Item -ItemType Directory -Force -Path $ibcCfgDir | Out-Null
 $ini = Join-Path $ibcCfgDir 'config.ini'
+# Nightly restart mode. AutoRestartTime = the gateway's OWN soft restart: it
+# reuses the session (no re-auth) and survives ~a week — but that reused session
+# can come back STALE, leaving the gateway up (API port open) yet unable to
+# reconnect to IBKR, rejecting API clients ("Client disconnected before version
+# was sent") until a full COLD relaunch. ColdRestartTime = IBC kills + relaunches
+# with a fresh login, which never lands in that stale state. Paper never prompts
+# 2FA, so cold is safe + strictly better here. A LIVE account MAY require a TOTP
+# on the cold re-login (IBC can't type it) and would wedge on the 2FA dialog
+# nightly, so keep the soft restart there. See [[tt-gateway-overnight-reauth]].
+$restartLine = if ($isPaper) { 'ColdRestartTime=11:55 PM' } else { 'AutoRestartTime=11:55 PM' }
 @"
 FIX=no
 TradingMode=$mode
@@ -84,7 +94,7 @@ OverrideTwsApiPort=$port
 ExistingSessionDetectedAction=primary
 ReloginAfterSecondFactorAuthenticationTimeout=yes
 SecondFactorAuthenticationExitInterval=60
-AutoRestartTime=11:55 PM
+$restartLine
 MinimizeMainWindow=no
 "@ | Set-Content -Path $ini -Encoding ASCII
 # MinimizeMainWindow stays 'no': dialogs (paper-trading disclaimer, 2FA) are
