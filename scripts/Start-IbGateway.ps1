@@ -83,7 +83,13 @@ $ini = Join-Path $ibcCfgDir 'config.ini'
 # 2FA, so cold is safe + strictly better here. A LIVE account MAY require a TOTP
 # on the cold re-login (IBC can't type it) and would wedge on the 2FA dialog
 # nightly, so keep the soft restart there. See [[tt-gateway-overnight-reauth]].
-$restartLine = if ($isPaper) { 'ColdRestartTime=11:55 PM' } else { 'AutoRestartTime=11:55 PM' }
+# 24-HOUR FORMAT, NOT '11:55 PM'. IBC 3.24.1 silently drops the AM/PM suffix:
+# with 'ColdRestartTime=11:55 PM' its own log said "Gateway will be cold
+# restarted at 2026/08/02 11:55" and it duly restarted at 11:55 *AM* on
+# 2026-08-02 -- midday, i.e. mid-session on any weekday. (It was a Sunday, and
+# the collateral damage was the data session wedging on the resulting socket
+# close: see [[tt-ereader-disconnect-deadlock]].)
+$restartLine = if ($isPaper) { 'ColdRestartTime=23:55' } else { 'AutoRestartTime=23:55' }
 @"
 FIX=no
 TradingMode=$mode
