@@ -132,6 +132,7 @@ add_executable(tt_terminal_tests
     tests/test_journal.cpp
     tests/test_alerts.cpp
     tests/test_sweep_guard.cpp
+    tests/test_hist_pacing.cpp
     src/panels/log_console.cpp
     src/journal.cpp
 )
