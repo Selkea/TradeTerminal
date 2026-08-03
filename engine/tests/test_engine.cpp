@@ -556,7 +556,12 @@ struct WarmupStrat : IStrategy {
     std::atomic<int> bars{0};
     std::atomic<int> accepted{0};       // submit_order returned a real order id
     std::atomic<double> last_close{0};  // engine thread writes, test thread reads
-    void on_init(IStrategyContext&) noexcept override { bars = 0; ++inits; }
+    std::atomic<double> alpha{-1};      // param as seen at the last on_init
+    void on_init(IStrategyContext& ctx) noexcept override {
+        bars = 0;
+        alpha = ctx.param("alpha", -1.0);
+        ++inits;
+    }
     void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar& b) noexcept override {
         last_close = b.close;
         ++bars;
@@ -663,5 +668,52 @@ TEST_CASE("live warmup: a params swap re-seeds instead of restarting cold") {
     CHECK(s.inits.load() == 2);
     CHECK(s.bars.load() >= 120);     // re-init zeroed the counter, replay refilled it
     CHECK(s.accepted.load() == 0);   // still nothing placed from history
+    eng.stop_live();
+}
+
+TEST_CASE("live warmup: reseed_symbol warms a cold symbol without touching params") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    cfg.symbol_params = {{{"alpha", 7.0}}};
+    // Started cold: the candle cache is memory-only, so the first session after
+    // launch has nothing to seed from.
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.inits.load() >= 1; }));
+    CHECK(s.bars.load() == 0);
+
+    // History arrives later; re-seed must warm the strategy and leave the
+    // symbol's params exactly as they were.
+    eng.reseed_symbol(1, seed(200, 20.0));
+    const bool warmed = wait_for([&] {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);   // swaps apply on the live loop
+        return s.bars.load() >= 200;
+    });
+    CHECK(warmed);
+    CHECK(s.inits.load() == 2);       // re-init, then replay
+    CHECK(s.accepted.load() == 0);    // replayed bars still place nothing
+    CHECK(s.alpha.load() == doctest::Approx(7.0));   // params survived the re-seed
+    eng.stop_live();
+}
+
+TEST_CASE("live warmup: reseed_symbol with no bars is a no-op") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.inits.load() >= 1; }));
+
+    // An empty fetch must not trigger a pointless re-init (which would WIPE the
+    // history the symbol had already accumulated from live bars).
+    eng.reseed_symbol(1, {});
+    for (int i = 0; i < 20; ++i) {
+        eng.push_live_tick("AAA", 1000 + i * 400, 50.0, 0.0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(s.inits.load() == 1);
     eng.stop_live();
 }
