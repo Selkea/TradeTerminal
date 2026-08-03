@@ -545,3 +545,123 @@ TEST_CASE("live risk: notional cap down-sizes an oversized entry to fit the budg
 
     eng.stop_live();
 }
+
+// ---- live warmup replay ----------------------------------------------------
+// Live sessions only ever get bars from tick aggregation, so a strategy whose
+// lookback exceeds one session's worth of bars could never warm up. LiveConfig
+// carries seed bars that are replayed straight after on_init.
+namespace {
+struct WarmupStrat : IStrategy {
+    std::atomic<int> inits{0};
+    std::atomic<int> bars{0};
+    std::atomic<int> accepted{0};       // submit_order returned a real order id
+    std::atomic<double> last_close{0};  // engine thread writes, test thread reads
+    void on_init(IStrategyContext&) noexcept override { bars = 0; ++inits; }
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar& b) noexcept override {
+        last_close = b.close;
+        ++bars;
+        // Every bar tries to trade. During the replay this must be refused.
+        OrderRequest r{};
+        r.symbol_id = sid;
+        r.side = Side::Buy;
+        r.type = OrdType::Market;
+        r.qty = 1.0;
+        if (ctx.submit_order(r) != 0) ++accepted;
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+std::vector<Bar> seed(int n, double base) {
+    std::vector<Bar> v;
+    v.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const double p = base + i;
+        v.push_back(Bar{static_cast<int64_t>(i) * 300'000'000'000LL, p, p, p, p, 10.0});
+    }
+    return v;
+}
+
+// The replay runs on the live thread inside run_live's init, so start_live()
+// returns before it has finished. Never REQUIRE before stop_live() in these
+// tests: an aborted test case skips stop_live and the engine thread then walks
+// into the destroyed stack strategy.
+template <class Pred>
+bool wait_for(Pred pred, int ms = 5000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!pred() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    return pred();
+}
+} // namespace
+
+TEST_CASE("live warmup: seed bars reach the strategy before any tick") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    cfg.symbol_warmup = {seed(250, 100.0)};
+    CHECK(eng.start_live(cfg, {&s}));
+
+    // No tick is ever pushed: the only bars this strategy can see are seeds.
+    const bool warmed = wait_for([&] { return s.bars.load() >= 250; });
+    CHECK(warmed);
+    CHECK(s.inits.load() == 1);
+    CHECK(s.bars.load() == 250);
+    CHECK(s.last_close.load() == doctest::Approx(349.0));   // 100 + 249
+    // ...and not one of those 250 bars was allowed to place an order.
+    CHECK(s.accepted.load() == 0);
+    eng.stop_live();
+}
+
+TEST_CASE("live warmup: replayed bars place no orders but live bars do") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 1;             // let real bars close quickly
+    cfg.symbol_warmup = {seed(40, 10.0)};
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.bars.load() >= 40; }));
+    CHECK(s.accepted.load() == 0);
+
+    // Now drive real ticks across a bar boundary: the same code path that was
+    // muted during the replay must work normally afterwards. The tick timestamp
+    // has to advance -- roll_bar only closes a bar when one crosses the edge.
+    int64_t ts_ms = 1'000'000;
+    const bool traded = wait_for([&] {
+        ts_ms += 1500;   // > bar_seconds, so every other tick closes a bar
+        eng.push_live_tick("AAA", ts_ms, 50.0, 0.0);
+        return s.accepted.load() > 0;
+    });
+    CHECK(traded);
+    CHECK(s.bars.load() > 40);
+    eng.stop_live();
+}
+
+TEST_CASE("live warmup: a params swap re-seeds instead of restarting cold") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    cfg.symbol_warmup = {seed(30, 100.0)};
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.bars.load() >= 30; }));
+
+    // A params-only update re-inits the strategy (wiping its history), so it
+    // must be handed fresh bars or it would restart from zero.
+    eng.update_symbol_params(1, {{"foo", 1.0}}, seed(120, 5.0));
+    const bool reinit = wait_for([&] {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);   // swaps apply on the live loop
+        return s.inits.load() >= 2 && s.bars.load() >= 120;
+    });
+    CHECK(reinit);
+    CHECK(s.inits.load() == 2);
+    CHECK(s.bars.load() >= 120);     // re-init zeroed the counter, replay refilled it
+    CHECK(s.accepted.load() == 0);   // still nothing placed from history
+    eng.stop_live();
+}

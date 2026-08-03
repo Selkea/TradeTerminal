@@ -235,6 +235,10 @@ private:
     void start_daily_lineup(bool autostart_when_done = false);  // Trade menu / schedule
     void pump_daily_lineup();                      // UI thread, per frame
     void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
+    // Newest cached candles for a live symbol, oldest first, as engine bars.
+    // Replayed through the strategy after on_init so lookback indicators are
+    // warm — a live session's only other bar source is tick aggregation.
+    std::vector<tt::Bar> seed_bars(const std::string& symbol, int bar_sec) const;
     bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
     // True while any backtest/optimizer/tournament/lineup work is in flight —
     // gates the engine's strategy-log flood to the optimizer panel instead of

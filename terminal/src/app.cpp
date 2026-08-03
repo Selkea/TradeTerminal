@@ -849,7 +849,8 @@ void App::pump_sweep() {
 
     if (sweep_holdout_phase_) {   // the winner's run on unseen data
         sweep_.has_holdout = true;
-        sweep_.holdout_val = sweep_metric_of(r, sweep_.metric);
+        sweep_.holdout_trades = r.trades;
+        sweep_.holdout_val = sweep_metric_of(r, sweep_.metric, kSweepMinHoldoutTrades);
         sweep_holdout_phase_ = false;
         sweep_.running = false;
         char buf[128];
@@ -860,7 +861,8 @@ void App::pump_sweep() {
         return;
     }
 
-    sweep_.vals[static_cast<size_t>(opt_.step)] = sweep_metric_of(r, sweep_.metric);
+    sweep_.vals[static_cast<size_t>(opt_.step)] =
+        sweep_metric_of(r, sweep_.metric, kSweepMinTrades);
     ++sweep_.done;
     ++opt_.step;
     if (opt_.step < kSweepSteps) {
@@ -1032,7 +1034,18 @@ void App::pump_tournament() {
                 e.params = sweep_.best;
                 e.holdout = sweep_.has_holdout;
                 e.score = sweep_.has_holdout ? sweep_.holdout_val : sweep_.best_metric;
-                e.valid = true;
+                // The holdout score is what crowns a champion, so a candidate
+                // that barely traded on unseen data is not a candidate at all -
+                // its score is noise, and on the minimised metric a zero-trade
+                // run would win outright.
+                const bool thin =
+                    sweep_.has_holdout && sweep_.holdout_trades < kSweepMinHoldoutTrades;
+                e.valid = !thin && std::isfinite(e.score);
+                if (!e.valid)
+                    route("tournament: " + strat_mgr_.display_name(e.key) +
+                             " rejected (" + std::to_string(sweep_.holdout_trades) +
+                             " holdout trades, need " +
+                             std::to_string(kSweepMinHoldoutTrades) + ")");
             }
             advance(std::move(e));
         }
@@ -1069,6 +1082,20 @@ void App::finish_tournament() {
         return;
     }
     const auto& c = tourn_.results[static_cast<size_t>(champ)];
+    // Winning the field is not the same as being worth trading. On every
+    // maximised metric a non-positive champion is one that lost money (or never
+    // won) on unseen data - crowning it hands the live engine a set we already
+    // know does not work. Better to keep whatever is running.
+    if (!minimize && !(c.score > 0.0)) {
+        char rej[192];
+        std::snprintf(rej, sizeof rej,
+                      "tournament: best candidate %s scored %s %.4g — not positive, "
+                      "keeping the incumbent",
+                      strat_mgr_.display_name(c.key).c_str(),
+                      kSweepMetrics[tourn_.base.metric], c.score);
+        route(rej);
+        return;
+    }
     strat_mgr_.set_param_values(c.key, c.params);   // champion's params stick
     if (!tourn_.target_symbol.empty())
         trade_.set_symbol_strategy(tourn_.target_symbol, c.key, c.params);
@@ -1513,8 +1540,17 @@ void App::autopilot_evaluate() {
 
     if (champ->key == S.key) {
         // Same strategy: refresh params only if they genuinely score better.
-        if (!S.has_score || ap_better(ap_.metric, champ->score, S.incumbent_score)) {
-            engine_.update_symbol_params(S.sid, champ->params);
+        // The !has_score arm is the FIRST cycle after arming, where there is no
+        // incumbent score to beat — it used to apply whatever came back, however
+        // bad. Require a positive score there too, or one poor first cycle
+        // installs a losing set for the rest of the day.
+        const bool first_cycle_ok =
+            !S.has_score && (sweep_metric_minimize(ap_.metric) || champ->score > 0.0);
+        if (first_cycle_ok || (S.has_score &&
+                               ap_better(ap_.metric, champ->score, S.incumbent_score))) {
+            // Re-seed: the re-init this queues wipes the strategy's bar history.
+            engine_.update_symbol_params(S.sid, champ->params,
+                                         seed_bars(S.symbol, cfg_.trade_bar_sec));
             trade_.set_symbol_strategy(S.symbol, champ->key, champ->params);
             S.incumbent_score = champ->score;
             S.has_score = true;
@@ -1554,7 +1590,8 @@ void App::autopilot_evaluate() {
         return;
     }
     leases_.push_back({inst, champ->key, StrategyLease::Live});
-    engine_.swap_symbol_strategy(S.sid, inst, champ->params);
+    engine_.swap_symbol_strategy(S.sid, inst, champ->params,
+                                 seed_bars(S.symbol, cfg_.trade_bar_sec));
     trade_.set_symbol_strategy(S.symbol, champ->key, champ->params);
     S.key = champ->key;
     S.incumbent_score = champ->score;
@@ -2417,6 +2454,28 @@ void App::route(std::string line) {
     sink.add(std::move(line));
 }
 
+// Cap on replayed history. Comfortably covers the largest lookback the sweep
+// can elect (1000 bars) several times over, while keeping the replay to a few
+// tens of milliseconds per session start.
+static constexpr size_t kMaxSeedBars = 4000;
+
+std::vector<tt::Bar> App::seed_bars(const std::string& symbol, int bar_sec) const {
+    // Same interval strings the optimizer/lineup fetch under, so the cache the
+    // autopilot already fills every cycle is the cache we read here.
+    const char* ivl = bar_sec >= 86400 ? "1d" : (bar_sec >= 3600 ? "1h" : "5m");
+    SeriesStore::Series s;
+    uint64_t seen = 0;   // 0 = "unseen", so this copies whatever is cached
+    if (!series_.copy_if_newer(symbol, ivl, seen, s) || s.candles.empty()) return {};
+    const size_t n = std::min(s.candles.size(), kMaxSeedBars);
+    std::vector<tt::Bar> out;
+    out.reserve(n);
+    for (size_t i = s.candles.size() - n; i < s.candles.size(); ++i) {
+        const Candle& c = s.candles[i];
+        out.push_back(tt::Bar{c.ts * 1'000'000'000LL, c.open, c.high, c.low, c.close, c.volume});
+    }
+    return out;
+}
+
 void App::start_live_session(const TradePanel::StartOpts& opts) {
     std::vector<std::string> syms;
     std::vector<int> sym_bars;
@@ -2580,6 +2639,10 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         // ctx.param("__hold_losers")). Live-only overlay — backtests behave normally.
         if (so.risk.disable_auto_halt) sp["__hold_losers"] = 1.0;
         cfg.symbol_params.push_back(std::move(sp));
+        // Warm this instance on cached history. Without it the strategy starts
+        // with zero bars and a lookback of a few hundred can never be satisfied
+        // inside one session — the daily lineup swap re-inits every morning.
+        cfg.symbol_warmup.push_back(seed_bars(so.symbol, cfg.bar_seconds));
         new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
     }
     if (!acq_ok) {

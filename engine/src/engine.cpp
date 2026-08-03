@@ -97,6 +97,9 @@ public:
     }
 
     uint64_t submit_order(const OrderRequest& in) noexcept override {
+        // Replaying seed history to warm indicators: the strategy is seeing old
+        // bars, so any signal it raises is historical. Warm it, place nothing.
+        if (warming_) return 0;
         if (in.qty <= 0.0 || in.symbol_id == 0 || in.symbol_id > symbols_.size())
             return 0;
         if ((risk_ || symbol_risk_) && !risk_ok(in)) {
@@ -151,6 +154,7 @@ public:
         return id;
     }
     bool cancel_order(uint64_t order_id) noexcept override {
+        if (warming_) return false;   // nothing was placed during the replay
         return broker_ ? broker_->cancel(order_id) : exec_.cancel(order_id);
     }
     Position position(uint32_t symbol_id) const noexcept override {
@@ -177,6 +181,9 @@ public:
         return it != params_.end() ? it->second : fallback;
     }
     void log(int level, const char* msg) noexcept override {
+        // A warmup replay pushes hundreds of historical bars through on_bar;
+        // letting each one log would bury the session in thousands of lines.
+        if (warming_) return;
         static constexpr const char* kLevels[] = {"debug", "info", "warn", "error"};
         const int l = level < 0 ? 0 : (level > 3 ? 3 : level);
         eng_.push_log(std::string("[strategy ") + kLevels[l] + "] " + msg);
@@ -185,6 +192,8 @@ public:
     void set_current_event_tsc(int64_t tsc) { cur_event_tsc_ = tsc; }
     // The symbol whose strategy callback is running now (per-symbol params).
     void set_current_symbol(uint32_t symbol_id) { cur_symbol_ = symbol_id; }
+    // While true, submit_order() is a no-op (see LiveConfig::symbol_warmup).
+    void set_warming(bool w) { warming_ = w; }
     void set_last_price(uint32_t symbol_id, double p) {
         if (symbol_id == 0) return;
         if (last_price_.size() < symbol_id) last_price_.resize(symbol_id, 0.0);
@@ -283,6 +292,7 @@ private:
     const std::vector<std::map<std::string, double>>* symbol_params_ = nullptr;
     uint32_t cur_symbol_ = 0;
     OrderHook on_order_;
+    bool warming_ = false;
     IBrokerAdapter* broker_;
     std::vector<std::string> symbols_;
     int64_t cur_event_tsc_ = 0;
@@ -662,14 +672,16 @@ void Engine::queue_swap(PendingSwap s) {
     has_swaps_.store(true, std::memory_order_release);
 }
 
-void Engine::update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params) {
-    queue_swap(PendingSwap{symbol_id, nullptr, std::move(params)});
+void Engine::update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params,
+                                  std::vector<Bar> warmup) {
+    queue_swap(PendingSwap{symbol_id, nullptr, std::move(params), std::move(warmup)});
 }
 
 void Engine::swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
-                                  std::map<std::string, double> params) {
+                                  std::map<std::string, double> params,
+                                  std::vector<Bar> warmup) {
     if (!strategy) return;
-    queue_swap(PendingSwap{symbol_id, strategy, std::move(params)});
+    queue_swap(PendingSwap{symbol_id, strategy, std::move(params), std::move(warmup)});
 }
 
 void Engine::stop_live(bool keep_broker_orders) {
@@ -762,6 +774,9 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // pointer, so in-place updates are visible immediately after a re-init).
     // Stale swaps from a previous session are dropped.
     cfg.symbol_params.resize(cfg.symbols.size());
+    // Sized unconditionally so a later hot-swap always has a slot to drop its
+    // fresh seed bars into, even when the session started with none.
+    cfg.symbol_warmup.resize(cfg.symbols.size());
     {
         std::lock_guard lock(swap_mu_);
         pending_swaps_.clear();
@@ -964,11 +979,35 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             if (strategies[j] == strategies[i]) return false;
         return true;
     };
+    // Replay this symbol's seed bars through its (freshly initialised) strategy
+    // so lookback indicators are warm immediately. In a live session the ONLY
+    // source of on_bar is tick aggregation (roll_bar below), which yields at
+    // most one bar per bar_seconds — so a 365-bar lookback on 5m bars needs
+    // ~30 hours of continuous session to warm, and the daily lineup swap
+    // re-inits every morning. Without this, such a strategy never signals.
+    // Called directly rather than through the feed-event path: that path stamps
+    // the tick counter, the capture file and the stale-feed watchdog before it
+    // looks at the event type, and none of that should move for replayed history.
+    auto replay_warmup = [&](uint32_t symbol_id) {
+        const size_t i = symbol_id - 1;
+        if (i >= cfg.symbol_warmup.size() || i >= strategies.size()) return;
+        const std::vector<Bar>& seed = cfg.symbol_warmup[i];
+        IStrategy* s = strategies[i];
+        if (seed.empty() || !s) return;
+        ctx.set_current_symbol(symbol_id);
+        ctx.set_warming(true);
+        for (const Bar& b : seed) s->on_bar(ctx, symbol_id, b);
+        ctx.set_warming(false);
+        push_log("live: " + cfg.symbols[i] + ": warmed on " +
+                 std::to_string(seed.size()) + " seed bar(s)");
+    };
+
     // Each symbol's strategy instance gets its own on_init.
     for (size_t i = 0; i < strategies.size(); ++i)
         if (strategies[i] && first_use(i)) {
             ctx.set_current_symbol(static_cast<uint32_t>(i + 1));
             strategies[i]->on_init(ctx);
+            replay_warmup(static_cast<uint32_t>(i + 1));
         }
     std::string symbol_list;
     for (const std::string& s : cfg.symbols)
@@ -1067,6 +1106,12 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             ctx.set_current_event_tsc(0);
             ctx.set_current_symbol(s.symbol_id);
             strategies[i]->on_init(ctx);
+            // on_init wipes the strategy's bar history, so a params update would
+            // otherwise reset warmup to zero every autopilot cycle. Take the
+            // swap's fresh bars when it carried any, else re-use the session's.
+            if (!s.warmup.empty() && i < cfg.symbol_warmup.size())
+                cfg.symbol_warmup[i] = std::move(s.warmup);
+            replay_warmup(s.symbol_id);
             push_log("live: " + cfg.symbols[i] +
                      (s.strategy ? ": strategy swapped" : ": params updated") +
                      " (re-init while flat)");
