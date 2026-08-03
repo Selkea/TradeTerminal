@@ -1,5 +1,7 @@
 #include "net/tws_data.h"
 
+#include "net/hist_pacing.h"
+
 #include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
 #include "DefaultEWrapper.h"
@@ -12,6 +14,7 @@
 #include <chrono>
 #include <ctime>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tt::net {
 
@@ -33,7 +36,8 @@ constexpr int kScanReqId = 400'000;
 // normal 1y/1h fetch answers in a few seconds, so 20s is unambiguous. On this
 // we force a data-session reconnect to clear it; the cooldown stops a genuinely
 // unrecoverable failure from thrashing the quotes that share the session.
-constexpr int64_t kHistTimeoutMs = 20'000;
+// kHistTimeoutMs, kBigBatchBars and the send/retry predicates live in
+// net/hist_pacing.h, with the measurements that justify them.
 constexpr auto kHistResetCooldown = std::chrono::seconds(60);
 
 // TickType ids on the reqMktData stream (live + delayed variants).
@@ -120,10 +124,67 @@ struct TwsData::Io final : DefaultEWrapper {
     // In-flight candle fetches: TWS reqId == the public request id.
     struct Pending {
         std::string symbol, interval;
+        std::string dur, bar;   // resolved IB strings, kept so we can re-issue
         std::vector<Candle> candles;
         std::chrono::steady_clock::time_point sent;   // when reqHistoricalData went out
+        bool retried = false;   // already cancelled + re-issued once
     };
     std::unordered_map<int, Pending> hist;
+    // Distinct farm-status codes already reported (the stream repeats them).
+    std::unordered_set<int> farm_codes_seen;
+    // When the last historicalDataEnd landed, and how big it was. IB stops
+    // answering a request issued too soon after a large delivery — see
+    // kBigBatchBars.
+    std::chrono::steady_clock::time_point last_hist_end{};
+    size_t last_hist_bars = 0;
+
+    // Issue (or re-issue) one history request. Kept in one place so the retry
+    // path below is byte-identical to the original send.
+    void send_history(int id, Pending& p) {
+        p.candles.clear();
+        p.sent = std::chrono::steady_clock::now();
+        client->reqHistoricalData(static_cast<TickerId>(id), stock(p.symbol), "",
+                                  p.dur, p.bar, "TRADES",
+                                  /*useRTH=*/1, /*formatDate=*/2,
+                                  /*keepUpToDate=*/false, TagValueListSPtr());
+    }
+
+    // A history request that blew the timeout is almost never a broken session:
+    // measurement showed it is one request IB silently declined to answer while
+    // its siblings on the SAME socket succeeded. Cancel and re-issue just that
+    // one. Tearing the session down (drop_connection) also destroys and
+    // re-subscribes every quote stream, ~75 times a day, and re-queues the very
+    // requests that were already in flight — which is why the same batch was
+    // being fetched over and over. Returns true if anything was retried; a
+    // request that dies a SECOND time is left for the caller to treat as a
+    // genuine half-open.
+    bool retry_dead_history(std::chrono::steady_clock::time_point now) {
+        bool retried_any = false;
+        for (auto& [id, p] : hist) {
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - p.sent).count();
+            if (history_action(age, p.retried) != HistAction::Retry) continue;
+            p.retried = true;
+            retried_any = true;
+            if (client) client->cancelHistoricalData(static_cast<TickerId>(id));
+            d.log(p.symbol + " " + p.interval + ": history unanswered for " +
+                  std::to_string(age / 1000) + "s - cancelled and retrying (req " +
+                  std::to_string(id) + ")");
+            if (client) send_history(id, p);
+        }
+        return retried_any;
+    }
+
+    // Any request that has now blown the timeout for the SECOND time - the
+    // retry above did not help, so the session itself is suspect.
+    bool has_twice_dead_history(std::chrono::steady_clock::time_point now) const {
+        for (const auto& [id, p] : hist) {
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - p.sent).count();
+            if (history_action(age, p.retried) == HistAction::Escalate) return true;
+        }
+        return false;
+    }
 
     // Age of the longest-outstanding history fetch, in ms (0 when none). Steady
     // clock so a wall-clock/NTP jump around a gateway restart can't distort it.
@@ -228,7 +289,22 @@ struct TwsData::Io final : DefaultEWrapper {
                 have_scan = true;
             }
         }
-        for (const CandleReq& r : reqs) {
+        for (size_t ri = 0; ri < reqs.size(); ++ri) {
+            const CandleReq& r = reqs[ri];
+            // Quiet window after a large delivery (see kBigBatchBars): sending
+            // into it is what gets a request silently dropped. Put the rest back
+            // and come round again — the io_loop re-enters within ~1s.
+            const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - last_hist_end)
+                                       .count();
+            if (history_send_blocked(last_hist_bars, since_end)) {
+                {
+                    std::lock_guard lock(d.mu_);
+                    d.reqs_.insert(d.reqs_.begin(),
+                                   reqs.begin() + static_cast<ptrdiff_t>(ri), reqs.end());
+                }
+                break;   // NOT return: the stream/scan work below was already drained
+            }
             const char* bar = tws_bar_size(r.interval);
             int di = dur_idx(r.range);
             if (!bar || di < 0) {
@@ -247,12 +323,9 @@ struct TwsData::Io final : DefaultEWrapper {
             // di is clamped above (e.g. 1-sec bars cap at "30m" = 1800 bars,
             // the most IB returns per request); the live tail extends it forward.
             const char* dur = kDurs[di].dur;
-            hist[static_cast<int>(r.id)] = {r.symbol, r.interval, {},
-                                            std::chrono::steady_clock::now()};
-            client->reqHistoricalData(static_cast<TickerId>(r.id), stock(r.symbol),
-                                      "", dur, bar, "TRADES",
-                                      /*useRTH=*/1, /*formatDate=*/2,
-                                      /*keepUpToDate=*/false, TagValueListSPtr());
+            hist[static_cast<int>(r.id)] = {r.symbol, r.interval, dur, bar, {},
+                                            std::chrono::steady_clock::now(), false};
+            send_history(static_cast<int>(r.id), hist[static_cast<int>(r.id)]);
         }
         if (dirty) {
             for (auto it = streams.begin(); it != streams.end();) {
@@ -337,7 +410,23 @@ struct TwsData::Io final : DefaultEWrapper {
 
     void error(int id, int errorCode, const std::string& errorString,
                const std::string&) override {
-        if (errorCode >= 2100 && errorCode <= 2170) return;   // farm status noise
+        // Farm status (2100-2170) is routine chatter, but this used to return
+        // BEFORE the hist lookup below — so any such message carrying a live
+        // history reqId was swallowed whole and left that request Pending
+        // forever with nothing in the log. Report each distinct code once (the
+        // stream repeats them constantly), and never erase on one: 2106/2158 are
+        // "connection is OK" notices and killing a healthy fetch on those would
+        // be worse than the silence. A genuinely dead request is caught by the
+        // timeout + retry path instead.
+        if (errorCode >= 2100 && errorCode <= 2170) {
+            if (farm_codes_seen.insert(errorCode).second)
+                d.log("gateway farm status " + std::to_string(errorCode) + ": " +
+                      errorString);
+            if (hist.count(id))
+                d.log("...that arrived on in-flight history request " +
+                      std::to_string(id) + " (" + hist[id].symbol + ")");
+            return;
+        }
         if (errorCode == 10141) {
             // Paper disclaimer dialog not accepted yet — IBC clicks it a
             // couple of seconds after login, so connecting right after the
@@ -391,6 +480,10 @@ struct TwsData::Io final : DefaultEWrapper {
         b.interval = it->second.interval;
         b.candles = std::move(it->second.candles);
         hist.erase(it);
+        // Remember how much just landed: the next request must not follow a big
+        // batch too closely (see kBigBatchBars).
+        last_hist_end = std::chrono::steady_clock::now();
+        last_hist_bars = b.candles.size();
         if (d.cbs_.on_candles) d.cbs_.on_candles(std::move(b));
     }
 
@@ -590,8 +683,12 @@ void TwsData::io_loop() {
                                  now - last_connect > std::chrono::seconds(10);
             // Half-open *data* guard: connected, streaming fine, but a history
             // request has gone unanswered far past its normal turnaround.
+            // A single unanswered request is retried in place first; only a
+            // request that dies AGAIN after that retry means the session is
+            // genuinely half-open and worth the (expensive) full teardown.
+            if (connected_.load(std::memory_order_acquire)) io.retry_dead_history(now);
             const bool hist_stalled = connected_.load(std::memory_order_acquire) &&
-                                      io.oldest_hist_ms(now) > kHistTimeoutMs &&
+                                      io.has_twice_dead_history(now) &&
                                       now - last_hist_reset > kHistResetCooldown;
             if (io.reset_conn || stalled || hist_stalled) {
                 if (io.reset_conn) {
@@ -601,7 +698,8 @@ void TwsData::io_loop() {
                 } else {
                     log("history request unanswered for >" +
                         std::to_string(kHistTimeoutMs / 1000) +
-                        "s - reconnecting data session (half-open)");
+                        "s even after a retry - reconnecting data session "
+                        "(half-open)");
                     last_hist_reset = now;
                 }
                 io.reset_conn = false;
