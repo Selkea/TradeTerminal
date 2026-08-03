@@ -2,7 +2,9 @@
 
 #include "engine/engine.h"
 
+#include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -43,6 +45,7 @@ public:
         double holdout_pct = 0;       // >0: holdout run follows the passes
         bool has_holdout = false;     // holdout_val is valid
         double holdout_val = 0;       // winner's metric on unseen data
+        int holdout_trades = 0;       // sample size behind holdout_val
 
         // Strategy tournament (auto-pick): every loaded strategy is optimized
         // on the same data; the champion (best holdout score) is applied.
@@ -116,13 +119,33 @@ constexpr double kSweepRefineWindow = 0.25;
 // Higher is better for every metric except max drawdown.
 constexpr const char* kSweepMetrics[] = {"Sharpe", "Return", "Max drawdown", "Win rate"};
 inline bool sweep_metric_minimize(int m) { return m == 2; }
-inline double sweep_metric_of(const BacktestResult& r, int m) {
+
+// A parameter set that barely trades is not a good parameter set — it is an
+// unmeasured one. Every metric here degenerates on a thin sample: Sharpe and
+// win rate are computed from a handful of returns, and "Max drawdown" is
+// MINIMISED, so a run that never opens a position scores a flat 0.0 and is the
+// unbeatable global optimum. Require a sample proportional to the window, with
+// a hard floor, and score anything thinner as the worst possible value.
+constexpr int kSweepMinTrades = 20;
+// The holdout is only the last slice of the window (holdout_pct, default 25%),
+// so it gets a proportionally smaller floor - but still not zero.
+constexpr int kSweepMinHoldoutTrades = 5;
+inline double sweep_reject_score(int m) {
+    return sweep_metric_minimize(m) ? std::numeric_limits<double>::infinity()
+                                    : -std::numeric_limits<double>::infinity();
+}
+inline double sweep_metric_of(const BacktestResult& r, int m, int min_trades) {
+    if (r.trades < min_trades) return sweep_reject_score(m);
     switch (m) {
     case 1: return r.total_return;
     case 2: return r.max_drawdown;
     case 3: return r.win_rate;
     default: return r.sharpe;
     }
+}
+// Back-compat overload: no sample-size opinion. Prefer the 3-arg form.
+inline double sweep_metric_of(const BacktestResult& r, int m) {
+    return sweep_metric_of(r, m, 0);
 }
 
 } // namespace tt::ui

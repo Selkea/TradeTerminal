@@ -131,9 +131,11 @@ add_executable(tt_terminal_tests
     tests/test_log_console.cpp
     tests/test_journal.cpp
     tests/test_alerts.cpp
+    tests/test_sweep_guard.cpp
     src/panels/log_console.cpp
     src/journal.cpp
 )
 target_include_directories(tt_terminal_tests PRIVATE src)
-target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3)
+# tt_engine: sweep.h scores a BacktestResult, declared in engine/engine.h.
+target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine)
 add_test(NAME terminal_tests COMMAND tt_terminal_tests)

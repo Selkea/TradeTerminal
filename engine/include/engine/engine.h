@@ -96,6 +96,13 @@ struct LiveConfig {
     // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
     // session-wide (per-symbol halting needs per-symbol portfolios).
     std::vector<RiskLimits> symbol_risk;
+    // Optional per-symbol seed bars (parallel to symbols), replayed through the
+    // strategy right after on_init so indicators are warm when the session
+    // starts. Live bars only ever come from tick aggregation, so a strategy
+    // whose lookback exceeds one session's worth of bars could otherwise NEVER
+    // warm up — and the daily lineup swap re-inits every morning. Orders are
+    // suppressed during the replay. Oldest first, same bar size as the symbol.
+    std::vector<std::vector<Bar>> symbol_warmup;
     int bar_seconds = 60;           // tick->bar aggregation for on_bar (fallback)
     // Optional per-symbol bar size (parallel to symbols; 0/absent = bar_seconds).
     std::vector<int> symbol_bar_seconds;
@@ -252,9 +259,17 @@ public:
     // it re-reads its params with clean state; a watchdog halt on the symbol
     // is lifted. The instance is caller-owned and must outlive the session
     // (lease it like any live strategy). Latest queued swap per symbol wins.
-    void update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params);
+    // `warmup`: fresh seed bars to replay after the re-init this triggers.
+    // on_init clears the strategy's history, so passing none means the symbol
+    // restarts cold — pass the same bars the caller would seed a new session
+    // with. Empty = keep whatever history the session was started with.
+    void update_symbol_params(uint32_t symbol_id, std::map<std::string, double> params,
+                              std::vector<Bar> warmup = {});
+    // `warmup` as in update_symbol_params: a brand-new instance starts with no
+    // history at all, so this one matters even more.
     void swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
-                              std::map<std::string, double> params);
+                              std::map<std::string, double> params,
+                              std::vector<Bar> warmup = {});
 
 private:
     friend class EngineCtx;
@@ -300,6 +315,11 @@ private:
         uint32_t symbol_id = 0;
         IStrategy* strategy = nullptr;   // null = params-only update
         std::map<std::string, double> params;
+        // Fresh seed bars for the re-init this swap triggers. on_init clears the
+        // strategy's history, so without these every params update would reset
+        // the warmup to zero — see LiveConfig::symbol_warmup. Empty = re-use
+        // whatever the session already had.
+        std::vector<Bar> warmup;
     };
     std::mutex swap_mu_;
     std::vector<PendingSwap> pending_swaps_;
