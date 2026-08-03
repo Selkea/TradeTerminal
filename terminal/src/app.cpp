@@ -410,7 +410,28 @@ App::App(std::string gateway_url)
         start_pending_backtest(b);
         stash_pending_sweep(b);
         collect_lineup_bars(b);   // before the move: needs b.candles
+        const std::string sym = b.symbol;
+        const std::string ivl = b.interval;
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
+        // A live symbol that started cold can now be warmed (after the put, so
+        // seed_bars sees this batch).
+        uint32_t want_sid = 0;
+        {
+            std::lock_guard lock(warmup_mu_);
+            const auto it = warmup_want_.find(sym);
+            if (it != warmup_want_.end()) {
+                want_sid = it->second;
+                warmup_want_.erase(it);
+            }
+        }
+        if (want_sid && engine_.live_running()) {
+            std::vector<tt::Bar> bars = seed_bars(sym, cfg_.trade_bar_sec);
+            if (!bars.empty()) {
+                route("live: " + sym + ": warmup history arrived (" +
+                         std::to_string(bars.size()) + " bars, " + ivl + ")");
+                engine_.reseed_symbol(want_sid, std::move(bars));
+            }
+        }
     };
 
     // Session persistence (cfg_ is loaded in the init list) + file logging.
@@ -2459,10 +2480,14 @@ void App::route(std::string line) {
 // tens of milliseconds per session start.
 static constexpr size_t kMaxSeedBars = 4000;
 
+// Same interval strings the optimizer/lineup fetch under, so the cache the
+// autopilot already fills every cycle is the cache we read here.
+static const char* warmup_interval(int bar_sec) {
+    return bar_sec >= 86400 ? "1d" : (bar_sec >= 3600 ? "1h" : "5m");
+}
+
 std::vector<tt::Bar> App::seed_bars(const std::string& symbol, int bar_sec) const {
-    // Same interval strings the optimizer/lineup fetch under, so the cache the
-    // autopilot already fills every cycle is the cache we read here.
-    const char* ivl = bar_sec >= 86400 ? "1d" : (bar_sec >= 3600 ? "1h" : "5m");
+    const char* ivl = warmup_interval(bar_sec);
     SeriesStore::Series s;
     uint64_t seen = 0;   // 0 = "unseen", so this copies whatever is cached
     if (!series_.copy_if_newer(symbol, ivl, seen, s) || s.candles.empty()) return {};
@@ -2642,15 +2667,37 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
         // Warm this instance on cached history. Without it the strategy starts
         // with zero bars and a lookback of a few hundred can never be satisfied
         // inside one session — the daily lineup swap re-inits every morning.
-        cfg.symbol_warmup.push_back(seed_bars(so.symbol, cfg.bar_seconds));
+        std::vector<tt::Bar> seed = seed_bars(so.symbol, cfg.bar_seconds);
+        if (seed.empty()) {
+            // Cold cache (always true for the first session after launch, since
+            // series_ lives only in memory). Fetch it and re-seed on arrival.
+            // "1mo" of 5m bars is ~1,640 - comfortably more than the largest
+            // lookback the sweep can elect, and deliberately under the ~3,000-bar
+            // batch size that makes IB drop the NEXT request (see hist_pacing.h).
+            std::lock_guard lock(warmup_mu_);
+            warmup_want_[so.symbol] = static_cast<uint32_t>(cfg.symbol_warmup.size() + 1);
+        }
+        cfg.symbol_warmup.push_back(std::move(seed));
         new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
     }
     if (!acq_ok) {
         for (const auto& l : new_leases) release_strategy(l);
         return;
     }
+    const int warm_bar_sec = cfg.bar_seconds;
     if (engine_.start_live(std::move(cfg), std::move(strategies))) {
         for (const auto& l : new_leases) leases_.push_back(l);
+        // Pull history for any symbol that started cold; on_candles re-seeds it.
+        {
+            std::lock_guard lock(warmup_mu_);
+            for (const auto& [sym, sid] : warmup_want_) {
+                (void)sid;
+                data_.request_candles(sym, warmup_interval(warm_bar_sec), "1mo");
+            }
+            if (!warmup_want_.empty())
+                route("live: fetching warmup history for " +
+                         std::to_string(warmup_want_.size()) + " cold symbol(s)");
+        }
         // Arm the autopilot for symbols that asked for it.
         ap_ = Autopilot{};
         for (size_t i = 0; i < opts.symbols.size(); ++i) {

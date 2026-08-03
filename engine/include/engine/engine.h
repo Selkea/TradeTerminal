@@ -270,6 +270,11 @@ public:
     void swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
                               std::map<std::string, double> params,
                               std::vector<Bar> warmup = {});
+    // Re-run a symbol's strategy over fresh history without changing anything
+    // else. For when the bars a session wanted at start-up only became
+    // available later (the candle cache is memory-only, so it is cold on the
+    // very first session after launch).
+    void reseed_symbol(uint32_t symbol_id, std::vector<Bar> warmup);
 
 private:
     friend class EngineCtx;
@@ -320,6 +325,9 @@ private:
         // the warmup to zero — see LiveConfig::symbol_warmup. Empty = re-use
         // whatever the session already had.
         std::vector<Bar> warmup;
+        // True: this swap exists ONLY to deliver warmup bars; leave the
+        // symbol's current params untouched.
+        bool keep_params = false;
     };
     std::mutex swap_mu_;
     std::vector<PendingSwap> pending_swaps_;

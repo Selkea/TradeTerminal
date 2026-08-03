@@ -677,6 +677,12 @@ void Engine::update_symbol_params(uint32_t symbol_id, std::map<std::string, doub
     queue_swap(PendingSwap{symbol_id, nullptr, std::move(params), std::move(warmup)});
 }
 
+void Engine::reseed_symbol(uint32_t symbol_id, std::vector<Bar> warmup) {
+    if (warmup.empty()) return;
+    PendingSwap s{symbol_id, nullptr, {}, std::move(warmup), /*keep_params=*/true};
+    queue_swap(std::move(s));
+}
+
 void Engine::swap_symbol_strategy(uint32_t symbol_id, IStrategy* strategy,
                                   std::map<std::string, double> params,
                                   std::vector<Bar> warmup) {
@@ -1099,7 +1105,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         }
         for (PendingSwap& s : ready) {
             const size_t i = s.symbol_id - 1;
-            cfg.symbol_params[i] = std::move(s.params);
+            if (!s.keep_params) cfg.symbol_params[i] = std::move(s.params);
             if (s.strategy) strategies[i] = s.strategy;
             if (!strategies[i]) continue;
             strat_halted[i] = 0;   // fresh start: watchdog halt lifted
@@ -1113,7 +1119,9 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 cfg.symbol_warmup[i] = std::move(s.warmup);
             replay_warmup(s.symbol_id);
             push_log("live: " + cfg.symbols[i] +
-                     (s.strategy ? ": strategy swapped" : ": params updated") +
+                     (s.strategy      ? ": strategy swapped"
+                      : s.keep_params ? ": re-seeded"
+                                      : ": params updated") +
                      " (re-init while flat)");
         }
     };

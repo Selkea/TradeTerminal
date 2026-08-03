@@ -239,6 +239,13 @@ private:
     // Replayed through the strategy after on_init so lookback indicators are
     // warm — a live session's only other bar source is tick aggregation.
     std::vector<tt::Bar> seed_bars(const std::string& symbol, int bar_sec) const;
+    // Symbols whose warmup history was not cached when the live session
+    // started, mapped to their engine symbol id. The candle cache is
+    // memory-only, so the first session after launch always finds it cold; we
+    // fetch the bars and re-seed those symbols when they land. Touched from the
+    // UI thread (session start) and the data thread (on_candles).
+    std::mutex warmup_mu_;
+    std::map<std::string, uint32_t> warmup_want_;
     bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
     // True while any backtest/optimizer/tournament/lineup work is in flight —
     // gates the engine's strategy-log flood to the optimizer panel instead of
