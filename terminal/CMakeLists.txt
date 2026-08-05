@@ -133,9 +133,23 @@ add_executable(tt_terminal_tests
     tests/test_alerts.cpp
     tests/test_sweep_guard.cpp
     tests/test_hist_pacing.cpp
+    tests/test_strategies.cpp
     src/panels/log_console.cpp
     src/journal.cpp
 )
+# Strategies under test are compiled in the same "promoted" mode tt_terminal
+# uses (self-registering into static_strategy_registry instead of exporting DLL
+# factories), so the test drives the exact same translation unit that ships.
+set(TT_TESTED_STRATEGIES
+    ${CMAKE_SOURCE_DIR}/strategies/rsi2_pullback.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/orb_breakout.cpp
+)
+target_sources(tt_terminal_tests PRIVATE ${TT_TESTED_STRATEGIES})
+foreach(_src ${TT_TESTED_STRATEGIES})
+    get_filename_component(_key ${_src} NAME)
+    set_source_files_properties(${_src} PROPERTIES
+        COMPILE_DEFINITIONS "TT_STRATEGY_STATIC_LINK;TT_STRATEGY_STATIC_KEY=\"${_key}\"")
+endforeach()
 target_include_directories(tt_terminal_tests PRIVATE src)
 # tt_engine: sweep.h scores a BacktestResult, declared in engine/engine.h.
 target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine)

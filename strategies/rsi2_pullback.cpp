@@ -27,6 +27,15 @@ constexpr ParamDesc kParams[] = {
     {"trend_ma", 200, 20, 1000},    // regime SMA (bars)
     {"budget_pct", 100, 1, 100},    // % of the risk budget per entry (ctx.budget)
     {"max_qty", 5000, 1, 100000},   // hard share cap per position
+    // Entry window, local hours (9.5 = 09:30). Exits are never gated, and the
+    // window is ignored on daily+ bars (see on_bar). Defaults to US regular
+    // hours rather than the always-on 0/24 the other strategies declare: a 5m
+    // bar built from thin PRE-MARKET prints is exactly what this strategy's
+    // "buy the panic" entry mistakes for a signal. On 2026-08-04 it fired at
+    // 04:37; IBKR held the order PreSubmitted for five hours and filled it at
+    // the open, at a price the strategy never evaluated.
+    {"enter_from_h", 9.5, 0, 24},
+    {"enter_until_h", 16, 0, 24},
 };
 }
 
@@ -39,6 +48,10 @@ public:
         trend_ma_ = static_cast<int>(ctx.param("trend_ma", 200));
         budget_pct_ = ctx.param("budget_pct", 100);
         max_qty_ = ctx.param("max_qty", 5000);
+        enter_from_h_ = ctx.param("enter_from_h", 9.5);
+        enter_until_h_ = ctx.param("enter_until_h", 16);
+        bar_sec_ = 0;
+        prev_ts_ = 0;
         if (rsi_len_ < 2) rsi_len_ = 2;
         if (exit_ma_ < 2) exit_ma_ = 2;
         if (trend_ma_ < exit_ma_) trend_ma_ = exit_ma_;
@@ -62,6 +75,11 @@ public:
     void on_bar(IStrategyContext& ctx, uint32_t symbol_id, const Bar& bar) noexcept override {
         if (sym_ == 0) sym_ = symbol_id;
         if (symbol_id != sym_) return;
+
+        // Bar size, inferred from the first gap (the strategy is never told it).
+        if (bar_sec_ == 0 && prev_ts_ > 0 && bar.ts_ns > prev_ts_)
+            bar_sec_ = static_cast<int>((bar.ts_ns - prev_ts_) / 1'000'000'000);
+        prev_ts_ = bar.ts_ns;
 
         // Wilder RSI: seed with simple averages, then smooth.
         if (prev_close_ > 0.0) {
@@ -105,6 +123,13 @@ public:
         }
 
         if (entry_id_ != 0 || exit_id_ != 0) return;  // an order is in flight
+        // Entry window — intraday bars only. A daily bar is stamped at the
+        // session date, so a time-of-day window would reject every entry and
+        // silently turn a daily backtest into a no-trade run.
+        if (intraday()) {
+            const double hod = hour_of_day_local(bar.ts_ns);
+            if (hod < enter_from_h_ || hod >= enter_until_h_) return;
+        }
         if (bar.close > trend_sum_ / trend_ma_ && rsi <= buy_below_) {
             // Size off the risk budget, not cash: the engine caps the position
             // notional anyway, so a % of the account is a number it discards.
@@ -143,8 +168,14 @@ public:
     void destroy() noexcept override { delete this; }
 
 private:
+    // Bars shorter than a day carry a meaningful time of day; daily+ bars don't.
+    bool intraday() const noexcept { return bar_sec_ > 0 && bar_sec_ < 23 * 3600; }
+
     int rsi_len_ = 2, exit_ma_ = 5, trend_ma_ = 200;
     double buy_below_ = 10, budget_pct_ = 100, max_qty_ = 5000;
+    double enter_from_h_ = 9.5, enter_until_h_ = 16;
+    int bar_sec_ = 0;
+    int64_t prev_ts_ = 0;
 
     uint32_t sym_ = 0;
     std::vector<double> closes_;

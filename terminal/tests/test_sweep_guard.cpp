@@ -9,6 +9,30 @@
 #include <cmath>
 
 using namespace tt;
+
+// ---- which parameters the optimizer may touch ------------------------------
+TEST_CASE("sweep: sizing and session-shape parameters are never swept") {
+    using tt::ui::sweep_param_is_fixed;
+    // Sizing: optimizing it just maximizes leverage.
+    CHECK(sweep_param_is_fixed("qty"));
+    CHECK(sweep_param_is_fixed("max_qty"));
+    CHECK(sweep_param_is_fixed("budget_pct"));
+    CHECK(sweep_param_is_fixed("alloc_pct"));   // pre-SDK-v3 name
+    CHECK(sweep_param_is_fixed("risk_pct"));
+    // Session shape: a policy choice or a fact about the market. session_min /
+    // eod_min were the leak — ORB's session window, missing from the list, and
+    // the optimizer had SNXX trading a 155-minute day live.
+    CHECK(sweep_param_is_fixed("enter_from_h"));
+    CHECK(sweep_param_is_fixed("enter_until_h"));
+    CHECK(sweep_param_is_fixed("session_min"));
+    CHECK(sweep_param_is_fixed("eod_min"));
+    // Signal parameters must still be swept, or the optimizer does nothing.
+    CHECK_FALSE(sweep_param_is_fixed("entry_z"));
+    CHECK_FALSE(sweep_param_is_fixed("trend_len"));
+    CHECK_FALSE(sweep_param_is_fixed("range_min"));
+    CHECK_FALSE(sweep_param_is_fixed("tp_r"));
+    CHECK_FALSE(sweep_param_is_fixed("rsi_len"));
+}
 using namespace tt::ui;
 
 namespace {
