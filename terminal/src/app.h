@@ -253,9 +253,6 @@ private:
     // backtest flips running_ false before the UI drains its buffered flood, so
     // the tail (often the whole run) would leak into the live log. The outer
     // sweep/tournament/lineup flags stay set across all the sub-backtests.
-    bool optimizing() const {
-        return engine_.running() || sweep_.running || tourn_.active || lineup_active();
-    }
     // One live-start path shared by the Trade panel's Start button and the
     // daily-lineup scheduler (extracted from the panel start callback so the
     // scheduler can't drift from the manual path).

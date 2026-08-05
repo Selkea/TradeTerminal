@@ -12,6 +12,12 @@
 
 namespace tt {
 
+// True only on the live-session thread. Backtests and the live loop share one
+// log queue, so every line is stamped with its origin here — the UI cannot
+// otherwise tell them apart, and guessing from global state ("is a tournament
+// running?") misfiles live output for most of the trading day.
+static thread_local bool tt_on_live_thread = false;
+
 namespace {
 int64_t median_gap_ns(const std::vector<Bar>& bars) {
     if (bars.size() < 2) return 60'000'000'000;  // default 1 minute
@@ -186,7 +192,12 @@ public:
         if (warming_) return;
         static constexpr const char* kLevels[] = {"debug", "info", "warn", "error"};
         const int l = level < 0 ? 0 : (level > 3 ? 3 : level);
-        eng_.push_log(std::string("[strategy ") + kLevels[l] + "] " + msg);
+        // Name the symbol whose callback is running. A bare "entry 5000 @ z=-1.50"
+        // is unattributable once more than one symbol is live.
+        std::string sym;
+        if (cur_symbol_ >= 1 && cur_symbol_ <= symbols_.size())
+            sym = symbols_[cur_symbol_ - 1] + ": ";
+        eng_.push_log(std::string("[strategy ") + kLevels[l] + "] " + sym + msg);
     }
 
     void set_current_event_tsc(int64_t tsc) { cur_event_tsc_ = tsc; }
@@ -308,14 +319,20 @@ Engine::~Engine() {
 
 void Engine::push_log(std::string line) {
     std::lock_guard lock(log_mu_);
-    logs_.push_back(std::move(line));
+    logs_.emplace_back(std::move(line), tt_on_live_thread);
     while (logs_.size() > 1000) logs_.pop_front();
 }
 
 bool Engine::pop_log(std::string& out) {
+    bool ignored = false;
+    return pop_log(out, ignored);
+}
+
+bool Engine::pop_log(std::string& out, bool& from_live) {
     std::lock_guard lock(log_mu_);
     if (logs_.empty()) return false;
-    out = std::move(logs_.front());
+    out = std::move(logs_.front().first);
+    from_live = logs_.front().second;
     logs_.pop_front();
     return true;
 }
@@ -736,6 +753,8 @@ bool Engine::start_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
 }
 
 void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
+    // Stamp everything this thread logs as live (see tt_on_live_thread).
+    tt_on_live_thread = true;
     // The trading thread outranks everything else in this process.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (cfg.pin_core >= 0 && cfg.pin_core < 64) {
@@ -910,10 +929,16 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 o.fee = f.fee;
                 orders_dirty = true;
             }
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "live: fill #%llu %s %.0f @ %.2f",
-                      static_cast<unsigned long long>(f.order_id),
-                      f.side == Side::Buy ? "BUY" : "SELL", f.qty, f.price);
+        // Lead with the SYMBOL: without it a fill line cannot be attributed at
+        // all, and journal.db was the only place that carried it. The order id
+        // stays so a fill still pairs with its "tws: order #N acked" line.
+        const char* fsym = (f.symbol_id >= 1 && f.symbol_id <= cfg.symbols.size())
+                               ? cfg.symbols[f.symbol_id - 1].c_str()
+                               : "?";
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "live: %s fill %s %.0f @ %.2f (order #%llu)",
+                      fsym, f.side == Side::Buy ? "BUY" : "SELL", f.qty, f.price,
+                      static_cast<unsigned long long>(f.order_id));
         push_log(buf);
         push_fill(FillRecord{f.ts_ns, f.order_id, f.symbol_id,
                              static_cast<uint8_t>(f.side), f.qty, f.price, f.fee});

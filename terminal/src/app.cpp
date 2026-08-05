@@ -2087,16 +2087,18 @@ void App::draw() {
     // Surface engine/strategy/broker/feed log lines in the console; scan
     // them for alert-worthy events on the way through.
     std::string line;
-    while (engine_.pop_log(line)) {
+    bool from_live = false;
+    while (engine_.pop_log(line, from_live)) {
         alert_scan(line);
-        // While an optimizer/tournament/lineup runs, its backtests' strategy
-        // logs flood in with no prefix — send them to the optimizer panel. Gate
-        // on optimizing() (not engine_.running() alone): a short backtest flips
-        // running_ false before we drain its buffered flood, so the tail would
-        // otherwise leak into the live console. Live engine lines (halts, fills,
-        // "live: …") run with nothing optimizing, so they fall through to route().
-        if (optimizing()) opt_log_.add(std::move(line));
-        else route(std::move(line));
+        // Route on the line's ORIGIN, not on global state. Backtest strategy
+        // logs flood in during a sweep/tournament/lineup and belong in the
+        // optimizer panel; everything the live session emits belongs in the
+        // console. The old test — "is anything optimizing?" — was true for most
+        // of the trading day because of the 30-minute autopilot, so live fills,
+        // strategy entries and risk lines were being filed into the 58 MB
+        // optimizer.log where nobody would find them.
+        if (from_live) route(std::move(line));
+        else opt_log_.add(std::move(line));
     }
     if (ibkr_)
         while (ibkr_->pop_log(line)) {

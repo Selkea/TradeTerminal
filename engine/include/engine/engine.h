@@ -209,6 +209,12 @@ public:
     bool take_result(BacktestResult& out);
     // Engine/strategy log lines, drained by the UI each frame.
     bool pop_log(std::string& out);
+    // Same, but also reports whether the line came from the LIVE session thread
+    // rather than a backtest. The two share this queue, and a caller that can
+    // only guess from global state (e.g. "is a tournament running?") will
+    // misfile live output during the autopilot's backtests - which is most of
+    // the trading day.
+    bool pop_log(std::string& out, bool& from_live);
 
     // ---- live paper trading ----
     // One strategy instance per symbol (parallel to cfg.symbols); each is
@@ -305,7 +311,7 @@ private:
     BacktestResult result_;
 
     std::mutex log_mu_;
-    std::deque<std::string> logs_;
+    std::deque<std::pair<std::string, bool>> logs_;   // text, came-from-live
 
     std::mutex fill_mu_;
     std::deque<FillRecord> fill_feed_;
