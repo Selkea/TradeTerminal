@@ -143,6 +143,7 @@ add_executable(tt_terminal_tests
 set(TT_TESTED_STRATEGIES
     ${CMAKE_SOURCE_DIR}/strategies/rsi2_pullback.cpp
     ${CMAKE_SOURCE_DIR}/strategies/orb_breakout.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/bollinger_reversion.cpp
 )
 target_sources(tt_terminal_tests PRIVATE ${TT_TESTED_STRATEGIES})
 foreach(_src ${TT_TESTED_STRATEGIES})
