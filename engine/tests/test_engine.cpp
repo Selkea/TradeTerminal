@@ -174,6 +174,123 @@ struct StubBroker : IBrokerAdapter {
 };
 } // namespace
 
+// ---- order lifecycle: a death that nobody reports -------------------------
+// Strategies gate new entries on "an order is in flight" and only ever clear
+// the id in on_fill. A rejected order never reaches on_fill, so before SDK v4
+// one reject silenced that symbol for the whole session with nothing in the log
+// to say why.
+namespace {
+// Accepts every submit with a fresh id, then asynchronously rejects it — the
+// production shape (IBKR acks the order, then reports it Inactive).
+struct RejectingBroker : IBrokerAdapter {
+    std::mutex mu;
+    std::deque<EngineEvent> q;
+    uint64_t next = 1;
+    uint64_t submit(const OrderRequest& r, int64_t) override {
+        std::lock_guard l(mu);
+        const uint64_t id = next++;
+        EngineEvent e{};
+        e.type = static_cast<uint16_t>(EvType::OrderCancel);
+        e.flags = kEvFlagRejected;
+        e.symbol_id = r.symbol_id;
+        e.u.order.order_id = id;
+        q.push_back(e);
+        return id;
+    }
+    bool cancel(uint64_t) override { return true; }
+    void cancel_all() override {}
+    void flatten() override {}
+    bool poll_event(EngineEvent& out) override {
+        std::lock_guard l(mu);
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool ready() const override { return true; }
+};
+
+// The in-flight guard every shipped strategy uses. `handles_end == false` is
+// the pre-v4 strategy: it never learns the id died.
+struct GatedEntryStrat : IStrategy {
+    bool handles_end;
+    std::atomic<int> attempts{0};
+    std::atomic<int> ends{0};
+    uint64_t entry_id = 0;   // engine thread only
+    explicit GatedEntryStrat(bool h) : handles_end(h) {}
+    void on_init(IStrategyContext&) noexcept override { entry_id = 0; }
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        if (entry_id != 0) return;   // "an order is in flight, wait"
+        entry_id = ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 10,
+                                     0, 0, 0, 0});
+        if (entry_id) ++attempts;
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd& e) noexcept override {
+        ++ends;
+        if (handles_end && e.order_id == entry_id) entry_id = 0;
+    }
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+} // namespace
+
+// ---- the simulator has no cancel event -------------------------------------
+// A real broker reports every cancel. ExecSim just erased orders, so in
+// backtests and paper-live an OCO sibling vanished with nothing reported — the
+// same wedge, in the path the optimizer grades every candidate on.
+TEST_CASE("exec sim: the OCO sibling dropped when a bracket leg fills is reported") {
+    ExecParams p;
+    p.latency_ns = 0;
+    p.latency_jitter_ns = 0;
+    p.slippage_bps = 0;
+    ExecSim sim(p);
+    std::vector<Fill> fills;
+    // Bracketed buy: take-profit 110, stop-loss 90.
+    const uint64_t parent =
+        sim.submit({1, Side::Buy, OrdType::Market, {}, 10, 0, 0, 110.0, 90.0}, 0);
+    CHECK(parent != 0);
+    sim.on_price(1, 100.0, 1, fills);   // parent fills; TP + SL children spawn
+    CHECK(sim.take_cancels().empty());  // nothing has died yet
+    CHECK(sim.open_orders() == 2);
+
+    fills.clear();
+    sim.on_price(1, 111.0, 2, fills);   // TP fills -> the stop must be reported
+    REQUIRE(fills.size() == 1);
+    const auto cancels = sim.take_cancels();
+    REQUIRE(cancels.size() == 1);
+    CHECK(cancels[0].symbol_id == 1);
+    CHECK(cancels[0].order_id != fills[0].order_id);
+    CHECK(sim.open_orders() == 0);
+}
+
+TEST_CASE("exec sim: an explicit cancel reports itself and its OCO partner") {
+    ExecParams p;
+    p.latency_ns = 0;
+    p.latency_jitter_ns = 0;
+    p.slippage_bps = 0;
+    ExecSim sim(p);
+    std::vector<Fill> fills;
+    sim.submit({1, Side::Buy, OrdType::Market, {}, 10, 0, 0, 110.0, 90.0}, 0);
+    sim.on_price(1, 100.0, 1, fills);
+    sim.take_cancels();
+    REQUIRE(sim.open_orders() == 2);
+
+    // Cancel one leg: the group goes, and BOTH ids must be reported — the
+    // partner is exactly the id a strategy would otherwise wait on forever.
+    fills.clear();
+    sim.on_price(1, 100.0, 2, fills);   // no fill, just to keep ids stable
+    uint64_t leg = 0;
+    for (uint64_t id = 1; id < 8 && !leg; ++id)
+        if (id != 1 && sim.cancel(id)) leg = id;
+    REQUIRE(leg != 0);
+    const auto cancels = sim.take_cancels();
+    CHECK(cancels.size() == 2);
+    CHECK(sim.open_orders() == 0);
+}
+
 TEST_CASE("broker: default take_reject reports no reason") {
     StubBroker b;
     const RejectReason r = b.take_reject(42);
@@ -278,7 +395,47 @@ bool pump_until(Engine& eng, Pred pred, int ms = 3000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
+// Drives a GatedEntryStrat against a broker that rejects everything and returns
+// how many entries it managed before going quiet.
+int entries_against_rejects(bool handles_end) {
+    Engine eng;
+    RejectingBroker broker;
+    GatedEntryStrat strat(handles_end);
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;   // no bars fire; drive the on_tick path
+    cfg.broker = &broker;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump_until(eng, [&] { return strat.attempts.load() >= 5; }, 1500);
+    const int n = strat.attempts.load();
+    eng.stop_live();
+    return n;
+}
 } // namespace
+
+TEST_CASE("order lifecycle: an unreported reject wedges the symbol for the session") {
+    // The defect, reproduced: one order goes out, the broker rejects it, and the
+    // strategy waits forever on an id that will never reach on_fill. This is
+    // what "the strategy just stopped trading" looked like.
+    CHECK(entries_against_rejects(/*handles_end=*/false) == 1);
+}
+
+TEST_CASE("order lifecycle: on_order_end lets a strategy recover from a reject") {
+    CHECK(entries_against_rejects(/*handles_end=*/true) >= 5);
+}
+
+TEST_CASE("order lifecycle: a broker reject reaches the strategy") {
+    Engine eng;
+    RejectingBroker broker;
+    GatedEntryStrat strat(true);
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.broker = &broker;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    CHECK(pump_until(eng, [&] { return strat.ends.load() >= 1; }));
+    eng.stop_live();
+}
 
 TEST_CASE("live reconciliation: gate dispatch, hold until flat, then resume") {
     Engine eng;

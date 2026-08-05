@@ -91,6 +91,13 @@ public:
 
     void destroy() noexcept override { delete this; }
 
+    // Without this, one rejected order leaves entry_id_/exit_id_ set and the
+    // `entry_id_ == 0 && exit_id_ == 0` guard blocks the rest of the session.
+    void on_order_end(IStrategyContext&, const OrderEnd& e) noexcept override {
+        if (e.order_id == entry_id_) entry_id_ = 0;
+        else if (e.order_id == exit_id_) exit_id_ = 0;
+    }
+
 private:
     int fast_ = 10, slow_ = 30;
     double qty_ = 100;

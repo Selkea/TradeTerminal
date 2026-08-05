@@ -52,6 +52,25 @@ struct Fill {
 };
 static_assert(sizeof(Fill) == 48);
 
+enum class OrderEndReason : uint8_t {
+    Cancelled = 1,   // withdrawn: by the strategy, the UI, or an OCO sibling filling
+    Rejected  = 2,   // the broker refused it
+};
+
+// An order that left the book without completing. Delivered to
+// IStrategy::on_order_end — the ONLY notice a strategy gets that an id it is
+// tracking will never be seen in on_fill.
+struct OrderEnd {
+    uint64_t       order_id;
+    uint32_t       symbol_id;
+    OrderEndReason reason;
+    uint8_t        _pad[3]{};
+    int64_t        ts_ns;
+    int32_t        code;      // broker reject code (0 = none captured)
+    int32_t        _pad2{};
+};
+static_assert(sizeof(OrderEnd) == 32);
+
 struct Position {
     uint32_t symbol_id;
     double   qty;            // signed; negative = short

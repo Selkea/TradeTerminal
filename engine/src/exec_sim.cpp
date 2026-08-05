@@ -46,11 +46,13 @@ bool ExecSim::cancel(uint64_t order_id) {
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
         if (it->id == order_id) {
             const uint64_t sibling = it->oco_sibling;
+            cancels_.push_back({it->id, it->symbol_id});
             pending_.erase(it);
             // Cancelling one bracket leg cancels the group (like Alpaca).
             if (sibling)
                 for (auto s = pending_.begin(); s != pending_.end(); ++s)
                     if (s->id == sibling) {
+                        cancels_.push_back({s->id, s->symbol_id});
                         pending_.erase(s);
                         break;
                     }
@@ -107,6 +109,7 @@ void ExecSim::on_price(uint32_t symbol_id, double price, int64_t now_ns,
         if (o.oco_sibling)   // one-cancels-other: drop the surviving leg
             for (auto s = pending_.begin(); s != pending_.end(); ++s)
                 if (s->id == o.oco_sibling) {
+                    cancels_.push_back({s->id, s->symbol_id});
                     pending_.erase(s);
                     break;
                 }

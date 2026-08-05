@@ -174,6 +174,37 @@ public:
         }
     }
 
+    void on_order_end(IStrategyContext& ctx, const OrderEnd& e) noexcept override {
+        if (e.order_id == entry_id_) {
+            entry_id_ = 0;
+            // Same stand-down as a synchronous reject above: don't machine-gun
+            // a symbol that just refused an order.
+            cooldown_until_ns_ =
+                ctx.now_ns() + static_cast<int64_t>(cooldown_s_ * 1e9);
+        } else if (e.order_id == tp_id_) {
+            tp_id_ = 0;
+        } else if (e.order_id == sl_id_) {
+            sl_id_ = 0;
+            // A scalp without its stop is the one thing this strategy cannot
+            // ride out — a REJECTED stop means get flat now, not re-arm and
+            // hope. (A cancelled one is cancel_exits/OCO doing its job.)
+            const double pos = ctx.position(sym_).qty;
+            if (e.reason == OrderEndReason::Rejected && pos != 0.0 &&
+                flatten_id_ == 0) {
+                if (tp_id_) {
+                    ctx.cancel_order(tp_id_);
+                    tp_id_ = 0;
+                }
+                flatten_id_ = ctx.submit_order({sym_, pos > 0 ? Side::Sell : Side::Buy,
+                                                OrdType::Market, {}, std::abs(pos),
+                                                0.0, 0.0, 0.0, 0.0});
+                ctx.log(3, "protective stop rejected — flattening");
+            }
+        } else if (e.order_id == flatten_id_) {
+            flatten_id_ = 0;   // died; the time-stop path re-tries on a later tick
+        }
+    }
+
     void on_stop(IStrategyContext& ctx) noexcept override {
         ctx.log(1, "Scalper stopped");
     }

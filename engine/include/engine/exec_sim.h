@@ -28,6 +28,14 @@ struct ExecParams {
     uint64_t seed = 42;                  // deterministic latency jitter
 };
 
+// An order the simulator dropped, reported through take_cancels(). Carries the
+// symbol so the engine can route it without a lookup — bracket children have no
+// engine-side OrderRecord to look it up in.
+struct SimCancel {
+    uint64_t order_id;
+    uint32_t symbol_id;
+};
+
 class ExecSim {
 public:
     explicit ExecSim(const ExecParams& p = {}) { reset(p); }
@@ -36,6 +44,7 @@ public:
         params_ = p;
         rng_.seed(p.seed);
         pending_.clear();
+        cancels_.clear();
         next_id_ = 1;
     }
 
@@ -50,6 +59,18 @@ public:
 
     // Cancels everything; returns the cancelled ids (kill switch).
     std::vector<uint64_t> cancel_all();
+
+    // Every order the sim dropped since the last drain: an explicit cancel(),
+    // plus any OCO sibling that died with it or when its partner filled.
+    // NOTHING else reports these — unlike a real broker there is no cancel
+    // event, so a strategy tracking the id would wait on it forever (and the
+    // engine's order table would show it Working). cancel_all() is excluded:
+    // it hands its ids straight back to the caller.
+    std::vector<SimCancel> take_cancels() {
+        std::vector<SimCancel> out;
+        out.swap(cancels_);
+        return out;
+    }
 
     size_t open_orders() const { return pending_.size(); }
 
@@ -71,6 +92,7 @@ private:
     ExecParams params_;
     std::mt19937_64 rng_;
     std::vector<PendingOrder> pending_;
+    std::vector<SimCancel> cancels_;   // drained by take_cancels()
     uint64_t next_id_ = 1;
 };
 
