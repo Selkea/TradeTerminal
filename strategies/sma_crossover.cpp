@@ -58,9 +58,10 @@ public:
         if (prev_valid_ && entry_id_ == 0 && exit_id_ == 0) {
             const double pos = ctx.position(sym_).qty;
             if (prev_diff_ <= 0.0 && diff > 0.0 && pos <= 0.0) {
-                // Never buy more than the cash can carry.
+                // Never buy more than the risk budget carries (the engine caps
+                // the position there regardless).
                 const double qty =
-                    std::min(qty_, std::floor(ctx.cash() * 0.95 / bar.close));
+                    std::min(qty_, std::floor(ctx.budget(sym_) / bar.close));
                 if (qty >= 1.0)
                     entry_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Market,
                                                   {}, qty, 0.0, 0.0, 0.0, 0.0});

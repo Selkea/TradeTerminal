@@ -835,7 +835,9 @@ void App::pump_sweep() {
                 // hourly bars) that then barely trades on the live intraday feed.
                 // Both keep their manual values; only signal params are swept.
                 auto is_fixed = [](const std::string& n) {
-                    return n == "qty" || n == "max_qty" || n == "alloc_pct" ||
+                    return n == "qty" || n == "max_qty" || n == "budget_pct" ||
+                           n == "alloc_pct" ||   // pre-v3 name; kept so an old
+                                                 // saved value can't be swept
                            n == "risk_pct" || n == "enter_from_h" ||
                            n == "enter_until_h";
                 };
@@ -2552,9 +2554,29 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     // 20% drop, 2026-07-29).
     constexpr double kAdverseMove = 0.20;     // assume up to a 20% move against us
     constexpr double kLossBudgetFrac = 0.5;   // one trade risks <= half the budget
-    for (RiskLimits& rl : sym_risk)
-        if (rl.max_position_notional <= 0.0 && rl.daily_max_loss > 0.0)
-            rl.max_position_notional = kLossBudgetFrac * rl.daily_max_loss / kAdverseMove;
+    // With no daily-loss limit there is nothing to derive a cap from, but a live
+    // symbol must never be uncapped: strategies now size off this number
+    // (ctx.budget), so an absent cap would hand one position the whole paper
+    // account. Fall back to a fixed slice of session cash — the allocation
+    // these strategies shipped with before sizing moved onto the budget.
+    constexpr double kNoLimitAllocFrac = 0.20;
+    for (RiskLimits& rl : sym_risk) {
+        if (rl.max_position_notional > 0.0) continue;
+        rl.max_position_notional =
+            rl.daily_max_loss > 0.0
+                ? kLossBudgetFrac * rl.daily_max_loss / kAdverseMove
+                : kNoLimitAllocFrac * opts.session_cash;
+    }
+    // Sizing is invisible otherwise: the strategy asks for a qty, the engine
+    // may shrink it, and nothing says what the ceiling was. Name it per symbol
+    // so a "why is this position so small" question has an answer in the log.
+    for (size_t i = 0; i < syms.size(); ++i) {
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "live: %s position budget $%.0f%s",
+                      syms[i].c_str(), sym_risk[i].max_position_notional,
+                      sym_risk[i].daily_max_loss > 0.0 ? "" : " (no daily-loss limit set)");
+        route(buf);
+    }
 
     // Session default bar size (feed gap-backfill granularity);
     // each symbol still aggregates at its own size below.

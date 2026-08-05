@@ -14,9 +14,11 @@
 
 #include <ctime>
 
+// v3: IStrategyContext gained budget() — the sizing base every strategy must
+//     use instead of cash() (see below).
 // v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
 // OrdType gained Stop. Old DLLs are rejected by the version check.
-#define TT_SDK_VERSION 2u
+#define TT_SDK_VERSION 3u
 
 namespace tt {
 
@@ -43,6 +45,22 @@ public:
     virtual bool     cancel_order(uint64_t order_id) noexcept = 0;
     virtual Position position(uint32_t symbol_id) const noexcept = 0;
     virtual double   cash() const noexcept = 0;
+    // Dollars this strategy may put into ONE position in `symbol_id`.
+    //
+    // SIZE AGAINST THIS, NOT cash(). The risk manager caps every entry at a
+    // per-position notional (a slice of the daily loss budget) and silently
+    // shrinks anything larger, so a percentage of the raw account balance is
+    // not a size — it's a number that gets thrown away. On a $1M paper account
+    // against a $5k cap, "20% of cash" and "100% of cash" both come back as the
+    // same $5k order, which is what made every alloc_pct/risk_pct knob inert.
+    // budget() is the number the cap actually allows, so `budget * pct` is a
+    // size the engine will honour.
+    //
+    // Already net of a small cash reserve, so a 100% allocation still leaves
+    // room for fees and slippage. Falls back to cash when no cap is configured
+    // (a plain backtest). Reducing/closing orders are never capped — an exit
+    // can always leave, whatever budget() says.
+    virtual double   budget(uint32_t symbol_id) const noexcept = 0;
     // Engine time (backtest or real): epoch nanoseconds.
     virtual int64_t  now_ns() const noexcept = 0;
     // Interns a symbol string to the id used in events.

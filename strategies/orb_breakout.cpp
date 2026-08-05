@@ -141,7 +141,10 @@ public:
             range_h_ = h;
             const double cash = ctx.cash();
             double qty = std::floor(cash * (risk_pct_ / 100.0) / h);
-            qty = std::min(qty, std::floor(cash * 0.95 / range_hi_));
+            // Notional bound is the risk budget, not the raw balance: the engine
+            // caps the position there anyway, and the tp/stop legs below are
+            // sized off this qty, so they must match what will actually fill.
+            qty = std::min(qty, std::floor(ctx.budget(sym_) / range_hi_));
             qty = std::min(qty, max_qty_);
             if (qty < 1.0) return;
             long_stop_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Stop, {},

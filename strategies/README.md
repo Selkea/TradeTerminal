@@ -73,6 +73,31 @@ Limit orders set `OrdType::Limit` and the limit price; Stop orders set
 Params declared in `kParams` appear as editable fields in the UI and are read
 with `ctx.param("name", fallback)`.
 
+### Sizing: use `ctx.budget(sym)`, never `ctx.cash()`
+
+`ctx.budget(sym)` is the dollars allowed in **one** position. The risk manager
+caps every entry at a per-position notional (half the daily loss budget over an
+assumed 20% adverse move) and silently shrinks anything bigger, so a percentage
+of `cash()` is not a size — it's a number the engine discards. Against a $1M
+paper account and a $5k cap, `cash() * 0.20` and `cash() * 1.00` submit the same
+$5k order, which is exactly how `alloc_pct` sat dead in every strategy until
+SDK v3.
+
+```cpp
+double qty = std::floor(ctx.budget(sym_) * (budget_pct_ / 100.0) / price);
+```
+
+The knob is named `budget_pct` (not the pre-v3 `alloc_pct`) precisely because
+its meaning changed: a stored `alloc_pct: 20` was written to mean 20% of the
+account and would now silently mean 20% of a much smaller budget. A new name
+lets old configs fall through to the default instead of being reinterpreted.
+
+`budget()` already holds back a cash reserve for fees and slippage, so a 100%
+allocation is safe; it falls back to cash when no cap is configured (a plain
+backtest). `cash()` is still the right base for a **risk-per-share** knob
+("risk 0.5% of the account, stop 2 ATR away") — but bound the result by
+`budget() / price` so the qty you bracket is the qty you'll get.
+
 ## Rules (the ABI contract)
 
 1. **Reset everything in `on_init`** — the same instance may run many backtests.
