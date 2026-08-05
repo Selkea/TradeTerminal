@@ -162,7 +162,10 @@ private:
         const double per_share_risk = stop_atr_ * atr_;
         if (per_share_risk <= 0.0 || price <= 0.0) return;
         double qty = std::floor(cash * (risk_pct_ / 100.0) / per_share_risk);
-        qty = std::min(qty, std::floor(cash * 0.95 / price));  // never over-spend
+        // Notional bound is the risk budget, not the raw balance: the engine
+        // caps the position there anyway, and a stop sized off a qty the engine
+        // is about to shrink protects a position that was never placed.
+        qty = std::min(qty, std::floor(ctx.budget(sym_) / price));
         qty = std::min(qty, max_qty_);
         if (qty < 1.0) return;
         entry_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Market, {}, qty, 0.0,

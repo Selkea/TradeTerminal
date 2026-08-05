@@ -27,7 +27,7 @@ constexpr ParamDesc kParams[] = {
     {"exit_z", 0.25, 0, 3},        // exit at or above -exit_z
     {"time_stop", 12, 0, 500},     // max bars in trade (0 = off)
     {"trend_len", 200, 0, 1000},   // SMA trend filter (0 = off)
-    {"alloc_pct", 20, 1, 100},     // % of cash per entry
+    {"budget_pct", 100, 1, 100},   // % of the risk budget per entry (ctx.budget)
     {"max_qty", 5000, 1, 100000},  // hard share cap per position
     // Entry window, local hours (9.5 = 09:30). 0/24 = always; exits not gated.
     {"enter_from_h", 0, 0, 24},
@@ -43,7 +43,7 @@ public:
         exit_z_ = ctx.param("exit_z", 0.25);
         time_stop_ = static_cast<int>(ctx.param("time_stop", 12));
         trend_len_ = static_cast<int>(ctx.param("trend_len", 200));
-        alloc_pct_ = ctx.param("alloc_pct", 20);
+        budget_pct_ = ctx.param("budget_pct", 100);
         max_qty_ = ctx.param("max_qty", 5000);
         enter_from_h_ = ctx.param("enter_from_h", 0);
         enter_until_h_ = ctx.param("enter_until_h", 24);
@@ -114,8 +114,10 @@ public:
         const double hod = hour_of_day_local(bar.ts_ns);
         const bool time_ok = hod >= enter_from_h_ && hod < enter_until_h_;
         if (z <= -entry_z_ && trend_ok && time_ok) {
-            const double cash = ctx.cash();
-            double qty = std::floor(cash * (alloc_pct_ / 100.0) / bar.close);
+            // Size off the risk budget, not cash: the engine caps the position
+            // notional anyway, so a % of the account is a number it discards.
+            const double budget = ctx.budget(sym_);
+            double qty = std::floor(budget * (budget_pct_ / 100.0) / bar.close);
             qty = std::min(qty, max_qty_);
             if (qty < 1.0) return;
             entry_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Market, {}, qty,
@@ -147,7 +149,7 @@ public:
 
 private:
     int length_ = 20, time_stop_ = 12, trend_len_ = 200;
-    double entry_z_ = 2.0, exit_z_ = 0.25, alloc_pct_ = 20, max_qty_ = 5000;
+    double entry_z_ = 2.0, exit_z_ = 0.25, budget_pct_ = 100, max_qty_ = 5000;
     double enter_from_h_ = 0, enter_until_h_ = 24;
 
     uint32_t sym_ = 0;

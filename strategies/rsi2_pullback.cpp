@@ -25,7 +25,7 @@ constexpr ParamDesc kParams[] = {
     {"buy_below", 10, 1, 40},       // entry threshold
     {"exit_ma", 5, 2, 50},          // exit SMA (bars)
     {"trend_ma", 200, 20, 1000},    // regime SMA (bars)
-    {"alloc_pct", 25, 1, 100},      // % of cash per entry
+    {"budget_pct", 100, 1, 100},    // % of the risk budget per entry (ctx.budget)
     {"max_qty", 5000, 1, 100000},   // hard share cap per position
 };
 }
@@ -37,7 +37,7 @@ public:
         buy_below_ = ctx.param("buy_below", 10);
         exit_ma_ = static_cast<int>(ctx.param("exit_ma", 5));
         trend_ma_ = static_cast<int>(ctx.param("trend_ma", 200));
-        alloc_pct_ = ctx.param("alloc_pct", 25);
+        budget_pct_ = ctx.param("budget_pct", 100);
         max_qty_ = ctx.param("max_qty", 5000);
         if (rsi_len_ < 2) rsi_len_ = 2;
         if (exit_ma_ < 2) exit_ma_ = 2;
@@ -54,8 +54,8 @@ public:
 
         char buf[128];
         std::snprintf(buf, sizeof(buf),
-                      "RSI2: len=%d buy<%.0f exitMA=%d trendMA=%d alloc=%.0f%%",
-                      rsi_len_, buy_below_, exit_ma_, trend_ma_, alloc_pct_);
+                      "RSI2: len=%d buy<%.0f exitMA=%d trendMA=%d budget=%.0f%%",
+                      rsi_len_, buy_below_, exit_ma_, trend_ma_, budget_pct_);
         ctx.log(1, buf);
     }
 
@@ -106,8 +106,10 @@ public:
 
         if (entry_id_ != 0 || exit_id_ != 0) return;  // an order is in flight
         if (bar.close > trend_sum_ / trend_ma_ && rsi <= buy_below_) {
-            const double cash = ctx.cash();
-            double qty = std::floor(cash * (alloc_pct_ / 100.0) / bar.close);
+            // Size off the risk budget, not cash: the engine caps the position
+            // notional anyway, so a % of the account is a number it discards.
+            const double budget = ctx.budget(sym_);
+            double qty = std::floor(budget * (budget_pct_ / 100.0) / bar.close);
             qty = std::min(qty, max_qty_);
             if (qty < 1.0) return;
             entry_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Market, {}, qty,
@@ -135,7 +137,7 @@ public:
 
 private:
     int rsi_len_ = 2, exit_ma_ = 5, trend_ma_ = 200;
-    double buy_below_ = 10, alloc_pct_ = 25, max_qty_ = 5000;
+    double buy_below_ = 10, budget_pct_ = 100, max_qty_ = 5000;
 
     uint32_t sym_ = 0;
     std::vector<double> closes_;

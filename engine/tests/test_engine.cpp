@@ -546,6 +546,96 @@ TEST_CASE("live risk: notional cap down-sizes an oversized entry to fit the budg
     eng.stop_live();
 }
 
+namespace {
+// Sizes one entry as alloc_pct% of ctx.budget() — the sizing pattern every
+// shipped strategy uses. Records the budget it saw so the test can assert on
+// the number, not just on the resulting position.
+struct BudgetSizedStrat : IStrategy {
+    double alloc_pct;
+    int seen = 0;
+    bool sent = false;
+    std::atomic<double> saw_budget{-1};
+    explicit BudgetSizedStrat(double pct) : alloc_pct(pct) {}
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick& t) noexcept override {
+        if (sent || ++seen < 2) return;
+        const double b = ctx.budget(sid);
+        saw_budget = b;
+        const double qty = std::floor(b * (alloc_pct / 100.0) / t.price);
+        if (qty >= 1.0)
+            ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, qty, 0, 0, 0, 0});
+        sent = true;
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+// Runs one BudgetSizedStrat against a notional cap and returns the position it
+// ended up with (0 if it never filled).
+double run_sized(double alloc_pct, double cap, double cash = 1'000'000.0) {
+    Engine eng;
+    BudgetSizedStrat strat(alloc_pct);
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;   // no bars fire; assert on the on_tick path
+    cfg.initial_cash = cash;
+    cfg.risk.max_order_qty = 100'000;
+    cfg.risk.max_position_qty = 100'000;
+    cfg.risk.max_position_notional = cap;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty > 0.0; });
+    const double qty = eng.live_snapshot().symbols[0].position.qty;
+    eng.stop_live();
+    return qty;
+}
+} // namespace
+
+// The defect this pins: strategies sized off cash() and the engine then clamped
+// the order to the notional cap, so every allocation above the cap collapsed to
+// the same position and the knob did nothing. budget() hands them the cap up
+// front, so the percentage survives to the fill.
+TEST_CASE("sizing: alloc_pct off budget() actually moves the position size") {
+    // pump_until feeds AAA @ 50 and the cap is 5000 -> 100 shares is the ceiling.
+    CHECK(run_sized(100.0, 5'000.0) == doctest::Approx(100.0));
+    CHECK(run_sized(50.0, 5'000.0) == doctest::Approx(50.0));
+    CHECK(run_sized(25.0, 5'000.0) == doctest::Approx(25.0));
+}
+
+TEST_CASE("sizing: the same allocations off cash() would all collapse to the cap") {
+    // The pre-fix behaviour, reproduced through the engine's clamp: 100%, 50%
+    // and 25% of a $1M account are all far past a $5k cap, so all three arrive
+    // as the identical 100-share position. This is what made alloc_pct inert.
+    Engine eng;
+    for (double pct : {100.0, 50.0, 25.0}) {
+        OversizedBuyStrat strat(std::floor(1'000'000.0 * (pct / 100.0) / 50.0));
+        LiveConfig cfg;
+        cfg.symbols = {"AAA"};
+        cfg.bar_seconds = 100'000;
+        cfg.initial_cash = 1'000'000.0;
+        cfg.risk.max_order_qty = 100'000;
+        cfg.risk.max_position_qty = 100'000;
+        cfg.risk.max_position_notional = 5'000;
+        REQUIRE(eng.start_live(cfg, {&strat}));
+        pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty > 0.0; });
+        CHECK(eng.live_snapshot().symbols[0].position.qty == doctest::Approx(100.0));
+        eng.stop_live();
+    }
+}
+
+TEST_CASE("sizing: budget() falls back to cash when no notional cap is set") {
+    // A plain backtest configures no cap, so the budget is the account less the
+    // fee/slippage reserve: 100% of $10,000 * 0.95 / $50 = 190 shares.
+    CHECK(run_sized(100.0, 0.0, 10'000.0) == doctest::Approx(190.0));
+}
+
+TEST_CASE("sizing: budget() is bounded by cash even when the cap exceeds it") {
+    // Cap far above the account: cash, not the cap, has to bind — otherwise the
+    // order comes back rejected for buying power instead of down-sized.
+    CHECK(run_sized(100.0, 500'000.0, 10'000.0) == doctest::Approx(190.0));
+}
+
 // ---- live warmup replay ----------------------------------------------------
 // Live sessions only ever get bars from tick aggregation, so a strategy whose
 // lookback exceeds one session's worth of bars could never warm up. LiveConfig

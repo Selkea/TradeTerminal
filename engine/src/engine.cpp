@@ -167,6 +167,19 @@ public:
         return pf_.position(symbol_id);
     }
     double cash() const noexcept override { return pf_.cash(); }
+    // The sizing base (see IStrategyContext::budget). This is the same number
+    // clamp_to_notional() enforces, handed to the strategy up front so its
+    // percentage knobs mean something and its brackets are sized off the qty it
+    // will actually get. kCashReserve leaves room for fees/slippage so a 100%
+    // allocation can't trip the buying-power check on the fill.
+    double budget(uint32_t symbol_id) const noexcept override {
+        constexpr double kCashReserve = 0.95;
+        const double spendable = pf_.cash() * kCashReserve;
+        if (spendable <= 0.0) return 0.0;
+        const RiskLimits* rl = resolve_risk(symbol_id);
+        const double cap = rl ? rl->max_position_notional : 0.0;
+        return cap > 0.0 ? std::min(cap, spendable) : spendable;
+    }
     int64_t now_ns() const noexcept override { return now_(); }
 
     uint32_t symbol_id(const char* symbol) noexcept override {
