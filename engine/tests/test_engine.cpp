@@ -717,3 +717,54 @@ TEST_CASE("live warmup: reseed_symbol with no bars is a no-op") {
     CHECK(s.inits.load() == 1);
     eng.stop_live();
 }
+
+// ---- log origin tagging -----------------------------------------------------
+// Backtests and the live loop share one log queue. The UI has to file backtest
+// floods into the optimizer panel and live output into the console, and it used
+// to decide with a global "is anything optimizing?" test — which is true for
+// most of a trading day once a 30-minute autopilot is running, so live fills and
+// strategy lines were being buried in the optimizer log.
+TEST_CASE("log lines are tagged with the thread they came from") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    cfg.symbol_warmup = {seed(5, 10.0)};
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.bars.load() >= 5; }));
+
+    // Everything the live session emitted must be marked live.
+    std::string line;
+    bool from_live = false;
+    int live_lines = 0, other = 0;
+    bool saw_started = false;
+    while (eng.pop_log(line, from_live)) {
+        if (from_live) ++live_lines; else ++other;
+        if (line.find("BROKER trading") != std::string::npos ||
+            line.find("paper trading") != std::string::npos) {
+            saw_started = true;
+            CHECK(from_live);          // the session banner is live output
+        }
+        if (line.find("warmed on") != std::string::npos) CHECK(from_live);
+    }
+    CHECK(saw_started);
+    CHECK(live_lines > 0);
+    CHECK(other == 0);                 // nothing here came from a backtest
+    eng.stop_live();
+}
+
+TEST_CASE("the legacy single-argument pop_log still drains") {
+    Engine eng;
+    WarmupStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.inits.load() >= 1; }));
+    std::string line;
+    int n = 0;
+    while (eng.pop_log(line)) ++n;
+    CHECK(n > 0);
+    eng.stop_live();
+}
