@@ -179,6 +179,109 @@ TEST_CASE("orb: flattens on the clock even when session_min outlives the day") {
     s->destroy();
 }
 
+// ---- bollinger_reversion: "reverted" must mean the price came back ---------
+// z is a distance from a ROLLING mean, so it recovers either because the price
+// rose or because the mean fell to meet the price. Only the first is a
+// reversion. SPCH, 2026-08-05: bought 770 @ 6.49, price fell 6.3%, and the
+// strategy exited "reverted to band" at 6.08 for -$315.70 — reporting a failed
+// trade as a success.
+namespace {
+// Drives bollinger through a dip entry and then `after` more closes, returning
+// the orders it sent. length is deliberately short (5, as SPCH ran) so the mean
+// catches up to the price within a few bars.
+std::vector<OrderRequest> boll_run(const std::vector<double>& after,
+                                   bool fill_entry_at) {
+    IStrategy* s = make("bollinger_reversion.cpp");
+    FakeCtx ctx;
+    ctx.params["length"] = 5;
+    ctx.params["entry_z"] = 1.5;
+    ctx.params["exit_z"] = 0.58;
+    ctx.params["time_stop"] = 500;   // far away: isolate the reversion test
+    ctx.params["trend_len"] = 0;     // trend filter off
+    s->on_init(ctx);
+
+    int64_t ts = local_ts(2026, 8, 5, 10, 0);
+    auto bar = [&](double px) {
+        s->on_bar(ctx, 1, mk_bar(ts, px));
+        ts += 300LL * 1'000'000'000LL;
+    };
+    // Flat, steady, then a sharp drop -> z far below the mean -> entry.
+    for (int i = 0; i < 12; ++i) bar(100.0);
+    bar(96.0);
+    REQUIRE(ctx.sent.size() == 1);            // the entry went out
+    const double entry_px = 96.0;
+    ctx.sent.clear();
+    if (fill_entry_at) {
+        Fill f{1, 1, Side::Buy, {}, ts, entry_px, 10.0, 0.0};
+        ctx.pos = Position{1, 10.0, entry_px, 0.0, 0.0};
+        s->on_fill(ctx, f);
+    } else {
+        ctx.pos = Position{1, 10.0, entry_px, 0.0, 0.0};   // adopted: no fill seen
+    }
+    for (double px : after) bar(px);
+    const std::vector<OrderRequest> out = ctx.sent;
+    s->destroy();
+    return out;
+}
+} // namespace
+
+TEST_CASE("bollinger: does not call it a reversion when the mean fell to the price") {
+    // The SPCH shape: price drops, then STABILISES below the entry. The 5-bar
+    // mean walks down to meet it, z climbs back over -exit_z, and the pre-fix
+    // code sold here — underwater — calling it a reversion. (A price that keeps
+    // falling keeps z negative; it is the flattening that fakes the recovery.)
+    const auto orders = boll_run({95.5, 95.2, 95.0, 95.3, 95.1, 95.2, 95.0}, true);
+    CHECK(orders.empty());
+}
+
+TEST_CASE("bollinger: exits when the price genuinely recovers") {
+    // Positive control: same mechanism, but the price comes back above entry.
+    const auto orders = boll_run({97.0, 98.5, 99.5, 100.0, 100.5}, true);
+    REQUIRE(orders.size() >= 1);
+    CHECK(orders[0].side == Side::Sell);
+}
+
+TEST_CASE("bollinger: an adopted position still exits on z alone") {
+    // No fill of ours behind the position (hot restart adopted it), so there is
+    // no entry price to judge against — fall back to the old behaviour rather
+    // than hold something we cannot reason about.
+    const auto orders = boll_run({95.5, 95.2, 95.0, 95.3, 95.1, 95.2, 95.0}, false);
+    CHECK_FALSE(orders.empty());
+}
+
+TEST_CASE("bollinger: a stored time_stop of 0 is repaired, not obeyed") {
+    // The optimizer swept time_stop to 0 on SPCH. With no price stop by design,
+    // 0 leaves a losing position with nothing to close it at all.
+    IStrategy* s = make("bollinger_reversion.cpp");
+    FakeCtx ctx;
+    ctx.params["length"] = 5;
+    ctx.params["entry_z"] = 1.5;
+    ctx.params["exit_z"] = 0.58;
+    ctx.params["time_stop"] = 0;     // the value that shipped live
+    ctx.params["trend_len"] = 0;
+    s->on_init(ctx);
+
+    int64_t ts = local_ts(2026, 8, 5, 10, 0);
+    auto bar = [&](double px) {
+        s->on_bar(ctx, 1, mk_bar(ts, px));
+        ts += 300LL * 1'000'000'000LL;
+    };
+    for (int i = 0; i < 12; ++i) bar(100.0);
+    bar(96.0);
+    REQUIRE(ctx.sent.size() == 1);
+    Fill f{1, 1, Side::Buy, {}, ts, 96.0, 10.0, 0.0};
+    ctx.pos = Position{1, 10.0, 96.0, 0.0, 0.0};
+    s->on_fill(ctx, f);
+    ctx.sent.clear();
+
+    // Price never recovers, so only a time stop can close this. With the stored
+    // 0 obeyed it would ride forever; repaired to 12 bars it must exit.
+    for (int i = 0; i < 20; ++i) bar(90.0);
+    REQUIRE_FALSE(ctx.sent.empty());
+    CHECK(ctx.sent[0].side == Side::Sell);
+    s->destroy();
+}
+
 TEST_CASE("orb: the backstop does not fire before the close") {
     IStrategy* s = make("orb_breakout.cpp");
     FakeCtx ctx;
