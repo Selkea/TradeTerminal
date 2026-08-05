@@ -201,6 +201,43 @@ public:
         }
     }
 
+    void on_order_end(IStrategyContext& ctx, const OrderEnd& e) noexcept override {
+        if (e.order_id == long_stop_id_ || e.order_id == short_stop_id_) {
+            if (e.order_id == long_stop_id_) long_stop_id_ = 0;
+            else short_stop_id_ = 0;
+            // Both breakout stops died without ever triggering. armed_ latches
+            // for the session, so this is the difference between "ORB missed
+            // one entry" and "ORB produces nothing for the rest of the day".
+            // Bounded: a symbol that rejects every time must not be retried on
+            // every bar until the close.
+            if (!entered_ && !eod_done_ && long_stop_id_ == 0 &&
+                short_stop_id_ == 0 && rearms_ < kMaxRearms) {
+                ++rearms_;
+                armed_ = false;
+                ctx.log(2, "breakout orders died before triggering — re-arming");
+            }
+        } else if (e.order_id == prot_id_) {
+            prot_id_ = 0;
+            // A REJECTED protective stop leaves the position naked; re-arm at
+            // the same far range side. A cancelled one is cancel_all/OCO.
+            const Position p = ctx.position(sym_);
+            if (e.reason == OrderEndReason::Rejected && p.qty != 0.0) {
+                const double prot = p.qty > 0.0 ? range_lo_ : range_hi_;
+                prot_id_ = ctx.submit_order({sym_, p.qty > 0.0 ? Side::Sell : Side::Buy,
+                                             OrdType::Stop, {}, std::abs(p.qty), 0.0,
+                                             prot, 0.0, 0.0});
+                if (prot_id_ == 0)
+                    ctx.log(3, "protective stop rejected — position unprotected");
+            }
+        } else if (e.order_id == tp_id_) {
+            tp_id_ = 0;
+        } else if (e.order_id == flatten_id_) {
+            flatten_id_ = 0;
+            if (ctx.position(sym_).qty != 0.0)
+                ctx.log(3, "EOD flatten died — position still open");
+        }
+    }
+
     void on_stop(IStrategyContext& ctx) noexcept override {
         ctx.log(1, "ORB stopped");
     }
@@ -208,10 +245,15 @@ public:
     void destroy() noexcept override { delete this; }
 
 private:
+    // How many times a session may re-arm after its breakout orders died
+    // without triggering (see on_order_end).
+    static constexpr int kMaxRearms = 2;
+
     void reset_session() noexcept {
         bars_today_ = 0;
         range_hi_ = range_lo_ = range_h_ = 0.0;
         armed_ = entered_ = eod_done_ = false;
+        rearms_ = 0;
     }
 
     void cancel_all(IStrategyContext& ctx) noexcept {
@@ -232,6 +274,7 @@ private:
     int bars_today_ = 0;
     double range_hi_ = 0.0, range_lo_ = 0.0, range_h_ = 0.0;
     bool armed_ = false, entered_ = false, eod_done_ = false;
+    int rearms_ = 0;
     uint64_t long_stop_id_ = 0, short_stop_id_ = 0;
     uint64_t prot_id_ = 0, tp_id_ = 0, flatten_id_ = 0;
 };

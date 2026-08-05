@@ -141,6 +141,13 @@ public:
         }
     }
 
+    // Without this, one rejected order leaves entry_id_ set and the in-flight
+    // guard above blocks every later entry for the rest of the session.
+    void on_order_end(IStrategyContext&, const OrderEnd& e) noexcept override {
+        if (e.order_id == entry_id_) entry_id_ = 0;
+        else if (e.order_id == exit_id_) exit_id_ = 0;
+    }
+
     void on_stop(IStrategyContext& ctx) noexcept override {
         ctx.log(1, "BollRev stopped");
     }

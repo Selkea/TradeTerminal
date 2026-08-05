@@ -14,11 +14,13 @@
 
 #include <ctime>
 
+// v4: IStrategy gained on_order_end() — an order dying without filling is now
+//     reported (see below).
 // v3: IStrategyContext gained budget() — the sizing base every strategy must
 //     use instead of cash() (see below).
 // v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
 // OrdType gained Stop. Old DLLs are rejected by the version check.
-#define TT_SDK_VERSION 3u
+#define TT_SDK_VERSION 4u
 
 namespace tt {
 
@@ -80,6 +82,22 @@ public:
     virtual void on_bar(IStrategyContext& ctx, uint32_t symbol_id, const Bar& bar) noexcept = 0;
     virtual void on_tick(IStrategyContext& ctx, uint32_t symbol_id, const Tick& tick) noexcept = 0;
     virtual void on_fill(IStrategyContext& ctx, const Fill& fill) noexcept = 0;
+    // An order died without completing — rejected by the broker, cancelled from
+    // the UI, or dropped because its OCO sibling filled.
+    //
+    // ANY strategy that stores an order id MUST clear it here. Strategies gate
+    // new entries on "an order is in flight" (`if (entry_id_ != 0) return;`),
+    // and a dead id is never seen again in on_fill — so an unhandled death
+    // wedges that symbol silently for the rest of the session, until the next
+    // on_init. That failure mode looks exactly like "the strategy stopped
+    // signalling", with nothing in the log to explain it.
+    //
+    // Not pure: a strategy that only sends market orders it never tracks has
+    // nothing to do here. Default is a no-op, i.e. the pre-v4 behaviour.
+    virtual void on_order_end(IStrategyContext& ctx, const OrderEnd& e) noexcept {
+        (void)ctx;
+        (void)e;
+    }
     virtual void on_stop(IStrategyContext& ctx) noexcept = 0;
     // DLL-side `delete this` — the host never deletes strategy pointers.
     virtual void destroy() noexcept = 0;

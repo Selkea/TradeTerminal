@@ -150,6 +150,25 @@ public:
         }
     }
 
+    void on_order_end(IStrategyContext& ctx, const OrderEnd& e) noexcept override {
+        if (e.order_id == entry_id_) {
+            entry_id_ = 0;   // else the in-flight guard blocks every later entry
+        } else if (e.order_id == exit_id_) {
+            exit_id_ = 0;
+        } else if (e.order_id == stop_id_) {
+            const double px = stop_px_;
+            stop_id_ = 0;
+            stop_px_ = 0.0;
+            // A REJECTED protective stop leaves the position naked, so re-arm
+            // it once at the same price. A CANCELLED one was withdrawn on
+            // purpose (manage_long swaps it for a channel exit, or the UI
+            // pulled it) — re-placing would fight that.
+            const double pos = ctx.position(sym_).qty;
+            if (e.reason == OrderEndReason::Rejected && pos > 0.0)
+                place_stop(ctx, pos, px);   // logs level 3 if it fails again
+        }
+    }
+
     void on_stop(IStrategyContext& ctx) noexcept override {
         ctx.log(1, "Donchian stopped");
     }

@@ -475,6 +475,14 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
                                          f.qty, f.price, f.fee});
             strategy->on_fill(ctx, f);
         }
+        // Orders the sim dropped (an OCO sibling killed by the fill above, or
+        // anything on_fill cancelled). Backtests are where the optimizer grades
+        // every candidate, so a wedge that only fails live would never show up
+        // in a score — the callback has to fire here too.
+        for (const SimCancel& c : exec.take_cancels())
+            strategy->on_order_end(ctx, OrderEnd{c.order_id, c.symbol_id,
+                                                 OrderEndReason::Cancelled, {},
+                                                 clock.now_ns(), 0, {}});
         pf.mark(ev.symbol_id, price);
 
         if (ev.type == static_cast<uint16_t>(EvType::Tick)) {
@@ -597,6 +605,10 @@ void Engine::run_replay(ReplayConfig cfg, IStrategy* strategy) {
                                          f.qty, f.price, f.fee});
             strategy->on_fill(ctx, f);
         }
+        for (const SimCancel& c : exec.take_cancels())   // see run_backtest
+            strategy->on_order_end(ctx, OrderEnd{c.order_id, c.symbol_id,
+                                                 OrderEndReason::Cancelled, {},
+                                                 clock.now_ns(), 0, {}});
         pf.mark(ev.symbol_id, price);
 
         Tick t{ev.ts_event_ns, price, ev.u.tick.size, ev.u.tick.bid, ev.u.tick.ask};
@@ -972,6 +984,45 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             }
     };
 
+    // An order left the book without completing. Strategies store in-flight
+    // order ids and gate new entries on them ("an order is in flight, wait"),
+    // and a dead id never appears in on_fill — so a death nobody reports wedges
+    // that symbol until the next on_init, i.e. the whole session, silently.
+    // Gated exactly like apply_fill: submit_order has no halt knowledge, so a
+    // halted/held/reconciling strategy must not be woken here either.
+    auto notify_order_end = [&](uint64_t id, uint32_t sid, OrderEndReason reason,
+                                int32_t code) {
+        if (id == 0) return;
+        if (sid == 0)   // sim cancels carry the symbol; broker events may not
+            for (const auto& o : orders)
+                if (o.id == id) {
+                    sid = o.symbol_id;
+                    break;
+                }
+        if (sid < 1 || sid > n_sym) return;   // e.g. a sim bracket child
+        if (halted || adopt_hold[sid - 1] || strat_halted[sid - 1] || reconciling)
+            return;
+        if (IStrategy* s = strat_for(sid)) {
+            ctx.set_current_symbol(sid);
+            s->on_order_end(ctx, OrderEnd{id, sid, reason, {}, rt.now_ns(), code, {}});
+        }
+    };
+
+    // The simulator has no cancel event, so every order it drops (an explicit
+    // cancel, or an OCO sibling going with it) surfaces only here. Marks the
+    // order table too — without this a strategy-cancelled order shows Working
+    // in the blotter forever.
+    auto drain_sim_cancels = [&] {
+        for (const SimCancel& c : exec.take_cancels()) {
+            for (auto& o : orders)
+                if (o.id == c.order_id && o.status == OrderStatus::Working) {
+                    o.status = OrderStatus::Cancelled;
+                    orders_dirty = true;
+                }
+            notify_order_end(c.order_id, c.symbol_id, OrderEndReason::Cancelled, 0);
+        }
+    };
+
     // Kill-switch behavior, shared by the manual command and automated risk
     // halts: cancel everything, flatten, halt the strategy.
     auto kill_all = [&](const std::string& why) {
@@ -1241,6 +1292,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                             orders_dirty = true;
                         }
                     push_log("live: cancelled order #" + std::to_string(c.order_id));
+                    drain_sim_cancels();   // and tell the strategy its id died
                 }
                 break;
             case LiveCmd::Kill:
@@ -1329,6 +1381,13 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                         line += rr.message + "]";
                     }
                     push_log(line);
+                    // Tell the owning strategy before reacting below: this is
+                    // the only notice it gets that the id is dead, and the
+                    // protective-reject path may halt the symbol immediately.
+                    notify_order_end(bev.u.order.order_id, bev.symbol_id,
+                                     rejected ? OrderEndReason::Rejected
+                                              : OrderEndReason::Cancelled,
+                                     rejected ? rr.code : 0);
                     // Naked-position safety net: a protective stop rejected by the
                     // broker leaves the position it guarded exposed. Flatten that
                     // symbol at market and halt just it (the broker sets symbol_id
@@ -1453,6 +1512,10 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 fills.clear();
                 exec.on_price(sid, price, now, fills);
                 for (const Fill& f : fills) apply_fill(f);
+                // Before on_tick: a strategy deciding on stale in-flight state
+                // is exactly the wedge this exists to prevent. Catches the OCO
+                // sibling this fill just killed, and anything on_fill cancelled.
+                drain_sim_cancels();
             }
             pf.mark(sid, price);
 
@@ -1465,6 +1528,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     guarded(sid, [&] { s->on_tick(ctx, sid, t); });
                 }
             roll_bar(sid, ev.ts_event_ns, price);
+            if (!broker) drain_sim_cancels();   // cancels made inside on_tick/on_bar
             check_risk();
             if (halted) publish();          // a risk halt must surface instantly
             else publish_throttled(now);

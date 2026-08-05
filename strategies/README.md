@@ -73,6 +73,34 @@ Limit orders set `OrdType::Limit` and the limit price; Stop orders set
 Params declared in `kParams` appear as editable fields in the UI and are read
 with `ctx.param("name", fallback)`.
 
+### If you store an order id, you MUST implement `on_order_end`
+
+`on_fill` is not the only way an order ends. It can be rejected by the broker,
+cancelled from the UI, or dropped because its OCO sibling filled — and in none
+of those cases does the id ever reach `on_fill`. A strategy that gates entries
+on an in-flight id and only clears it in `on_fill`:
+
+```cpp
+if (entry_id_ != 0) return;                 // "an order is in flight, wait"
+```
+
+stops trading that symbol **for the rest of the session** the first time an
+order dies, with nothing in the log to explain it. Clear the id:
+
+```cpp
+void on_order_end(IStrategyContext&, const OrderEnd& e) noexcept override {
+    if (e.order_id == entry_id_) entry_id_ = 0;
+    else if (e.order_id == exit_id_) exit_id_ = 0;
+}
+```
+
+`e.reason` separates the two cases, and they want opposite responses. A
+**Rejected** protective stop leaves a live position naked — re-arm it, or get
+flat. A **Cancelled** one was withdrawn deliberately (by your own
+`cancel_order`, by an OCO partner filling, or from the UI), so re-placing it
+fights whoever cancelled it. `e.code` carries the broker's reject code when
+there is one.
+
 ### Sizing: use `ctx.budget(sym)`, never `ctx.cash()`
 
 `ctx.budget(sym)` is the dollars allowed in **one** position. The risk manager
