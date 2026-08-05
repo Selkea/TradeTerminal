@@ -101,7 +101,17 @@ public:
         // End of day: pull every resting order, flatten, stay out.
         if (bar_sec_ > 0) {
             const double minutes = bars_today_ * bar_sec_ / 60.0;
-            if (minutes >= session_min_ - eod_min_) {
+            // Counted bars OR the clock. The count is only as good as
+            // session_min: set above the real session length it never trips and
+            // the position rides overnight — an intraday strategy holding
+            // through the close, from one bad parameter. The clock backstop
+            // cannot be pushed past the close by any value. Intraday bars only
+            // (a daily bar has no meaningful time of day), and it only ever
+            // ADDS a flatten, so a session that legitimately ends earlier is
+            // unaffected. Assumes an Eastern-time box, as US RTH gates do.
+            const bool by_clock =
+                bar_sec_ < 23 * 3600 && hour_of_day_local(bar.ts_ns) >= kEodBackstopH;
+            if (minutes >= session_min_ - eod_min_ || by_clock) {
                 if (!eod_done_) {
                     eod_done_ = true;
                     entered_ = true;  // no re-arming today
@@ -248,6 +258,10 @@ private:
     // How many times a session may re-arm after its breakout orders died
     // without triggering (see on_order_end).
     static constexpr int kMaxRearms = 2;
+
+    // Hard EOD flatten time (local), regardless of session_min/eod_min: 15:54,
+    // matching the default eod_min of 5 minutes before a 16:00 US close.
+    static constexpr double kEodBackstopH = 15.9;
 
     void reset_session() noexcept {
         bars_today_ = 0;

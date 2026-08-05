@@ -11,6 +11,32 @@
 
 namespace tt::ui {
 
+// Parameters the optimizer must NOT sweep, whatever a strategy declares.
+//
+// Two kinds, both of which the sweep would happily ruin:
+//
+//  - SIZING (qty, max_qty, budget_pct, risk_pct). Not signal. Optimizing size
+//    just maximizes leverage — the simulator obliges, the risk manager doesn't.
+//    (alloc_pct is budget_pct's pre-SDK-v3 name; kept so a value left in an old
+//    config can't be swept either.)
+//  - SESSION SHAPE (enter_from_h, enter_until_h, session_min, eod_min). A
+//    policy choice or a fact about the market, not something to discover from
+//    price. Sweeping a trading window overfits to whatever slice the backtest
+//    got lucky on and then barely trades live.
+//
+// session_min/eod_min were the leak: they are ORB's session window, they were
+// missing from this list, and on 2026-08-05 SNXX was live with session_min
+// 185.45 / eod_min 30.68 — an optimizer-invented 155-minute day that stopped
+// trading the symbol around noon. Worse in the other direction: session_min
+// swept ABOVE the real session means the bar-count EOD flatten never trips and
+// the position rides overnight (orb_breakout carries a clock backstop for
+// exactly that, but the parameter should never have been tunable).
+inline bool sweep_param_is_fixed(const std::string& n) {
+    return n == "qty" || n == "max_qty" || n == "budget_pct" ||
+           n == "alloc_pct" || n == "risk_pct" || n == "enter_from_h" ||
+           n == "enter_until_h" || n == "session_min" || n == "eod_min";
+}
+
 // Automatic optimizer: coordinate descent over a strategy's declared
 // parameters — each pass sweeps every param 1-D across its range (others
 // fixed at the best so far), a second pass refines in a narrower window,
