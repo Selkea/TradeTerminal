@@ -13,6 +13,7 @@
 
 #include "engine/ack_latency.h"
 #include "engine/version.h"
+#include "net/feed_order.h"   // which symbol may lose tick-by-tick
 
 #include <nlohmann/json.hpp>
 
@@ -1872,9 +1873,19 @@ std::string App::build_diag_json() {
         const bool naked = ss.position.qty != 0.0 && !has_working_stop(ss.symbol);
         e["unprotected"] = naked;
         if (naked) ++unprotected;
+        // Params come from the ENGINE, not from cfg_.trade_symbols. The Trade
+        // tab's copy is overwritten by every crowned champion, while the live
+        // engine only takes one when autopilot's improvement test passes — so
+        // the terminal's copy is a PROPOSAL and reporting it as live state was
+        // how /diag came to show parameters that were never trading. When the
+        // two disagree, say so rather than picking one silently.
+        e["params"] = ss.params;
         if (const TradeSymbol* ts = strat_for(ss.symbol)) {
             e["strategy"] = ts->strat_key.empty() ? "built-in SMA" : ts->strat_key;
-            e["params"] = ts->params;
+            if (!engine_.live_running() || ss.params.empty())
+                e["params"] = ts->params;   // not live yet: config is all there is
+            else if (ts->params != ss.params)
+                e["params_proposed"] = ts->params;   // queued/rejected, NOT trading
         }
         syms.push_back(std::move(e));
     }
@@ -2509,7 +2520,14 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     auto tight = [](double cur, double v) {
         return v > 0 && (cur == 0 || v < cur) ? v : cur;
     };
-    for (const auto& so : opts.symbols) {
+    // The feed subscribes in this order, and IBKR's tick-by-tick cap means the
+    // tail of the list falls back to sampled quotes. Put the strategies that
+    // only read bar closes there (see feed_order.h) instead of leaving it to
+    // whatever order the lineup happened to produce.
+    std::vector<TradePanel::SymbolOpt> ordered = opts.symbols;
+    order_by_feed_fidelity(ordered,
+                           [](const TradePanel::SymbolOpt& s) { return s.strat_key; });
+    for (const auto& so : ordered) {
         syms.push_back(so.symbol);
         sym_bars.push_back(so.bar_seconds);
         sym_accts.push_back(so.account);

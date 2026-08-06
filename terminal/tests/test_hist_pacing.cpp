@@ -6,6 +6,48 @@
 // succeeded.
 #include "doctest.h"
 
+#include "net/feed_order.h"
+
+#include <string>
+#include <vector>
+
+// ---- feed fidelity ordering ------------------------------------------------
+TEST_CASE("feed order: close-only strategies take the sampled slots") {
+    using tt::ui::feed_fidelity_rank;
+    // Tick-driven needs the tape most.
+    CHECK(feed_fidelity_rank("scalper_burst.cpp") <
+          feed_fidelity_rank("orb_breakout.cpp"));
+    // High/low readers beat close-only readers.
+    CHECK(feed_fidelity_rank("orb_breakout.cpp") <
+          feed_fidelity_rank("bollinger_reversion.cpp"));
+    CHECK(feed_fidelity_rank("donchian_trend.cpp") <
+          feed_fidelity_rank("rsi2_pullback.cpp"));
+    // An unclassified strategy must NOT be demoted into the sampled slot.
+    CHECK(feed_fidelity_rank("something_new.cpp") <
+          feed_fidelity_rank("bollinger_reversion.cpp"));
+    // The built-in ("") reads closes only.
+    CHECK(feed_fidelity_rank("") == feed_fidelity_rank("sma_crossover.cpp"));
+}
+
+TEST_CASE("feed order: sorting is stable and puts close-only last") {
+    struct S {
+        std::string sym, key;
+    };
+    // The live 2026-08-05 lineup, in the order it actually ran.
+    std::vector<S> v{{"SNXX", "orb_breakout.cpp"},  {"MUU", "orb_breakout.cpp"},
+                     {"SOXS", "orb_breakout.cpp"},  {"SNDQ", "rsi2_pullback.cpp"},
+                     {"AMIX", "orb_breakout.cpp"},  {"SPCH", "bollinger_reversion.cpp"}};
+    tt::ui::order_by_feed_fidelity(v, [](const S& s) { return s.key; });
+    // Every high/low reader ahead of every close-only one...
+    CHECK(v[0].sym == "SNXX");
+    CHECK(v[1].sym == "MUU");
+    CHECK(v[2].sym == "SOXS");
+    CHECK(v[3].sym == "AMIX");   // was 5th; promoted past the close-only pair
+    // ...and the close-only pair keeps its original relative order.
+    CHECK(v[4].sym == "SNDQ");
+    CHECK(v[5].sym == "SPCH");
+}
+
 #include "net/hist_pacing.h"
 
 using namespace tt::net;

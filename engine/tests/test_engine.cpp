@@ -793,6 +793,41 @@ TEST_CASE("sizing: budget() is bounded by cash even when the cap exceeds it") {
     CHECK(run_sized(100.0, 500'000.0, 10'000.0) == doctest::Approx(190.0));
 }
 
+// ---- the snapshot reports the params that are actually running -------------
+// /diag used to read the terminal's Trade-tab copy, which the optimizer
+// overwrites with every crowned champion whether or not the live engine took
+// it. That made /diag report parameter sets that were never trading — and it
+// misled a real diagnosis. The engine's own view is the only ground truth.
+TEST_CASE("live snapshot: per-symbol params reflect the engine, and follow a swap") {
+    Engine eng;
+    RecordingStrat strat;
+
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.symbol_params = {{{"alpha", 1.0}, {"beta", 2.0}}};
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    REQUIRE(pump_until(eng, [&] {
+        return !eng.live_snapshot().symbols[0].params.empty();
+    }));
+    {
+        const auto p = eng.live_snapshot().symbols[0].params;
+        CHECK(p.at("alpha") == doctest::Approx(1.0));
+        CHECK(p.at("beta") == doctest::Approx(2.0));
+    }
+
+    // A params update must show up as the new live set, not the old one.
+    eng.update_symbol_params(1, {{"alpha", 9.0}, {"beta", 8.0}});
+    CHECK(pump_until(eng, [&] {
+        const auto p = eng.live_snapshot().symbols[0].params;
+        const auto it = p.find("alpha");
+        return it != p.end() && it->second == 9.0;
+    }));
+    CHECK(eng.live_snapshot().symbols[0].params.at("beta") == doctest::Approx(8.0));
+
+    eng.stop_live();
+}
+
 // ---- live warmup replay ----------------------------------------------------
 // Live sessions only ever get bars from tick aggregation, so a strategy whose
 // lookback exceeds one session's worth of bars could never warm up. LiveConfig
