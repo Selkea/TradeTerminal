@@ -2521,7 +2521,22 @@ std::vector<tt::Bar> App::seed_bars(const std::string& symbol, int bar_sec) cons
     return out;
 }
 
-void App::start_live_session(const TradePanel::StartOpts& opts) {
+void App::start_live_session(const TradePanel::StartOpts& opts_in) {
+    // The feed subscribes in symbol order, and IBKR's tick-by-tick cap means
+    // the tail of the list falls back to sampled quotes, so order by what each
+    // symbol's strategy actually needs off the tape (see net/feed_order.h).
+    //
+    // Sort the INPUT, once, here. The session's symbol ids are positions in
+    // this list, and everything below — strategies, per-symbol params, risk
+    // limits, accounts, bar sizes — is built by iterating it. 0.9.0 sorted a
+    // separate copy and left the other loops on the original, so cfg.symbols
+    // was reordered while cfg.symbol_params and the strategy vector were not:
+    // AMIX ran ORB with RSI-2's parameters and SNDQ ran RSI-2 with ORB's.
+    // Reordering the one list every loop reads makes that impossible.
+    TradePanel::StartOpts opts = opts_in;
+    order_by_feed_fidelity(opts.symbols,
+                           [](const TradePanel::SymbolOpt& s) { return s.strat_key; });
+
     std::vector<std::string> syms;
     std::vector<int> sym_bars;
     std::vector<std::string> sym_accts;
@@ -2536,14 +2551,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     auto tight = [](double cur, double v) {
         return v > 0 && (cur == 0 || v < cur) ? v : cur;
     };
-    // The feed subscribes in this order, and IBKR's tick-by-tick cap means the
-    // tail of the list falls back to sampled quotes. Put the strategies that
-    // only read bar closes there (see feed_order.h) instead of leaving it to
-    // whatever order the lineup happened to produce.
-    std::vector<TradePanel::SymbolOpt> ordered = opts.symbols;
-    order_by_feed_fidelity(ordered,
-                           [](const TradePanel::SymbolOpt& s) { return s.strat_key; });
-    for (const auto& so : ordered) {
+    for (const auto& so : opts.symbols) {
         syms.push_back(so.symbol);
         sym_bars.push_back(so.bar_seconds);
         sym_accts.push_back(so.account);
@@ -2730,6 +2738,26 @@ void App::start_live_session(const TradePanel::StartOpts& opts) {
     if (!acq_ok) {
         for (const auto& l : new_leases) release_strategy(l);
         return;
+    }
+    // Everything above is built by index off one list, so a params/strategy
+    // mismatch is silent — the engine cannot tell that a set belongs to a
+    // different symbol, and ctx.param() just returns the fallback for every
+    // name the strategy asks for. 0.9.0 shipped exactly that. Catch it here:
+    // a param the strategy never declared can only have come from another
+    // symbol's set. Cheap, runs once per session, and names the symbol.
+    for (size_t i = 0; i < cfg.symbol_params.size() && i < opts.symbols.size(); ++i) {
+        const auto& so = opts.symbols[i];
+        const auto specs = strat_mgr_.param_specs(so.strat_key);
+        for (const auto& [name, val] : cfg.symbol_params[i]) {
+            if (name.rfind("__", 0) == 0) continue;   // engine overlays (__hold_losers)
+            const bool declared =
+                std::any_of(specs.begin(), specs.end(),
+                            [&](const auto& s) { return name == s.name; });
+            if (!declared)
+                route("live: WARNING " + so.symbol + " carries parameter '" + name +
+                      "' which " + strat_mgr_.display_name(so.strat_key) +
+                      " does not declare — parameter sets may be mismatched");
+        }
     }
     const int warm_bar_sec = cfg.bar_seconds;
     if (engine_.start_live(std::move(cfg), std::move(strategies))) {
