@@ -274,6 +274,9 @@ private:
     void pump_broker_watchdog();
     double broker_down_since_s_ = 0.0;       // GetTime when the broker first went down (0 = up)
     double broker_down_last_alert_s_ = 0.0;  // GetTime of the last down-alert (0 = none this episode)
+    void pump_orphan_watchdog();
+    double orphan_since_s_ = 0.0;            // GetTime an adopted position first showed up naked
+    double orphan_last_alert_s_ = 0.0;       // GetTime of the last orphan alert (0 = none)
 
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
