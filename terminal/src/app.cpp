@@ -2222,6 +2222,7 @@ void App::draw() {
     pump_lineup_swap();       // drive an in-progress live swap onto new picks
     pump_daily_lineup();
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
+    pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
 
     draw_menu_bar();
     draw_account_modal();
@@ -3257,6 +3258,68 @@ void App::pump_broker_watchdog() {
                             "s during a live session - check IB Gateway";
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);   // console/ /logs visibility; route() does not re-scan
+}
+
+// Orphaned-position watchdog.
+//
+// An ADOPTED position (hot restart, or a lineup swap re-homing a symbol) leaves
+// its strategy paused until the position goes flat, on the assumption that the
+// adopted broker-side stop/TP is what will close it. When no protective order
+// came across with it, that assumption is silently false: nothing closes it and
+// nothing is watching. SNXX sat like that from 10:00 on 2026-08-06 and lost
+// $846 by 15:05. The 0.10.0 engine backstop now flattens it at 15:57, but that
+// is hours of unmanaged exposure — this pages as soon as it is detectable.
+//
+// Deliberately narrower than "unprotected": Bollinger and RSI-2 hold their OWN
+// positions without a stop by design (they exit on a time stop), so a blanket
+// naked-position alert would cry wolf every session. adopted && no-stop is the
+// state that is always wrong.
+void App::pump_orphan_watchdog() {
+    static constexpr double kOrphanAlertSec = 120.0;    // let a restart settle
+    static constexpr double kOrphanReAlertSec = 900.0;  // re-page every 15 min
+    if (!engine_.live_running()) {
+        orphan_since_s_ = 0.0;
+        orphan_last_alert_s_ = 0.0;
+        return;
+    }
+    const LiveSnapshot s = engine_.live_snapshot();
+    auto has_working_stop = [&](uint32_t sid) {
+        for (const OrderRecord& o : s.orders)
+            if (o.symbol_id == sid && o.status == OrderStatus::Working &&
+                o.type == static_cast<uint8_t>(OrdType::Stop))
+                return true;
+        return false;
+    };
+    std::string orphans;
+    for (size_t i = 0; i < s.symbols.size(); ++i) {
+        const SymbolState& ss = s.symbols[i];
+        if (!ss.adopted || ss.position.qty == 0.0) continue;
+        if (has_working_stop(static_cast<uint32_t>(i + 1))) continue;
+        if (!orphans.empty()) orphans += ", ";
+        orphans += ss.symbol + " " +
+                   std::to_string(static_cast<long long>(ss.position.qty));
+    }
+    const double now = ImGui::GetTime();
+    if (orphans.empty()) {
+        if (orphan_last_alert_s_ != 0.0)
+            alerts_.notify(AlertNotifier::Warning,
+                           "positions: no orphaned positions left");
+        orphan_since_s_ = 0.0;
+        orphan_last_alert_s_ = 0.0;
+        return;
+    }
+    if (orphan_since_s_ == 0.0) orphan_since_s_ = now;
+    const double age_s = now - orphan_since_s_;
+    if (age_s < kOrphanAlertSec) return;
+    if (orphan_last_alert_s_ != 0.0 &&
+        now - orphan_last_alert_s_ < kOrphanReAlertSec)
+        return;
+    orphan_last_alert_s_ = now;
+    const std::string msg =
+        "WATCHDOG adopted position(s) with NO protective stop and a paused "
+        "strategy - nothing will close them: " + orphans;
+    alerts_.notify(AlertNotifier::Critical, msg);
+    route("alert: " + msg);
 }
 
 void App::refresh_ibkr_accounts() {

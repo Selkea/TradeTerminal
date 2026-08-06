@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <functional>
 
 namespace tt {
@@ -914,6 +915,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         for (size_t i = 0; i < n_sym; ++i) {
             snap_.symbols[i].last_price = last_price[i];
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
+            snap_.symbols[i].adopted = adopt_hold[i] != 0;
         }
         // Params change only at session start and on a swap, so copy the maps
         // then rather than on every publish.
@@ -1060,6 +1062,75 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             next_is_manual = false;
         }
         push_log("live: " + why + " — all orders cancelled, flattening, strategy halted");
+    };
+
+    // End-of-day backstop: nothing rides overnight unmanaged.
+    //
+    // Strategy-level EOD logic only ever covers the strategy that OPENED the
+    // position. A lineup swap re-homes a symbol onto a DIFFERENT strategy and
+    // pauses it via adopt_hold, so the position it inherits has nobody driving
+    // it flat — and if no protective order was adopted with it, nothing will
+    // ever close it. SNXX rode 8.35 -> 10.34 that way on 2026-08-06 while its
+    // new strategy sat paused waiting for a fill that could not come.
+    //
+    // Engine-level, so it applies to every symbol regardless of which strategy
+    // (if any) is running it. Deliberately LATER than the strategies' own EOD
+    // (ORB flattens at 15:54) and the UI's scheduled stop (15:55): this only
+    // fires when both of those already failed. Does NOT halt — a live session
+    // can span days (this one has), and halting here would kill tomorrow.
+    //
+    // Hold mode (disable_auto_halt) opts out: that setting exists to ride a
+    // position through rather than realise it, and this must not fight it.
+    constexpr double kEodBackstopH = 15.95;   // 15:57 local
+    int64_t eod_day = -1;
+    double eod_prev_h = -1.0;   // last hour-of-day seen; -1 = first observation
+    auto eod_backstop = [&] {
+        if (cfg.risk.disable_auto_halt) return;   // ride it through, by design
+        const std::time_t t = std::time(nullptr);
+        std::tm tm{};
+        localtime_s(&tm, &t);
+        const int64_t day = static_cast<int64_t>(tm.tm_year) * 400 + tm.tm_yday;
+        const double hod = tm.tm_hour + tm.tm_min / 60.0;
+        const double prev_h = eod_prev_h;
+        eod_prev_h = hod;
+        if (day == eod_day) return;   // already handled today
+        // EDGE-triggered: the session must have been running and watched the
+        // clock cross 15:57. A level trigger would flatten the instant the
+        // engine came up at, say, 16:10 — turning a restart into a liquidation
+        // of positions the user may well have meant to hold.
+        if (prev_h < 0.0 || prev_h >= kEodBackstopH || hod < kEodBackstopH) return;
+
+        bool any_pos = false;
+        for (size_t i = 0; i < n_sym && !any_pos; ++i)
+            any_pos = pf.position(static_cast<uint32_t>(i + 1)).qty != 0.0;
+        eod_day = day;          // mark done either way: don't re-check all evening
+        if (!any_pos) return;   // flat already — the normal path, stay quiet
+
+        if (broker) {
+            broker->cancel_all();
+            broker->flatten();
+            push_log("live: EOD BACKSTOP — open position(s) past 15:57 with no "
+                     "strategy closing them; broker cancel-all + flatten requested");
+            return;
+        }
+        for (uint64_t id : exec.cancel_all())
+            for (auto& o : orders)
+                if (o.id == id) {
+                    o.status = OrderStatus::Cancelled;
+                    orders_dirty = true;
+                }
+        for (size_t i = 0; i < n_sym; ++i) {
+            const uint32_t sid = static_cast<uint32_t>(i + 1);
+            const double pos = pf.position(sid).qty;
+            if (pos == 0.0) continue;
+            OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy,
+                           OrdType::Market, {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
+            next_is_manual = true;   // closing must always work
+            record_order(r, exec.submit(r, rt.now_ns()));
+            next_is_manual = false;
+        }
+        push_log("live: EOD BACKSTOP — open position(s) past 15:57 with no "
+                 "strategy closing them; cancelled + flattening");
     };
 
     // Automated halts: equity-based limits re-checked after every fill/tick.
@@ -1591,6 +1662,9 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     publish();
                 }
             }
+            // Same idle cadence: cheap (one localtime, then a day-stamp check
+            // short-circuits it for the rest of the day).
+            if (stale_due) eod_backstop();
         }
     }
 

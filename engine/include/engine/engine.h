@@ -168,6 +168,12 @@ struct SymbolState {
     // accepted it — so the two disagree exactly when a proposal was rejected,
     // and reading the terminal's copy reports a set that is not trading.
     std::map<std::string, double> params;
+    // This position came from the broker on connect (hot restart / lineup
+    // swap), not from a fill of ours, and its strategy is PAUSED until it goes
+    // flat. The adopted broker-side stop/TP is what exits it — so an adopted
+    // position with no working protective order has nothing that will ever
+    // close it, and no strategy watching. Surfaced so the terminal can page.
+    bool adopted = false;
 };
 
 // Live headroom to the session's automated equity halts, so a remote monitor
