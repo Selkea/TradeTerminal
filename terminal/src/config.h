@@ -122,6 +122,13 @@ struct AppConfig {
     std::string diag_control_token;
     // Which panels (View menu) were open; missing entry = the panel's default.
     std::map<std::string, bool> panels;
+    // Which log panel was last in front ("log" | "optlog"). Log Console and
+    // Optimizer Log share a dock node, and ImGui's own selected-tab memory is
+    // not enough: Build Output docks in the same node and comes and goes, and
+    // whenever the saved tab id is missing ImGui selects the LAST window
+    // submitted for that node — which is Optimizer Log. So it won every launch
+    // regardless of what was left open. Restored explicitly on startup.
+    std::string active_log;
     // Strategy panel: which strategies were loaded and each one's edited
     // parameter values — restored (rebuilt) on startup.
     std::vector<std::string> strategy_loaded;       // .cpp basenames to reload

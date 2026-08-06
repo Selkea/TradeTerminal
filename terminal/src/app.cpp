@@ -2400,8 +2400,24 @@ void App::draw() {
     if (show_blotter_) blotter_.draw(&show_blotter_);
     if (show_positions_) positions_.draw(&show_positions_);
     if (show_journal_) journal_panel_.draw(&show_journal_);
-    if (show_log_) log_.draw("Log Console", &show_log_);
-    if (show_opt_log_) opt_log_.draw("Optimizer Log", &show_opt_log_);
+    // Remember which of the two logs was in front (Begin reports false for a
+    // docked tab sitting behind another), then restore it once on startup —
+    // see Config::active_log for why ImGui's own tab memory isn't enough.
+    const bool log_front = show_log_ && log_.draw("Log Console", &show_log_);
+    const bool opt_front = show_opt_log_ && opt_log_.draw("Optimizer Log", &show_opt_log_);
+    if (log_front) cfg_.active_log = "log";
+    else if (opt_front) cfg_.active_log = "optlog";
+    if (log_focus_frames_ <= 2 && !cfg_.active_log.empty()) {
+        // Wait for frame 2: the windows must have been submitted once for their
+        // dock tabs to exist, or SetWindowFocus has nothing to select. Runs
+        // once, so it never fights the user changing tabs afterwards.
+        if (++log_focus_frames_ == 2) {
+            if (cfg_.active_log == "optlog" && show_opt_log_)
+                ImGui::SetWindowFocus("Optimizer Log");
+            else if (cfg_.active_log == "log" && show_log_)
+                ImGui::SetWindowFocus("Log Console");
+        }
+    }
 
 #ifdef TT_DEBUG
     // Debug menu (or TT_SIM_TICKS=1): synthesize a 2 Hz random walk for the
@@ -3585,9 +3601,16 @@ void App::setup_default_layout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Backtest", right);
     ImGui::DockBuilderDockWindow("Strategy", right);
     ImGui::DockBuilderDockWindow("Trade", right);
-    ImGui::DockBuilderDockWindow("Log Console", bottom);
     ImGui::DockBuilderDockWindow("Blotter", bottom);
     ImGui::DockBuilderDockWindow("Positions", bottom);
+    ImGui::DockBuilderDockWindow("Journal", bottom);
+    // Log Console last so it is the bottom node's selected tab on a first run:
+    // ImGui selects the newest tab added to a node, and the log is what you
+    // want in front. Optimizer Log and Build Output share the node but are
+    // docked ahead of it so neither takes the front on launch.
+    ImGui::DockBuilderDockWindow("Build Output", bottom);
+    ImGui::DockBuilderDockWindow("Optimizer Log", bottom);
+    ImGui::DockBuilderDockWindow("Log Console", bottom);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
