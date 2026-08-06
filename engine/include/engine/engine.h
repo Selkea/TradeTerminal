@@ -162,6 +162,12 @@ struct SymbolState {
     std::string symbol;
     double last_price = 0.0;
     Position position{};
+    // The parameters this symbol's strategy is ACTUALLY running, as the engine
+    // holds them. The terminal keeps its own copy in the Trade tab, which the
+    // optimizer overwrites with each champion whether or not the live engine
+    // accepted it — so the two disagree exactly when a proposal was rejected,
+    // and reading the terminal's copy reports a set that is not trading.
+    std::map<std::string, double> params;
 };
 
 // Live headroom to the session's automated equity halts, so a remote monitor

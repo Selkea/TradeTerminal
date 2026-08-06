@@ -797,6 +797,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
 
     std::vector<OrderRecord> orders;   // engine-thread master copy
     bool orders_dirty = true;          // snapshot copies the vector only on change
+    bool params_dirty = true;          // same, for the per-symbol param maps
     bool next_is_manual = false;
     auto symbol_name = [&](uint32_t symbol_id) -> std::string {
         return symbol_id > 0 && symbol_id <= cfg.symbols.size()
@@ -913,6 +914,13 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         for (size_t i = 0; i < n_sym; ++i) {
             snap_.symbols[i].last_price = last_price[i];
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
+        }
+        // Params change only at session start and on a swap, so copy the maps
+        // then rather than on every publish.
+        if (params_dirty) {
+            for (size_t i = 0; i < n_sym && i < cfg.symbol_params.size(); ++i)
+                snap_.symbols[i].params = cfg.symbol_params[i];
+            params_dirty = false;
         }
         if (fresh) snap_orders_ = std::move(fresh);
         snap_.ticks = ticks;
@@ -1194,7 +1202,10 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         }
         for (PendingSwap& s : ready) {
             const size_t i = s.symbol_id - 1;
-            if (!s.keep_params) cfg.symbol_params[i] = std::move(s.params);
+            if (!s.keep_params) {
+                cfg.symbol_params[i] = std::move(s.params);
+                params_dirty = true;   // republish what is actually running
+            }
             if (s.strategy) strategies[i] = s.strategy;
             if (!strategies[i]) continue;
             strat_halted[i] = 0;   // fresh start: watchdog halt lifted
