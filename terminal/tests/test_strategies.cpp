@@ -301,3 +301,127 @@ TEST_CASE("orb: the backstop does not fire before the close") {
     CHECK_FALSE(saw_flatten(ctx));
     s->destroy();
 }
+
+// ---- bracket sizing: cover the WHOLE position, not the first print ---------
+//
+// SNXX, 2026-08-06: one breakout order filled 526 shares in five prints
+// (100/150/100/100/76). The strategies zeroed the entry order id on the FIRST
+// fill and sized the protective pair off that fill's qty, so 426 shares were
+// naked from birth — and stayed naked when the 100-share stop later completed
+// in full. The log line read "SHORT 100 @ 8.36" while 526 were short.
+
+// Drive a strategy's entry order through `parts`, growing the position as a
+// real venue would, and return every order it submitted in response.
+std::vector<OrderRequest> fills_through(IStrategy* s, FakeCtx& ctx, uint64_t entry_id,
+                                        Side side, const std::vector<double>& parts,
+                                        double px, int64_t ts) {
+    const double dir = side == Side::Buy ? 1.0 : -1.0;
+    double filled = 0.0;
+    ctx.sent.clear();
+    for (double q : parts) {
+        filled += q;
+        ctx.pos = Position{1, dir * filled, px, 0.0, 0.0};
+        Fill f{};
+        f.order_id = entry_id;
+        f.symbol_id = 1;
+        f.side = side;
+        f.ts_ns = ts;
+        f.price = px;
+        f.qty = q;
+        s->on_fill(ctx, f);
+    }
+    return ctx.sent;
+}
+
+// The last order of `type` the strategy submitted — i.e. the leg left working.
+double last_qty_of(const std::vector<OrderRequest>& sent, OrdType type) {
+    double qty = 0.0;
+    for (const OrderRequest& r : sent)
+        if (r.type == type) qty = r.qty;
+    return qty;
+}
+
+TEST_CASE("orb: the bracket covers every partial of the entry, not just the first") {
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.params["allow_short"] = 1;
+    s->on_init(ctx);
+
+    // 15 minutes of 5-minute bars build the opening range; the next one arms
+    // the breakout pair.
+    int64_t ts = local_ts(2026, 8, 6, 9, 30);
+    for (int i = 0; i < 4; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 101.0 : 99.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    // Find the long breakout order by shape, not by position in the list.
+    uint64_t entry_id = 0;
+    for (size_t i = 0; i < ctx.sent.size(); ++i)
+        if (ctx.sent[i].side == Side::Buy && ctx.sent[i].type == OrdType::Stop)
+            entry_id = static_cast<uint64_t>(i + 1);   // FakeCtx ids run 1..N
+    REQUIRE(entry_id != 0);
+
+    const auto sent = fills_through(s, ctx, entry_id, Side::Buy,
+                                    {100, 150, 100, 100, 76}, 8.36, ts);
+    // The working stop and take-profit must both cover all 526 shares.
+    CHECK(last_qty_of(sent, OrdType::Stop) == doctest::Approx(526.0));
+    CHECK(last_qty_of(sent, OrdType::Limit) == doctest::Approx(526.0));
+    s->destroy();
+}
+
+TEST_CASE("orb: a single-print fill still places exactly one bracket") {
+    // Guard against the fix trading one bug for another: the common case must
+    // not churn cancel/replace cycles through the broker.
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["allow_short"] = 1;
+    s->on_init(ctx);
+
+    int64_t ts = local_ts(2026, 8, 6, 9, 30);
+    for (int i = 0; i < 4; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 101.0 : 99.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    uint64_t entry_id = 0;
+    for (size_t i = 0; i < ctx.sent.size(); ++i)
+        if (ctx.sent[i].side == Side::Buy && ctx.sent[i].type == OrdType::Stop)
+            entry_id = static_cast<uint64_t>(i + 1);
+    REQUIRE(entry_id != 0);
+
+    ctx.cancelled.clear();
+    const auto sent = fills_through(s, ctx, entry_id, Side::Buy, {526}, 8.36, ts);
+    CHECK(sent.size() == 2);            // one stop + one take-profit
+    CHECK(ctx.cancelled.size() == 1);   // only the untriggered breakout sibling
+    s->destroy();
+}
+
+TEST_CASE("donchian: the stop covers every partial of the entry") {
+    IStrategy* s = make("donchian_trend.cpp");
+    FakeCtx ctx;
+    ctx.params["entry_len"] = 3;
+    ctx.params["exit_len"] = 3;
+    ctx.params["atr_len"] = 3;
+    s->on_init(ctx);
+
+    // Rising closes: builds ATR + the channel, then breaks out and buys.
+    int64_t ts = local_ts(2026, 8, 6, 10, 0);
+    uint64_t entry_id = 0;
+    for (int i = 0; i < 12 && entry_id == 0; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, 100.0 + i * 2.0));
+        ts += 300LL * 1'000'000'000LL;
+        for (size_t k = 0; k < ctx.sent.size(); ++k)
+            if (ctx.sent[k].side == Side::Buy)
+                entry_id = static_cast<uint64_t>(k + 1);
+    }
+    REQUIRE(entry_id != 0);
+
+    const auto sent = fills_through(s, ctx, entry_id, Side::Buy, {40, 60, 50},
+                                    120.0, ts);
+    CHECK(last_qty_of(sent, OrdType::Stop) == doctest::Approx(150.0));
+    s->destroy();
+}

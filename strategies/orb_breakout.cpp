@@ -178,33 +178,39 @@ public:
             // Manual OCO on the entries: the untriggered side dies now.
             const uint64_t sibling = went_long ? short_stop_id_ : long_stop_id_;
             if (sibling) ctx.cancel_order(sibling);
+            // KEEP the entry id (in entry_ord_): a marketable breakout order
+            // fills in several partials and every one of them has to grow the
+            // bracket. Zeroing it here was what left 426 of SNXX's 526 shares
+            // naked on 2026-08-06 — see arm_bracket.
+            entry_ord_ = f.order_id;
             long_stop_id_ = short_stop_id_ = 0;
             entered_ = true;
-
-            // Exit pair: protective stop at the far range side, TP at tp_r
-            // range-heights from the breakout. Managed as manual OCO below.
-            const double prot = went_long ? range_lo_ : range_hi_;
-            const double tp = went_long ? f.price + tp_r_ * range_h_
-                                        : f.price - tp_r_ * range_h_;
-            const Side exit_side = went_long ? Side::Sell : Side::Buy;
-            prot_id_ = ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, f.qty,
-                                         0.0, prot, 0.0, 0.0});
-            tp_id_ = ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, f.qty,
-                                       tp, 0.0, 0.0, 0.0});
-            if (prot_id_ == 0)
-                ctx.log(3, "protective stop rejected — position unprotected");
+            arm_bracket(ctx);
             std::snprintf(buf, sizeof(buf), "%s %.0f @ %.2f, stop %.2f tp %.2f",
-                          went_long ? "LONG" : "SHORT", f.qty, f.price, prot, tp);
+                          went_long ? "LONG" : "SHORT", bracket_qty_, f.price,
+                          prot_px_, tp_px_);
             ctx.log(1, buf);
-        } else if (f.order_id == prot_id_) {
-            if (tp_id_) ctx.cancel_order(tp_id_);
-            prot_id_ = tp_id_ = 0;
-            std::snprintf(buf, sizeof(buf), "stopped out @ %.2f", f.price);
-            ctx.log(1, buf);
-        } else if (f.order_id == tp_id_) {
-            if (prot_id_) ctx.cancel_order(prot_id_);
-            prot_id_ = tp_id_ = 0;
-            std::snprintf(buf, sizeof(buf), "take profit @ %.2f", f.price);
+        } else if (f.order_id == entry_ord_) {
+            // A later partial of the same entry: the position just grew.
+            arm_bracket(ctx);
+            std::snprintf(buf, sizeof(buf), "entry filled to %.0f, bracket resized",
+                          bracket_qty_);
+            ctx.log(0, buf);
+        } else if (f.order_id == prot_id_ || f.order_id == tp_id_) {
+            const bool stopped = f.order_id == prot_id_;
+            if (std::abs(ctx.position(sym_).qty) > 0.0) {
+                // Partial exit. The filled leg still works its own remainder,
+                // but the sibling is now oversized — completing it would flip
+                // the position instead of closing it. Re-place it at live size.
+                resize_sibling(ctx, stopped);
+                return;
+            }
+            const uint64_t sibling = stopped ? tp_id_ : prot_id_;
+            if (sibling) ctx.cancel_order(sibling);
+            prot_id_ = tp_id_ = entry_ord_ = 0;
+            bracket_qty_ = 0.0;
+            std::snprintf(buf, sizeof(buf), "%s @ %.2f",
+                          stopped ? "stopped out" : "take profit", f.price);
             ctx.log(1, buf);
         } else if (f.order_id == flatten_id_) {
             flatten_id_ = 0;
@@ -230,15 +236,9 @@ public:
             prot_id_ = 0;
             // A REJECTED protective stop leaves the position naked; re-arm at
             // the same far range side. A cancelled one is cancel_all/OCO.
-            const Position p = ctx.position(sym_);
-            if (e.reason == OrderEndReason::Rejected && p.qty != 0.0) {
-                const double prot = p.qty > 0.0 ? range_lo_ : range_hi_;
-                prot_id_ = ctx.submit_order({sym_, p.qty > 0.0 ? Side::Sell : Side::Buy,
-                                             OrdType::Stop, {}, std::abs(p.qty), 0.0,
-                                             prot, 0.0, 0.0});
-                if (prot_id_ == 0)
-                    ctx.log(3, "protective stop rejected — position unprotected");
-            }
+            if (e.reason == OrderEndReason::Rejected &&
+                ctx.position(sym_).qty != 0.0)
+                arm_bracket(ctx);
         } else if (e.order_id == tp_id_) {
             tp_id_ = 0;
         } else if (e.order_id == flatten_id_) {
@@ -268,6 +268,8 @@ private:
         range_hi_ = range_lo_ = range_h_ = 0.0;
         armed_ = entered_ = eod_done_ = false;
         rearms_ = 0;
+        entry_ord_ = 0;
+        bracket_qty_ = 0.0;
     }
 
     void cancel_all(IStrategyContext& ctx) noexcept {
@@ -275,6 +277,58 @@ private:
             if (*id) ctx.cancel_order(*id);
             *id = 0;
         }
+        entry_ord_ = 0;
+        bracket_qty_ = 0.0;
+    }
+
+    // (Re)arm the protective pair so it covers the ENTIRE live position.
+    //
+    // Sizing off the fill is the trap: a marketable entry arrives as several
+    // partials, so the first one covers a fraction of what ends up open and
+    // the rest of the position never gets a stop at all. Size off the position
+    // and re-arm as each partial lands. Idempotent — a call that finds the
+    // bracket already the right size does nothing, so the common
+    // single-print fill still places exactly two orders.
+    void arm_bracket(IStrategyContext& ctx) noexcept {
+        const Position p = ctx.position(sym_);
+        const double qty = std::abs(p.qty);
+        if (qty <= 0.0) return;
+        if (prot_id_ != 0 && tp_id_ != 0 && qty == bracket_qty_) return;
+
+        const bool went_long = p.qty > 0.0;
+        // TP keys off the position's AVERAGE entry, not the first print, so a
+        // bracket rebuilt mid-fill targets the same edge the whole way up.
+        prot_px_ = went_long ? range_lo_ : range_hi_;
+        tp_px_ = went_long ? p.avg_price + tp_r_ * range_h_
+                           : p.avg_price - tp_r_ * range_h_;
+        const Side exit_side = went_long ? Side::Sell : Side::Buy;
+
+        if (prot_id_) ctx.cancel_order(prot_id_);
+        if (tp_id_) ctx.cancel_order(tp_id_);
+        prot_id_ = ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, qty, 0.0,
+                                     prot_px_, 0.0, 0.0});
+        tp_id_ = ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, qty,
+                                   tp_px_, 0.0, 0.0, 0.0});
+        bracket_qty_ = qty;
+        if (prot_id_ == 0)
+            ctx.log(3, "protective stop rejected — position unprotected");
+    }
+
+    // One protective leg partially filled: shrink the other to match what is
+    // actually still open. The filled leg is left alone — it is already
+    // working its own remainder, and cancelling a triggered stop races it.
+    void resize_sibling(IStrategyContext& ctx, bool stopped) noexcept {
+        const Position p = ctx.position(sym_);
+        const double qty = std::abs(p.qty);
+        uint64_t& sib = stopped ? tp_id_ : prot_id_;
+        if (sib == 0 || qty <= 0.0) return;
+        ctx.cancel_order(sib);
+        const Side exit_side = p.qty > 0.0 ? Side::Sell : Side::Buy;
+        sib = stopped ? ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, qty,
+                                          tp_px_, 0.0, 0.0, 0.0})
+                      : ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, qty,
+                                          0.0, prot_px_, 0.0, 0.0});
+        bracket_qty_ = qty;
     }
 
     double range_min_ = 15, tp_r_ = 2.0, risk_pct_ = 1.0;
@@ -291,6 +345,10 @@ private:
     int rearms_ = 0;
     uint64_t long_stop_id_ = 0, short_stop_id_ = 0;
     uint64_t prot_id_ = 0, tp_id_ = 0, flatten_id_ = 0;
+    // The triggered entry order, kept alive across its partials so each one
+    // can re-arm the bracket; and what that bracket currently covers.
+    uint64_t entry_ord_ = 0;
+    double bracket_qty_ = 0.0, prot_px_ = 0.0, tp_px_ = 0.0;
 };
 
 TT_STRATEGY(OrbBreakoutStrategy, "Opening Range Breakout", kParams)
