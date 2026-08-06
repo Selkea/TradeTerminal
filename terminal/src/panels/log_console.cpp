@@ -77,12 +77,12 @@ LogConsole::Slice LogConsole::slice_since(uint64_t since) {
     return out;
 }
 
-void LogConsole::draw(const char* title, bool* open) {
+bool LogConsole::draw(const char* title, bool* open) {
     const bool visible = ImGui::Begin(title, open);
     tab_drag_hint();
     if (!visible) {
         ImGui::End();
-        return;
+        return false;
     }
 
     if (ImGui::Button("Clear")) {
@@ -107,6 +107,7 @@ void LogConsole::draw(const char* title, bool* open) {
     }
     ImGui::EndChild();
     ImGui::End();
+    return true;
 }
 
 } // namespace tt::ui

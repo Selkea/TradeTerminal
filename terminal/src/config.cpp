@@ -101,6 +101,7 @@ AppConfig AppConfig::load(const std::string& path) {
     if (j.contains("panels") && j["panels"].is_object())
         for (const auto& [k, v] : j["panels"].items())
             if (v.is_boolean()) c.panels[k] = v.get<bool>();
+    c.active_log = j.value("active_log", c.active_log);
     if (j.contains("strategy_loaded") && j["strategy_loaded"].is_array())
         for (const auto& s : j["strategy_loaded"])
             if (s.is_string()) c.strategy_loaded.push_back(s.get<std::string>());
@@ -190,6 +191,7 @@ void AppConfig::save(const std::string& path) const {
     j["diag_control_enabled"] = diag_control_enabled;
     j["diag_control_token"] = diag_control_token;
     j["panels"] = panels;
+    j["active_log"] = active_log;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;
     j["strategy_tourn_excluded"] = strategy_tourn_excluded;

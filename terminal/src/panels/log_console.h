@@ -18,7 +18,11 @@ public:
     void set_log_file(std::string path);
 
     void add(std::string line);
-    void draw(const char* title, bool* open);
+    // Returns true when this window was actually VISIBLE this frame — for a
+    // docked window that means its tab is the selected one, since ImGui::Begin
+    // reports false for a tab sitting behind another. The app uses it to
+    // remember which log the user last had in front.
+    bool draw(const char* title, bool* open);
 
     // Monotonic view of the ring for the diagnostics /logs endpoint: every line
     // carries an increasing id so a remote poller can request "everything since

@@ -451,6 +451,9 @@ private:
 
     bool had_ini_ = false;
     bool layout_checked_ = false;
+    // Frames drawn since launch, capped — used to restore Config::active_log on
+    // frame 2, once the log windows' dock tabs exist.
+    int log_focus_frames_ = 0;
     bool autorun_bt_done_ = false;
     bool autorun_sweep_done_ = false;
     bool show_chart_ = true;
