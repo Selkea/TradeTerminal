@@ -76,8 +76,9 @@ public:
         atr_ = 0.0;
         tr_sum_ = 0.0;
         tr_n_ = 0;
-        entry_id_ = stop_id_ = exit_id_ = 0;
+        entry_id_ = stop_id_ = exit_id_ = entry_ord_ = 0;
         stop_px_ = 0.0;
+        stop_qty_ = 0.0;
         highest_close_ = 0.0;
 
         char buf[128];
@@ -131,16 +132,35 @@ public:
 
     void on_fill(IStrategyContext& ctx, const Fill& f) noexcept override {
         char buf[128];
-        if (f.order_id == entry_id_) {
+        if (f.order_id == entry_id_ || f.order_id == entry_ord_) {
+            // entry_ord_ outlives entry_id_ so the LATER partials of the same
+            // order still re-size the stop; sizing off one fill leaves the rest
+            // of the position naked (see orb_breakout.cpp::arm_bracket).
+            const bool first = f.order_id == entry_id_;
+            entry_ord_ = f.order_id;
             entry_id_ = 0;
-            highest_close_ = f.price;
-            place_stop(ctx, f.qty, f.price - stop_atr_ * atr_);
-            std::snprintf(buf, sizeof(buf), "entry %.0f @ %.2f, stop %.2f",
-                          f.qty, f.price, stop_px_);
-            ctx.log(1, buf);
+            if (first) highest_close_ = f.price;
+            const Position p = ctx.position(sym_);
+            const double qty = std::abs(p.qty);
+            if (qty > 0.0 && qty != stop_qty_) {
+                if (stop_id_) ctx.cancel_order(stop_id_);
+                stop_id_ = 0;
+                place_stop(ctx, qty, p.avg_price - stop_atr_ * atr_);
+            }
+            if (first) {
+                std::snprintf(buf, sizeof(buf), "entry %.0f @ %.2f, stop %.2f",
+                              qty, f.price, stop_px_);
+                ctx.log(1, buf);
+            }
         } else if (f.order_id == stop_id_) {
+            // Only retire the stop once the position is actually gone —
+            // otherwise manage_long sees stop_id_ == 0 with shares still open
+            // and stacks a SECOND stop on top of the working remainder.
+            if (std::abs(ctx.position(sym_).qty) > 0.0) return;
             stop_id_ = 0;
             stop_px_ = 0.0;
+            stop_qty_ = 0.0;
+            entry_ord_ = 0;
             std::snprintf(buf, sizeof(buf), "stopped out %.0f @ %.2f", f.qty, f.price);
             ctx.log(1, buf);
         } else if (f.order_id == exit_id_) {
@@ -196,6 +216,7 @@ private:
         if (px <= 0.0 || qty <= 0.0) return;
         stop_id_ = ctx.submit_order({sym_, Side::Sell, OrdType::Stop, {}, qty, 0.0,
                                      px, 0.0, 0.0});
+        stop_qty_ = stop_id_ ? qty : 0.0;
         stop_px_ = stop_id_ ? px : 0.0;
         if (stop_id_ == 0) ctx.log(3, "protective stop rejected — position unprotected");
     }
@@ -241,6 +262,9 @@ private:
     double prev_close_ = 0.0, atr_ = 0.0, tr_sum_ = 0.0;
     int tr_n_ = 0;
     uint64_t entry_id_ = 0, stop_id_ = 0, exit_id_ = 0;
+    // Entry order kept alive across its partials, and the qty the stop covers.
+    uint64_t entry_ord_ = 0;
+    double stop_qty_ = 0.0;
     double stop_px_ = 0.0, highest_close_ = 0.0;
 };
 

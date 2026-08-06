@@ -60,7 +60,8 @@ public:
 
         sym_ = 0;
         window_.clear();
-        entry_id_ = tp_id_ = sl_id_ = flatten_id_ = 0;
+        entry_id_ = tp_id_ = sl_id_ = flatten_id_ = entry_ord_ = 0;
+        bracket_qty_ = 0.0;
         entered_ns_ = 0;
         cooldown_until_ns_ = 0;
 
@@ -137,29 +138,30 @@ public:
 
     void on_fill(IStrategyContext& ctx, const Fill& f) noexcept override {
         char buf[128];
-        if (f.order_id == entry_id_) {
+        if (f.order_id == entry_id_ || f.order_id == entry_ord_) {
+            // Keep entry_ord_ across the partials: sizing the bracket off a
+            // single fill covers only that print and leaves the rest of the
+            // position naked (see arm_bracket).
+            const bool first = f.order_id == entry_id_;
+            entry_ord_ = f.order_id;
             entry_id_ = 0;
-            entered_ns_ = ctx.now_ns();
-            // Exit pair around the actual fill price (manual OCO in on_fill).
-            const double tp = entry_long_ ? f.price * (1.0 + tp_bps_ / 10'000.0)
-                                          : f.price * (1.0 - tp_bps_ / 10'000.0);
-            const double sl = entry_long_ ? f.price * (1.0 - sl_bps_ / 10'000.0)
-                                          : f.price * (1.0 + sl_bps_ / 10'000.0);
-            const Side exit_side = entry_long_ ? Side::Sell : Side::Buy;
-            sl_id_ = ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, f.qty,
-                                       0.0, sl, 0.0, 0.0});
-            tp_id_ = ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, f.qty,
-                                       tp, 0.0, 0.0, 0.0});
-            if (sl_id_ == 0)
-                ctx.log(3, "protective stop rejected — position unprotected");
-            std::snprintf(buf, sizeof(buf), "in %.0f @ %.2f, tp %.2f sl %.2f", f.qty,
-                          f.price, tp, sl);
-            ctx.log(1, buf);
+            if (first) entered_ns_ = ctx.now_ns();
+            arm_bracket(ctx);
+            if (first) {
+                std::snprintf(buf, sizeof(buf), "in %.0f @ %.2f, tp %.2f sl %.2f",
+                              bracket_qty_, f.price, tp_px_, sl_px_);
+                ctx.log(1, buf);
+            }
         } else if (f.order_id == sl_id_ || f.order_id == tp_id_) {
             const bool stopped = f.order_id == sl_id_;
+            if (std::abs(ctx.position(sym_).qty) > 0.0) {
+                resize_sibling(ctx, stopped);   // partial exit — see orb_breakout
+                return;
+            }
             const uint64_t sibling = stopped ? tp_id_ : sl_id_;
             if (sibling) ctx.cancel_order(sibling);
-            tp_id_ = sl_id_ = 0;
+            tp_id_ = sl_id_ = entry_ord_ = 0;
+            bracket_qty_ = 0.0;
             entered_ns_ = 0;
             cooldown_until_ns_ =
                 ctx.now_ns() + static_cast<int64_t>(cooldown_s_ * 1e9);
@@ -217,6 +219,48 @@ private:
             if (*id) ctx.cancel_order(*id);
             *id = 0;
         }
+        entry_ord_ = 0;
+        bracket_qty_ = 0.0;
+    }
+
+    // Cover the whole live position, re-arming as each entry partial lands.
+    // See the long note in orb_breakout.cpp — same defect, same shape.
+    void arm_bracket(IStrategyContext& ctx) noexcept {
+        const Position p = ctx.position(sym_);
+        const double qty = std::abs(p.qty);
+        if (qty <= 0.0) return;
+        if (sl_id_ != 0 && tp_id_ != 0 && qty == bracket_qty_) return;
+
+        const bool went_long = p.qty > 0.0;
+        tp_px_ = went_long ? p.avg_price * (1.0 + tp_bps_ / 10'000.0)
+                           : p.avg_price * (1.0 - tp_bps_ / 10'000.0);
+        sl_px_ = went_long ? p.avg_price * (1.0 - sl_bps_ / 10'000.0)
+                           : p.avg_price * (1.0 + sl_bps_ / 10'000.0);
+        const Side exit_side = went_long ? Side::Sell : Side::Buy;
+
+        if (sl_id_) ctx.cancel_order(sl_id_);
+        if (tp_id_) ctx.cancel_order(tp_id_);
+        sl_id_ = ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, qty, 0.0,
+                                   sl_px_, 0.0, 0.0});
+        tp_id_ = ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, qty,
+                                   tp_px_, 0.0, 0.0, 0.0});
+        bracket_qty_ = qty;
+        if (sl_id_ == 0)
+            ctx.log(3, "protective stop rejected — position unprotected");
+    }
+
+    void resize_sibling(IStrategyContext& ctx, bool stopped) noexcept {
+        const Position p = ctx.position(sym_);
+        const double qty = std::abs(p.qty);
+        uint64_t& sib = stopped ? tp_id_ : sl_id_;
+        if (sib == 0 || qty <= 0.0) return;
+        ctx.cancel_order(sib);
+        const Side exit_side = p.qty > 0.0 ? Side::Sell : Side::Buy;
+        sib = stopped ? ctx.submit_order({sym_, exit_side, OrdType::Limit, {}, qty,
+                                          tp_px_, 0.0, 0.0, 0.0})
+                      : ctx.submit_order({sym_, exit_side, OrdType::Stop, {}, qty,
+                                          0.0, sl_px_, 0.0, 0.0});
+        bracket_qty_ = qty;
     }
 
     double window_s_ = 3, burst_bps_ = 8, tp_bps_ = 10, sl_bps_ = 8;
@@ -229,6 +273,9 @@ private:
     std::deque<std::pair<int64_t, double>> window_;   // (engine ns, price)
     bool entry_long_ = false;
     uint64_t entry_id_ = 0, tp_id_ = 0, sl_id_ = 0, flatten_id_ = 0;
+    // Entry order kept alive across its partials, and what the bracket covers.
+    uint64_t entry_ord_ = 0;
+    double bracket_qty_ = 0.0, tp_px_ = 0.0, sl_px_ = 0.0;
     int64_t entered_ns_ = 0, cooldown_until_ns_ = 0;
 };
 
