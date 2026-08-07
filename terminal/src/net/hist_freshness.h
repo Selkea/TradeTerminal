@@ -40,6 +40,20 @@ struct StaleBars {
     bool ever = false;    // false = no bar set has EVER arrived for this symbol
 };
 
+// A symbol the watchdog is entitled to expect refreshes for, together with the
+// cadence that is supposed to deliver them.
+//
+// The cadence is per SYMBOL and not one figure for the lineup. 0.12.0 took a
+// single grace off the slowest armed symbol, which lets one neighbour on a
+// 240-minute re-optimize cadence stretch the threshold for everybody to 12
+// hours: replay 2026-08-07 into that lineup and SOXS sits 284 minutes stale
+// inside a 720-minute grace, so the outage this watchdog exists for pages
+// nobody, all session, for the whole lineup.
+struct WatchedSymbol {
+    std::string symbol;
+    double refresh_interval_min = 0;   // this symbol's own autopilot cadence
+};
+
 // Grace period before stale bars are worth paging about, from the refresh
 // cadence that is supposed to keep them fresh.
 //
@@ -103,28 +117,42 @@ public:
         return worst;
     }
 
-    // Symbols past `grace_ms`, worst first. A symbol that has NEVER been
-    // answered is not healthy — the failure can just as easily start before a
-    // symbol's first refresh lands — so it is aged from `session_ms`, how long
+    // Symbols past their OWN grace period, worst first. A symbol that has NEVER
+    // been answered is not healthy — the failure can just as easily start before
+    // a symbol's first refresh lands — so it is aged from `session_ms`, how long
     // the live session has been running. That is also what makes the grace
     // period double as a settle-in window at session start.
-    std::vector<StaleBars> stale(const std::vector<std::string>& symbols,
+    std::vector<StaleBars> stale(const std::vector<WatchedSymbol>& watched,
                                  const std::string& interval, int64_t now_ms,
-                                 int64_t grace_ms, int64_t session_ms) const {
+                                 int64_t session_ms) const {
         std::vector<StaleBars> out;
         {
             std::lock_guard<std::mutex> g(mu_);
-            for (const std::string& s : symbols) {
-                const auto it = last_.find(key(s, interval));
+            for (const WatchedSymbol& w : watched) {
+                const auto it = last_.find(key(w.symbol, interval));
                 const bool ever = it != last_.end();
                 const int64_t age = ever ? now_ms - it->second : session_ms;
-                if (age > grace_ms) out.push_back({s, age, ever});
+                if (age > bar_stale_grace_ms(w.refresh_interval_min))
+                    out.push_back({w.symbol, age, ever});
             }
         }
         for (size_t i = 1; i < out.size(); ++i)   // tiny n (a lineup is <10)
             for (size_t j = i; j > 0 && out[j].age_ms > out[j - 1].age_ms; --j)
                 std::swap(out[j], out[j - 1]);
         return out;
+    }
+
+    // Forget every delivery. Freshness belongs to a live SESSION, not to the
+    // process: stale() ages an answered symbol absolutely, and the settle-in
+    // window covers only symbols that have never been answered, so a delivery
+    // carried over from a session that has since stopped reads as hours of
+    // staleness on the first frame of the next one. The terminal is meant to
+    // stay up across the nightly 15:55 stop / 09:25 start, so that is the
+    // ordinary case rather than a corner. Called every idle frame, so it must
+    // stay cheap on an already-empty map.
+    void clear() {
+        std::lock_guard<std::mutex> g(mu_);
+        last_.clear();
     }
 
 private:

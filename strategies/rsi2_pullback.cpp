@@ -243,22 +243,37 @@ public:
     void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
 
     void on_fill(IStrategyContext& ctx, const Fill& f) noexcept override {
+        // The engine applies the fill BEFORE calling us, so this is the position
+        // as it stands AFTER this print — which is what says whether the order
+        // behind it is finished.
+        const Position p = ctx.position(f.symbol_id);
         if (f.order_id == entry_id_) {
             entry_id_ = 0;
             bars_held_ = 0;
-        } else if (f.order_id == exit_id_) {
+        } else if (f.order_id == exit_id_ && p.qty <= 0.0) {
+            // Clear the in-flight guard only once the exit has actually CLOSED
+            // the position. A market order arrives in pieces (SNXX filled 526
+            // shares in five prints, 2026-08-06) and every print lands here, so
+            // clearing on the first one re-opens the exit branch on the next bar
+            // while the rest of the same order is still working at the broker.
+            // `time_stop` is what makes that fatal: bars_held_ only ever grows,
+            // so unlike the old `close > SMA(exit_ma)` test the condition never
+            // goes false again, and the next bar submits a SECOND market sell
+            // for the residual. Both fill and the account is left SHORT — a
+            // state on_bar's `pos > 0.0` branch cannot see, let alone exit, and
+            // one neither risk_ok nor clamp_to_notional blocks, because they
+            // score the position they can see and not the sell still working.
+            // on_order_end below still clears the id when the order DIES without
+            // completing, which is the case that legitimately needs a resubmit.
             exit_id_ = 0;
         }
-        // Read the basis back off the portfolio instead of trusting f.price. The
-        // engine applies the fill BEFORE calling us, so avg_price is the average
-        // across every print of the entry — and a market order does arrive in
-        // pieces (SNXX filled 526 shares in five, 2026-08-06), which would leave
-        // the profit gate measuring against whichever print landed last. It also
-        // keeps the basis alive through a PARTIAL exit; dropping it there would
-        // read as "adopted" and quietly ungate the shares still open. Flat means
-        // no basis, which is the adopted path and is correct — there is nothing
-        // left to measure.
-        const Position p = ctx.position(f.symbol_id);
+        // Read the basis back off the portfolio instead of trusting f.price:
+        // avg_price is the average across every print of the entry, which would
+        // otherwise leave the profit gate measuring against whichever print
+        // landed last. It also keeps the basis alive through a PARTIAL exit;
+        // dropping it there would read as "adopted" and quietly ungate the
+        // shares still open. Flat means no basis, which is the adopted path and
+        // is correct — there is nothing left to measure.
         entry_px_ = p.qty > 0.0 ? p.avg_price : 0.0;
     }
 

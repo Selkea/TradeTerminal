@@ -432,7 +432,14 @@ App::App(std::string gateway_url)
         // this is the sole signal that can see the 2026-08-07 stall. No source
         // sets `cached` on delivery today, but if one ever replays a cache
         // instead of asking IB it must not count as proof the session works.
-        if (!b.cached) hist_fresh_.record(b.symbol, b.interval, steady_ms());
+        // Nor does an EMPTY delivery: on the ibkr_web route a gateway that has
+        // lost the conid's market-data entitlement answers 200 with
+        // {"data":[]}, ibkr_parse_history_bars accepts it, and the batch that
+        // reaches here carries no candles at all. Counting that as a refresh
+        // would reset the metric on the very failure it exists to catch, while
+        // the tournament scores nothing and seed_bars re-seeds nothing.
+        if (!b.cached && !b.candles.empty())
+            hist_fresh_.record(b.symbol, b.interval, steady_ms());
         start_pending_backtest(b);
         stash_pending_sweep(b);
         collect_lineup_bars(b);   // before the move: needs b.candles
@@ -3414,33 +3421,47 @@ std::string App::traded_bar_interval() const {
 // would be a new way to stop trading on a metric that has never run in anger.
 void App::pump_history_watchdog() {
     static constexpr double kHistStaleReAlertSec = 1800.0;   // re-page every 30 min
-    // Only autopilot-armed symbols have a refresh cadence at all: after the
-    // start-of-session warmup fetch, nothing else re-requests a live symbol's
-    // bars (the tick stream feeds the engine directly). An unarmed symbol is
-    // stale forever by design, so including it would page every session.
-    if (!engine_.live_running() || ap_.syms.empty()) {
+    if (!engine_.live_running()) {
+        // Only a delivery that lands DURING the session counts. Freshness was
+        // process-lifetime, and stale() ages an answered symbol absolutely while
+        // the settle-in window covers only never-answered ones — so yesterday's
+        // 15:32 delivery reads as ~17 hours of staleness on the first frame of
+        // the 09:25 auto-start, and the warmup fetch does not clear it either
+        // (start_live_session skips that whenever seed_bars finds something, and
+        // series_ still holds the previous session's bars in memory). That is
+        // two Critical pages every morning telling the operator to go and check
+        // a perfectly healthy gateway. Clearing on every idle frame rather than
+        // on the stop edge also covers a fetch made while nothing was trading —
+        // a chart pull or the daily lineup's 1d pass — which would otherwise
+        // hand the next session an age it never earned.
+        hist_fresh_.clear();
         hist_live_since_s_ = 0.0;
         hist_stale_last_alert_s_ = 0.0;
         return;
     }
     const double now = ImGui::GetTime();
     if (hist_live_since_s_ == 0.0) hist_live_since_s_ = now;
+    if (ap_.syms.empty()) return;
 
-    // One grace for the session, off the SLOWEST configured cadence, so a mixed
-    // lineup is judged by the symbol that refreshes least often rather than
-    // paging on the fastest one's schedule.
-    double slowest_min = 0.0;
-    std::vector<std::string> watched;
+    // Watch only what something is actually supposed to refresh. After the
+    // start-of-session warmup fetch, the autopilot's optimize cycle is the only
+    // thing that re-requests a live symbol's bars (the tick stream feeds the
+    // engine directly) — and pump_autopilot starts a cycle on a TIMER only for
+    // trigger 0 ("Timer") or 2 ("Both"). A symbol armed on "Drawdown" alone is
+    // therefore exactly as stale-by-design as an unarmed one and would page
+    // every session; the Trade panel does not even show its interval_min, so
+    // that field is not a cadence to size a grace off either. Each watched
+    // symbol carries its own (see net::WatchedSymbol).
+    std::vector<net::WatchedSymbol> watched;
     watched.reserve(ap_.syms.size());
     for (const Autopilot::Sym& S : ap_.syms) {
         if (S.mode <= 0) continue;
-        watched.push_back(S.symbol);
-        slowest_min = std::max(slowest_min, S.interval_min);
+        if (S.trigger != 0 && S.trigger != 2) continue;   // no timer, no cadence
+        watched.push_back({S.symbol, S.interval_min});
     }
     if (watched.empty()) return;
-    const int64_t grace_ms = net::bar_stale_grace_ms(slowest_min);
     const auto stale = hist_fresh_.stale(
-        watched, traded_bar_interval(), steady_ms(), grace_ms,
+        watched, traded_bar_interval(), steady_ms(),
         static_cast<int64_t>((now - hist_live_since_s_) * 1000.0));
 
     if (stale.empty()) {

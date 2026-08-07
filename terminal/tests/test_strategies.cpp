@@ -300,6 +300,106 @@ TEST_CASE("rsi2: the time stop is not queued behind the trend warmup") {
     s->destroy();
 }
 
+// ---- rsi2: a partly-filled exit is one order, not two ---------------------
+// The time stop is a LATCHED condition — bars_held_ only ever grows, so unlike
+// the old `close > SMA(exit_ma)` test it never goes false again once it fires.
+// Combined with clearing exit_id_ on the FIRST print of a partial fill (a market
+// order does arrive in pieces: SNXX filled 526 shares in five, 2026-08-06), the
+// next bar re-entered the exit branch while the rest of the same order was still
+// working and sold the residual a second time. Both halves fill and the account
+// is left SHORT — and on_bar's only position branch is `pos > 0.0`, so nothing
+// in this strategy can ever see that position, let alone close it.
+
+namespace {
+
+// Drive rsi2 to a time-stop exit it cannot avoid: our own fill at 125.00 on a
+// tape parked at 124.00, so the profit gate never opens and the MA test never
+// fires. Leaves the exit order working and returns the strategy mid-exit.
+IStrategy* rsi2_at_time_stop(FakeCtx& ctx, int64_t& ts) {
+    IStrategy* s = make("rsi2_pullback.cpp");
+    ctx.params["rsi_len"] = 2;
+    ctx.params["buy_below"] = 40;
+    ctx.params["exit_ma"] = 5;
+    ctx.params["trend_ma"] = 20;
+    ctx.params["min_gain_cps"] = 3;
+    ctx.params["time_stop"] = 3;
+    s->on_init(ctx);
+
+    ctx.pos = Position{1, 40.0, 125.0, 0.0, 0.0};
+    // Order id 99 matches neither entry_id_ nor exit_id_ (both 0 here), so this
+    // only does what the engine's entry fill does for the profit gate: hand the
+    // strategy its basis back off the portfolio.
+    s->on_fill(ctx, Fill{99, 1, Side::Buy, {}, 0, 125.0, 40.0, 0.0});
+
+    ts = local_ts(2026, 8, 7, 10, 0);
+    for (int i = 0; i < 3; ++i) {   // bars_held_ 1, 2, 3 -> time stop
+        s->on_bar(ctx, 1, mk_bar(ts, 124.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    REQUIRE(ctx.sent.size() == 1);
+    CHECK(ctx.sent[0].side == Side::Sell);
+    CHECK(ctx.sent[0].qty == 40.0);
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("rsi2: a half-filled exit is not resubmitted as a second sell") {
+    FakeCtx ctx;
+    int64_t ts = 0;
+    IStrategy* s = rsi2_at_time_stop(ctx, ts);
+    const uint64_t exit_id = 1;   // FakeCtx hands out ids from 1
+
+    // IBKR fills 20 of the 40 and leaves the rest working across the bar.
+    ctx.pos = Position{1, 20.0, 125.0, 0.0, 0.0};
+    s->on_fill(ctx, Fill{exit_id, 1, Side::Sell, {}, ts, 125.0, 20.0, 0.0});
+    ctx.sent.clear();
+
+    s->on_bar(ctx, 1, mk_bar(ts, 124.0));
+    CHECK(ctx.sent.empty());
+    s->destroy();
+}
+
+TEST_CASE("rsi2: an exit that dies without filling is resubmitted") {
+    // Positive control: holding the guard past a partial fill must not turn a
+    // rejected or cancelled exit into a position nothing ever closes again.
+    FakeCtx ctx;
+    int64_t ts = 0;
+    IStrategy* s = rsi2_at_time_stop(ctx, ts);
+    ctx.sent.clear();
+
+    s->on_order_end(ctx, OrderEnd{1, 1, OrderEndReason::Rejected, {}, ts, 201, 0});
+    s->on_bar(ctx, 1, mk_bar(ts, 124.0));
+    REQUIRE(ctx.sent.size() == 1);
+    CHECK(ctx.sent[0].side == Side::Sell);
+    CHECK(ctx.sent[0].qty == 40.0);
+    s->destroy();
+}
+
+TEST_CASE("rsi2: the exit guard is released once the position is closed") {
+    // The other half of the invariant — the guard is keyed on the position, so
+    // the final print must clear it or the strategy could never trade again.
+    FakeCtx ctx;
+    int64_t ts = 0;
+    IStrategy* s = rsi2_at_time_stop(ctx, ts);
+
+    ctx.pos = Position{1, 20.0, 125.0, 0.0, 0.0};
+    s->on_fill(ctx, Fill{1, 1, Side::Sell, {}, ts, 125.0, 20.0, 0.0});
+    ctx.pos = Position{1, 0.0, 0.0, 0.0, 0.0};
+    s->on_fill(ctx, Fill{1, 1, Side::Sell, {}, ts, 125.0, 20.0, 0.0});
+    ctx.sent.clear();
+
+    // Flat and unguarded: a fresh entry signal is taken. Same pullback series
+    // the entry tests use — a rise that ends in the two-bar dip RSI(2) reads.
+    for (double p : pullback_series()) {
+        s->on_bar(ctx, 1, mk_bar(ts, p));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    REQUIRE(ctx.sent.size() == 1);
+    CHECK(ctx.sent[0].side == Side::Buy);
+    s->destroy();
+}
+
 // ---- orb_breakout: the EOD flatten backstop -------------------------------
 // The bar-count EOD test is only as good as session_min. Swept above the real
 // session length it never trips, and an intraday strategy holds through the
