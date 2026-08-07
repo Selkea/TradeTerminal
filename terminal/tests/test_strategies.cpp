@@ -147,6 +147,159 @@ TEST_CASE("rsi2: the window is ignored on daily bars") {
     CHECK(rsi2_orders_from(0, 0, 86'400) == 1);
 }
 
+// ---- rsi2: an exit with no smoothing and no P&L term ----------------------
+// SPCH, 2026-08-07: 8 round trips, $88.11 gross, $53.54 IBKR commission — 60.8%
+// of gross — on $79,986 of turnover against a position that never exceeded
+// ~$5,000, netting $34.57. One round trip bought 642 @ 7.78 at 13:30:13 and
+// sold the same 642 @ 7.78 ten minutes later: $0.00 gross, $6.65 paid. Two
+// defects fed it. exit_ma was optimized to its floor of 2, where
+// `close > SMA(exit_ma)` reduces exactly to `close[t] > close[t-1]` — exit on
+// any single up bar. And the exit never looked at the entry price at all, so
+// nothing required a trade to clear its own fees before being closed.
+
+namespace {
+
+// Feed rsi2 `px` while it already holds a position it did not open — adopted,
+// so there is no entry price of ours and the profit gate is out of the picture.
+// Isolates the exit-MA test itself.
+std::vector<OrderRequest> rsi2_ma_exit(double exit_ma, const std::vector<double>& px) {
+    IStrategy* s = make("rsi2_pullback.cpp");
+    FakeCtx ctx;
+    ctx.params["rsi_len"] = 2;
+    ctx.params["exit_ma"] = exit_ma;
+    ctx.params["trend_ma"] = 2;      // no warmup standing between us and the exit
+    ctx.params["time_stop"] = 500;   // far away: isolate the MA test
+    s->on_init(ctx);
+
+    ctx.pos = Position{1, 100.0, 0.0, 0.0, 0.0};   // adopted: no fill of ours
+    int64_t ts = local_ts(2026, 8, 7, 10, 0);
+    for (double p : px) {
+        s->on_bar(ctx, 1, mk_bar(ts, p));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    const std::vector<OrderRequest> out = ctx.sent;
+    s->destroy();
+    return out;
+}
+
+// Drive rsi2 through a real entry so it has a fill of its own behind the
+// position, then feed `after` and return what it submitted in response.
+// fill_entry false withholds the fill, leaving the position adopted.
+std::vector<OrderRequest> rsi2_after_entry(const std::vector<double>& after,
+                                           double min_gain_cps, double time_stop,
+                                           bool fill_entry) {
+    IStrategy* s = make("rsi2_pullback.cpp");
+    FakeCtx ctx;
+    ctx.params["rsi_len"] = 2;
+    ctx.params["buy_below"] = 40;
+    ctx.params["exit_ma"] = 5;
+    ctx.params["trend_ma"] = 20;
+    ctx.params["min_gain_cps"] = min_gain_cps;
+    ctx.params["time_stop"] = time_stop;
+    s->on_init(ctx);
+
+    int64_t ts = local_ts(2026, 8, 7, 9, 35);
+    auto bar = [&](double px) {
+        s->on_bar(ctx, 1, mk_bar(ts, px));
+        ts += 300LL * 1'000'000'000LL;
+    };
+    // Stop the moment the entry goes out, so `after` starts from the entry bar.
+    double entry_px = 0.0;
+    for (double p : pullback_series()) {
+        bar(p);
+        if (!ctx.sent.empty()) {
+            entry_px = p;
+            break;
+        }
+    }
+    REQUIRE(ctx.sent.size() == 1);
+    const double qty = ctx.sent[0].qty;
+    ctx.sent.clear();
+    // The engine applies the fill to the portfolio BEFORE calling on_fill, so
+    // the position is already live (and carries avg_price) inside the callback.
+    ctx.pos = Position{1, qty, entry_px, 0.0, 0.0};
+    if (fill_entry) {
+        Fill f{1, 1, Side::Buy, {}, ts, entry_px, qty, 0.0};
+        s->on_fill(ctx, f);
+    }
+    for (double p : after) bar(p);
+    const std::vector<OrderRequest> out = ctx.sent;
+    s->destroy();
+    return out;
+}
+
+// The entry fills at 125.00 and the four closes before this series are
+// 125/126/127/125, so from the fourth bar on every close is above the exit
+// SMA(5) — the MA leg says "sell" the whole way — while the trade is never
+// worth even a cent a share. This is the 642 @ 7.78 -> 7.78 round trip.
+const std::vector<double> kNoGainRecovery{124.0, 124.5, 124.8, 125.0, 124.9, 125.0};
+
+} // namespace
+
+TEST_CASE("rsi2: a stored exit_ma of 2 is repaired, not obeyed") {
+    // 105 is an up bar against 104 and exit_ma 2 sells it; measured against a
+    // real 5-bar average (106.6) the close is still weak.
+    CHECK(rsi2_ma_exit(2, {110.0, 108.0, 106.0, 104.0, 105.0}).empty());
+}
+
+TEST_CASE("rsi2: the repaired exit MA still fires on real strength") {
+    // Positive control — same shape, but the close clears the average.
+    const auto orders = rsi2_ma_exit(2, {110.0, 108.0, 106.0, 104.0, 112.0});
+    REQUIRE(orders.size() == 1);
+    CHECK(orders[0].side == Side::Sell);
+}
+
+TEST_CASE("rsi2: the MA exit waits for a gain that covers the commission") {
+    CHECK(rsi2_after_entry(kNoGainRecovery, 3, 500, true).empty());
+}
+
+TEST_CASE("rsi2: the MA exit fires once the gain covers the commission") {
+    // Positive control: identical until the last bar, which clears entry + 3c.
+    const auto orders = rsi2_after_entry({124.0, 124.5, 124.8, 126.0}, 3, 500, true);
+    REQUIRE(orders.size() == 1);
+    CHECK(orders[0].side == Side::Sell);
+}
+
+TEST_CASE("rsi2: an adopted position still exits on the MA alone") {
+    // A hot restart adopted the position, so there is no fill of ours to measure
+    // a gain against. Fall back to the bare MA test rather than let the new gate
+    // turn a position we cannot reason about into one we can never leave.
+    CHECK_FALSE(rsi2_after_entry(kNoGainRecovery, 3, 500, false).empty());
+}
+
+TEST_CASE("rsi2: the time stop fires while the profit gate is closed") {
+    // Entry at 125.00, price parks at 124.00: the gate never opens. The MA exit
+    // was this strategy's ONLY exit, so gating it without adding a time stop
+    // would have made an underwater position unexitable — the bollinger
+    // time_stop-0 and ORB end-of-day mistakes a third time.
+    const auto orders = rsi2_after_entry(
+        {124.0, 124.0, 124.0, 124.0, 124.0, 124.0, 124.0, 124.0}, 3, 5, true);
+    REQUIRE_FALSE(orders.empty());
+    CHECK(orders[0].side == Side::Sell);
+    CHECK(orders[0].type == OrdType::Market);
+}
+
+TEST_CASE("rsi2: the time stop is not queued behind the trend warmup") {
+    // trend_ma is 200 bars by default — two sessions of 5-minute bars, counted
+    // from zero again after every restart. The position block used to sit BELOW
+    // that gate, so an adopted position had no exit of any kind for two days.
+    IStrategy* s = make("rsi2_pullback.cpp");
+    FakeCtx ctx;
+    ctx.params["exit_ma"] = 5;
+    ctx.params["trend_ma"] = 200;
+    ctx.params["time_stop"] = 5;
+    s->on_init(ctx);
+
+    ctx.pos = Position{1, 100.0, 0.0, 0.0, 0.0};
+    int64_t ts = local_ts(2026, 8, 7, 10, 0);
+    for (int i = 0; i < 10; ++i) {   // nowhere near 200
+        s->on_bar(ctx, 1, mk_bar(ts, 100.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    CHECK(saw_flatten(ctx));
+    s->destroy();
+}
+
 // ---- orb_breakout: the EOD flatten backstop -------------------------------
 // The bar-count EOD test is only as good as session_min. Swept above the real
 // session length it never trips, and an intraday strategy holds through the
