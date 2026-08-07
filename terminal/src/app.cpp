@@ -45,6 +45,25 @@ void reap_async(std::unique_ptr<T> obj) {
     std::thread([o = std::move(obj)]() mutable { o.reset(); }).detach();
 }
 
+// Monotonic milliseconds, for ages that must survive a clock change. The
+// gateway restarts nightly and the VPS re-syncs NTP around it; a wall-clock
+// jump there would show up as hours of fake bar staleness and page the phone.
+int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Optimizer/autopilot interval strings, indexed by SweepPanel::Settings::
+// interval_idx (same table as panels/sweep.cpp's kIntervals). Named once
+// because /diag, /metrics and the history watchdog must all measure the SAME
+// series the autopilot re-fetches — pick a different one and the staleness
+// figure is about a series nothing refreshes.
+const char* sweep_interval_str(int idx) {
+    static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
+    return kIvl[std::clamp(idx, 0, 2)];
+}
+
 // Fill-sim order latency: once the live broker has logged at least this many
 // acks, backtest/optimizer/replay use the measured median + spread; until then
 // they use the realistic VPS default (~75 ms), not the 250 us ExecParams toy.
@@ -408,6 +427,19 @@ App::App(std::string gateway_url)
     cbs.on_candles = [this](net::CandleBatch&& b) {
         route("candles: " + b.symbol + " " + b.interval + " x" +
                  std::to_string(b.candles.size()) + (b.cached ? " (cache)" : ""));
+        // The only place a history fetch is known to have SUCCEEDED. A failing
+        // request is cancelled at the 20s mark and leaves the pending set, so
+        // this is the sole signal that can see the 2026-08-07 stall. No source
+        // sets `cached` on delivery today, but if one ever replays a cache
+        // instead of asking IB it must not count as proof the session works.
+        // Nor does an EMPTY delivery: on the ibkr_web route a gateway that has
+        // lost the conid's market-data entitlement answers 200 with
+        // {"data":[]}, ibkr_parse_history_bars accepts it, and the batch that
+        // reaches here carries no candles at all. Counting that as a refresh
+        // would reset the metric on the very failure it exists to catch, while
+        // the tournament scores nothing and seed_bars re-seeds nothing.
+        if (!b.cached && !b.candles.empty())
+            hist_fresh_.record(b.symbol, b.interval, steady_ms());
         start_pending_backtest(b);
         stash_pending_sweep(b);
         collect_lineup_bars(b);   // before the move: needs b.candles
@@ -1436,12 +1468,11 @@ void App::pump_daily_lineup() {
             return;
         }
         const SweepPanel::Settings st = sweep_panel_.settings();
-        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
         static constexpr const char* kRng[] = {"1mo", "6mo", "1y", "2y", "5y", "max"};
         const std::string sym = lineup_.picks[lineup_.tourn_idx++];
         SweepPanel::Request rq;
         rq.symbol = sym;
-        rq.interval = kIvl[std::clamp(st.interval_idx, 0, 2)];
+        rq.interval = sweep_interval_str(st.interval_idx);
         rq.range = kRng[std::clamp(st.range_idx, 0, 5)];
         rq.cash = st.cash;
         rq.metric = st.metric;
@@ -1511,11 +1542,10 @@ void App::pump_autopilot() {
 
         // Data settings come from the Optimizer panel; symbol from the session.
         const SweepPanel::Settings st = sweep_panel_.settings();
-        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
         static constexpr const char* kRng[] = {"1mo", "6mo", "1y", "2y", "5y", "max"};
         SweepPanel::Request rq;
         rq.symbol = S.symbol;
-        rq.interval = kIvl[std::clamp(st.interval_idx, 0, 2)];
+        rq.interval = sweep_interval_str(st.interval_idx);
         rq.range = kRng[std::clamp(st.range_idx, 0, 5)];
         rq.cash = st.cash;
         rq.metric = st.metric;
@@ -1836,12 +1866,34 @@ std::string App::build_diag_json() {
     // path): this is the historical-candle session the tournament/optimizer
     // depends on. oldest_history_age_ms climbing while connected is a half-open
     // data session — requests issued, answers silently dropped.
+    //
+    // last_bar_age_ms below is the answer to the 2026-08-07 outage, where all
+    // three fields above looked perfect for five hours: connected stayed true
+    // on a half-open socket, and oldest_history_age_ms never grew because the
+    // failing requests were CANCELLED at 20s and left the pending set. Anything
+    // keyed off in-flight requests is blind to that by construction, so this
+    // measures the last SUCCESS instead. See net/hist_freshness.h.
+    const std::string bar_ivl = traded_bar_interval();
+    const int64_t steady_now = steady_ms();
     {
         json d;
         d["source"] = use_tws_data_ ? "tws" : "ibkr_web";
         d["connected"] = data_.connected();
         d["pending_history"] = data_.pending_history();
         d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
+        // Which series the ages refer to: the one the autopilot re-fetches.
+        d["bar_interval"] = bar_ivl;
+        std::vector<std::string> live_syms;
+        live_syms.reserve(s.symbols.size());
+        for (const auto& ss : s.symbols) live_syms.push_back(ss.symbol);
+        // Worst age over every live symbol; -1 = none has ever been answered
+        // (idle session, or a data client broken since startup). Broader than
+        // what pump_history_watchdog pages on, which is limited to
+        // autopilot-armed symbols — nothing re-fetches an unarmed symbol's bars
+        // after the session-start warmup, so a large figure here can be by
+        // design. The per-symbol ages below say which case it is.
+        d["worst_last_bar_age_ms"] =
+            hist_fresh_.worst_age_ms(live_syms, bar_ivl, steady_now);
         j["data"] = std::move(d);
     }
 
@@ -1873,6 +1925,10 @@ std::string App::build_diag_json() {
         const bool naked = ss.position.qty != 0.0 && !has_working_stop(ss.symbol);
         e["unprotected"] = naked;
         if (naked) ++unprotected;
+        // ms since this symbol's last SUCCESSFUL bar delivery at data.bar_interval
+        // (-1 = never in this process). SOXS read 09:17 all afternoon on
+        // 2026-08-07 while every other field here looked healthy.
+        e["last_bar_age_ms"] = hist_fresh_.age_ms(ss.symbol, bar_ivl, steady_now);
         // Params come from the ENGINE, not from cfg_.trade_symbols. The Trade
         // tab's copy is overwritten by every crowned champion, while the live
         // engine only takes one when autopilot's improvement test passes — so
@@ -2025,6 +2081,27 @@ std::string App::build_metrics() {
             n = std::max(n, s.risk.drawdown_pct / s.risk.drawdown_limit_pct);
         return n < 0.0 ? 0.0 : n;
     }());
+
+    // Bar staleness: ms since each symbol's last SUCCESSFUL history delivery.
+    // Alert on this, not on tt_data_pending_history — a stalled request is
+    // cancelled at 20s and never ages (see net/hist_freshness.h).
+    {
+        const std::string bar_ivl = traded_bar_interval();
+        const int64_t steady_now = steady_ms();
+        std::vector<std::string> live_syms;
+        live_syms.reserve(s.symbols.size());
+        for (const auto& ss : s.symbols) live_syms.push_back(ss.symbol);
+        g("tt_worst_bar_stale_ms",
+          "ms since the oldest traded symbol's last history delivery (-1 = none yet)",
+          static_cast<double>(hist_fresh_.worst_age_ms(live_syms, bar_ivl, steady_now)));
+        m += "# HELP tt_bar_stale_ms ms since this symbol's last history delivery "
+             "(-1 = none yet)\n# TYPE tt_bar_stale_ms gauge\n";
+        for (const auto& ss : s.symbols)
+            m += "tt_bar_stale_ms{symbol=\"" + lbl(ss.symbol) + "\"} " +
+                 fmt_num(static_cast<double>(
+                     hist_fresh_.age_ms(ss.symbol, bar_ivl, steady_now))) +
+                 '\n';
+    }
 
     // Per-symbol position + unrealized pnl (labelled series).
     m += "# HELP tt_position Signed position size per symbol\n# TYPE tt_position gauge\n";
@@ -2223,6 +2300,7 @@ void App::draw() {
     pump_daily_lineup();
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
+    pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
 
     draw_menu_bar();
     draw_account_modal();
@@ -2352,12 +2430,11 @@ void App::draw() {
                         // Auto-pick: tournament on this symbol with the Optimizer
                         // panel's data settings; champion lands back in the tab.
                         const SweepPanel::Settings s = sweep_panel_.settings();
-                        static constexpr const char* kIvl[] = {"5m", "1h", "1d"};
                         static constexpr const char* kRng[] = {"1mo", "6mo", "1y",
                                                                "2y",  "5y",  "max"};
                         SweepPanel::Request rq;
                         rq.symbol = sym;
-                        rq.interval = kIvl[std::clamp(s.interval_idx, 0, 2)];
+                        rq.interval = sweep_interval_str(s.interval_idx);
                         rq.range = kRng[std::clamp(s.range_idx, 0, 5)];
                         rq.cash = s.cash;
                         rq.metric = s.metric;
@@ -3318,6 +3395,101 @@ void App::pump_orphan_watchdog() {
     const std::string msg =
         "WATCHDOG adopted position(s) with NO protective stop and a paused "
         "strategy - nothing will close them: " + orphans;
+    alerts_.notify(AlertNotifier::Critical, msg);
+    route("alert: " + msg);
+}
+
+// The series the autopilot re-fetches every cycle — the one that is supposed to
+// stay fresh, and therefore the one /diag, /metrics and the watchdog measure.
+std::string App::traded_bar_interval() const {
+    return sweep_interval_str(sweep_panel_.settings().interval_idx);
+}
+
+// History-staleness watchdog.
+//
+// On 2026-08-07 the data client started failing every historical-bar request on
+// a 30-minute cycle from ~10:31. SOXS/AAOX/SNDQ candles went 4.5-5.2 hours old
+// while their strategies traded on, and nothing anywhere said so: data.connected
+// was true (half-open socket), oldest_history_age_ms was flat (dead requests are
+// cancelled at 20s and leave the pending set), and broker_upstream only watches
+// the ORDERS client. pump_broker_watchdog covers the order path the same way
+// this covers the data path — measured from the last SUCCESS, because every
+// request-side signal is structurally blind to this failure.
+//
+// DIAGNOSTIC ONLY. It pages; it never halts, cancels or flattens. The right
+// response is a human looking at the gateway, and an automatic reaction here
+// would be a new way to stop trading on a metric that has never run in anger.
+void App::pump_history_watchdog() {
+    static constexpr double kHistStaleReAlertSec = 1800.0;   // re-page every 30 min
+    if (!engine_.live_running()) {
+        // Only a delivery that lands DURING the session counts. Freshness was
+        // process-lifetime, and stale() ages an answered symbol absolutely while
+        // the settle-in window covers only never-answered ones — so yesterday's
+        // 15:32 delivery reads as ~17 hours of staleness on the first frame of
+        // the 09:25 auto-start, and the warmup fetch does not clear it either
+        // (start_live_session skips that whenever seed_bars finds something, and
+        // series_ still holds the previous session's bars in memory). That is
+        // two Critical pages every morning telling the operator to go and check
+        // a perfectly healthy gateway. Clearing on every idle frame rather than
+        // on the stop edge also covers a fetch made while nothing was trading —
+        // a chart pull or the daily lineup's 1d pass — which would otherwise
+        // hand the next session an age it never earned.
+        hist_fresh_.clear();
+        hist_live_since_s_ = 0.0;
+        hist_stale_last_alert_s_ = 0.0;
+        return;
+    }
+    const double now = ImGui::GetTime();
+    if (hist_live_since_s_ == 0.0) hist_live_since_s_ = now;
+    if (ap_.syms.empty()) return;
+
+    // Watch only what something is actually supposed to refresh. After the
+    // start-of-session warmup fetch, the autopilot's optimize cycle is the only
+    // thing that re-requests a live symbol's bars (the tick stream feeds the
+    // engine directly) — and pump_autopilot starts a cycle on a TIMER only for
+    // trigger 0 ("Timer") or 2 ("Both"). A symbol armed on "Drawdown" alone is
+    // therefore exactly as stale-by-design as an unarmed one and would page
+    // every session; the Trade panel does not even show its interval_min, so
+    // that field is not a cadence to size a grace off either. Each watched
+    // symbol carries its own (see net::WatchedSymbol).
+    std::vector<net::WatchedSymbol> watched;
+    watched.reserve(ap_.syms.size());
+    for (const Autopilot::Sym& S : ap_.syms) {
+        if (S.mode <= 0) continue;
+        if (S.trigger != 0 && S.trigger != 2) continue;   // no timer, no cadence
+        watched.push_back({S.symbol, S.interval_min});
+    }
+    if (watched.empty()) return;
+    const auto stale = hist_fresh_.stale(
+        watched, traded_bar_interval(), steady_ms(),
+        static_cast<int64_t>((now - hist_live_since_s_) * 1000.0));
+
+    if (stale.empty()) {
+        if (hist_stale_last_alert_s_ != 0.0)
+            alerts_.notify(AlertNotifier::Warning,
+                           "history: bars are refreshing again");
+        hist_stale_last_alert_s_ = 0.0;
+        return;
+    }
+    if (hist_stale_last_alert_s_ != 0.0 &&
+        now - hist_stale_last_alert_s_ < kHistStaleReAlertSec)
+        return;
+    hist_stale_last_alert_s_ = now;
+    std::string detail;
+    for (const net::StaleBars& sb : stale) {
+        if (!detail.empty()) detail += ", ";
+        detail += sb.symbol + " " +
+                  (sb.ever ? std::to_string(sb.age_ms / 60'000) + "m"
+                           : std::string("never"));
+    }
+    // Name the socket state: "connected" here is the 2026-08-07 half-open case
+    // (check the gateway), "disconnected" is the ordinary outage the reconnect
+    // path is already working on.
+    const std::string msg =
+        "WATCHDOG historical bars have stopped refreshing for " +
+        std::to_string(stale.size()) + " traded symbol(s) - strategies are "
+        "trading on stale candles: " + detail + " (data socket reports " +
+        (data_.connected() ? "CONNECTED - check IB Gateway)" : "disconnected)");
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
 }

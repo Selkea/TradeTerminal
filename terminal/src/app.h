@@ -17,6 +17,7 @@
 #include "market_data.h"
 #include "net/diag_server.h"
 #include "net/gateway_data.h"
+#include "net/hist_freshness.h"
 #include "net/tws_data.h"
 #include "update_check.h"
 #include "panels/backtest.h"
@@ -277,6 +278,25 @@ private:
     void pump_orphan_watchdog();
     double orphan_since_s_ = 0.0;            // GetTime an adopted position first showed up naked
     double orphan_last_alert_s_ = 0.0;       // GetTime of the last orphan alert (0 = none)
+
+    // History-staleness watchdog: pages when a traded symbol's bars stop being
+    // refreshed while the data socket still reports connected. The 2026-08-07
+    // outage was invisible to every existing signal (see net/hist_freshness.h);
+    // this measures the SUCCESSES instead of the in-flight requests. Diagnostic
+    // only — it never halts, cancels or flattens.
+    void pump_history_watchdog();
+    net::HistoryFreshness hist_fresh_;       // fed from the on_candles success path
+    // The "since" of the since/last-alert pair is the SESSION clock, not the
+    // start of the stale episode: staleness is already measured in absolute bar
+    // age, and a symbol that has never been answered at all has to be aged from
+    // something — session start is the only honest anchor (and makes the grace
+    // period double as a settle-in window after a restart).
+    double hist_live_since_s_ = 0.0;         // GetTime the current live session was first seen
+    double hist_stale_last_alert_s_ = 0.0;   // GetTime of the last stale-bars alert (0 = none)
+    // The interval the autopilot re-fetches, i.e. the series that is supposed
+    // to stay fresh. Shared by /diag, /metrics and the watchdog so all three
+    // report the same thing.
+    std::string traded_bar_interval() const;
 
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
