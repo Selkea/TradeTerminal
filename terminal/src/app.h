@@ -298,6 +298,20 @@ private:
     // report the same thing.
     std::string traded_bar_interval() const;
 
+    // Pre-open gateway AUTHENTICATION check: 08:45 local on a weekday, once,
+    // edge-triggered on the clock crossing it. The ONLY check that runs without
+    // a live session — every other one is gated on live_running() and was
+    // therefore blind while a failed overnight re-login burned 13 hours on
+    // 2026-08-09. Pages if the gateway is up but not logged in, then makes
+    // EXACTLY ONE relaunch attempt (see the day stamp: IBKR locks accounts on
+    // repeated failed logins) and pages the outcome.
+    void pump_preopen_gateway_check();
+    bool preopen_authed() const;             // farms up, or a live order path reaching IBKR
+    double preopen_prev_h_ = -1.0;           // last hour-of-day seen (-1 = no observation yet)
+    int64_t preopen_day_ = -1;               // tm_year*400+tm_yday of the last check
+    int64_t preopen_relaunch_day_ = -1;      // ...of the last relaunch ATTEMPT (never twice)
+    double preopen_recheck_at_s_ = 0.0;      // GetTime to re-check after a relaunch (0 = none)
+
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
     // flattening the symbols that carry over — those are re-adopted + held on the

@@ -1881,6 +1881,17 @@ std::string App::build_diag_json() {
         d["connected"] = data_.connected();
         d["pending_history"] = data_.pending_history();
         d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
+        // Is the GATEWAY logged in to IBKR, as opposed to merely listening?
+        // The one overnight health signal there is: broker_connected above is
+        // false all night by design (no live session, so the orders client is
+        // deliberately disconnected), and on 2026-08-09 a gateway parked on a
+        // failed-login dialog kept both its process and port 4002 up for 13
+        // hours with connected=true here. Proven by the data farms, so it is
+        // TWS-route only — on ibkr_web it reads false/-1/0 always.
+        // See net/gateway_auth.h.
+        d["gateway_authed"] = data_.gateway_authed();
+        d["farms_ok_age_ms"] = data_.gateway_auth_age_ms();   // -1 = never proven
+        d["farms_ok"] = data_.gateway_farms_ok();             // 0..3 currently up
         // Which series the ages refer to: the one the autopilot re-fetches.
         d["bar_interval"] = bar_ivl;
         std::vector<std::string> live_syms;
@@ -2056,6 +2067,15 @@ std::string App::build_metrics() {
       ((ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false)) &&
        (tws_ ? tws_->upstream_connected() : true))
           ? 1 : 0);
+    // The overnight signal. tt_broker_connected is 0 all night BY DESIGN, so
+    // this is the only gauge that can distinguish a gateway that is logged in
+    // from one parked on a failed-login dialog (2026-08-09; gateway_auth.h).
+    // TWS route only — 0 / -1 on the ibkr_web route, where nothing proves it.
+    g("tt_gateway_authed", "1 if IB Gateway is proven logged in to IBKR (TWS route)",
+      data_.gateway_authed() ? 1 : 0);
+    g("tt_gateway_auth_age_ms",
+      "ms since the last proof the gateway is logged in (-1 = never)",
+      static_cast<double>(data_.gateway_auth_age_ms()));
     g("tt_equity_dollars", "account equity", s.equity);
     g("tt_cash_dollars", "account cash", s.cash);
     g("tt_ticks_total", "market-data ticks this session", static_cast<double>(s.ticks));
@@ -2301,6 +2321,7 @@ void App::draw() {
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
+    pump_preopen_gateway_check();   // 08:45: is the gateway actually LOGGED IN?
 
     draw_menu_bar();
     draw_account_modal();
@@ -3492,6 +3513,130 @@ void App::pump_history_watchdog() {
         (data_.connected() ? "CONNECTED - check IB Gateway)" : "disconnected)");
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
+}
+
+// Pre-open gateway AUTHENTICATION check — 08:45 local, weekdays.
+//
+// 2026-08-09: the 00:55 cold restart's automated re-login failed and the gateway
+// sat on "UNRECOGNIZED USERNAME OR PASSWORD" for 13 hours. Nothing paged,
+// because every check we had is gated on a live session and there is no live
+// session overnight: pump_broker_watchdog returns on !live_running(), /diag
+// broker_connected is false all night by design, and the external keepalive only
+// acts on live && !broker_connected. The process was up and port 4002 was
+// listening the whole time, so the two things a human (and an agent) actually
+// looked at both said "healthy".
+//
+// This is the one check that runs with NO session — that is the entire point —
+// so it must touch nothing that assumes one exists. It reads gateway login state
+// (net/gateway_auth.h, proven by the data farms) 40 minutes before the 09:25
+// scheduled auto-start, which is the last moment a human can still fix it by
+// hand before the open.
+//
+// DIAGNOSTIC + exactly one relaunch. See the retry guard below: IBKR LOCKS
+// ACCOUNTS ON REPEATED FAILED LOGINS, so this may never loop.
+void App::pump_preopen_gateway_check() {
+    static constexpr double kPreOpenH = 8.75;      // 08:45 local
+    static constexpr double kRecheckSec = 240.0;   // relaunch + login + farms
+    // TWS route only: gateway_authed() is proven by the TWS data farms and the
+    // ibkr_web source has no evidence to offer, so it answers false forever —
+    // running this there would page every morning and relaunch nothing.
+    if (!use_tws_data_) return;
+
+    const double now = ImGui::GetTime();
+    // Deferred re-check after a relaunch. First, because it must still land if
+    // the day stamp below has already been set (it always has by then).
+    if (preopen_recheck_at_s_ != 0.0 && now >= preopen_recheck_at_s_) {
+        preopen_recheck_at_s_ = 0.0;
+        if (preopen_authed()) {
+            const std::string msg =
+                "PRE-OPEN gateway relaunch worked - IB Gateway is logged in to "
+                "IBKR again, the 09:25 auto-start should be fine";
+            alerts_.notify(AlertNotifier::Warning, msg);   // recovery, as the other watchdogs do
+            route("alert: " + msg);
+        } else {
+            const std::string msg =
+                "WATCHDOG PRE-OPEN the gateway relaunch did NOT restore the IBKR "
+                "login - LOG IN BY HAND (RDP) before 09:25 or the auto-started "
+                "session will trade blind. No further automatic attempt will be "
+                "made today: IBKR locks accounts on repeated failed logins";
+            alerts_.notify(AlertNotifier::Critical, msg);
+            route("alert: " + msg);
+        }
+    }
+
+    // EDGE-triggered on the clock crossing 08:45, exactly like the engine's EOD
+    // backstop: a level trigger would fire every frame after 08:45 and, worse,
+    // fire the instant the app was launched at 09:00 — relaunching (and
+    // re-logging-in) a gateway that was only ever fine.
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    const int64_t day = static_cast<int64_t>(tm.tm_year) * 400 + tm.tm_yday;
+    const double hod = tm.tm_hour + tm.tm_min / 60.0;
+    const double prev_h = preopen_prev_h_;
+    preopen_prev_h_ = hod;
+    if (tm.tm_wday < 1 || tm.tm_wday > 5) return;   // no open to be pre- of
+    if (day == preopen_day_) return;                // already checked today
+    if (prev_h < 0.0 || prev_h >= kPreOpenH || hod < kPreOpenH) return;
+    preopen_day_ = day;
+
+    if (preopen_authed()) return;   // healthy: silent, by design
+
+    const int64_t age = data_.gateway_auth_age_ms();
+    const std::string since =
+        age < 0 ? std::string("never on this gateway session")
+                : std::to_string(age / 60'000) + " min ago";
+    const std::string msg =
+        "WATCHDOG PRE-OPEN IB Gateway is UP but NOT logged in to IBKR - no data "
+        "farm has connected (" + since + "). The 09:25 auto-start will bring up "
+        "a session that cannot reach the market. ~40 minutes to fix it. The "
+        "CREDENTIALS ARE PROBABLY FINE: IBKR answers 'unrecognized username or "
+        "password' during its maintenance window (2026-08-09 lost 13 hours to "
+        "exactly that). Trying ONE relaunch now";
+    alerts_.notify(AlertNotifier::Critical, msg);
+    route("alert: " + msg);
+
+    // ---- exactly one recovery attempt, ever, per day ----
+    //
+    // IBKR LOCKS ACCOUNTS ON REPEATED FAILED LOGINS. A locked account is a far
+    // worse outage than the one being recovered from — it cannot be fixed from
+    // here at all. So: its own day stamp, set BEFORE the launch, checked
+    // regardless of what happens afterwards. preopen_day_ above already makes
+    // this once-a-day; this second stamp exists so that no future edit to the
+    // trigger (a retry loop, a re-arm, a second call site) can turn one login
+    // attempt into many without deliberately removing this.
+    if (preopen_relaunch_day_ == day) return;
+    preopen_relaunch_day_ = day;
+#ifdef _WIN32
+    // -Restart, not a bare start: Start-IbGateway.ps1 exits immediately when the
+    // API port is already up (it is idempotent by design, and the app calls it
+    // on every launch), which is precisely the state we are in. -Restart kills
+    // the gateway and relaunches it with ONE fresh login.
+    const std::string args = ps_args("Start-IbGateway.ps1", true, "-Restart");
+    if (args.empty()) {
+        route("alert: PRE-OPEN cannot relaunch - scripts\\Start-IbGateway.ps1 is "
+              "missing; log in by hand");
+        return;
+    }
+    run_hidden(args);
+    route("gateway: PRE-OPEN relaunching IB Gateway (one attempt, re-checking in " +
+          std::to_string(static_cast<int>(kRecheckSec)) + "s)");
+    preopen_recheck_at_s_ = now + kRecheckSec;
+#else
+    route("alert: PRE-OPEN automatic relaunch is Windows-only; log in by hand");
+#endif
+}
+
+// "The gateway is logged in", for the pre-open check.
+//
+// The farms are the overnight signal, but a live ORDER path that is reaching
+// IBKR proves the same thing more directly, so it counts too. That second term
+// is not redundant: it is what stops a false negative here from killing a
+// healthy session, since the recovery is a gateway relaunch. Overnight tws_ is
+// null and it contributes nothing — which is the blindness being fixed.
+bool App::preopen_authed() const {
+    if (data_.gateway_authed()) return true;
+    return tws_ && tws_->ready() && tws_->upstream_connected();
 }
 
 void App::refresh_ibkr_accounts() {
