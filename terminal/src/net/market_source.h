@@ -53,6 +53,18 @@ public:
     virtual int pending_history() const { return 0; }
     virtual int oldest_history_age_ms() const { return 0; }
 
+    // Is the upstream gateway LOGGED IN to the broker, as opposed to merely
+    // reachable? connected() above cannot answer that — an IB Gateway parked on
+    // a failed-login dialog still accepts the socket, which is how a 13-hour
+    // outage went unseen on 2026-08-09 (see net/gateway_auth.h). Proven by the
+    // data farms, so only the TWS route reports it; the defaults below say "no
+    // evidence" and callers must treat this as TWS-route-only.
+    //   gateway_auth_age_ms: ms since the freshest proof, -1 = never.
+    //   gateway_farms_ok:    how many of the three data farms are up (0..3).
+    virtual bool gateway_authed() const { return false; }
+    virtual int64_t gateway_auth_age_ms() const { return -1; }
+    virtual int gateway_farms_ok() const { return 0; }
+
     // Thread-safe; return the request id used (0 if not running).
     virtual uint32_t request_candles(const std::string& symbol,
                                      const std::string& interval,

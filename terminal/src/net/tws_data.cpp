@@ -113,6 +113,15 @@ int64_t now_ms() {
         .count();
 }
 
+// Monotonic milliseconds for GatewayAuth's ages. Steady, not wall clock: the
+// VPS re-syncs NTP around the nightly gateway restart, and a jump there would
+// read as hours of fake staleness on the 08:45 pre-open check.
+int64_t steady_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+        .count();
+}
+
 } // namespace
 
 struct TwsData::Io final : DefaultEWrapper {
@@ -239,6 +248,11 @@ struct TwsData::Io final : DefaultEWrapper {
 
     void drop_connection() {
         d.connected_.store(false, std::memory_order_release);
+        // Login proof belongs to the SESSION that produced it. A gateway
+        // restart drops us, and last night's farm messages say nothing about
+        // whether tonight's re-login worked — which is the exact failure the
+        // pre-open check exists for.
+        d.auth_.session_lost();
         if (client) client->eDisconnect();
         reader.reset();
         client.reset();
@@ -405,11 +419,20 @@ struct TwsData::Io final : DefaultEWrapper {
     void connectionClosed() override {
         d.connected_.store(false, std::memory_order_release);
         d.account_kind_.store(AccountKind::Unknown, std::memory_order_release);
+        d.auth_.session_lost();   // see drop_connection
         d.log("connection closed");
     }
 
     void error(int id, int errorCode, const std::string& errorString,
                const std::string&) override {
+        // Gateway<->IBKR connectivity: 1100 = lost, 1101/1102 = restored. Same
+        // pair TwsBroker tracks for the ORDERS client — which is deliberately
+        // disconnected outside a live session, so overnight this data client is
+        // the only one in a position to see it.
+        // Not logged here: these fall through to the generic error line below,
+        // which already carries IB's own wording verbatim.
+        if (errorCode == 1100) d.auth_.upstream_lost();
+        else if (errorCode == 1101 || errorCode == 1102) d.auth_.upstream_restored();
         // Farm status (2100-2170) is routine chatter, but this used to return
         // BEFORE the hist lookup below — so any such message carrying a live
         // history reqId was swallowed whole and left that request Pending
@@ -419,6 +442,13 @@ struct TwsData::Io final : DefaultEWrapper {
         // be worse than the silence. A genuinely dead request is caught by the
         // timeout + retry path instead.
         if (errorCode >= 2100 && errorCode <= 2170) {
+            // BEFORE the dedup, always: a farm connecting is the only proof we
+            // get that the gateway is logged in to IBKR, and farm_codes_seen is
+            // a process-lifetime log filter (drop_connection does not clear it),
+            // so every session after the first would otherwise contribute no
+            // evidence at all. See net/gateway_auth.h for the 2026-08-09 outage
+            // this exists for.
+            d.auth_.farm_status(errorCode, steady_ms());
             if (farm_codes_seen.insert(errorCode).second)
                 d.log("gateway farm status " + std::to_string(errorCode) + ": " +
                       errorString);
@@ -484,6 +514,11 @@ struct TwsData::Io final : DefaultEWrapper {
         // batch too closely (see kBigBatchBars).
         last_hist_end = std::chrono::steady_clock::now();
         last_hist_bars = b.candles.size();
+        // Bars only come back over an authenticated session, so a NON-EMPTY
+        // delivery is independent proof the gateway is logged in — and it is the
+        // proof that stays fresh during the day, after this session's farm
+        // messages have gone quiet. An empty batch proves nothing.
+        if (!b.candles.empty()) d.auth_.bars_delivered(steady_ms());
         if (d.cbs_.on_candles) d.cbs_.on_candles(std::move(b));
     }
 
@@ -629,6 +664,14 @@ uint32_t TwsData::request_scan(const ScanSpec& spec, ScanCb cb) {
     wake();
     return id;
 }
+
+// UI thread (/diag, /metrics, App::pump_preopen_gateway_check). GatewayAuth
+// carries its own mutex; "now" is passed in so the policy stays testable.
+bool TwsData::gateway_authed() const { return auth_.authed(steady_ms()); }
+int64_t TwsData::gateway_auth_age_ms() const {
+    return auth_.proof_age_ms(steady_ms());
+}
+int TwsData::gateway_farms_ok() const { return auth_.farms_ok(); }
 
 std::string TwsData::account() const {
     std::lock_guard lock(mu_);

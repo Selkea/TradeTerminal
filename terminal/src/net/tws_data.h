@@ -10,6 +10,7 @@
 // auto-reconnects; UI-thread requests are queued under a mutex and pumped on
 // the I/O thread.
 
+#include "net/gateway_auth.h"
 #include "net/market_source.h"
 
 #include <atomic>
@@ -68,6 +69,13 @@ public:
         return oldest_hist_ms_.load(std::memory_order_relaxed);
     }
 
+    // Gateway login state, from the data farms (see net/gateway_auth.h). NOT
+    // inline: the age is measured off a steady clock owned by the .cpp, and the
+    // policy object takes "now" as an argument so it stays testable.
+    bool gateway_authed() const override;
+    int64_t gateway_auth_age_ms() const override;
+    int gateway_farms_ok() const override;
+
     uint32_t request_candles(const std::string& symbol, const std::string& interval,
                              const std::string& range) override;
     uint32_t subscribe_quotes(const std::vector<std::string>& symbols,
@@ -121,6 +129,13 @@ private:
     std::atomic<int> oldest_hist_ms_{0};
 
     std::atomic<AccountKind> account_kind_{AccountKind::Unknown};
+
+    // Is the GATEWAY logged in to IBKR? connected_ above cannot answer that: a
+    // gateway sitting on the "UNRECOGNIZED USERNAME OR PASSWORD" modal still
+    // listens on the API port. Fed from the farm-status codes and successful
+    // history deliveries on the I/O thread; read from the UI thread (/diag,
+    // /metrics, the pre-open check) — the class carries its own mutex.
+    GatewayAuth auth_;
 
     mutable std::mutex mu_;   // guards account_, accounts_, reqs_, want_syms_
     std::string account_;

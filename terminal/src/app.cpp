@@ -2,6 +2,7 @@
 #include "alert_rules.h"   // classify_alert: what pages the phone
 #include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
 #include "dev_paths.h"
+#include "market_calendar.h"   // is_us_trading_day: the pre-open check may not act on a holiday
 
 #include "imgui_internal.h"  // DockBuilder API (default first-run layout) + private dock node flags
 #include "implot.h"
@@ -328,6 +329,23 @@ IbkrAccountList read_ibkr_accounts() {
         r.accounts.push_back(std::move(acc));
     }
     return r;
+}
+
+// Is the ACTIVE IBKR account a paper one? UNKNOWN READS AS LIVE — no store, an
+// unparseable store, or an `active` name matching no entry all answer false.
+// The only caller uses this to decide whether it may COLD-restart IB Gateway,
+// and a cold re-login on a live account can stop dead on a 2FA prompt IBC
+// cannot type (which is why Start-IbGateway.ps1 keeps live accounts on the soft
+// AutoRestartTime). "I don't know" must not authorize that.
+//
+// Deliberately not folded into tws_api_port() below, which defaults the other
+// way: picking port 4002 for an unknown account is a harmless wrong guess,
+// killing a live gateway is not.
+bool active_account_is_paper() {
+    const auto ib = read_ibkr_accounts();
+    for (const auto& a : ib.accounts)
+        if (a.name == ib.active) return a.paper;
+    return false;
 }
 
 // IB Gateway socket port follows the active account's mode.
@@ -1881,6 +1899,17 @@ std::string App::build_diag_json() {
         d["connected"] = data_.connected();
         d["pending_history"] = data_.pending_history();
         d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
+        // Is the GATEWAY logged in to IBKR, as opposed to merely listening?
+        // The one overnight health signal there is: broker_connected above is
+        // false all night by design (no live session, so the orders client is
+        // deliberately disconnected), and on 2026-08-09 a gateway parked on a
+        // failed-login dialog kept both its process and port 4002 up for 13
+        // hours with connected=true here. Proven by the data farms, so it is
+        // TWS-route only — on ibkr_web it reads false/-1/0 always.
+        // See net/gateway_auth.h.
+        d["gateway_authed"] = data_.gateway_authed();
+        d["farms_ok_age_ms"] = data_.gateway_auth_age_ms();   // -1 = never proven
+        d["farms_ok"] = data_.gateway_farms_ok();             // 0..3 currently up
         // Which series the ages refer to: the one the autopilot re-fetches.
         d["bar_interval"] = bar_ivl;
         std::vector<std::string> live_syms;
@@ -2056,6 +2085,15 @@ std::string App::build_metrics() {
       ((ibkr_ ? ibkr_->ready() : (tws_ ? tws_->ready() : false)) &&
        (tws_ ? tws_->upstream_connected() : true))
           ? 1 : 0);
+    // The overnight signal. tt_broker_connected is 0 all night BY DESIGN, so
+    // this is the only gauge that can distinguish a gateway that is logged in
+    // from one parked on a failed-login dialog (2026-08-09; gateway_auth.h).
+    // TWS route only — 0 / -1 on the ibkr_web route, where nothing proves it.
+    g("tt_gateway_authed", "1 if IB Gateway is proven logged in to IBKR (TWS route)",
+      data_.gateway_authed() ? 1 : 0);
+    g("tt_gateway_auth_age_ms",
+      "ms since the last proof the gateway is logged in (-1 = never)",
+      static_cast<double>(data_.gateway_auth_age_ms()));
     g("tt_equity_dollars", "account equity", s.equity);
     g("tt_cash_dollars", "account cash", s.cash);
     g("tt_ticks_total", "market-data ticks this session", static_cast<double>(s.ticks));
@@ -2301,6 +2339,7 @@ void App::draw() {
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
+    pump_background();        // 08:45 window: is the gateway actually LOGGED IN?
 
     draw_menu_bar();
     draw_account_modal();
@@ -3492,6 +3531,229 @@ void App::pump_history_watchdog() {
         (data_.connected() ? "CONNECTED - check IB Gateway)" : "disconnected)");
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
+}
+
+// Monotonic seconds since this App was constructed. NOT ImGui::GetTime(): that
+// clock only advances inside NewFrame, and the whole point of pump_background()
+// is to keep running when no frame is being built (see main.cpp's iconified
+// branch). Steady, so an NTP correction around the nightly gateway restart
+// cannot make a settle window look satisfied or a deadline look expired.
+double App::mono_s() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         mono_epoch_).count();
+}
+
+// Everything that must keep ticking on a frame that is never drawn.
+//
+// main.cpp skips App::draw() entirely while the window is iconified, and the
+// VPS is operated over RDP, where minimizing the terminal is the normal thing
+// to do. A wall-clock check that only runs while a window is visible is a check
+// an operator can switch off by accident — and the one below exists precisely
+// because nobody was watching. Nothing called from here may touch ImGui: there
+// is no frame in progress.
+void App::pump_background() {
+    pump_preopen_gateway_check();
+}
+
+// Pre-open gateway AUTHENTICATION check — a WINDOW, 08:45-09:15 local, on days
+// the market actually opens.
+//
+// 2026-08-09: the 00:55 cold restart's automated re-login failed and the gateway
+// sat on "UNRECOGNIZED USERNAME OR PASSWORD" for 13 hours. Nothing paged,
+// because every check we had is gated on a live session and there is no live
+// session overnight: pump_broker_watchdog returns on !live_running(), /diag
+// broker_connected is false all night by design, and the external keepalive only
+// acts on live && !broker_connected. The process was up and port 4002 was
+// listening the whole time, so the two things a human (and an agent) actually
+// looked at both said "healthy".
+//
+// This is the one check that runs with NO session — that is the entire point —
+// so it must touch nothing that assumes one exists. It reads gateway login state
+// (net/gateway_auth.h, proven by the data farms) ahead of the 09:25 scheduled
+// auto-start, the last moment a human can still fix it by hand before the open.
+//
+// A WINDOW WITH A SETTLE TIME, not a clock edge. 0.14.0 fired on the frame that
+// first observed the clock crossing 08:45, which broke three ways:
+//   - an app started at 08:45:01 (a deploy, a crash restart, the operator's
+//     routine) had already "missed" the crossing and skipped the day silently —
+//     losing the check in the exact window a restart is most likely;
+//   - an app started at 08:44:40 fired 20 seconds in, before TwsData could
+//     connect, and cold-restarted a gateway that was only ever fine;
+//   - the crossing was sampled only on drawn frames, so minimizing the window
+//     both lost it and left it armed to fire at an arbitrary later hour.
+// Level-triggered inside the window with a day stamp instead — the same shape
+// pump_lineup_schedule uses "so a late launch still catches it" — plus a
+// continuous-failure settle time, because a momentary "not authed" is what a
+// data-socket reconnect looks like from here: the reconnect loop calls
+// drop_connection() on every pass while disconnected, and that wipes all auth
+// proof by design (session_lost).
+//
+// DIAGNOSTIC first, and at most one relaunch: IBKR LOCKS ACCOUNTS ON REPEATED
+// FAILED LOGINS, so this may never loop. See the guards on the relaunch below.
+void App::pump_preopen_gateway_check() {
+    static constexpr double kWindowStartH = 8.75;   // 08:45 local
+    static constexpr double kWindowEndH = 9.25;     // 09:15, still ahead of 09:25
+    static constexpr double kSettleSec = 150.0;     // continuously not-authed
+    static constexpr double kMinUptimeSec = 180.0;  // > the 90s gateway_starting_until_
+    static constexpr double kVerdictSec = 480.0;    // kill + JVM + login + disclaimer + farms
+    // TWS route only: gateway_authed() is proven by the TWS data farms and the
+    // ibkr_web source has no evidence to offer, so it answers false forever —
+    // running this there would page every morning and relaunch nothing.
+    if (!use_tws_data_) return;
+
+    const double now = mono_s();
+
+    // Outcome of a relaunch. POLLED, not sampled once: 0.14.0 looked exactly
+    // once at +240s and pages "the relaunch did NOT restore the login - LOG IN
+    // BY HAND" if that instant missed, with nothing to retract it afterwards.
+    // The real budget is longer and highly variable — Start-IbGateway.ps1 alone
+    // allows 120s for the API port, then IBC has to clear the paper-trading
+    // disclaimer (the 10141 backoff in tws_data), then TwsData reconnects on a
+    // 3s cycle, and only then do the farms report. So: page recovery the moment
+    // it recovers, and page failure only once the whole budget is gone.
+    if (preopen_verdict_until_ != 0.0) {
+        if (preopen_authed()) {
+            preopen_verdict_until_ = 0.0;
+            const std::string msg =
+                "PRE-OPEN gateway relaunch worked - IB Gateway is logged in to "
+                "IBKR again, the 09:25 auto-start should be fine";
+            alerts_.notify(AlertNotifier::Warning, msg);   // recovery, as the other watchdogs do
+            route("alert: " + msg);
+        } else if (now >= preopen_verdict_until_) {
+            preopen_verdict_until_ = 0.0;
+            const std::string msg =
+                "WATCHDOG PRE-OPEN the gateway relaunch did NOT restore the IBKR "
+                "login - LOG IN BY HAND (RDP) before 09:25 or the auto-started "
+                "session will trade blind. No further automatic attempt will be "
+                "made today: IBKR locks accounts on repeated failed logins";
+            alerts_.notify(AlertNotifier::Critical, msg);
+            route("alert: " + msg);
+        }
+    }
+
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    const int64_t day = static_cast<int64_t>(tm.tm_year) * 400 + tm.tm_yday;
+    const double hod = tm.tm_hour + tm.tm_min / 60.0;
+    // is_us_trading_day, not just a weekday: the recovery below spends a login
+    // attempt, and spending one on Thanksgiving or Good Friday buys nothing and
+    // aims it straight into an IBKR holiday maintenance window — the same
+    // window that produces the misleading credential error. See market_calendar.h.
+    const bool armed = hod >= kWindowStartH && hod < kWindowEndH &&
+                       is_us_trading_day(tm) && day != preopen_day_;
+    if (!armed || now < kMinUptimeSec) {
+        // The streak means nothing outside the window, and a just-started app
+        // has not had time to connect to anything yet — counting either as
+        // evidence is how a healthy gateway gets killed.
+        preopen_bad_since_ = 0.0;
+        return;
+    }
+    if (preopen_authed()) {   // healthy: silent, by design, and re-armed
+        preopen_bad_since_ = 0.0;
+        return;
+    }
+    if (preopen_bad_since_ == 0.0) preopen_bad_since_ = now;
+    if (now - preopen_bad_since_ < kSettleSec) return;
+    preopen_day_ = day;
+
+    const int64_t age = data_.gateway_auth_age_ms();
+    const std::string since =
+        age < 0 ? std::string("nothing at all on this gateway session")
+                : std::string("last ") + std::to_string(age / 60'000) + " min ago";
+    // Two genuinely different faults, and the operator has ~40 minutes to act on
+    // whichever it is, so do not blur them. Socket down = we cannot even reach
+    // the gateway (the keepalive's port-down path owns that recovery, and it
+    // must not be raced). Socket up = the 2026-08-09 shape exactly.
+    const bool socket_up = data_.connected();
+    std::string msg =
+        socket_up
+            ? "WATCHDOG PRE-OPEN IB Gateway is UP but NOT logged in to IBKR - it "
+              "has told the data client " + since + ". "
+            : "WATCHDOG PRE-OPEN cannot reach IB Gateway on the API port at all "
+              "(no data session; it has said " + since + "). ";
+    msg += "The 09:25 auto-start will bring up a session that cannot reach the "
+           "market. The CREDENTIALS ARE PROBABLY FINE: IBKR answers 'unrecognized "
+           "username or password' during its maintenance window (2026-08-09 lost "
+           "13 hours to exactly that). ";
+
+    // ---- at most one recovery attempt, ever, per day ----
+    //
+    // IBKR LOCKS ACCOUNTS ON REPEATED FAILED LOGINS. A locked account is a far
+    // worse outage than the one being recovered from — it cannot be fixed from
+    // here at all. Three separate things bound this, because the day stamp alone
+    // demonstrably cannot:
+    //   1. this stamp, set BEFORE the launch, so a crash between the two costs
+    //      nothing and no future edit to the trigger can turn one attempt into
+    //      many;
+    //   2. PAPER ONLY (below), because -Restart is a COLD relaunch;
+    //   3. Start-IbGateway.ps1's own cross-process launch mutex + login-attempt
+    //      governor, which is the only guard that also binds Watch-IbGateway.ps1
+    //      — this relaunch takes the API port down, which is exactly what arms
+    //      the keepalive's own port-down relaunch, and the keepalive cannot see
+    //      an in-process day stamp. That collision is what would actually have
+    //      locked the account.
+    bool relaunch = socket_up && preopen_relaunch_day_ != day;
+    // A LIVE cold re-login may demand a TOTP that IBC cannot type, and would
+    // then wedge on the 2FA dialog with no login at all — strictly worse than
+    // the state being recovered from, and unfixable without RDP. This is the
+    // same reason Start-IbGateway.ps1 writes AutoRestartTime (soft) rather than
+    // ColdRestartTime for a live account. Live gets the page and nothing else.
+    const bool paper = active_account_is_paper();
+    if (relaunch && !paper) {
+        relaunch = false;
+        msg += "NOT relaunching: this is a LIVE account and a cold re-login can "
+               "stop on a 2FA prompt IBC cannot answer. LOG IN BY HAND (RDP)";
+    } else if (!relaunch) {
+        msg += "Not relaunching automatically - LOG IN BY HAND (RDP)";
+    }
+
+#ifdef _WIN32
+    const std::string args =
+        relaunch ? ps_args("Start-IbGateway.ps1", true, "-Restart") : std::string();
+    if (relaunch && args.empty()) {
+        relaunch = false;
+        msg += "Cannot relaunch: scripts\\Start-IbGateway.ps1 is missing. LOG IN "
+               "BY HAND (RDP)";
+    } else if (relaunch) {
+        msg += "Trying ONE relaunch now";
+    }
+#else
+    if (relaunch) {
+        relaunch = false;
+        msg += "Automatic relaunch is Windows-only. LOG IN BY HAND (RDP)";
+    }
+#endif
+
+    alerts_.notify(AlertNotifier::Critical, msg);
+    route("alert: " + msg);
+    if (!relaunch) return;
+
+#ifdef _WIN32
+    // -Restart, not a bare start: Start-IbGateway.ps1 exits immediately when the
+    // API port is already up (it is idempotent by design, and the app calls it
+    // on every launch), which is precisely the state we are in. -Restart kills
+    // the gateway and relaunches it with ONE fresh login — and the script's
+    // governor will refuse even that if logins have already been attempted too
+    // often, leaving the gateway untouched.
+    preopen_relaunch_day_ = day;
+    run_hidden(args);
+    route("gateway: PRE-OPEN relaunching IB Gateway (one attempt; verdict within " +
+          std::to_string(static_cast<int>(kVerdictSec)) + "s)");
+    preopen_verdict_until_ = now + kVerdictSec;
+#endif
+}
+
+// "The gateway is logged in", for the pre-open check.
+//
+// The farms are the overnight signal, but a live ORDER path that is reaching
+// IBKR proves the same thing more directly, so it counts too. That second term
+// is not redundant: it is what stops a false negative here from killing a
+// healthy session, since the recovery is a gateway relaunch. Overnight tws_ is
+// null and it contributes nothing — which is the blindness being fixed.
+bool App::preopen_authed() const {
+    if (data_.gateway_authed()) return true;
+    return tws_ && tws_->ready() && tws_->upstream_connected();
 }
 
 void App::refresh_ibkr_accounts() {

@@ -35,6 +35,7 @@
 #include "imgui.h"
 
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <map>
 #include <mutex>
@@ -53,6 +54,12 @@ public:
     ~App();
 
     void draw();
+
+    // Host-loop hook for iterations that draw NO frame (the window is
+    // iconified). Runs the wall-clock work that must not be skipped just
+    // because nobody is looking; touches no ImGui state. draw() calls it too,
+    // so it is the single list of "must tick regardless".
+    void pump_background();
 
     // Window-close request from the host loop. Quits immediately if nothing is
     // trading; otherwise pops a confirm dialog and quits only once confirmed.
@@ -297,6 +304,26 @@ private:
     // to stay fresh. Shared by /diag, /metrics and the watchdog so all three
     // report the same thing.
     std::string traded_bar_interval() const;
+
+    // Pre-open gateway AUTHENTICATION check: 08:45-09:15 local on a trading day,
+    // once, level-triggered inside the window with a settle time. The ONLY check
+    // that runs without a live session — every other one is gated on
+    // live_running() and was therefore blind while a failed overnight re-login
+    // burned 13 hours on 2026-08-09. Pages if the gateway is up but not logged
+    // in, then makes AT MOST ONE relaunch attempt (day stamp + paper only + the
+    // script's own governor: IBKR locks accounts on repeated failed logins) and
+    // polls the outcome. Runs from pump_background(), NOT only from draw().
+    void pump_preopen_gateway_check();
+    bool preopen_authed() const;             // farms up, or a live order path reaching IBKR
+    int64_t preopen_day_ = -1;               // tm_year*400+tm_yday of the last check
+    int64_t preopen_relaunch_day_ = -1;      // ...of the last relaunch ATTEMPT (never twice)
+    double preopen_bad_since_ = 0.0;         // mono_s when it first read not-authed (0 = it doesn't)
+    double preopen_verdict_until_ = 0.0;     // mono_s deadline for the post-relaunch verdict (0 = none)
+
+    // Steady seconds since construction — the clock for anything that must keep
+    // time on a frame that is never drawn, where ImGui::GetTime() stands still.
+    double mono_s() const;
+    std::chrono::steady_clock::time_point mono_epoch_ = std::chrono::steady_clock::now();
 
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
