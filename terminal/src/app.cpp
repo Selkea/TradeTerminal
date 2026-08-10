@@ -3499,8 +3499,9 @@ void App::pump_history_watchdog() {
         watched.push_back({S.symbol, S.interval_min});
     }
     if (watched.empty()) return;
+    const int64_t now_steady = steady_ms();
     const auto stale = hist_fresh_.stale(
-        watched, traded_bar_interval(), steady_ms(),
+        watched, traded_bar_interval(), now_steady,
         static_cast<int64_t>((now - hist_live_since_s_) * 1000.0));
 
     if (stale.empty()) {
@@ -3521,14 +3522,20 @@ void App::pump_history_watchdog() {
                   (sb.ever ? std::to_string(sb.age_ms / 60'000) + "m"
                            : std::string("never"));
     }
-    // Name the socket state: "connected" here is the 2026-08-07 half-open case
-    // (check the gateway), "disconnected" is the ordinary outage the reconnect
-    // path is already working on.
-    const std::string msg =
-        "WATCHDOG historical bars have stopped refreshing for " +
-        std::to_string(stale.size()) + " traded symbol(s) - strategies are "
-        "trading on stale candles: " + detail + " (data socket reports " +
-        (data_.connected() ? "CONNECTED - check IB Gateway)" : "disconnected)");
+    // The wording is net::hist_stall_alert's, not this function's: the old text
+    // ended "check IB Gateway" on evidence that argues the opposite (the same
+    // socket and farms serve the healthy symbols in the very cycles the others
+    // die), and a page that sends the operator to restart a healthy gateway is
+    // one worth being able to test. See net/hist_freshness.h.
+    //
+    // The page names the symbols that are DEMONSTRABLY still being served —
+    // symbols with a recent delivery — not the ones that merely have not
+    // crossed their own grace yet. On a lineup of mixed autopilot cadences the
+    // second set includes symbols that have delivered nothing all session.
+    const std::string msg = net::hist_stall_alert(
+        detail, stale,
+        hist_fresh_.refreshing(watched, traded_bar_interval(), now_steady),
+        data_.connected());
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
 }
