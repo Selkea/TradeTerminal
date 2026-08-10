@@ -260,6 +260,27 @@ TEST_CASE("rsi2: the MA exit fires once the gain covers the commission") {
     CHECK(orders[0].side == Side::Sell);
 }
 
+TEST_CASE("rsi2: a stored min_gain_cps of 100 is repaired, not obeyed") {
+    // What the optimizer wrote into the live lineup on 2026-08-10: a $1.00
+    // per-share gate on a $7 stock, i.e. a profit target wearing a cost floor's
+    // name. Left obeyed, the MA exit can never fire and every trade leaves on
+    // the time stop. Nothing clamps a stored param to its declared range at
+    // load, so removing it from the sweep is not enough on its own — the saved
+    // value has to be repaired here.
+    // Entry is at 125.00 and the last bar clears it by 4c, which a repaired 3c
+    // gate passes and a 100c gate does not.
+    const auto orders = rsi2_after_entry({124.0, 124.5, 124.8, 125.04}, 100, 500, true);
+    REQUIRE(orders.size() == 1);
+    CHECK(orders[0].side == Side::Sell);
+}
+
+TEST_CASE("rsi2: a hand-set gain inside the range is still obeyed") {
+    // Negative control for the repair: 8c is a plausible cost floor for a thin
+    // name, it is inside the declared range, and it must NOT be reset to 3 —
+    // the same 4c recovery stays held.
+    CHECK(rsi2_after_entry({124.0, 124.5, 124.8, 125.04}, 8, 500, true).empty());
+}
+
 TEST_CASE("rsi2: an adopted position still exits on the MA alone") {
     // A hot restart adopted the position, so there is no fill of ours to measure
     // a gain against. Fall back to the bare MA test rather than let the new gate

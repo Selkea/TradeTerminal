@@ -44,6 +44,10 @@
 using namespace tt;
 
 namespace {
+// Ceiling for min_gain_cps, shared by the declared range and the repair in
+// on_init (see both for the 2026-08-10 optimizer pinning that motivates it).
+constexpr double kMaxGainCps = 10;
+
 constexpr ParamDesc kParams[] = {
     {"rsi_len", 2, 2, 14},          // RSI period (Wilder)
     {"buy_below", 10, 1, 40},       // entry threshold
@@ -57,9 +61,20 @@ constexpr ParamDesc kParams[] = {
     // the cost being covered: IBKR bills per share and does not care what the
     // share costs, which is why a day of 8 trades on a $7.78 stock handed 60.8%
     // of its gross to fees. Measured round-trip cost was ~1.05 c/share, so the
-    // floor of 2 is the cheapest setting that still clears fees — assume the
-    // optimizer pins it there, because that is what it did to exit_ma.
-    {"min_gain_cps", 3, 2, 100},
+    // floor of 2 is the cheapest setting that still clears fees.
+    //
+    // Ceiling 10, not 100. The old ceiling assumed the optimizer would pin this
+    // to the FLOOR the way it did exit_ma; it did the opposite. Every one of the
+    // 13 winning runs on 2026-08-10 came back 69.93-100 c/share (SNXX at exactly
+    // 100 in 5 of 6), because in-sample a high bar simply selects the winners.
+    // A $1.00/share gate on a $7 stock is not a cost floor, it is a fantasy
+    // profit target, and it hands every exit to the time stop. This parameter is
+    // no longer swept at all (sweep_param_is_fixed in panels/sweep.h), so the
+    // range now only bounds what a human types: 10 c/share is ~5x the measured
+    // round trip and ~5x the worst case IBKR's $1 order minimum can produce on a
+    // 100-share round trip, while on the $7-8 names this trades it is already
+    // 1.3% a trade — past that it is a target, not a cost.
+    {"min_gain_cps", 3, 2, kMaxGainCps},
     // Max bars in trade, and the only exit a losing position has. MANDATORY
     // (minimum 1, never 0) — with no price stop and a profit gate on the MA
     // exit, a trade that never gets min_gain_cps above entry has nothing else
@@ -116,6 +131,21 @@ public:
             ctx.log(2, "time_stop was 0 (no risk control) — restored to 24 bars");
         }
         if (min_gain_cps_ < 0.0) min_gain_cps_ = 0.0;   // a negative gate is no gate
+        // Repair a value the optimizer swept in before this became a fixed
+        // parameter, the same way exit_ma=2 is repaired above. Nothing clamps a
+        // stored param to its declared range at load, so the 69.93-100 c/share
+        // settings the 2026-08-10 tournaments wrote into the live lineup would
+        // otherwise survive every future optimization untouched — fixing the
+        // sweep stops new ones, this undoes the ones already saved.
+        if (min_gain_cps_ > kMaxGainCps) {
+            char fix[112];
+            std::snprintf(fix, sizeof(fix),
+                          "min_gain_cps was %.2fc (a profit target, not a cost "
+                          "floor) — restored to 3c",
+                          min_gain_cps_);
+            min_gain_cps_ = 3;
+            ctx.log(2, fix);
+        }
         if (trend_ma_ < exit_ma_) trend_ma_ = exit_ma_;
 
         sym_ = 0;

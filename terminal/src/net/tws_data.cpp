@@ -1,6 +1,7 @@
 #include "net/tws_data.h"
 
 #include "net/hist_pacing.h"
+#include "net/hist_requests.h"
 
 #include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
@@ -130,15 +131,11 @@ struct TwsData::Io final : DefaultEWrapper {
     std::unique_ptr<EClientSocket> client;
     std::unique_ptr<EReader> reader;
 
-    // In-flight candle fetches: TWS reqId == the public request id.
-    struct Pending {
-        std::string symbol, interval;
-        std::string dur, bar;   // resolved IB strings, kept so we can re-issue
-        std::vector<Candle> candles;
-        std::chrono::steady_clock::time_point sent;   // when reqHistoricalData went out
-        bool retried = false;   // already cancelled + re-issued once
-    };
-    std::unordered_map<int, Pending> hist;
+    // In-flight candle fetches. The TWS reqId is NO LONGER the public request
+    // id: a retry re-issues under a fresh id and HistPending::pub_id carries the
+    // caller's id across the swap. See net/hist_requests.h for why (a retry that
+    // reused its own id was destroyed by its own cancel acknowledgement).
+    HistRequests hist;
     // Distinct farm-status codes already reported (the stream repeats them).
     std::unordered_set<int> farm_codes_seen;
     // When the last historicalDataEnd landed, and how big it was. IB stops
@@ -149,9 +146,9 @@ struct TwsData::Io final : DefaultEWrapper {
 
     // Issue (or re-issue) one history request. Kept in one place so the retry
     // path below is byte-identical to the original send.
-    void send_history(int id, Pending& p) {
+    void send_history(int id, HistPending& p) {
         p.candles.clear();
-        p.sent = std::chrono::steady_clock::now();
+        p.sent_ms = steady_ms();
         client->reqHistoricalData(static_cast<TickerId>(id), stock(p.symbol), "",
                                   p.dur, p.bar, "TRADES",
                                   /*useRTH=*/1, /*formatDate=*/2,
@@ -164,48 +161,36 @@ struct TwsData::Io final : DefaultEWrapper {
     // one. Tearing the session down (drop_connection) also destroys and
     // re-subscribes every quote stream, ~75 times a day, and re-queues the very
     // requests that were already in flight — which is why the same batch was
-    // being fetched over and over. Returns true if anything was retried; a
-    // request that dies a SECOND time is left for the caller to treat as a
-    // genuine half-open.
-    bool retry_dead_history(std::chrono::steady_clock::time_point now) {
+    // being fetched over and over.
+    //
+    // The re-issue takes a NEW reqId off the same monotonic counter the public
+    // ids come from. Re-using the dead id (0.13.x-0.14.1) meant IB's cancel
+    // acknowledgement — error 162, delivered on the NEXT processMsgs — matched
+    // the retry and erased it, so the retry could never be seen to succeed and
+    // the escalation below could never fire. That silently replaced a recovery
+    // that had worked 286 times with no recovery at all. See
+    // net/hist_requests.h.
+    bool retry_dead_history(int64_t now_ms) {
         bool retried_any = false;
-        for (auto& [id, p] : hist) {
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 now - p.sent).count();
-            if (history_action(age, p.retried) != HistAction::Retry) continue;
-            p.retried = true;
+        for (const int id : hist.dead_ids(now_ms)) {
+            const HistPending* dead = hist.find(id);
+            if (!dead) continue;
+            const int64_t age = now_ms - dead->sent_ms;
+            const int new_id =
+                static_cast<int>(d.next_id_.fetch_add(1, std::memory_order_relaxed));
+            HistPending* p = hist.begin_retry(id, new_id, now_ms);
+            if (!p) continue;
             retried_any = true;
+            // Cancel FIRST, then send: the ack for `id` is now owed to the
+            // awaiting-ack set, not to the request going out on `new_id`.
             if (client) client->cancelHistoricalData(static_cast<TickerId>(id));
-            d.log(p.symbol + " " + p.interval + ": history unanswered for " +
-                  std::to_string(age / 1000) + "s - cancelled and retrying (req " +
-                  std::to_string(id) + ")");
-            if (client) send_history(id, p);
+            d.log(p->symbol + " " + p->interval + ": history unanswered for " +
+                  std::to_string(age / 1000) + "s - cancelled req " +
+                  std::to_string(id) + ", retrying as req " +
+                  std::to_string(new_id));
+            if (client) send_history(new_id, *p);
         }
         return retried_any;
-    }
-
-    // Any request that has now blown the timeout for the SECOND time - the
-    // retry above did not help, so the session itself is suspect.
-    bool has_twice_dead_history(std::chrono::steady_clock::time_point now) const {
-        for (const auto& [id, p] : hist) {
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 now - p.sent).count();
-            if (history_action(age, p.retried) == HistAction::Escalate) return true;
-        }
-        return false;
-    }
-
-    // Age of the longest-outstanding history fetch, in ms (0 when none). Steady
-    // clock so a wall-clock/NTP jump around a gateway restart can't distort it.
-    int oldest_hist_ms(std::chrono::steady_clock::time_point now) const {
-        int oldest = 0;
-        for (const auto& [id, p] : hist) {
-            const int age = static_cast<int>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - p.sent)
-                    .count());
-            if (age > oldest) oldest = age;
-        }
-        return oldest;
     }
 
     // Active quote streams: symbol -> tickerId + last known quote state.
@@ -257,9 +242,13 @@ struct TwsData::Io final : DefaultEWrapper {
         reader.reset();
         client.reset();
         // In-flight history requests will never answer; unblock the waiters.
-        for (auto& [id, p] : hist)
+        // Reported under pub_id, not the map key: after a retry the key is an
+        // id the caller was never given. clear() also drops any cancelled id
+        // still awaiting its acknowledgement — the socket that owed it is gone,
+        // so holding the entry would only leak it across the reconnect.
+        for (const auto& [id, p] : hist.live())
             if (d.cbs_.on_error)
-                d.cbs_.on_error(static_cast<uint32_t>(id), "tws",
+                d.cbs_.on_error(p.pub_id, "tws",
                                 "connection lost fetching " + p.symbol);
         hist.clear();
         // An in-flight scan will never complete; deliver empty so the caller
@@ -337,9 +326,19 @@ struct TwsData::Io final : DefaultEWrapper {
             // di is clamped above (e.g. 1-sec bars cap at "30m" = 1800 bars,
             // the most IB returns per request); the live tail extends it forward.
             const char* dur = kDurs[di].dur;
-            hist[static_cast<int>(r.id)] = {r.symbol, r.interval, dur, bar, {},
-                                            std::chrono::steady_clock::now(), false};
-            send_history(static_cast<int>(r.id), hist[static_cast<int>(r.id)]);
+            // First issue: the TWS reqId starts out equal to the public id, and
+            // first_sent_ms is pinned here so /diag reports the whole outage
+            // rather than the age of the current attempt.
+            const int req_id = static_cast<int>(r.id);
+            HistPending p;
+            p.pub_id = r.id;
+            p.symbol = r.symbol;
+            p.interval = r.interval;
+            p.dur = dur;
+            p.bar = bar;
+            p.sent_ms = p.first_sent_ms = steady_ms();
+            hist.add(req_id, std::move(p));
+            send_history(req_id, *hist.find(req_id));
         }
         if (dirty) {
             for (auto it = streams.begin(); it != streams.end();) {
@@ -452,9 +451,9 @@ struct TwsData::Io final : DefaultEWrapper {
             if (farm_codes_seen.insert(errorCode).second)
                 d.log("gateway farm status " + std::to_string(errorCode) + ": " +
                       errorString);
-            if (hist.count(id))
+            if (const HistPending* p = hist.find(id))
                 d.log("...that arrived on in-flight history request " +
-                      std::to_string(id) + " (" + hist[id].symbol + ")");
+                      std::to_string(id) + " (" + p->symbol + ")");
             return;
         }
         if (errorCode == 10141) {
@@ -465,12 +464,18 @@ struct TwsData::Io final : DefaultEWrapper {
             reset_conn = true;
             return;
         }
-        const auto it = hist.find(id);
-        if (it != hist.end()) {
+        // A request WE cancelled to retry it. IB answers cancelHistoricalData
+        // with error 162 ("API historical data query cancelled: N") one
+        // processMsgs later; before 0.15.0 the retry reused N, so this line
+        // erased the retry and reported it to the caller as a feed error — 512
+        // times on 2026-08-10. The ack belongs to the OLD request, which is
+        // already gone from the live set, so absorb it silently: the "cancelled
+        // req N, retrying as req M" line above already said what happened.
+        if (hist.take_cancel_ack(id)) return;
+        if (const HistPending* p = hist.find(id)) {
             if (d.cbs_.on_error)
-                d.cbs_.on_error(static_cast<uint32_t>(id), "tws",
-                                it->second.symbol + ": " + errorString);
-            hist.erase(it);
+                d.cbs_.on_error(p->pub_id, "tws", p->symbol + ": " + errorString);
+            hist.erase(id);
             return;
         }
         if (scan.running && id == kScanReqId) {
@@ -487,8 +492,13 @@ struct TwsData::Io final : DefaultEWrapper {
     }
 
     void historicalData(TickerId reqId, const ::Bar& bar) override {
-        const auto it = hist.find(static_cast<int>(reqId));
-        if (it == hist.end()) return;
+        // Unknown id = a late bar for a request we already cancelled; drop it.
+        // A bar for the RETRY's id lands here normally now, which is the whole
+        // point: before 0.15.0 the retry had been erased by its own cancel ack,
+        // so its bars were discarded and the app could not tell the retry had
+        // worked.
+        HistPending* p = hist.find(static_cast<int>(reqId));
+        if (!p) return;
         Candle c;
         c.ts = parse_bar_time(bar.time);
         c.open = bar.open;
@@ -497,19 +507,19 @@ struct TwsData::Io final : DefaultEWrapper {
         c.close = bar.close;
         c.volume = DecimalFunctions::decimalToDouble(bar.volume);
         if (c.volume < 0) c.volume = 0;   // -1 = not reported for this bar
-        it->second.candles.push_back(c);
+        p->candles.push_back(c);
     }
 
     void historicalDataEnd(int reqId, const std::string&,
                            const std::string&) override {
-        const auto it = hist.find(reqId);
-        if (it == hist.end()) return;
+        HistPending* p = hist.find(reqId);
+        if (!p) return;
         CandleBatch b;
-        b.id = static_cast<uint32_t>(reqId);
-        b.symbol = it->second.symbol;
-        b.interval = it->second.interval;
-        b.candles = std::move(it->second.candles);
-        hist.erase(it);
+        b.id = p->pub_id;   // the id the CALLER asked under, not the retry's
+        b.symbol = p->symbol;
+        b.interval = p->interval;
+        b.candles = std::move(p->candles);
+        hist.erase(reqId);
         // Remember how much just landed: the next request must not follow a big
         // batch too closely (see kBigBatchBars).
         last_hist_end = std::chrono::steady_clock::now();
@@ -721,6 +731,7 @@ void TwsData::io_loop() {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();
             const auto now = std::chrono::steady_clock::now();
+            const int64_t now_steady = steady_ms();   // same clock, ms form
             // Half-open guard: socket up but no nextValidId within 10s.
             const bool stalled = !connected_.load(std::memory_order_acquire) &&
                                  now - last_connect > std::chrono::seconds(10);
@@ -729,9 +740,12 @@ void TwsData::io_loop() {
             // A single unanswered request is retried in place first; only a
             // request that dies AGAIN after that retry means the session is
             // genuinely half-open and worth the (expensive) full teardown.
-            if (connected_.load(std::memory_order_acquire)) io.retry_dead_history(now);
+            if (connected_.load(std::memory_order_acquire)) {
+                io.hist.prune_cancel_acks(now_steady);
+                io.retry_dead_history(now_steady);
+            }
             const bool hist_stalled = connected_.load(std::memory_order_acquire) &&
-                                      io.has_twice_dead_history(now) &&
+                                      io.hist.has_twice_dead(now_steady) &&
                                       now - last_hist_reset > kHistResetCooldown;
             if (io.reset_conn || stalled || hist_stalled) {
                 if (io.reset_conn) {
@@ -752,9 +766,12 @@ void TwsData::io_loop() {
             io.pump_requests();
         }
         // Publish history-fetch state for /diag (I/O thread owns io.hist).
-        pending_hist_.store(static_cast<int>(io.hist.size()),
-                            std::memory_order_relaxed);
-        oldest_hist_ms_.store(io.oldest_hist_ms(std::chrono::steady_clock::now()),
+        // These read 0 through the whole 184-minute 2026-08-10 outage because a
+        // retry was erased by its own cancel ack the instant it was issued; a
+        // retried request now stays in the pending set under its new id, and its
+        // age is measured from the FIRST attempt.
+        pending_hist_.store(io.hist.pending(), std::memory_order_relaxed);
+        oldest_hist_ms_.store(io.hist.oldest_age_ms(steady_ms()),
                               std::memory_order_relaxed);
     }
 

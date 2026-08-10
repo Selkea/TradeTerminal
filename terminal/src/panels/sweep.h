@@ -23,6 +23,14 @@ namespace tt::ui {
 //    policy choice or a fact about the market, not something to discover from
 //    price. Sweeping a trading window overfits to whatever slice the backtest
 //    got lucky on and then barely trades live.
+//  - COST FLOORS (min_gain_cps). A measurement of what the broker charges, not
+//    a knob. Swept, it stops being a cost floor and becomes a profit target —
+//    and the optimizer always wants a bigger one, because in-sample the trades
+//    that clear a high bar are exactly the winners. On 2026-08-10 all 13
+//    winning rsi2_pullback runs came back between 69.93 and 100 c/share, SNXX
+//    pinned at exactly 100 in 5 of 6 runs: a $1.00-per-share minimum gain on a
+//    $7 stock, against a measured round-trip cost of ~1.05 c/share. The gate
+//    then never opens, so every position leaves on the time stop instead.
 //
 // session_min/eod_min were the leak: they are ORB's session window, they were
 // missing from this list, and on 2026-08-05 SNXX was live with session_min
@@ -34,7 +42,8 @@ namespace tt::ui {
 inline bool sweep_param_is_fixed(const std::string& n) {
     return n == "qty" || n == "max_qty" || n == "budget_pct" ||
            n == "alloc_pct" || n == "risk_pct" || n == "enter_from_h" ||
-           n == "enter_until_h" || n == "session_min" || n == "eod_min";
+           n == "enter_until_h" || n == "session_min" || n == "eod_min" ||
+           n == "min_gain_cps";
 }
 
 // Automatic optimizer: coordinate descent over a strategy's declared

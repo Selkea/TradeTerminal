@@ -182,3 +182,56 @@ TEST_CASE("stale: a stopped session's deliveries do not follow it into the next"
     CHECK(f.stale(syms, "5m", next_open, 1 * kMin).empty());
     CHECK(f.stale(syms, "5m", next_open, 91 * kMin).size() == 1);
 }
+
+// ---- the page text ---------------------------------------------------------
+// The 2026-08-10 stall killed history for four symbols while two others were
+// served perfectly by the SAME socket, session and farms. The old page ended
+// "(data socket reports CONNECTED - check IB Gateway)", which sends the operator
+// to restart something the evidence says is healthy — and a forced re-login can
+// hit IBKR's maintenance window or, repeated, lock the account.
+namespace {
+std::vector<WatchedSymbol> watch(const std::vector<std::string>& syms) {
+    std::vector<WatchedSymbol> out;
+    for (const std::string& s : syms) out.push_back({s, 30});
+    return out;
+}
+bool has(const std::string& hay, const std::string& needle) {
+    return hay.find(needle) != std::string::npos;
+}
+} // namespace
+
+TEST_CASE("alert: a stall beside healthy symbols is not blamed on the gateway") {
+    const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true},
+                                       {"MUU", 60 * kMin, false}};
+    const std::string msg =
+        hist_stall_alert("SOXS 284m, MUU never", stale,
+                         watch({"SOXS", "MUU", "AAOX", "SNDQ"}), true);
+    CHECK(has(msg, "SOXS 284m, MUU never"));
+    // The contrast that IS the diagnosis: same session, still refreshing.
+    CHECK(has(msg, "AAOX, SNDQ"));
+    CHECK(has(msg, "app-side history stall, not the gateway"));
+    CHECK(has(msg, "do NOT restart the gateway"));
+    CHECK_FALSE(has(msg, "check IB Gateway"));
+    CHECK(has(msg, "2 traded symbol(s)"));
+}
+
+TEST_CASE("alert: with nothing refreshing the gateway is not cleared either") {
+    // Every watched symbol is stale, so the upstream is still a live suspect —
+    // but the operator is pointed at the log first, not at a blind restart.
+    const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true}};
+    const std::string msg =
+        hist_stall_alert("SOXS 284m", stale, watch({"SOXS"}), true);
+    CHECK(has(msg, "NO watched symbol is refreshing"));
+    CHECK(has(msg, "before touching the gateway"));
+    CHECK_FALSE(has(msg, "check IB Gateway"));
+    CHECK_FALSE(has(msg, "not the gateway:"));   // no verdict without evidence
+}
+
+TEST_CASE("alert: a dropped socket says the reconnect path already owns it") {
+    const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true}};
+    const std::string msg =
+        hist_stall_alert("SOXS 284m", stale, watch({"SOXS", "AAOX"}), false);
+    CHECK(has(msg, "data socket disconnected"));
+    CHECK(has(msg, "reconnect path is already on it"));
+    CHECK_FALSE(has(msg, "gateway"));   // nothing for the operator to restart
+}

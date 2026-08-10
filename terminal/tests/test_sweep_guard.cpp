@@ -26,6 +26,11 @@ TEST_CASE("sweep: sizing and session-shape parameters are never swept") {
     CHECK(sweep_param_is_fixed("enter_until_h"));
     CHECK(sweep_param_is_fixed("session_min"));
     CHECK(sweep_param_is_fixed("eod_min"));
+    // Cost floor: a measurement of what the broker charges. Swept, it inverts
+    // into a profit target — on 2026-08-10 all 13 winning rsi2_pullback runs
+    // came back 69.93-100 c/share (SNXX pinned at exactly 100 in 5 of 6) on a
+    // $7 stock whose measured round-trip cost was ~1.05 c/share.
+    CHECK(sweep_param_is_fixed("min_gain_cps"));
     // Signal parameters must still be swept, or the optimizer does nothing.
     CHECK_FALSE(sweep_param_is_fixed("entry_z"));
     CHECK_FALSE(sweep_param_is_fixed("trend_len"));

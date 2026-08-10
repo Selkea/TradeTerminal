@@ -80,6 +80,57 @@ inline int64_t bar_stale_grace_ms(double refresh_interval_min) {
                : kBarStaleGraceFloorMs;
 }
 
+// The page text for a history stall, built where it can be tested rather than
+// inline in App::pump_history_watchdog.
+//
+// It exists because the OLD text was actively misleading: it ended "(data
+// socket reports CONNECTED - check IB Gateway)". On 2026-08-10 four symbols
+// went hours stale while two others were served perfectly by the SAME socket,
+// the same session and the same three farms, in the very cycles the others
+// died — /diag read farms 3/3, gateway_authed true, and not one half-open
+// reconnect all process. Sending the operator to restart the gateway on that
+// evidence is worse than useless: a forced re-login can land in IBKR's
+// maintenance window (the 2026-07-31 12-hour outage) and repeated failed logins
+// lock the account. Naming the symbols that ARE refreshing puts the actual
+// diagnosis in the page — the stall is app-side, not upstream.
+//
+// `detail` is the caller's per-symbol age list; `watched` is everything the
+// watchdog is entitled to expect refreshes for, so the healthy set is what is
+// left after `stale` is removed.
+inline std::string hist_stall_alert(const std::string& detail,
+                                    const std::vector<StaleBars>& stale,
+                                    const std::vector<WatchedSymbol>& watched,
+                                    bool socket_connected) {
+    std::string healthy;
+    for (const WatchedSymbol& w : watched) {
+        bool is_stale = false;
+        for (const StaleBars& sb : stale)
+            if (sb.symbol == w.symbol) { is_stale = true; break; }
+        if (is_stale) continue;
+        if (!healthy.empty()) healthy += ", ";
+        healthy += w.symbol;
+    }
+    // Disconnected is the ordinary outage the reconnect path is already working
+    // on. Connected with NOTHING refreshing is the one case where the upstream
+    // is still a live suspect, so it does not get the "not the gateway" verdict
+    // — but it still does not get told to restart anything blind.
+    const std::string state =
+        !socket_connected
+            ? " (data socket disconnected - the reconnect path is already on it)"
+        : healthy.empty()
+            ? " (data socket CONNECTED but NO watched symbol is refreshing - "
+              "check the tws-data log for 'retrying as req' / 'reconnecting data "
+              "session' lines before touching the gateway)"
+            : " (data socket CONNECTED and still refreshing " + healthy +
+              " on the same session - app-side history stall, not the gateway: "
+              "check the tws-data 'retrying as req' lines; do NOT restart the "
+              "gateway)";
+    return "WATCHDOG historical bars have stopped refreshing for " +
+           std::to_string(stale.size()) +
+           " traded symbol(s) - strategies are trading on stale candles: " +
+           detail + state;
+}
+
 class HistoryFreshness {
 public:
     // Data worker thread, once per successfully delivered bar set.
