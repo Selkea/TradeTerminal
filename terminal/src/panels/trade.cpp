@@ -44,13 +44,67 @@ void TradePanel::set_symbol_strategy(const std::string& symbol, const std::strin
                         def_ap_interval_min_, def_ap_dd_pct_});
 }
 
+bool TradePanel::store_symbol_params(const std::string& symbol, const std::string& key,
+                                     const std::map<std::string, double>& params) {
+    for (SymRow& r : pending_)
+        if (r.symbol == symbol && r.strat_key == key) {
+            r.params = params;
+            return true;
+        }
+    return false;
+}
+
+std::vector<std::string> TradePanel::pending_symbols() const {
+    std::vector<std::string> out;
+    out.reserve(pending_.size());
+    for (const SymRow& r : pending_) out.push_back(r.symbol);
+    return out;
+}
+
+bool TradePanel::has_own_params(const std::string& symbol) const {
+    for (const SymRow& r : pending_)
+        if (r.symbol == symbol) return !r.params.empty();
+    return false;
+}
+
+int TradePanel::remove_symbols(const std::vector<std::string>& symbols) {
+    const size_t before = pending_.size();
+    pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+                                  [&](const SymRow& r) {
+                                      return std::find(symbols.begin(), symbols.end(),
+                                                       r.symbol) != symbols.end();
+                                  }),
+                   pending_.end());
+    if (pending_.empty()) selected_symbol_idx_ = 0;
+    else selected_symbol_idx_ =
+             std::min(selected_symbol_idx_, static_cast<int>(pending_.size()) - 1);
+    want_tab_ = pending_.empty() ? -1 : selected_symbol_idx_;
+    return static_cast<int>(before - pending_.size());
+}
+
 void TradePanel::set_lineup(const std::vector<std::string>& symbols) {
     if (symbols.empty()) return;   // don't strip the panel down to no tabs
-    pending_.clear();
-    for (const std::string& sym : symbols)
-        pending_.push_back({sym, def_bar_sec_, def_record_, 0, def_risk_,
-                            def_risk_dd_pct_, def_strat_key_, {}, def_ap_mode_,
-                            def_ap_trigger_, def_ap_interval_min_, def_ap_dd_pct_});
+    // Carry over a repeat pick's OWN (strategy, params) pair before the tabs are
+    // rebuilt. Until 0.16.0 this cleared params unconditionally, so a symbol
+    // whose tournament then failed had nothing of its own left and inherited
+    // whatever the shared per-strategy map happened to hold — on 2026-08-10, a
+    // set fitted to SSPC. The pair moves together on purpose: params fitted for
+    // one strategy mean nothing to another that happens to declare the same
+    // parameter names.
+    std::vector<SymRow> prev;
+    prev.swap(pending_);
+    for (const std::string& sym : symbols) {
+        SymRow row{sym,     def_bar_sec_,     def_record_,    0,
+                   def_risk_, def_risk_dd_pct_, def_strat_key_, {},
+                   def_ap_mode_, def_ap_trigger_, def_ap_interval_min_, def_ap_dd_pct_};
+        for (const SymRow& old : prev)
+            if (old.symbol == sym && !old.params.empty()) {
+                row.strat_key = old.strat_key;
+                row.params = old.params;
+                break;
+            }
+        pending_.push_back(std::move(row));
+    }
     selected_symbol_idx_ = 0;
     want_tab_ = 0;
 }
@@ -77,15 +131,31 @@ TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
                 ? account.subaccounts[r.account_idx] : std::string();
         RiskLimits rk = r.risk;
         rk.max_drawdown_pct = r.risk_dd_pct / 100.0;   // percent -> fraction
-        // This symbol's params for its current strategy (edited value or the
-        // strategy's current value); other strategies' edits ignored.
-        std::map<std::string, double> p;
-        for (const StratParam& sp : strat_params(r.strat_key)) {
-            const auto it = r.params.find(sp.name);
-            p[sp.name] = it != r.params.end() ? it->second : sp.value;
-        }
-        opts.symbols.push_back({r.symbol, r.bar_sec, r.record, acct, r.strat_key, p, rk,
-                                r.ap_mode, r.ap_trigger, r.ap_interval_min, r.ap_dd_pct});
+        // This symbol's params for its current strategy: its OWN value for every
+        // declared name it has one for, the strategy's current value for the
+        // rest. That fallback is what made 2026-08-10 invisible — six tabs with
+        // params={} all silently took the same shared set — so the selection now
+        // reports where each name came from and the caller logs it.
+        std::vector<ParamDefault> declared;
+        for (const StratParam& sp : strat_params(r.strat_key))
+            declared.push_back({sp.name, sp.value});
+        ParamSelection sel = select_symbol_params(r.params, declared);
+
+        SymbolOpt so;
+        so.symbol = r.symbol;
+        so.bar_seconds = r.bar_sec;
+        so.record = r.record;
+        so.account = acct;
+        so.strat_key = r.strat_key;
+        so.params = std::move(sel.params);
+        so.param_source = sel.source;
+        so.inherited_params = std::move(sel.inherited_names);
+        so.risk = rk;
+        so.ap_mode = r.ap_mode;
+        so.ap_trigger = r.ap_trigger;
+        so.ap_interval_min = r.ap_interval_min;
+        so.ap_dd_pct = r.ap_dd_pct;
+        opts.symbols.push_back(std::move(so));
     }
     return opts;
 }

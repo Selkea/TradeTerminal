@@ -3,6 +3,7 @@
 #include "config.h"
 #include "engine/engine.h"
 #include "market_data.h"   // QuoteBook (live bid/ask for the marketable-limit calc)
+#include "symbol_params.h" // own-vs-inherited parameter selection
 
 #include <functional>
 #include <map>
@@ -27,6 +28,11 @@ public:
         std::string account;      // IBKR sub-account id; "" = shared account/pool
         std::string strat_key;    // strategy source basename; "" = built-in SMA
         std::map<std::string, double> params;   // this symbol's strategy params
+        // Where `params` came from. Carried to the start path so the session log
+        // and /diag can name it: a symbol silently running the shared strategy
+        // default is exactly the 2026-08-10 failure, and it left no trace.
+        ParamSource param_source = ParamSource::None;
+        std::vector<std::string> inherited_params;   // declared names that fell back
         RiskLimits risk{};
         // Autopilot: re-optimize while trading. mode 0 off, 1 params-only,
         // 2 full (strategy can be swapped). trigger 0 timer, 1 drawdown, 2 both.
@@ -81,10 +87,28 @@ public:
     void set_symbol_strategy(const std::string& symbol, const std::string& key,
                              const std::map<std::string, double>& params);
 
+    // Store a fit against an EXISTING tab that already runs `key`; returns false
+    // otherwise. A plain Optimizer sweep must not conjure a Trade tab for a
+    // symbol you only meant to optimize, nor silently re-point a tab at the
+    // strategy you were experimenting with — but its winner still belongs to
+    // that symbol rather than to the shared per-strategy map (symbol_params.h).
+    bool store_symbol_params(const std::string& symbol, const std::string& key,
+                             const std::map<std::string, double>& params);
+
+    // Lineup admission (symbol_params.h): the pending symbols, whether one
+    // carries a parameter set of its own, and dropping the ones that earned no
+    // validated set this morning. remove_symbols returns how many tabs went.
+    std::vector<std::string> pending_symbols() const;
+    bool has_own_params(const std::string& symbol) const;
+    int remove_symbols(const std::vector<std::string>& symbols);
+
     // Replace all pending tabs with exactly `symbols`, each a fresh tab seeded
     // from the panel's per-symbol defaults (built-in strategy until a
     // tournament assigns one). Used by the daily auto-lineup. No-op if empty
     // (keeps the current tabs rather than leaving the panel symbol-less).
+    // A symbol that is already a tab keeps its (strategy, params) PAIR: if this
+    // morning's tournament produces nothing for it, its own previous fit is the
+    // only set left that was ever fitted to this instrument.
     void set_lineup(const std::vector<std::string>& symbols);
 
     // Build the StartOpts the "Start Trading" button would send, from the

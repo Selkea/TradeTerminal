@@ -965,9 +965,27 @@ void App::pump_sweep() {
         return;
     }
 
-    // All passes done: apply the winner to the strategy's parameters.
-    strat_mgr_.set_param_values(opt_.key, opt_.best);
-    sweep_.applied = true;
+    // All passes done. Where the winner goes depends on WHO asked for the sweep.
+    //
+    // Until 0.16.0 this unconditionally stamped opt_.best into the shared
+    // per-strategy map. A tournament runs one sweep per candidate through this
+    // exact path, so on 2026-08-10 each of the five candidates per symbol wrote
+    // its IN-SAMPLE winner there — before holdout scoring, before the champion
+    // decision, and with no rollback when the champion was rejected. The last
+    // sweep to finish anywhere (an SSPC run at 09:40:40) became the parameter
+    // set that all six live symbols traded. A candidate sweep is not a verdict:
+    // only finish_tournament decides, and it writes the SYMBOL, not the map.
+    const bool candidate_of_tournament = tourn_.active;
+    bool on_symbol = false;
+    if (!candidate_of_tournament) {
+        // A manual Optimizer run is the user setting this strategy's defaults —
+        // keep that. Give the swept SYMBOL its own copy too, so it stops
+        // depending on a map every other symbol also reads.
+        strat_mgr_.set_param_values(opt_.key, opt_.best);
+        sweep_.applied = true;
+        on_symbol = !sweep_base_.symbol.empty() &&
+                    trade_.store_symbol_params(sweep_base_.symbol, opt_.key, opt_.best);
+    }
     std::string bests;
     for (const auto& [k, v] : opt_.best) {
         char kv[64];
@@ -975,7 +993,12 @@ void App::pump_sweep() {
         bests += kv;
     }
     route("optimizer: finished " + std::to_string(sweep_.done) + " backtests (" +
-             sweep_.label + ") — applied " + bests);
+             sweep_.label + ") — " +
+             (candidate_of_tournament
+                  ? "candidate result (not applied; the tournament decides) "
+                  : on_symbol ? "applied to " + sweep_base_.symbol + " and the strategy "
+                              : "applied ") +
+             bests);
 
     if (sweep_.holdout_pct <= 0 || sweep_test_bars_.empty()) {
         sweep_.running = false;
@@ -1141,7 +1164,18 @@ void App::finish_tournament() {
     }
 
     if (champ < 0) {
-        route("tournament: no candidate produced a result");
+        // 2026-08-10: SOXS, MUU, KORU and SOXL each lost all five candidates to
+        // candle-fetch timeouts and landed here — then traded anyway, on a set
+        // fitted to SSPC. Record it so the lineup can drop the symbol instead
+        // (plan_lineup, symbol_params.h). Only a lineup tournament is recorded;
+        // an autopilot cycle failing is a different question, handled in
+        // autopilot_evaluate (it simply keeps the incumbent).
+        route("tournament: no candidate produced a result" +
+              (tourn_.target_symbol.empty() ? std::string()
+                                            : " for " + tourn_.target_symbol));
+        if (!tourn_.target_symbol.empty() &&
+            lineup_.phase == DailyLineup::Phase::Tournaments)
+            lineup_.no_result.push_back(tourn_.target_symbol);
         return;
     }
     const auto& c = tourn_.results[static_cast<size_t>(champ)];
@@ -1150,17 +1184,28 @@ void App::finish_tournament() {
     // won) on unseen data - crowning it hands the live engine a set we already
     // know does not work. Better to keep whatever is running.
     if (!minimize && !(c.score > 0.0)) {
-        char rej[192];
+        char rej[256];
         std::snprintf(rej, sizeof rej,
-                      "tournament: best candidate %s scored %s %.4g — not positive, "
-                      "keeping the incumbent",
+                      "tournament: best candidate %s scored %s %.4g on %s — not "
+                      "positive, keeping the incumbent (%s keeps whatever set it "
+                      "already had)",
                       strat_mgr_.display_name(c.key).c_str(),
-                      kSweepMetrics[tourn_.base.metric], c.score);
+                      kSweepMetrics[tourn_.base.metric], c.score,
+                      tourn_.base.symbol.c_str(),
+                      tourn_.target_symbol.empty() ? "the symbol"
+                                                   : tourn_.target_symbol.c_str());
         route(rej);
         return;
     }
-    strat_mgr_.set_param_values(c.key, c.params);   // champion's params stick
-    if (!tourn_.target_symbol.empty())
+    // The champion was fitted to ONE instrument, so it belongs to that symbol.
+    // Writing it to the shared per-strategy map as well is how a symbol with no
+    // set of its own ended up trading another symbol's fit (2026-08-10); the map
+    // stays the strategy's own defaults, which is all a never-optimized symbol
+    // should ever inherit. An untargeted tournament has no symbol to write to,
+    // so there the map is still the right home.
+    if (tourn_.target_symbol.empty())
+        strat_mgr_.set_param_values(c.key, c.params);
+    else
         trade_.set_symbol_strategy(tourn_.target_symbol, c.key, c.params);
     char buf[192];
     std::snprintf(buf, sizeof buf, "tournament: champion %s (%s %.4g%s) -> %s",
@@ -1473,6 +1518,7 @@ void App::pump_daily_lineup() {
         route(msg);
         trade_.set_lineup(lineup_.picks);
         show_trade_ = true;   // surface the freshly built tabs
+        lineup_.no_result.clear();
         lineup_.tourn_idx = 0;
         lineup_.phase = Phase::Tournaments;
         lineup_.stamp_s = now;
@@ -1501,8 +1547,49 @@ void App::pump_daily_lineup() {
         return;
     }
 
-    case Phase::Done:
-        route("lineup: ready - " + std::to_string(lineup_.picks.size()) +
+    case Phase::Done: {
+        // Admission. A pick whose tournament produced no candidate at all has no
+        // parameters fitted to itself; before 0.16.0 it traded anyway on
+        // whatever the shared per-strategy map happened to hold, which on
+        // 2026-08-10 meant four symbols running an SSPC fit. Decide with
+        // plan_lineup (symbol_params.h) so the rule is testable.
+        std::vector<std::pair<std::string, SymbolOutcome>> outcomes;
+        for (const std::string& sym : trade_.pending_symbols()) {
+            SymbolOutcome o;
+            o.tournament_ran =
+                std::find(lineup_.picks.begin(), lineup_.picks.end(), sym) !=
+                lineup_.picks.end();
+            o.produced_result =
+                std::find(lineup_.no_result.begin(), lineup_.no_result.end(), sym) ==
+                lineup_.no_result.end();
+            o.has_own_params = trade_.has_own_params(sym);
+            outcomes.emplace_back(sym, o);
+        }
+        const LineupPlan plan = plan_lineup(outcomes);
+        for (const std::string& sym : plan.own_previous)
+            route("lineup: " + sym +
+                     " tournament produced no result - trading its OWN previous "
+                     "parameters (fitted to " + sym + ", just not this morning)");
+        if (!plan.start) {
+            // Every pick failed. A session where every symbol runs borrowed
+            // parameters is worse than no session, so start nothing and say so.
+            route("lineup: ABORTED - no pick produced a usable parameter set (" +
+                     std::to_string(lineup_.no_result.size()) +
+                     " tournament(s) returned nothing). Starting NOTHING rather than "
+                     "trading on another symbol's parameters. Tabs left in place.");
+            lineup_.phase = Phase::Idle;
+            return;
+        }
+        if (!plan.excluded.empty()) {
+            std::string list;
+            for (const std::string& s : plan.excluded)
+                list += (list.empty() ? "" : ", ") + s;
+            route("lineup: EXCLUDED " + list +
+                     " - tournament produced no result and no parameters of their "
+                     "own; trading them would mean running another symbol's fit");
+            trade_.remove_symbols(plan.excluded);
+        }
+        route("lineup: ready - " + std::to_string(plan.admitted.size()) +
                  " symbols loaded into the Trade tabs");
         // Arm the auto-start for the draw() call site, which has the account +
         // data-availability context to build the StartOpts (see start_live_session
@@ -1510,6 +1597,7 @@ void App::pump_daily_lineup() {
         if (lineup_.autostart) lineup_autostart_pending_ = true;
         lineup_.phase = Phase::Idle;
         return;
+    }
     }
 }
 
@@ -1965,6 +2053,17 @@ std::string App::build_diag_json() {
         // how /diag came to show parameters that were never trading. When the
         // two disagree, say so rather than picking one silently.
         e["params"] = ss.params;
+        // Where those values came from, latched at session start: "own" (fitted
+        // to THIS symbol), "mixed", "inherited" (the strategy's shared defaults
+        // — nothing fitted to this symbol at all), "none". Six symbols showing
+        // identical "params" with "inherited" is the 2026-08-10 failure, stated
+        // instead of left for a human to notice.
+        // Latched at start, so it only describes a RUNNING session — reporting
+        // it afterwards would label config values with the last session's source.
+        if (engine_.live_running())
+            if (const auto psrc = live_param_source_.find(ss.symbol);
+                psrc != live_param_source_.end())
+                e["params_source"] = psrc->second;
         if (const TradeSymbol* ts = strat_for(ss.symbol)) {
             e["strategy"] = ts->strat_key.empty() ? "built-in SMA" : ts->strat_key;
             if (!engine_.live_running() || ss.params.empty())
@@ -2818,6 +2917,9 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // One strategy instance + param set per symbol.
     std::vector<IStrategy*> strategies;
     std::vector<StrategyLease> new_leases;
+    // symbol -> "own" / "mixed" / "inherited" / "none", published to /diag once
+    // the session actually starts (see symbol_params.h).
+    std::map<std::string, std::string> param_src;
     bool acq_ok = true;
     for (const auto& so : opts.symbols) {
         IStrategy* inst = acquire_strategy(so.strat_key);
@@ -2829,8 +2931,25 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
             break;
         }
         strategies.push_back(inst);
-        std::map<std::string, double> sp =
-            so.params.empty() ? strat_mgr_.param_values(so.strat_key) : so.params;
+        // build_start_opts already resolved this symbol's set (own value per
+        // declared name, strategy default for the rest) and recorded WHICH.
+        // Say it out loud: on 2026-08-10 six symbols silently started on one
+        // borrowed set and nothing in the log or /diag named the inheritance.
+        std::map<std::string, double> sp = so.params;
+        param_src[so.symbol] = param_source_name(so.param_source);
+        if (so.param_source == ParamSource::Inherited ||
+            so.param_source == ParamSource::Mixed) {
+            std::string names;
+            for (const std::string& n : so.inherited_params)
+                names += (names.empty() ? "" : ", ") + n;
+            route("live: " + so.symbol + " params " +
+                     std::string(param_source_name(so.param_source)) +
+                     " - " + names + " came from the " +
+                     strat_mgr_.display_name(so.strat_key) +
+                     " defaults, NOT from a fit on " + so.symbol);
+        } else if (so.param_source == ParamSource::Own) {
+            route("live: " + so.symbol + " params own (fitted to " + so.symbol + ")");
+        }
         // "hold — don't halt" mode: tell hold-aware strategies not to force-flatten
         // an underwater position in their EOD/new-day housekeeping (they read
         // ctx.param("__hold_losers")). Live-only overlay — backtests behave normally.
@@ -2878,6 +2997,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     }
     const int warm_bar_sec = cfg.bar_seconds;
     if (engine_.start_live(std::move(cfg), std::move(strategies))) {
+        live_param_source_ = std::move(param_src);
         for (const auto& l : new_leases) leases_.push_back(l);
         // Pull history for any symbol that started cold; on_candles re-seeds it.
         {

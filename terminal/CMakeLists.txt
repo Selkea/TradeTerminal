@@ -138,8 +138,10 @@ add_executable(tt_terminal_tests
     tests/test_gateway_auth.cpp
     tests/test_market_calendar.cpp
     tests/test_strategies.cpp
+    tests/test_symbol_params.cpp
     src/panels/log_console.cpp
     src/journal.cpp
+    src/config.cpp   # test_symbol_params round-trips per-symbol params through it
 )
 # Strategies under test are compiled in the same "promoted" mode tt_terminal
 # uses (self-registering into static_strategy_registry instead of exporting DLL
@@ -159,5 +161,6 @@ foreach(_src ${TT_TESTED_STRATEGIES})
 endforeach()
 target_include_directories(tt_terminal_tests PRIVATE src)
 # tt_engine: sweep.h scores a BacktestResult, declared in engine/engine.h.
-target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine)
+target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine
+                                                nlohmann_json)
 add_test(NAME terminal_tests COMMAND tt_terminal_tests)

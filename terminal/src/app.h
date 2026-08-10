@@ -226,6 +226,11 @@ private:
         std::map<std::string, std::vector<tt::RankBar>> bars;  // fetched, per pool sym
         std::set<std::string> awaiting;      // pool syms whose bars aren't in yet
         std::vector<std::string> picks;      // ranked winners (installed as tabs)
+        // Picks whose tournament produced NO candidate result at all (every
+        // candidate timed out fetching candles, as on 2026-08-10). They have no
+        // parameters fitted to themselves, so Phase::Done drops them rather than
+        // letting them trade another symbol's set — see symbol_params.h.
+        std::vector<std::string> no_result;
         std::size_t tourn_idx = 0;           // next pick to run a tournament for
         bool autostart = false;              // on Done, start the live session
     };
@@ -265,6 +270,11 @@ private:
     // daily-lineup scheduler (extracted from the panel start callback so the
     // scheduler can't drift from the manual path).
     void start_live_session(const TradePanel::StartOpts& opts);
+    // symbol -> "own" / "mixed" / "inherited" / "none": where the RUNNING
+    // session's parameters for that symbol came from, latched at start and
+    // reported by /diag. On 2026-08-10 all six symbols inherited one SSPC fit
+    // and no field anywhere said so (see symbol_params.h).
+    std::map<std::string, std::string> live_param_source_;
     // The active-account snapshot the Trade panel header shows; also feeds the
     // scheduler's auto-start so it routes to the same broker/sub-accounts.
     TradePanel::AccountInfo trade_account_info();
