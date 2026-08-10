@@ -97,8 +97,23 @@ public:
     // Ids whose request has blown the timeout and has NOT been retried yet.
     // Returned as a list rather than walked in place because begin_retry()
     // rehashes the map underneath the caller.
-    std::vector<int> dead_ids(int64_t now_ms) const {
+    //
+    // `send_blocked` is history_send_blocked() for right now, and it is a
+    // REQUIRED argument because forgetting it is exactly how 0.15.0 shipped: a
+    // retry is a reqHistoricalData like any other and obeys the same measured
+    // pacing rule (net/hist_pacing.h — issued within ~5s of a delivery of >6000
+    // bars, answered 1 time in 65). pump_requests holds a NEW request back for
+    // one io_loop pass when that window is open; a retry sent into it is a send
+    // the measurement says will never be answered, and now that the died-twice
+    // escalation is reachable that self-inflicted failure would tear the whole
+    // data session down 20s later (every quote stream cancelled and
+    // re-subscribed, every other in-flight fetch errored to its caller, the
+    // gateway login proof discarded). Deferring costs one pass (~1s) and cannot
+    // escalate anything: an un-retried request classifies as Retry forever, not
+    // Escalate.
+    std::vector<int> dead_ids(int64_t now_ms, bool send_blocked) const {
         std::vector<int> out;
+        if (send_blocked) return out;
         for (const auto& [id, p] : live_)
             if (history_action(now_ms - p.sent_ms, p.retried) == HistAction::Retry)
                 out.push_back(id);

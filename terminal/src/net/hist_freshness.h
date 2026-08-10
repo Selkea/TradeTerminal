@@ -70,6 +70,19 @@ struct WatchedSymbol {
 // tournament legitimately takes minutes, so 3 x 5 min would cry wolf.
 inline constexpr int64_t kBarStaleGraceFloorMs = 45 * 60 * 1000;
 
+// How recent a delivery has to be to count as EVIDENCE that the session is
+// still serving history (HistoryFreshness::refreshing below).
+//
+// Deliberately absolute, and deliberately NOT each symbol's own grace period.
+// The grace is 3x that symbol's cadence, so "inside its grace" stretches to 12
+// hours for a symbol on a 240-minute re-optimize cycle — the same heterogeneous
+// lineup this file already documents above. A symbol that has been silent for
+// eleven of those hours is not proof of anything, and hist_stall_alert spends
+// this evidence on an imperative verdict ("do NOT restart the gateway"). The
+// floor grace is the shortest silence this watchdog is ever willing to call
+// stale, which makes it the most generous bound that is still current.
+inline constexpr int64_t kRefreshEvidenceMs = kBarStaleGraceFloorMs;
+
 // (double because Autopilot::Sym::interval_min is one — the UI edits it.)
 inline int64_t bar_stale_grace_ms(double refresh_interval_min) {
     const double slack = refresh_interval_min > 0
@@ -94,21 +107,26 @@ inline int64_t bar_stale_grace_ms(double refresh_interval_min) {
 // lock the account. Naming the symbols that ARE refreshing puts the actual
 // diagnosis in the page — the stall is app-side, not upstream.
 //
-// `detail` is the caller's per-symbol age list; `watched` is everything the
-// watchdog is entitled to expect refreshes for, so the healthy set is what is
-// left after `stale` is removed.
+// `detail` is the caller's per-symbol age list; `refreshing` is the symbols
+// with POSITIVE evidence of a recent delivery (HistoryFreshness::refreshing).
+//
+// It is not "the watched symbols minus the stale ones". That set means "has not
+// yet crossed its OWN grace period", which is not the same claim at all: a
+// symbol that has never delivered a bar this session is aged from session start
+// and a symbol on a 240-minute cadence has a 12-hour grace, so both sit outside
+// `stale` for hours while delivering nothing — and the verdict below would then
+// name a dead symbol as the reason to keep away from the gateway. That is the
+// mirror image of the misdirection this text was written to remove: the old
+// wording sent the operator to a healthy gateway, and that one would tell them
+// to stay away from a broken one.
 inline std::string hist_stall_alert(const std::string& detail,
                                     const std::vector<StaleBars>& stale,
-                                    const std::vector<WatchedSymbol>& watched,
+                                    const std::vector<std::string>& refreshing,
                                     bool socket_connected) {
     std::string healthy;
-    for (const WatchedSymbol& w : watched) {
-        bool is_stale = false;
-        for (const StaleBars& sb : stale)
-            if (sb.symbol == w.symbol) { is_stale = true; break; }
-        if (is_stale) continue;
+    for (const std::string& s : refreshing) {
         if (!healthy.empty()) healthy += ", ";
-        healthy += w.symbol;
+        healthy += s;
     }
     // Disconnected is the ordinary outage the reconnect path is already working
     // on. Connected with NOTHING refreshing is the one case where the upstream
@@ -190,6 +208,25 @@ public:
         for (size_t i = 1; i < out.size(); ++i)   // tiny n (a lineup is <10)
             for (size_t j = i; j > 0 && out[j].age_ms > out[j - 1].age_ms; --j)
                 std::swap(out[j], out[j - 1]);
+        return out;
+    }
+
+    // Watched symbols with a delivery of their OWN inside kRefreshEvidenceMs:
+    // the only symbols entitled to back hist_stall_alert's "still refreshing X
+    // on the same session" verdict. A symbol that has never been answered is
+    // absent from the map and so can never appear here, which is the case
+    // "watched minus stale" got wrong — see kRefreshEvidenceMs.
+    std::vector<std::string> refreshing(const std::vector<WatchedSymbol>& watched,
+                                        const std::string& interval,
+                                        int64_t now_ms) const {
+        std::vector<std::string> out;
+        std::lock_guard<std::mutex> g(mu_);
+        for (const WatchedSymbol& w : watched) {
+            const auto it = last_.find(key(w.symbol, interval));
+            if (it == last_.end()) continue;                    // never delivered
+            if (now_ms - it->second > kRefreshEvidenceMs) continue;
+            out.push_back(w.symbol);
+        }
         return out;
     }
 

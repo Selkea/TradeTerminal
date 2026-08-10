@@ -69,6 +69,20 @@ void StrategyManagerPanel::adopt_params(const std::string& key) {
         if (old != param_vals_.end())
             for (const auto& o : old->second)
                 if (o.name == p.name) value = o.value;
+        // Outside the DECLARED range means the descriptor has changed since the
+        // value was written, so fall back to the strategy's own default rather
+        // than clamping to the nearest legal value. Clamping fabricates a
+        // setting nobody chose and then makes it indistinguishable from one a
+        // human typed. rsi2_pullback's min_gain_cps is the case that proved it:
+        // the 2026-08-10 tournaments swept a cost floor as if it were a profit
+        // target and saved 69.93-100 c/share, so the ceiling came down to 10 —
+        // and a clamp would have parked every one of those saved values at
+        // exactly 10, ~10x the measured ~1.05 c/share round-trip cost, where the
+        // strategy's own out-of-range repair cannot see it and (the parameter
+        // now being excluded from the sweep) nothing would ever move it again.
+        if (value < p.min || value > p.max) value = p.def;
+        // A descriptor whose own default sits outside its range would otherwise
+        // feed that straight back in.
         if (value < p.min) value = p.min;
         if (value > p.max) value = p.max;
         fresh.push_back(ParamValue{p.name, p.def, p.min, p.max, value});

@@ -132,11 +132,15 @@ public:
         }
         if (min_gain_cps_ < 0.0) min_gain_cps_ = 0.0;   // a negative gate is no gate
         // Repair a value the optimizer swept in before this became a fixed
-        // parameter, the same way exit_ma=2 is repaired above. Nothing clamps a
-        // stored param to its declared range at load, so the 69.93-100 c/share
-        // settings the 2026-08-10 tournaments wrote into the live lineup would
-        // otherwise survive every future optimization untouched — fixing the
-        // sweep stops new ones, this undoes the ones already saved.
+        // parameter, the same way exit_ma=2 is repaired above. The Strategy
+        // Manager's own store is fixed at load (adopt_params falls back to the
+        // declared default when a saved value is out of range), but the Trade
+        // panel's PER-SYMBOL overrides are not: build_start_opts copies
+        // SymRow::params through verbatim, so the 69.93-100 c/share settings the
+        // 2026-08-10 tournaments wrote into the live lineup arrive here intact
+        // until the next champion overwrites them. Fixing the sweep stops new
+        // ones; this is what a running instance does about the ones already
+        // saved.
         if (min_gain_cps_ > kMaxGainCps) {
             char fix[112];
             std::snprintf(fix, sizeof(fix),

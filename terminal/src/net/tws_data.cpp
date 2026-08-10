@@ -172,7 +172,15 @@ struct TwsData::Io final : DefaultEWrapper {
     // net/hist_requests.h.
     bool retry_dead_history(int64_t now_ms) {
         bool retried_any = false;
-        for (const int id : hist.dead_ids(now_ms)) {
+        // The retry goes out through the same socket as a first send, so it is
+        // subject to the same pacing rule pump_requests enforces below — see
+        // HistRequests::dead_ids for why sending into the quiet window would now
+        // cost a whole data session rather than one silently dropped request.
+        const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - last_hist_end)
+                                   .count();
+        const bool blocked = history_send_blocked(last_hist_bars, since_end);
+        for (const int id : hist.dead_ids(now_ms, blocked)) {
             const HistPending* dead = hist.find(id);
             if (!dead) continue;
             const int64_t age = now_ms - dead->sent_ms;
@@ -766,10 +774,19 @@ void TwsData::io_loop() {
             io.pump_requests();
         }
         // Publish history-fetch state for /diag (I/O thread owns io.hist).
-        // These read 0 through the whole 184-minute 2026-08-10 outage because a
-        // retry was erased by its own cancel ack the instant it was issued; a
-        // retried request now stays in the pending set under its new id, and its
-        // age is measured from the FIRST attempt.
+        // These read a flat 0 before 0.15.0 because a retry was erased by its
+        // own cancel ack the instant it was issued; a retried request now stays
+        // in the pending set under its new id, aged from its FIRST attempt.
+        //
+        // That makes them honest, NOT a stall metric. An entry lives at most one
+        // timeout plus one retry window (~40s, or ~100s while the escalation
+        // sits in kHistResetCooldown) before it is answered, errored, or taken
+        // out by drop_connection — so these can never show the 184-minute
+        // 2026-08-10 outage, and a small number here is not evidence the history
+        // path is healthy. Anything derived from in-flight requests is
+        // structurally incapable of seeing that failure, which is exactly why
+        // net/hist_freshness.h measures the SUCCESSES instead
+        // (data.worst_last_bar_age_ms, which read 11,059,982 ms that day).
         pending_hist_.store(io.hist.pending(), std::memory_order_relaxed);
         oldest_hist_ms_.store(io.hist.oldest_age_ms(steady_ms()),
                               std::memory_order_relaxed);

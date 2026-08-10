@@ -3499,8 +3499,9 @@ void App::pump_history_watchdog() {
         watched.push_back({S.symbol, S.interval_min});
     }
     if (watched.empty()) return;
+    const int64_t now_steady = steady_ms();
     const auto stale = hist_fresh_.stale(
-        watched, traded_bar_interval(), steady_ms(),
+        watched, traded_bar_interval(), now_steady,
         static_cast<int64_t>((now - hist_live_since_s_) * 1000.0));
 
     if (stale.empty()) {
@@ -3526,8 +3527,15 @@ void App::pump_history_watchdog() {
     // socket and farms serve the healthy symbols in the very cycles the others
     // die), and a page that sends the operator to restart a healthy gateway is
     // one worth being able to test. See net/hist_freshness.h.
-    const std::string msg =
-        net::hist_stall_alert(detail, stale, watched, data_.connected());
+    //
+    // The page names the symbols that are DEMONSTRABLY still being served —
+    // symbols with a recent delivery — not the ones that merely have not
+    // crossed their own grace yet. On a lineup of mixed autopilot cadences the
+    // second set includes symbols that have delivered nothing all session.
+    const std::string msg = net::hist_stall_alert(
+        detail, stale,
+        hist_fresh_.refreshing(watched, traded_bar_interval(), now_steady),
+        data_.connected());
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
 }

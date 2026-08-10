@@ -190,22 +190,71 @@ TEST_CASE("stale: a stopped session's deliveries do not follow it into the next"
 // to restart something the evidence says is healthy — and a forced re-login can
 // hit IBKR's maintenance window or, repeated, lock the account.
 namespace {
-std::vector<WatchedSymbol> watch(const std::vector<std::string>& syms) {
-    std::vector<WatchedSymbol> out;
-    for (const std::string& s : syms) out.push_back({s, 30});
-    return out;
-}
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 } // namespace
+
+TEST_CASE("refreshing: only a recent delivery of a symbol's OWN counts") {
+    HistoryFreshness f;
+    f.record("SOXS", "5m", 100 * kMin);
+    const std::vector<WatchedSymbol> syms{{"SOXS", 30}, {"NEVER", 30}};
+    // Inside the evidence window: the session is demonstrably serving history.
+    auto out = f.refreshing(syms, "5m", 100 * kMin + kRefreshEvidenceMs);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "SOXS");
+    // Past it, the same symbol stops being evidence of anything...
+    CHECK(f.refreshing(syms, "5m", 100 * kMin + kRefreshEvidenceMs + 1).empty());
+    // ...and a symbol that has never delivered can never become evidence.
+    f.record("NEVER", "1d", 100 * kMin);   // a lineup 1d pull is not its 5m series
+    CHECK(f.refreshing(syms, "5m", 101 * kMin).size() == 1);
+}
+
+TEST_CASE("refreshing: a slow-cadence symbol inside its grace is not evidence") {
+    // THE 0.15.0 DEFECT. hist_stall_alert derived its healthy set as "watched
+    // minus stale", i.e. "has not crossed its OWN grace period". Put a 240-min
+    // re-optimize cadence (720-min grace) next to the production 30-min one and
+    // a total gateway outage at 10:00 leaves SOXS stale at 11:31 while MUU,
+    // silent just as long, is still inside its grace — so the page named MUU as
+    // "still refreshing on the same session" and told the operator NOT to
+    // restart the gateway that had in fact died.
+    HistoryFreshness f;
+    f.record("SOXS", "5m", 60 * kMin);   // both last delivered at 10:00
+    f.record("MUU", "5m", 60 * kMin);
+    const std::vector<WatchedSymbol> syms{{"SOXS", 30}, {"MUU", 240}};
+    const int64_t now = 151 * kMin;      // 11:31
+    const auto stale = f.stale(syms, "5m", now, now);
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].symbol == "SOXS");    // MUU is not stale: 91m of a 720m grace
+    CHECK(f.refreshing(syms, "5m", now).empty());   // ...but it is not refreshing
+    const std::string msg =
+        hist_stall_alert("SOXS 91m", stale, f.refreshing(syms, "5m", now), true);
+    CHECK(has(msg, "NO watched symbol is refreshing"));
+    CHECK_FALSE(has(msg, "do NOT restart the gateway"));
+    CHECK_FALSE(has(msg, "MUU"));
+}
+
+TEST_CASE("refreshing: a never-answered symbol cannot clear the gateway") {
+    // Same shape at session start, where stale() ages a never-answered symbol
+    // from session_ms: at 47 minutes the 15-min symbol is past its floor grace
+    // and the 60-min one is not, so "watched minus stale" nominated a symbol
+    // that had delivered nothing at all.
+    HistoryFreshness f;
+    const std::vector<WatchedSymbol> syms{{"SOXS", 15}, {"SNDQ", 60}};
+    const int64_t now = 47 * kMin;
+    const auto stale = f.stale(syms, "5m", now, now);
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].symbol == "SOXS");
+    CHECK_FALSE(stale[0].ever);
+    CHECK(f.refreshing(syms, "5m", now).empty());
+}
 
 TEST_CASE("alert: a stall beside healthy symbols is not blamed on the gateway") {
     const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true},
                                        {"MUU", 60 * kMin, false}};
     const std::string msg =
         hist_stall_alert("SOXS 284m, MUU never", stale,
-                         watch({"SOXS", "MUU", "AAOX", "SNDQ"}), true);
+                         {"AAOX", "SNDQ"}, true);
     CHECK(has(msg, "SOXS 284m, MUU never"));
     // The contrast that IS the diagnosis: same session, still refreshing.
     CHECK(has(msg, "AAOX, SNDQ"));
@@ -219,8 +268,7 @@ TEST_CASE("alert: with nothing refreshing the gateway is not cleared either") {
     // Every watched symbol is stale, so the upstream is still a live suspect —
     // but the operator is pointed at the log first, not at a blind restart.
     const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true}};
-    const std::string msg =
-        hist_stall_alert("SOXS 284m", stale, watch({"SOXS"}), true);
+    const std::string msg = hist_stall_alert("SOXS 284m", stale, {}, true);
     CHECK(has(msg, "NO watched symbol is refreshing"));
     CHECK(has(msg, "before touching the gateway"));
     CHECK_FALSE(has(msg, "check IB Gateway"));
@@ -230,7 +278,7 @@ TEST_CASE("alert: with nothing refreshing the gateway is not cleared either") {
 TEST_CASE("alert: a dropped socket says the reconnect path already owns it") {
     const std::vector<StaleBars> stale{{"SOXS", 284 * kMin, true}};
     const std::string msg =
-        hist_stall_alert("SOXS 284m", stale, watch({"SOXS", "AAOX"}), false);
+        hist_stall_alert("SOXS 284m", stale, {"AAOX"}, false);
     CHECK(has(msg, "data socket disconnected"));
     CHECK(has(msg, "reconnect path is already on it"));
     CHECK_FALSE(has(msg, "gateway"));   // nothing for the operator to restart

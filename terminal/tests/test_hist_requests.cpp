@@ -56,7 +56,7 @@ ErrOutcome deliver_error(HistRequests& h, int id) {
 
 // Drive one request to its retry and hand back the new id, as io_loop does.
 int retry_once(HistRequests& h, int old_id, int new_id, int64_t now) {
-    const auto dead = h.dead_ids(now);
+    const auto dead = h.dead_ids(now, /*send_blocked=*/false);
     REQUIRE(dead.size() == 1);
     CHECK(dead[0] == old_id);
     HistPending* p = h.begin_retry(old_id, new_id, now);
@@ -128,7 +128,7 @@ TEST_CASE("hist ids: the died-twice escalation is reachable again") {
     CHECK_FALSE(h.has_twice_dead(retried_at));
     CHECK_FALSE(h.has_twice_dead(retried_at + kHistTimeoutMs));
     // ...and it must not be retried a second time either.
-    CHECK(h.dead_ids(retried_at + kHistTimeoutMs + 1).empty());
+    CHECK(h.dead_ids(retried_at + kHistTimeoutMs + 1, false).empty());
     // Dead again: this is what drives io_loop's data-session reconnect, the
     // recovery that fired 286 times before the retry feature buried it.
     CHECK(h.has_twice_dead(retried_at + kHistTimeoutMs + 1));
@@ -160,7 +160,7 @@ TEST_CASE("hist ids: healthy siblings on the same session are untouched") {
     add(h, 10, "SOXS", kT0);                        // dies
     add(h, 11, "AAOX", kT0 + kHistTimeoutMs);       // sent later, still fine
     const int64_t now = kT0 + kHistTimeoutMs + 1;
-    const auto dead = h.dead_ids(now);
+    const auto dead = h.dead_ids(now, false);
     REQUIRE(dead.size() == 1);
     CHECK(dead[0] == 10);
     h.begin_retry(10, 12, now);
@@ -196,10 +196,37 @@ TEST_CASE("hist ids: a dropped session takes the awaiting-ack set with it") {
     CHECK(deliver_error(h, 88) == ErrOutcome::Ignored);
 }
 
+TEST_CASE("hist ids: a retry waits out the big-batch quiet window") {
+    // A retry is a reqHistoricalData like any other. net/hist_pacing.h measured
+    // one issued inside the quiet window after a >6000-bar delivery as answered
+    // 1 time in 65 — and 0.15.0 sent retries with no pacing check at all, so a
+    // retry fired 0.5s after a 9750-bar lineup fetch landed was a send the
+    // measurement already predicted would die. That is what makes it serious
+    // now: the second death is REACHABLE, so a doomed retry escalates 20s later
+    // and drop_connection tears down every quote stream and every other
+    // in-flight fetch on the session.
+    HistRequests h;
+    add(h, 88, "MUU", kT0);
+    const int64_t dead_at = kT0 + kHistTimeoutMs + 1;
+    CHECK(h.dead_ids(dead_at, /*send_blocked=*/true).empty());
+
+    // Deferring is safe: an un-retried request classifies as Retry however long
+    // it waits, never as Escalate, so nothing can tear the session down while
+    // the window is open.
+    CHECK_FALSE(h.has_twice_dead(dead_at + 10 * kHistTimeoutMs));
+    CHECK(h.pending() == 1);
+    CHECK(h.awaiting_ack() == 0);   // nothing was cancelled, so nothing is owed
+
+    // One io_loop pass later the window has closed and the retry goes out.
+    const auto dead = h.dead_ids(dead_at + 1'000, false);
+    REQUIRE(dead.size() == 1);
+    CHECK(dead[0] == 88);
+}
+
 TEST_CASE("hist ids: a request inside its window is left alone") {
     HistRequests h;
     add(h, 88, "MUU", kT0);
-    CHECK(h.dead_ids(kT0 + kHistTimeoutMs).empty());   // boundary: not yet dead
+    CHECK(h.dead_ids(kT0 + kHistTimeoutMs, false).empty());  // boundary: not dead yet
     CHECK_FALSE(h.has_twice_dead(kT0 + kHistTimeoutMs));
     CHECK(h.pending() == 1);
     CHECK(h.oldest_age_ms(kT0 + 5'000) == 5'000);
