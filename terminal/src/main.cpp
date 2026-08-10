@@ -213,6 +213,12 @@ int main() {
             app.request_quit();
         }
         if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+            // Not drawing is not the same as not watching. The pre-open gateway
+            // check is wall-clock driven and its whole job is to fire in an
+            // unattended morning window; a minimized window used to disable it
+            // silently, which is the 2026-08-09 blindness reinstated by a click.
+            // pump_background() touches no ImGui state — there is no frame here.
+            app.pump_background();
             ImGui_ImplGlfw_Sleep(10);
             continue;
         }

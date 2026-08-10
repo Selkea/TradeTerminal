@@ -25,11 +25,24 @@
     It never kills the gateway on its own exit - the gateway is left running so
     the login survives an app restart.
 
+    THIS LOOP IS NOT THE THING THAT BOUNDS LOGIN ATTEMPTS. It has no day stamp
+    and re-arms after every attempt, by design - it has to, since it is the only
+    thing that can recover a gateway that died at 03:00. The cap lives in
+    Start-IbGateway.ps1's governor, which every caller goes through and which
+    refuses an attempt that comes too soon. See the header there: the app's
+    08:45 pre-open check ALSO relaunches the gateway, and a relaunch is exactly
+    what takes the API port down and arms the loop below, so the two would
+    otherwise take turns re-logging-in an account IBKR locks for it.
+
     Params:
       -AppPid <int>         REQUIRED. Exit when this process is gone (app closed).
       -PollSec <int>        health-check cadence (default 20s).
       -DownGraceSec <int>   how long the API port may be down before forcing a
-                            re-login (default 90s) - rides out a brief blip.
+                            re-login (default 180s). MUST exceed the 120s
+                            Start-IbGateway.ps1 itself allows for the API port
+                            to come up: at the old 90s this loop routinely
+                            declared a cold start failed while it was still
+                            logging in, killed it, and spent another attempt.
       -BrokerGraceSec <int> how long a live session may be unable to reach the
                             broker (port up) before a COLD relaunch (default
                             240s) - long enough that a transient 1100->1102 blip
@@ -39,7 +52,7 @@
 param(
     [Parameter(Mandatory)][int]$AppPid,
     [int]$PollSec = 20,
-    [int]$DownGraceSec = 90,
+    [int]$DownGraceSec = 180,
     [int]$BrokerGraceSec = 240
 )
 $ErrorActionPreference = 'Continue'
@@ -139,7 +152,10 @@ while ($true) {
                 Log "gateway port down > ${DownGraceSec}s - forcing re-login (Start-IbGateway -Restart)"
                 # -Restart blocks up to ~120s waiting for the port; that IS the
                 # backoff. If the login still fails (e.g. mid-maintenance), the
-                # next pass re-arms $downSince and retries.
+                # next pass re-arms $downSince and retries - and Start-IbGateway's
+                # governor refuses the ones that come too fast, so "retries
+                # forever" cannot become "locks the account". A refusal is cheap
+                # and leaves the gateway alone; it just gets logged below.
                 & $script -Restart *>&1 | ForEach-Object { Log "relogin> $_" }
                 $downSince = $null
             }

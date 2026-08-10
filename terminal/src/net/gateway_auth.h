@@ -46,20 +46,46 @@ namespace tt::net {
 // restart, and a wall-clock jump there would read as hours of fake staleness and
 // page the phone at 08:45.
 
-// The farm-status codes worth an opinion. IB reports each farm's state as a
-// 21xx "error"; the OK/broken pairs below are the only ones that carry evidence.
+// The farm-status codes. IB reports each farm's state as a 21xx "error".
+//
+// TWO DIFFERENT QUESTIONS get answered from these, and conflating them was a
+// bug (fixed in 0.14.1):
+//   1. "is the gateway LOGGED IN?"  — ANY of these codes answers yes. A gateway
+//      parked on the login dialog has no connection to IBKR, therefore no farm
+//      connections, therefore nothing whatsoever to say about their state. It
+//      cannot report a farm as OK, as broken, or as idle. The message ARRIVING
+//      is the proof; its contents are irrelevant to this question.
+//   2. "is market data flowing?" — only the OK codes answer yes, and that is
+//      reported separately (farms_ok()) as diagnostic detail.
+// Reading a "broken"/"inactive" burst as "not logged in" is a FALSE POSITIVE,
+// and a false positive here relaunches the gateway — see kAuthProofMaxAgeMs.
 inline constexpr int kFarmMktDataOk = 2104;    // "Market data farm connection is OK:usfarm"
 inline constexpr int kFarmHmdsOk = 2106;       // "HMDS data farm connection is OK:ushmds"
 inline constexpr int kFarmSecDefOk = 2158;     // "Sec-def data farm connection is OK:secdefil"
 inline constexpr int kFarmMktDataBroken = 2103;   // "...is broken"
 inline constexpr int kFarmHmdsBroken = 2105;
 inline constexpr int kFarmSecDefBroken = 2157;
-// Deliberately NOT handled: 2107/2108 ("...connection is inactive but should be
-// available upon demand"). That is the NORMAL idle state of a logged-in gateway
-// out of hours — treating it as a farm going down would make a healthy
-// overnight gateway read as logged out and page every single morning.
+inline constexpr int kFarmHmdsIdle = 2107;     // "...is inactive but should be available upon demand"
+inline constexpr int kFarmMktDataIdle = 2108;
+inline constexpr int kFarmConnecting = 2119;   // "Market data farm is connecting:usfarm"
 
-// How long a proof stays good.
+// An explicit list, NOT the whole 2100-2170 range that tws_data logs. Codes in
+// that range which are not farm status — 2110 "Connectivity between TWS and
+// server is broken" above all — must never be mistaken for proof of a login,
+// which is exactly what accepting the range wholesale would do.
+inline constexpr bool is_farm_status(int code) {
+    return code == kFarmMktDataOk || code == kFarmHmdsOk || code == kFarmSecDefOk ||
+           code == kFarmMktDataBroken || code == kFarmHmdsBroken ||
+           code == kFarmSecDefBroken || code == kFarmHmdsIdle ||
+           code == kFarmMktDataIdle || code == kFarmConnecting;
+}
+
+// How long a POINT-IN-TIME proof stays good.
+//
+// Applies to the evidence that is an event rather than a state: a bar delivery,
+// or a farm reporting itself broken/idle. A farm the gateway has told us is OK
+// is different in kind — that is CURRENT STATE for this session, and it does not
+// age out (see authed()).
 //
 // The farm messages are not a heartbeat: IB sends them when a farm's state
 // CHANGES and when a client connects, so on a healthy night the freshest proof
@@ -90,7 +116,16 @@ public:
         case kFarmMktDataBroken: set_farm(0, false, now_ms); break;
         case kFarmHmdsBroken:    set_farm(1, false, now_ms); break;
         case kFarmSecDefBroken:  set_farm(2, false, now_ms); break;
-        default: break;   // no evidence either way (see 2107/2108 above)
+        // Idle / connecting: the farm is NOT usable, so it counts for nothing in
+        // farms_ok() and does not clear a broken flag — but the gateway could
+        // only tell us this if it were logged in, so it IS proof of the login.
+        // 2107/2108 is the normal out-of-hours state, and a client that connects
+        // overnight can legitimately receive nothing else; reading that as
+        // "logged out" would page and cold-restart the gateway every morning.
+        case kFarmHmdsIdle:
+        case kFarmMktDataIdle:
+        case kFarmConnecting:    note_login_proof(now_ms); break;
+        default: break;   // not a farm status at all (2110 &c): no evidence
         }
     }
 
@@ -100,7 +135,7 @@ public:
     // after this session's farm messages have gone quiet.
     void bars_delivered(int64_t now_ms) {
         std::lock_guard<std::mutex> g(mu_);
-        last_bars_ms_ = now_ms;
+        note_login_proof(now_ms);
         upstream_lost_ = false;
     }
 
@@ -129,34 +164,44 @@ public:
     void session_lost() {
         std::lock_guard<std::mutex> g(mu_);
         farm_ok_.fill(false);
-        last_farm_ok_ms_ = -1;
-        last_bars_ms_ = -1;
+        last_proof_ms_ = -1;
         upstream_lost_ = false;
     }
 
     // The question the pre-open check asks: is the gateway logged in RIGHT NOW?
     //
-    // Requires a farm that is currently OK, or a bar delivery — either one fresh
-    // enough — with no unrecovered 1100. Deliberately ANY farm rather than all
-    // three: one farm connecting already proves the login, whereas demanding the
-    // full set would page (and relaunch the gateway, spending a login attempt)
-    // whenever IBKR takes a single farm down, which is not a login failure at
-    // all. How complete the set is gets reported separately, see farms_ok().
+    // Two ways to answer yes, and no unrecovered 1100:
+    //   - a farm the gateway currently reports OK. That is STATE, not an aging
+    //     observation: while this session lives the gateway would have told us
+    //     otherwise (2103 broken, 2107/2108 idle, 1100) or dropped us. So it
+    //     does not expire — which also keeps authed() from contradicting
+    //     farms_ok(), as it used to at the 12h mark.
+    //   - any other proof, still fresh: a bar delivery, or a farm reporting
+    //     itself broken/idle. Those are point-in-time events, so they age out.
+    //
+    // Deliberately ANY farm rather than all three, and deliberately "the gateway
+    // said something about a farm" rather than "a farm is up": one farm
+    // connecting already proves the login, and a farm going DOWN is a farm
+    // outage, not a logout. The response to a false "not authed" is a gateway
+    // relaunch, i.e. a login attempt on an account IBKR locks after repeated
+    // failures — so where the evidence is ambiguous this must answer yes. The
+    // failure it exists to catch is SILENCE, and silence is unambiguous.
     bool authed(int64_t now_ms) const {
         std::lock_guard<std::mutex> g(mu_);
         if (upstream_lost_) return false;
-        const bool farm_proof = any_farm_ok() && fresh(last_farm_ok_ms_, now_ms);
-        return farm_proof || fresh(last_bars_ms_, now_ms);
+        return any_farm_ok() || fresh(last_proof_ms_, now_ms);
     }
 
     // ms since the freshest proof of authentication, -1 if there has never been
     // one on this session. This is what /diag reports: on the incident night it
     // would have read -1 from 00:55 onwards, every minute, all night.
+    //
+    // NOTE this can be large while authed() is true, and that is not a
+    // contradiction: a latched-OK farm is state that stays true long after the
+    // message announcing it. Read it with farms_ok(), never on its own.
     int64_t proof_age_ms(int64_t now_ms) const {
         std::lock_guard<std::mutex> g(mu_);
-        const int64_t newest = last_farm_ok_ms_ > last_bars_ms_ ? last_farm_ok_ms_
-                                                                : last_bars_ms_;
-        return newest < 0 ? -1 : now_ms - newest;
+        return last_proof_ms_ < 0 ? -1 : now_ms - last_proof_ms_;
     }
 
     // How many of the three farms are currently reporting OK (0..3). Diagnostic
@@ -173,11 +218,15 @@ private:
     // 0 = market data (usfarm), 1 = HMDS (ushmds), 2 = sec-def (secdefil).
     void set_farm(size_t i, bool ok, int64_t now_ms) {
         farm_ok_[i] = ok;
+        note_login_proof(now_ms);   // it spoke about a farm at all: it is logged in
         if (!ok) return;
-        last_farm_ok_ms_ = now_ms;
         // A farm cannot come up over a dead IBKR link, so an OK also clears a
-        // 1100 whose matching 1102 we never saw.
+        // 1100 whose matching 1102 we never saw. A "broken" deliberately does
+        // not — that is the 1100 being confirmed, not resolved.
         upstream_lost_ = false;
+    }
+    void note_login_proof(int64_t now_ms) {
+        if (now_ms > last_proof_ms_) last_proof_ms_ = now_ms;
     }
     bool any_farm_ok() const {
         for (const bool ok : farm_ok_)
@@ -189,9 +238,11 @@ private:
     }
 
     mutable std::mutex mu_;
-    std::array<bool, 3> farm_ok_{};   // current state per farm
-    int64_t last_farm_ok_ms_ = -1;    // freshest farm OK on this session (-1 = none)
-    int64_t last_bars_ms_ = -1;       // freshest successful bar delivery (-1 = none)
+    std::array<bool, 3> farm_ok_{};   // current state per farm (OK codes only)
+    // Freshest thing the gateway has said on THIS session that it could only
+    // have said while logged in: any farm status, or a non-empty bar delivery.
+    // -1 = it has said nothing at all, which is the 2026-08-09 state.
+    int64_t last_proof_ms_ = -1;
     bool upstream_lost_ = false;      // 1100 with no 1101/1102 since
 };
 
