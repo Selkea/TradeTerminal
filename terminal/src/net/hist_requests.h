@@ -56,7 +56,15 @@ struct HistPending {
     // about the TWS-side id we swap underneath it.
     uint32_t pub_id = 0;
     std::string symbol, interval;
+    // The CALLER's range ("6mo", "1mo", ...), kept unclamped — for log lines
+    // only. It is NOT the cache or gate key: those are keyed on the resolved
+    // (bar, dur) pair below, because that is what IB sees. See BarCacheKey.
+    std::string range;
     std::string dur, bar;        // resolved IB strings, kept so we can re-issue
+    // What the caller said this fetch is for. A retry is a send like any other
+    // and must draw on the same budget the original did, or a live-warmup retry
+    // would be paced as bulk traffic. See ReqPriority.
+    ReqPriority prio = ReqPriority::Bulk;
     std::vector<Candle> candles;
     // Last issue, in steady ms: this is what the timeout classifier measures,
     // so a retry gets a full fresh window rather than dying instantly.
@@ -109,8 +117,14 @@ public:
     // data session down 20s later (every quote stream cancelled and
     // re-subscribed, every other in-flight fetch errored to its caller, the
     // gateway login proof discarded). Deferring costs one pass (~1s) and cannot
-    // escalate anything: an un-retried request classifies as Retry forever, not
-    // Escalate.
+    // escalate anything WITHIN THE QUIET WINDOW, which is 10 s against the 40 s
+    // at which kHistEscalateMs takes over. That backstop is deliberate and it is
+    // load-bearing: the earlier reading of this comment — "an un-retried request
+    // classifies as Retry forever" — was true, and was the defect. It meant any
+    // hold on the retry (the send gate's budget hold lasts until sends age out of
+    // a ten-minute window) suppressed the escalation as well as the retry, so the
+    // data-session reconnect was unreachable exactly when the build had spent its
+    // budget. See kHistEscalateMs.
     std::vector<int> dead_ids(int64_t now_ms, bool send_blocked) const {
         std::vector<int> out;
         if (send_blocked) return out;
@@ -152,10 +166,12 @@ public:
     }
 
     // ---- escalation + diagnostics ------------------------------------------
-    // A request that has blown the timeout for the SECOND time: the retry did
-    // not help, so the session itself is suspect and the caller should do the
-    // (expensive) data-session reconnect. Unreachable before 0.15.0 — see the
-    // header note.
+    // A request that has blown the timeout for the SECOND time, OR that has been
+    // silent for kHistEscalateMs with no retry having gone out at all: either
+    // way the session itself is suspect and the caller should do the (expensive)
+    // data-session reconnect. Unreachable before 0.15.0 because the retry erased
+    // itself (see the header note); unreachable again whenever the send gate held
+    // the retry, until history_action grew the age-based arm.
     bool has_twice_dead(int64_t now_ms) const {
         for (const auto& [id, p] : live_)
             if (history_action(now_ms - p.sent_ms, p.retried) == HistAction::Escalate)

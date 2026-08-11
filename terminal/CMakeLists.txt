@@ -134,6 +134,7 @@ add_executable(tt_terminal_tests
     tests/test_sweep_guard.cpp
     tests/test_hist_pacing.cpp
     tests/test_hist_requests.cpp
+    tests/test_bar_cache.cpp
     tests/test_hist_freshness.cpp
     tests/test_gateway_auth.cpp
     tests/test_market_calendar.cpp

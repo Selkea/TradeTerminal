@@ -439,8 +439,49 @@ App::App(std::string gateway_url)
     };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
         route("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
-        std::lock_guard lock(pending_bt_mu_);
-        pending_bt_.active = false;  // data never arrives; don't wedge the panel
+        // Only the request that actually failed. This used to clear the pending
+        // backtest on ANY feed error, which was both too broad (an unrelated
+        // symbol's error cancelled the panel's run) and too narrow: it never
+        // touched the pending SWEEP, so a tournament candidate whose fetch was
+        // errored out by drop_connection went on waiting for bars that could
+        // never arrive until its whole 60s budget expired. Six of those in a row
+        // is five wasted minutes per symbol, and the 2026-08-10 build spent most
+        // of its 25 minutes exactly that way.
+        {
+            std::lock_guard lock(pending_bt_mu_);
+            if (pending_bt_.active && pending_bt_.req_id == id)
+                pending_bt_.active = false;
+            if (sweep_setup_.waiting && sweep_setup_.req_id == id) {
+                sweep_setup_.waiting = false;
+                sweep_setup_.ready = false;
+                sweep_setup_.req_id = 0;
+            }
+        }
+        // Every OTHER waiter on a request id, for the same reason. Each of these
+        // used to be released only by a timer, so a request the feed had already
+        // given up on still cost its waiter the full wait. Separate scopes, never
+        // nested: these locks have no ordering relationship with each other.
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            const auto it = lineup_want_bars_.find(id);
+            if (it != lineup_want_bars_.end()) {
+                lineup_dropped_.push_back(it->second);
+                lineup_want_bars_.erase(it);
+            }
+        }
+        {
+            std::lock_guard lock(warmup_mu_);
+            // A warmup that will never arrive. Dropping the ticket is the whole
+            // fix: left in place it is claimed by the NEXT delivery of some other
+            // request, which reseeds from whatever that one happened to fetch.
+            const auto it = warmup_want_.find(id);
+            if (it != warmup_want_.end()) {
+                route("live: WARNING " + it->second.symbol +
+                      " warmup history failed - it trades this session on "
+                      "tick-aggregated bars only");
+                warmup_want_.erase(it);
+            }
+        }
     };
     cbs.on_candles = [this](net::CandleBatch&& b) {
         route("candles: " + b.symbol + " " + b.interval + " x" +
@@ -463,15 +504,25 @@ App::App(std::string gateway_url)
         collect_lineup_bars(b);   // before the move: needs b.candles
         const std::string sym = b.symbol;
         const std::string ivl = b.interval;
+        const uint32_t bid = b.id;
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
         // A live symbol that started cold can now be warmed (after the put, so
-        // seed_bars sees this batch).
+        // seed_bars sees this batch). Matched on the REQUEST ID this warmup was
+        // asked under — see App::warmup_want_ for the ticket a same-symbol chart
+        // fetch used to steal.
         uint32_t want_sid = 0;
         {
             std::lock_guard lock(warmup_mu_);
-            const auto it = warmup_want_.find(sym);
+            const auto it = warmup_want_.find(bid);
             if (it != warmup_want_.end()) {
-                want_sid = it->second;
+                // The symbol check is belt and braces: an id that is ours cannot
+                // carry another symbol unless the id space is corrupt, and
+                // reseeding the wrong symbol's engine slot would be far worse
+                // than not reseeding at all.
+                if (it->second.symbol == sym) want_sid = it->second.sid;
+                else
+                    route("live: DISCARDING warmup req " + std::to_string(bid) +
+                          " - asked for " + it->second.symbol + ", got " + sym);
                 warmup_want_.erase(it);
             }
         }
@@ -629,9 +680,21 @@ App::App(std::string gateway_url)
 // engine idle" while the leased instance is being handed to the engine.
 void App::start_pending_backtest(net::CandleBatch& batch) {
     std::lock_guard lock(pending_bt_mu_);
-    if (!pending_bt_.active || pending_bt_.symbol != batch.symbol ||
-        pending_bt_.interval != batch.interval)
+    // By request id, not by symbol + interval: see SweepSetup::req_id.
+    if (!pending_bt_.active || pending_bt_.req_id == 0 ||
+        pending_bt_.req_id != batch.id)
         return;
+    if (pending_bt_.symbol != batch.symbol || pending_bt_.interval != batch.interval) {
+        // Cannot happen: the source stamps the batch with the pub_id of the
+        // request that asked for it. If it ever does, the id space has been
+        // corrupted and running a backtest on these bars would be the 2026-08-10
+        // failure again, so refuse loudly rather than quietly.
+        route("backtest: DISCARDING req " + std::to_string(batch.id) + " - asked for " +
+              pending_bt_.symbol + " " + pending_bt_.interval + ", got " + batch.symbol +
+              " " + batch.interval);
+        pending_bt_.active = false;
+        return;
+    }
     pending_bt_.active = false;   // GC-safe: engine start happens under the lock
     if (batch.candles.size() < 3) {
         route("backtest: not enough data for " + batch.symbol);
@@ -674,11 +737,18 @@ void App::queue_backtest(const std::string& key, const std::string& sym,
         return;
     }
     leases_.push_back({inst, key, StrategyLease::Backtest});
-    {
-        std::lock_guard lock(pending_bt_mu_);
-        pending_bt_ = {true, sym, ivl, strat_mgr_.param_values(key), cash, inst};
+    // The lock is held ACROSS request_candles so the id is in place before any
+    // delivery can be matched against it. Lock order is pending_bt_mu_ ->
+    // TwsData::mu_ and never the reverse: the data thread takes pending_bt_mu_
+    // from on_candles with no source lock held (pump_requests releases mu_ before
+    // it delivers, cache hit or not), so the two can never close a cycle.
+    std::lock_guard lock(pending_bt_mu_);
+    pending_bt_ = {true, 0, sym, ivl, strat_mgr_.param_values(key), cash, inst};
+    pending_bt_.req_id = data_.request_candles(sym, ivl, rng);
+    if (pending_bt_.req_id == 0) {
+        pending_bt_.active = false;
+        route("backtest: feed would not accept the request");
     }
-    data_.request_candles(sym, ivl, rng);
 }
 
 // "" is an alias for the promoted sma_crossover.cpp -- one implementation,
@@ -775,33 +845,47 @@ void App::pump_pending_run() {
 // ------------------------------------------------------------------ sweep
 
 // UI thread: capture the request + strategy and fetch the data.
-void App::queue_sweep(const SweepPanel::Request& rq, bool for_tournament) {
+//
+// Returns TRUE only when a fetch is genuinely outstanding — i.e. sweep_setup_ is
+// armed and waiting. Every `return false` below leaves sweep_setup_ exactly as it
+// was, which pump_tournament has to be able to tell apart from "the fetch came
+// back with nothing": its Queued phase reads !sweep_fetch_pending() as "settled",
+// and the previous candidate left waiting==false, so a candidate that was never
+// requested at all was written off on the very next frame.
+bool App::queue_sweep(const SweepPanel::Request& rq, bool for_tournament) {
     if (!data_.connected()) {
         route("sweep: feed is down, cannot fetch data");
-        return;
+        return false;
     }
     if (sweep_.running || engine_.running()) {
         route("sweep: engine busy, try again");
-        return;
+        return false;
     }
     const std::string key = rq.strat_key;
     IStrategy* inst = acquire_strategy(key);
     if (!inst) {
         route("sweep: strategy '" + strat_mgr_.display_name(key) + "' is not loaded");
-        return;
+        return false;
     }
     leases_.push_back({inst, key, StrategyLease::Sweep});
-    {
-        std::lock_guard lock(pending_bt_mu_);
-        sweep_setup_ = SweepSetup{};
-        sweep_setup_.waiting = true;
-        sweep_setup_.req = rq;
-        sweep_setup_.strategy = inst;
-        sweep_setup_.key = key;
-        sweep_setup_.params = strat_mgr_.param_values(key);
-        sweep_setup_.for_tournament = for_tournament;
+    // Held ACROSS request_candles: the id has to be recorded before the data
+    // thread can deliver against it, and with net/bar_cache.h a hit is delivered
+    // on the very next io_loop pass — the window is real, not theoretical. See
+    // queue_backtest for the lock ordering that makes holding it here safe.
+    std::lock_guard lock(pending_bt_mu_);
+    sweep_setup_ = SweepSetup{};
+    sweep_setup_.waiting = true;
+    sweep_setup_.req = rq;
+    sweep_setup_.strategy = inst;
+    sweep_setup_.key = key;
+    sweep_setup_.params = strat_mgr_.param_values(key);
+    sweep_setup_.for_tournament = for_tournament;
+    sweep_setup_.req_id = data_.request_candles(rq.symbol, rq.interval, rq.range);
+    if (sweep_setup_.req_id == 0) {
+        sweep_setup_.waiting = false;
+        route("sweep: feed would not accept the request for " + rq.symbol);
     }
-    data_.request_candles(rq.symbol, rq.interval, rq.range);
+    return sweep_setup_.waiting;
 }
 
 // The caller gave up on the candles it asked for. Clear the wait so a late
@@ -814,15 +898,39 @@ void App::cancel_pending_sweep() {
     if (!sweep_setup_.waiting) return;
     sweep_setup_.waiting = false;
     sweep_setup_.ready = false;
+    sweep_setup_.req_id = 0;
+}
+
+// UI thread. `ready` counts as pending: the bars are in but pump_sweep has not
+// turned them into a running sweep yet, and reporting "settled" in that window
+// would let pump_tournament write the candidate off one frame before it starts.
+bool App::sweep_fetch_pending() const {
+    std::lock_guard lock(pending_bt_mu_);
+    return sweep_setup_.waiting || sweep_setup_.ready;
 }
 
 // IPC thread: if this batch is what the sweep is waiting for, stash the
 // bars; the UI thread picks them up in pump_sweep().
 void App::stash_pending_sweep(net::CandleBatch& batch) {
     std::lock_guard lock(pending_bt_mu_);
-    if (!sweep_setup_.waiting || sweep_setup_.req.symbol != batch.symbol ||
-        sweep_setup_.req.interval != batch.interval)
+    // The delivery is this sweep's only if it carries the id this sweep asked
+    // under. See SweepSetup::req_id: the previous symbol+interval match handed a
+    // 6-month optimization 1567 warmup bars and nothing anywhere said so.
+    if (!sweep_setup_.waiting || sweep_setup_.req_id == 0 ||
+        sweep_setup_.req_id != batch.id)
         return;
+    if (sweep_setup_.req.symbol != batch.symbol ||
+        sweep_setup_.req.interval != batch.interval) {
+        // Unreachable unless the source mislabels its own deliveries. Refuse the
+        // bars rather than optimize on them, and say so — the whole point of the
+        // 2026-08-10 defect is that it was silent.
+        route("sweep: DISCARDING req " + std::to_string(batch.id) + " - asked for " +
+              sweep_setup_.req.symbol + " " + sweep_setup_.req.interval + " " +
+              sweep_setup_.req.range + ", got " + batch.symbol + " " + batch.interval);
+        sweep_setup_.waiting = false;
+        sweep_setup_.req_id = 0;
+        return;
+    }
     sweep_setup_.bars.clear();
     sweep_setup_.bars.reserve(batch.candles.size());
     for (const Candle& c : batch.candles)
@@ -951,12 +1059,49 @@ void App::pump_sweep() {
         }
     }
 
-    if (!sweep_.running) return;
-    // A mid-sweep rebuild is harmless now: the sweep's leased instance pins
-    // its module until the last cell finishes.
-    BacktestResult r;
-    if (!engine_.take_result(r)) return;
+    // Drain as many finished cells as the frame budget allows, instead of
+    // exactly one.
+    //
+    // Every cell here is a ~5.84 ms backtest (measured: 582 of them in the
+    // 2026-08-10 build for 3398 ms of engine CPU in total), and they already run
+    // off the UI thread. But this function took ONE result per frame and
+    // main.cpp asks for glfwSwapInterval(1), so each cell cost a whole vsync
+    // period — observed ~30 ms wall against 5.84 ms of work. The optimizer ran at
+    // the refresh rate of the monitor, on a headless VPS.
+    //
+    // consume_sweep_result() starts the next cell, so the poll below is waiting
+    // on a backtest that is already in flight; kSweepDrainBudgetMs bounds how
+    // much of the frame that may take, and is deliberately LONGER than one
+    // backtest (see the constant) — a budget shorter than that would just move
+    // the one-per-frame ceiling from 30 ms to 16.7 ms. It sleeps rather than
+    // spins: the engine is on another thread and this box has few cores to spare.
+    const auto drain_start = std::chrono::steady_clock::now();
+    auto drain_spent_ms = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - drain_start)
+            .count();
+    };
+    while (sweep_.running) {
+        // A mid-sweep rebuild is harmless now: the sweep's leased instance pins
+        // its module until the last cell finishes.
+        BacktestResult r;
+        if (engine_.take_result(r)) {
+            consume_sweep_result(r);
+            if (drain_spent_ms() >= kSweepDrainBudgetMs) break;
+            continue;
+        }
+        // Nothing ready. If nothing is running either, there is nothing to wait
+        // for — the sweep is between states and the next frame will move it on.
+        if (!engine_.running() || drain_spent_ms() >= kSweepDrainBudgetMs) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+    }
+}
 
+// One finished backtest, in the sweep's own state machine: score the cell, adopt
+// the pass winner, and start whatever comes next (the next cell, the next param,
+// or the holdout run). Split out of pump_sweep so the drain loop above can call
+// it more than once per frame.
+void App::consume_sweep_result(BacktestResult& r) {
     if (sweep_holdout_phase_) {   // the winner's run on unseen data
         sweep_.has_holdout = true;
         sweep_.holdout_trades = r.trades;
@@ -1150,7 +1295,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     } else {
         tourn_.candidates = std::move(candidates);
     }
-    tourn_.stamp_s = ImGui::GetTime();
+    tourn_.stamp_s = tourn_.start_s = ImGui::GetTime();
 
     sweep_.tourney = {};
     sweep_.tourney.active = true;
@@ -1179,10 +1324,52 @@ void App::pump_tournament() {
 
     switch (tourn_.phase) {
     case Tournament::Phase::Launch:
+        // The hard wall (kTournDeadlineS). Checked HERE, between candidates,
+        // because that is the only point where nothing is in flight: cutting a
+        // tournament off while a sweep is running would leave exactly the unowned
+        // sweep the 0.16.0 defect was about. Judge what has already scored — a
+        // field of three real results is a verdict; refusing to look at them
+        // because two candidates never got bars is not.
+        if (!sweep_.running && now - tourn_.start_s > kTournDeadlineS) {
+            route("tournament: " + tourn_.base.symbol + " hit its " +
+                     std::to_string(static_cast<int>(kTournDeadlineS)) +
+                     "s deadline after " + std::to_string(tourn_.idx) + " of " +
+                     std::to_string(tourn_.candidates.size()) +
+                     " candidates - judging the field it has");
+            cancel_pending_sweep();
+            finish_tournament();
+            break;
+        }
         if (!sweep_.running && !engine_.running()) {
+            // Do not even ask while the feed is down. queue_sweep would refuse
+            // without arming anything, and Phase::Queued reads an unarmed
+            // sweep_setup_ as "the fetch settled with nothing usable" — so a
+            // routine data-session reconnect (drop_connection then a >=3 s
+            // backoff before connect_gateway, which the died-twice escalation
+            // performs by design) burned every candidate of every symbol in about
+            // two seconds, and the whole lineup aborted for the day. WAITING here
+            // is bounded by kTournDeadlineS above, which is what that wall is for.
+            if (!data_.connected()) {
+                if (!tourn_.feed_wait_logged) {
+                    tourn_.feed_wait_logged = true;
+                    route("tournament: " + tourn_.base.symbol +
+                             " waiting for the data session before launching " +
+                             strat_mgr_.display_name(tourn_.candidates[tourn_.idx]));
+                }
+                break;
+            }
+            tourn_.feed_wait_logged = false;
             SweepPanel::Request rq = tourn_.base;
             rq.strat_key = tourn_.candidates[tourn_.idx];
-            queue_sweep(rq, /*for_tournament=*/true);
+            if (!queue_sweep(rq, /*for_tournament=*/true)) {
+                // Refused for a reason waiting cannot fix (the strategy is not
+                // loaded, or the source is shutting down). Score it as a
+                // non-starter and move on rather than spin on it every frame.
+                Tournament::Entry e;
+                e.key = tourn_.candidates[tourn_.idx];
+                advance(std::move(e));
+                break;
+            }
             // Keep the tournament banner alive (queue_sweep reset sweep_ state
             // when its candles arrive — re-assert below in Queued/Running).
             tourn_.phase = Tournament::Phase::Queued;
@@ -1198,34 +1385,70 @@ void App::pump_tournament() {
             sweep_.tourney.active = false;
         }
         break;
-    case Tournament::Phase::Queued:
+    case Tournament::Phase::Queued: {
         sweep_.tourney.active = true;   // survive pump_sweep's sweep_ reset
         sweep_.tourney.total = static_cast<int>(tourn_.candidates.size());
         sweep_.tourney.idx = static_cast<int>(tourn_.idx);
         sweep_.tourney.symbol = tourn_.base.symbol;
         if (sweep_.running) {
             tourn_.phase = Tournament::Phase::Running;
-        } else if (now - tourn_.stamp_s > 60.0) {
-            // The sweep never started: the candle fetch never came back (a
-            // silent half-open data session is the usual cause) or the strategy
-            // failed to load. Name it — otherwise this only shows as a generic
-            // "no candidate produced a result" downstream.
-            route("tournament: " + tourn_.base.symbol + " candle fetch timed out (" +
-                     (data_.connected()
-                          ? "data session connected but no bars in 60s"
-                          : "data session disconnected") +
-                     ") - skipping " + strat_mgr_.display_name(tourn_.candidates[tourn_.idx]));
-            // Stop waiting for those candles. Left armed, a batch arriving after
-            // the tournament ended still started this sweep — which then
-            // finished with no owner and wrote its unadjudicated in-sample
-            // winner into the shared per-strategy map (the 2026-08-10 defect,
-            // reintroduced by this very timeout).
-            cancel_pending_sweep();
-            Tournament::Entry e;
-            e.key = tourn_.candidates[tourn_.idx];
-            advance(std::move(e));
+            break;
         }
+        // The fetch is SETTLED but no sweep came of it: the feed errored the
+        // request out (on_error now clears the exact pending sweep), or the bars
+        // were too thin to optimize on. Waiting out the full fetch budget for an
+        // answer that has already arrived is pure dead time — 60s of it per
+        // candidate, and the 2026-08-10 build did that thirty times.
+        const bool settled = !sweep_fetch_pending();
+        const bool starved = now - tourn_.stamp_s > kTournFetchTimeoutS;
+        if (!settled && !starved) break;
+        const std::string key = tourn_.candidates[tourn_.idx];
+        route("tournament: " + tourn_.base.symbol + " has no bars for " +
+                 strat_mgr_.display_name(key) + " (" +
+                 (settled ? "the fetch came back with nothing usable"
+                          : data_.connected()
+                                ? "data session connected but no bars in " +
+                                      std::to_string(static_cast<int>(kTournFetchTimeoutS)) + "s"
+                                : "data session disconnected") +
+                 ")");
+        // Stop waiting for those candles. Left armed, a batch arriving after
+        // the tournament ended still started this sweep — which then
+        // finished with no owner and wrote its unadjudicated in-sample
+        // winner into the shared per-strategy map (the 2026-08-10 defect,
+        // reintroduced by this very timeout).
+        cancel_pending_sweep();
+        // ONE more turn, at the back of the field, before the candidate is
+        // written off. On 2026-08-10 SOXL SMA Crossover was discarded here and
+        // then produced holdout Sharpe +0.1213 — the only positive score in the
+        // entire build — three seconds after the tournament had already declared
+        // "no candidate produced a result". Accepting that result late is the
+        // wrong repair: an unowned sweep completing with nobody to own it is
+        // itself the 0.16.0 defect, and its bars had in any case come from a
+        // different request (see SweepSetup::req_id). Giving the candidate
+        // another turn is the safe shape of the same idea, and it composes with
+        // net/bar_cache.h: whatever the first attempt was waiting for is CACHED
+        // by the time the field comes round again, so the retry is served without
+        // touching IB at all.
+        //
+        // Bounded twice over — once per candidate (`requeued`) and by the
+        // tournament's own deadline — so a symbol whose data is simply gone
+        // cannot hold the lineup open.
+        const bool have_time = now - tourn_.start_s < kTournDeadlineS;
+        if (have_time && tourn_.requeued.insert(key).second) {
+            tourn_.candidates.push_back(key);
+            sweep_.tourney.total = static_cast<int>(tourn_.candidates.size());
+            route("tournament: " + strat_mgr_.display_name(key) +
+                     " goes to the back of the field for one more attempt");
+            ++tourn_.idx;   // cannot pass the end: we just appended
+            tourn_.phase = Tournament::Phase::Launch;
+            tourn_.stamp_s = now;
+            break;
+        }
+        Tournament::Entry e;
+        e.key = key;
+        advance(std::move(e));
         break;
+    }
     case Tournament::Phase::Running:
         if (sweep_.running) break;
         {
@@ -1488,6 +1711,23 @@ void App::pump_lineup_swap() {
     }
 }
 
+// How long the ranking pass may go without a single arrival, and how long the
+// whole pass may take. Seconds, on ImGui::GetTime(). Both replace a flat 15 s
+// quiet timer that was SHORTER than the deliberate pacing of the pass's own
+// requests, which is what made a paced pass indistinguishable from a failed one.
+//
+// THE QUIET STRETCH. Thirty requests at kHistMinGapMs (500 ms) occupy 15 s of
+// spacing on their own; a straggler that IB silently declines is classified dead
+// at kHistTimeoutMs (20 s) and retried once, so its answer can legitimately land
+// 40 s after the previous symbol's. 60 s clears that with margin.
+static constexpr double kLineupFetchQuietS = 60.0;
+// THE HARD DEADLINE, from phase entry. It has to outlast the longest a request
+// can legitimately be in the system: kHistQueueMaxWaitMs (90 s) of pacing hold
+// plus a fetch's own death-and-retry. Reaching it means the data session is not
+// answering, which the log now says explicitly rather than silently ranking
+// whatever turned up.
+static constexpr double kLineupFetchDeadlineS = 150.0;
+
 void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         route("lineup: already building");
@@ -1541,9 +1781,13 @@ void App::start_daily_lineup(bool autostart_when_done) {
 
 // I/O thread (on_candles): stage a pool symbol's daily bars for the UI thread.
 void App::collect_lineup_bars(net::CandleBatch& b) {
-    if (b.interval != "1d") return;   // the lineup fetches daily bars only
     std::lock_guard<std::mutex> g(lineup_mu_);
-    if (lineup_want_bars_.count(b.symbol) == 0) return;
+    // By request id: this batch is the ranking pass's only if the ranking pass
+    // asked for it. See lineup_want_bars_.
+    const auto it = lineup_want_bars_.find(b.id);
+    if (it == lineup_want_bars_.end()) return;
+    if (it->second != b.symbol) return;   // id space corrupted; never rank on it
+    lineup_want_bars_.erase(it);          // one delivery per request
     std::vector<tt::RankBar> bars;
     bars.reserve(b.candles.size());
     for (const auto& c : b.candles)
@@ -1627,39 +1871,75 @@ void App::pump_daily_lineup() {
         }
         route("lineup: " + std::to_string(lineup_.pool.size()) +
                  " candidates - fetching daily bars to rank");
-        {
-            std::lock_guard<std::mutex> g(lineup_mu_);
-            lineup_want_bars_ = {lineup_.pool.begin(), lineup_.pool.end()};
-            lineup_bar_inbox_.clear();
-        }
         lineup_.awaiting = {lineup_.pool.begin(), lineup_.pool.end()};
         lineup_.bars.clear();
-        for (const std::string& sym : lineup_.pool)
-            data_.request_candles(sym, "1d", "1mo");
+        // Under the lock across every request_candles call, so no delivery can
+        // arrive before the id that claims it is on record. This is the pass that
+        // put 30 requests on the wire in one second on 2026-08-10; they are still
+        // issued in one go, and net/hist_pacing.h is what now spreads them.
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            lineup_want_bars_.clear();
+            lineup_bar_inbox_.clear();
+            lineup_dropped_.clear();
+            for (const std::string& sym : lineup_.pool) {
+                const uint32_t rid = data_.request_candles(sym, "1d", "1mo");
+                if (rid) lineup_want_bars_[rid] = sym;
+                else lineup_.awaiting.erase(sym);   // never asked; never wait for it
+            }
+        }
         lineup_.phase = Phase::FetchingBars;
-        lineup_.stamp_s = now;
+        lineup_.stamp_s = lineup_.fetch_start_s = now;
         return;
     }
 
     case Phase::FetchingBars: {
         std::vector<std::pair<std::string, std::vector<tt::RankBar>>> arrived;
+        std::vector<std::string> dropped;
         {
             std::lock_guard<std::mutex> g(lineup_mu_);
             arrived.swap(lineup_bar_inbox_);
+            dropped.swap(lineup_dropped_);
         }
         for (auto& [sym, bars] : arrived) {
             lineup_.bars[sym] = std::move(bars);
             lineup_.awaiting.erase(sym);
         }
-        if (!arrived.empty()) lineup_.stamp_s = now;   // reset the quiet timer
-        // Proceed once every symbol answered, or after a quiet stretch — some
-        // history requests error out and their bars never arrive.
-        const bool quiet = now - lineup_.stamp_s > 15.0;
-        if (!lineup_.awaiting.empty() && !quiet) return;
+        // A request the feed errored out is ANSWERED, just not with bars. Before
+        // this the only way to notice was the quiet timer below, which cannot
+        // tell a failure from a request that is merely being paced.
+        for (const std::string& sym : dropped) lineup_.awaiting.erase(sym);
+        if (!arrived.empty() || !dropped.empty())
+            lineup_.stamp_s = now;                     // reset the quiet timer
+        // Proceed once every symbol has answered one way or the other. The two
+        // backstops behind that are both LONGER than the pacing that legitimately
+        // delays this pass — see the constants. The old 15 s quiet timer was
+        // shorter than the deliberate spacing of the pass's own 30 requests, so a
+        // held ranking pass advanced with the pool unfetched and the day's
+        // symbols were chosen from whichever few had been sent.
+        const bool quiet = now - lineup_.stamp_s > kLineupFetchQuietS;
+        const bool expired = now - lineup_.fetch_start_s > kLineupFetchDeadlineS;
+        if (!lineup_.awaiting.empty() && !quiet && !expired) return;
         {
             std::lock_guard<std::mutex> g(lineup_mu_);
             lineup_want_bars_.clear();
         }
+        // Say it when the pool is short. Ranking a partial pool is a legitimate
+        // outcome — one dead ticker must not cost the whole day — but it is NOT
+        // the same build as a complete one, and nothing in the log used to
+        // distinguish "the 6 most volatile of 30" from "the 6 that answered".
+        if (!lineup_.awaiting.empty())
+            route("lineup: WARNING ranking a PARTIAL pool - " +
+                     std::to_string(lineup_.bars.size()) + " of " +
+                     std::to_string(lineup_.pool.size()) +
+                     " symbols delivered bars (" +
+                     (expired ? "hit the " +
+                                    std::to_string(static_cast<int>(kLineupFetchDeadlineS)) +
+                                    "s fetch deadline"
+                              : "no arrivals for " +
+                                    std::to_string(static_cast<int>(kLineupFetchQuietS)) +
+                                    "s") +
+                     ") - today's picks come from that subset, not the full scan");
         lineup_.phase = Phase::Ranking;
         lineup_.stamp_s = now;
         return;
@@ -3132,6 +3412,10 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // symbol -> "own" / "mixed" / "inherited" / "none", published to /diag once
     // the session actually starts (see symbol_params.h).
     std::map<std::string, std::string> param_src;
+    // Symbols whose warmup history was not in the cache, with the engine symbol
+    // id to reseed. Local, not warmup_want_: this list is built while the session
+    // is still only a plan, and start_live can still fail below.
+    std::vector<WarmupWant> cold_warmup;
     bool acq_ok = true;
     for (const auto& so : opts.symbols) {
         IStrategy* inst = acquire_strategy(so.strat_key);
@@ -3183,8 +3467,12 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
             // "1mo" of 5m bars is ~1,640 - comfortably more than the largest
             // lookback the sweep can elect, and deliberately under the ~3,000-bar
             // batch size that makes IB drop the NEXT request (see hist_pacing.h).
-            std::lock_guard lock(warmup_mu_);
-            warmup_want_[so.symbol] = static_cast<uint32_t>(cfg.symbol_warmup.size() + 1);
+            //
+            // Only noted here; the fetch (and the ticket that claims its
+            // delivery) is issued below, once start_live has actually succeeded —
+            // a request id cannot be recorded before the request is made.
+            cold_warmup.push_back(
+                {so.symbol, static_cast<uint32_t>(cfg.symbol_warmup.size() + 1)});
         }
         cfg.symbol_warmup.push_back(std::move(seed));
         new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
@@ -3218,11 +3506,23 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         live_param_source_ = std::move(param_src);
         for (const auto& l : new_leases) leases_.push_back(l);
         // Pull history for any symbol that started cold; on_candles re-seeds it.
+        // ReqPriority::Live, not Bulk: an unseeded strategy cannot satisfy a
+        // several-hundred-bar lookback inside one session, so these six requests
+        // are the ones that must never queue behind a lineup's thirty ranking
+        // fetches (see net/hist_pacing.h). Under the lock across every call, so
+        // no delivery can arrive before the id that claims it is on record.
         {
             std::lock_guard lock(warmup_mu_);
-            for (const auto& [sym, sid] : warmup_want_) {
-                (void)sid;
-                data_.request_candles(sym, warmup_interval(warm_bar_sec), "1mo");
+            warmup_want_.clear();   // a previous session's tickets are not ours
+            for (const WarmupWant& w : cold_warmup) {
+                const uint32_t rid =
+                    data_.request_candles(w.symbol, warmup_interval(warm_bar_sec),
+                                          "1mo", net::ReqPriority::Live);
+                if (rid) warmup_want_[rid] = w;
+                else
+                    route("live: WARNING " + w.symbol +
+                          " starts cold and the feed would not accept its warmup "
+                          "request - it will trade on tick-aggregated bars only");
             }
             if (!warmup_want_.empty())
                 route("live: fetching warmup history for " +

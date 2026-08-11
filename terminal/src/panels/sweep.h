@@ -151,6 +151,42 @@ constexpr int kSweepPasses = 2;
 constexpr int kSweepSteps = 12;
 constexpr double kSweepRefineWindow = 0.25;
 
+// How long App::pump_sweep may spend draining finished backtests in one frame.
+//
+// It used to take exactly ONE result per frame, and main.cpp sets
+// glfwSwapInterval(1), so the optimizer advanced one cell per vsync: ~30 ms of
+// wall clock per cell against a measured 5.84 ms of engine time (582 backtests,
+// 3398 ms total, 2026-08-10 lineup build). The optimizer ran at the refresh rate
+// of a monitor nobody was looking at.
+//
+// 8 ms, chosen against that 5.84 ms mean rather than as a round number: a budget
+// SHORTER than one backtest collects at most one result per frame and leaves the
+// ceiling exactly where it was, just at 16.7 ms instead of 30. 8 ms clears the
+// mean with margin, and still leaves half of a 16.7 ms frame for the UI — which
+// only matters at all while a sweep is running.
+constexpr int64_t kSweepDrainBudgetMs = 8;
+
+// How long one tournament candidate may wait for its bars, and how long the
+// whole tournament for one symbol may take. Seconds, on ImGui::GetTime().
+//
+// THE FETCH BUDGET, from the measurements in net/hist_pacing.h rather than a
+// round number: a successful fetch is median 6 s and max 17 s; a silently
+// unanswered one is classified dead at 20 s and retried once, giving it another
+// 20 s; and net/hist_pacing.h may now hold a send back for a few seconds of
+// deliberate spacing. 20 + 20 + spacing is already ~45 s, so the old flat 60 s
+// left almost no margin for a fetch that legitimately died once and recovered.
+// 75 s covers the whole legitimate path with room to spare, and it is no longer
+// the common exit anyway: a fetch the feed ERRORS out is now settled within a
+// frame (App::sweep_fetch_pending), which is what the wait used to be spent on.
+constexpr double kTournFetchTimeoutS = 75.0;
+// The hard wall for one symbol. A healthy tournament is ~12 s once the bar cache
+// removes the duplicate fetches (one fetch, then four cache hits, and five
+// sweeps of ~110 backtests at ~5.84 ms each), so this is an order of magnitude
+// of headroom. It exists because the failure mode is not slowness, it is a data
+// session that has stopped answering — and on 2026-08-10 that ran unbounded for
+// five minutes per symbol, six symbols deep, with nothing to stop it.
+constexpr double kTournDeadlineS = 180.0;
+
 // Higher is better for every metric except max drawdown.
 constexpr const char* kSweepMetrics[] = {"Sharpe", "Return", "Max drawdown", "Win rate"};
 inline bool sweep_metric_minimize(int m) { return m == 2; }

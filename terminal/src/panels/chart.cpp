@@ -52,7 +52,13 @@ void ChartPanel::restore(const std::string& sym, int ivl_idx, int rng_idx) {
 void ChartPanel::request() {
     range_idx_ = std::min(range_idx_, max_range_idx(interval_idx_));
     for (char* c = sym_; *c; ++c) *c = static_cast<char>(std::toupper(*c));
-    if (sym_[0] && ipc_.request_candles(sym_, kIntervals[interval_idx_], kRanges[range_idx_]))
+    // ReqPriority::Live: a human is looking at this panel waiting for it to fill
+    // in. The TWS route's pacing budget is otherwise spent by background work
+    // (the daily lineup's 30-request ranking pass), and a hold there lasts until
+    // sends age out of a ten-minute window — minutes of a blank chart with only a
+    // log line to explain it. See net/hist_pacing.h.
+    if (sym_[0] && ipc_.request_candles(sym_, kIntervals[interval_idx_],
+                                        kRanges[range_idx_], net::ReqPriority::Live))
         requested_once_ = true;
 }
 

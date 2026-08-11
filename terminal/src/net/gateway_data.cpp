@@ -116,7 +116,8 @@ std::string GatewayData::login_url() const {
 
 uint32_t GatewayData::request_candles(const std::string& symbol,
                                       const std::string& interval,
-                                      const std::string& range) {
+                                      const std::string& range,
+                                      ReqPriority /*prio*/) {
     if (!running_.load(std::memory_order_acquire)) return 0;
     const uint32_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mu_);
