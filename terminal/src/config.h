@@ -48,6 +48,11 @@ struct AppConfig {
     bool trade_sched_on = false;
     std::string trade_sched_start = "09:25";
     std::string trade_sched_stop = "15:55";
+    // tm_yday the daily lineup refused to start a session on (-1 = none). The
+    // auto-start is level-triggered anywhere inside the window, and the VPS
+    // relaunches unattended, so this has to survive a restart or the refusal
+    // lasts only until the next reboot.
+    int trade_sched_blocked_day = -1;
 
     // Daily auto-lineup (IBKR scan -> volatility rank -> tournament). The scan
     // and rank knobs feed the manual "Build today's lineup"; the schedule
@@ -133,6 +138,16 @@ struct AppConfig {
     // parameter values — restored (rebuilt) on startup.
     std::vector<std::string> strategy_loaded;       // .cpp basenames to reload
     std::map<std::string, std::map<std::string, double>> strategy_params;
+    // One-shot upgrade marker for 0.16.1. Every build up to 0.16.0 stamped each
+    // tournament CANDIDATE sweep's in-sample winner into strategy_params, so on
+    // any existing install its contents are unattributable — a deliberate
+    // Optimizer-panel default and the last candidate's throwaway fit look
+    // identical (this repo's own config.json carries obvious optimizer artifacts
+    // such as risk_pct=0.050000000000000044 and qty=79545.659). A symbol with no
+    // set of its own inherits precisely that map, so it is discarded ONCE on
+    // upgrade and rebuilt from each strategy's declared defaults. From 0.16.1 on
+    // only deliberate writers touch it and there is nothing left to purge.
+    bool strategy_params_purged = false;
     // Strategies the user has excluded from tournaments / auto-pick (keys;
     // "" = built-in). A tournament skips these when it uses the default
     // (all-loaded) candidate set.

@@ -23,8 +23,13 @@ int parse_hhmm(const char* s) {
 } // namespace
 
 void TradePanel::restore_schedule(bool on, const std::string& start,
-                                  const std::string& stop) {
+                                  const std::string& stop, int blocked_day) {
     sched_on_ = on;
+    // A refusal to trade must outlive a restart. The VPS reboots and relaunches
+    // unattended, and the auto-start is level-triggered anywhere inside the
+    // session window — so an in-memory-only block would be undone by any restart
+    // between 09:25 and 15:55, starting exactly the tabs the lineup rejected.
+    sched_blocked_day_ = blocked_day;
     if (!start.empty() && start.size() < sizeof sched_start_)
         std::snprintf(sched_start_, sizeof sched_start_, "%s", start.c_str());
     if (!stop.empty() && stop.size() < sizeof sched_stop_)
@@ -44,11 +49,11 @@ void TradePanel::set_symbol_strategy(const std::string& symbol, const std::strin
                         def_ap_interval_min_, def_ap_dd_pct_});
 }
 
-bool TradePanel::store_symbol_params(const std::string& symbol, const std::string& key,
+bool TradePanel::merge_symbol_params(const std::string& symbol, const std::string& key,
                                      const std::map<std::string, double>& params) {
     for (SymRow& r : pending_)
         if (r.symbol == symbol && r.strat_key == key) {
-            r.params = params;
+            for (const auto& [name, v] : params) r.params[name] = v;
             return true;
         }
     return false;
@@ -61,10 +66,27 @@ std::vector<std::string> TradePanel::pending_symbols() const {
     return out;
 }
 
-bool TradePanel::has_own_params(const std::string& symbol) const {
-    for (const SymRow& r : pending_)
-        if (r.symbol == symbol) return !r.params.empty();
+bool TradePanel::has_own_params(const std::string& symbol,
+                                const ParamSpecsFn& strat_params) const {
+    for (const SymRow& r : pending_) {
+        if (r.symbol != symbol) continue;
+        if (r.params.empty()) return false;
+        // Against the strategy the tab runs NOW. build_start_opts drops every
+        // undeclared key, so params left over from a strategy this tab no longer
+        // runs contribute nothing to what it would actually trade — counting
+        // them as "its own" admits a symbol that then resolves to Inherited.
+        for (const StratParam& sp : strat_params(r.strat_key))
+            if (r.params.count(sp.name)) return true;
+        return false;
+    }
     return false;
+}
+
+void TradePanel::block_scheduled_start() {
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    sched_blocked_day_ = tm.tm_yday;
 }
 
 int TradePanel::remove_symbols(const std::vector<std::string>& symbols) {
@@ -331,8 +353,18 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     if (ImGui::BeginCombo("strategy", strat_name(r.strat_key).c_str())) {
                         for (const std::string& src : strat_sources) {
                             const std::string lbl = strat_name(src) + "###" + src;
-                            if (ImGui::Selectable(lbl.c_str(), src == r.strat_key))
+                            if (ImGui::Selectable(lbl.c_str(), src == r.strat_key) &&
+                                src != r.strat_key) {
                                 r.strat_key = src;
+                                // A fit belongs to a (symbol, STRATEGY) pair. Two
+                                // strategies that happen to declare the same
+                                // parameter name do not mean the same thing by it,
+                                // and leaving the old map behind made the tab claim
+                                // parameters "of its own" that the new strategy
+                                // never saw — enough to win lineup admission and
+                                // then silently inherit the shared defaults anyway.
+                                r.params.clear();
+                            }
                         }
                         ImGui::EndCombo();
                     }
@@ -516,11 +548,28 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
             localtime_s(&tm, &now_tt);
             const int now_min = tm.tm_hour * 60 + tm.tm_min;
             const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
+            // sched_blocked_day_: the daily lineup already decided today's tabs
+            // must not trade (block_scheduled_start). Without this test the
+            // lineup's "starting NOTHING" was purely advisory — this branch
+            // would start the very tabs it rejected, on the very parameters it
+            // rejected them for.
             if (start_min >= 0 && stop_min >= 0 && weekday &&
-                tm.tm_yday != sched_last_start_day_ && now_min >= start_min &&
+                tm.tm_yday != sched_last_start_day_ &&
+                tm.tm_yday != sched_blocked_day_ && now_min >= start_min &&
                 now_min < stop_min) {
                 sched_last_start_day_ = tm.tm_yday;
                 do_start();
+            }
+        }
+        if (sched_on_) {
+            std::time_t now_tt = std::time(nullptr);
+            std::tm tm{};
+            localtime_s(&tm, &now_tt);
+            if (tm.tm_yday == sched_blocked_day_) {
+                ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.25f, 1),
+                                   "Auto-start blocked today: the daily lineup found "
+                                   "no symbol with parameters fitted to itself. "
+                                   "Start manually to override.");
             }
         }
 

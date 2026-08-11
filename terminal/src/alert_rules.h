@@ -18,6 +18,14 @@ inline AlertClass classify_alert(const std::string& l) {
     // NOT bare "half-open". The routine data-feed reconnect logs "...data
     // session (half-open)" — it self-heals on every nightly gateway restart and
     // flaps all weekend, and was spamming the phone with Warning pages.
+    // A refused trading day is the loudest thing the lineup can say and it used
+    // to be unobservable: before 0.16.0 the lineup always started SOMETHING, so
+    // "no session today" was not a reachable outcome. Now it is, and an operator
+    // who is not at the machine has to hear it. Uppercase on purpose — the
+    // lineup emits these two verdicts in caps, and "excluded"/"aborted" in
+    // ordinary prose must not page anyone.
+    if (has("lineup: ABORTED")) return AlertClass::Critical;
+    if (has("lineup: EXCLUDED")) return AlertClass::Warning;
     if (has("rejected") || has("stream lost") || has("auth failed") ||
         has("(drops!)") || has("half-open order"))
         return AlertClass::Warning;

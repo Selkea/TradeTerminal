@@ -48,8 +48,15 @@ inline const char* param_source_name(ParamSource s) {
 }
 
 // A parameter the strategy declares, plus the value the strategy manager holds
-// for it right now (the fallback — a strategy-level default, never another
-// symbol's fit once App stops writing candidate sweeps into that map).
+// for it right now — the fallback.
+//
+// Be precise about what that fallback IS, because the first draft of this header
+// claimed more than the code can deliver: it is the strategy's SHARED value, the
+// one the Strategies panel edits and the Optimizer panel's "Run"/"Tournament"
+// buttons deliberately overwrite. Since 0.16.1 nothing writes it behind the
+// user's back (candidate sweeps no longer do), but "shared default" still never
+// means "fitted to this symbol". Inheriting it is a fact to be reported, never
+// evidence that the symbol was validated.
 struct ParamDefault {
     std::string name;
     double value = 0;
@@ -91,39 +98,72 @@ inline ParamSelection select_symbol_params(const std::map<std::string, double>& 
 
 // ---------------------------------------------------------------- admission
 
-// What the morning's tournament produced for one lineup pick.
+// What this morning's lineup build achieved for one pick.
 struct SymbolOutcome {
     // A tournament was attempted for this symbol in THIS lineup build. False for
     // a tab the user added by hand — admission never touches those.
     bool tournament_ran = false;
-    // At least one candidate came back with a score (champ >= 0). False is the
-    // 2026-08-10 case: every candidate lost to a candle-fetch timeout.
-    bool produced_result = false;
-    // The tab carries a non-empty parameter map of its own — either this
-    // morning's champion, or a fit for THIS symbol carried over from a previous
-    // session (set_lineup preserves those).
+    // THIS build's tournament crowned a champion AND installed it on THIS
+    // symbol's tab.
+    //
+    // Recorded positively, at the one line that does the install. The 0.16.0
+    // draft inferred the opposite — "not in the failed list" — and only ONE
+    // code path ever appended to that list (finish_tournament's champ<0 arm).
+    // Every other way a tournament can end therefore read as success: the 60s
+    // candle-fetch timeout, "optimizer busy", "every loaded strategy excluded",
+    // the Optimizer panel's Cancel button, and the champion being rejected as
+    // non-positive (which leaves the tab with nothing fitted to it at all). A
+    // path nobody thought of must make this rule STRICTER, not weaker, so the
+    // flag can only be set by the success itself.
+    bool fitted_this_build = false;
+    // The tab carries a parameter set of its own for the strategy it is
+    // currently running — either this morning's champion, or a fit for THIS
+    // symbol carried over from a previous session (set_lineup preserves those).
     bool has_own_params = false;
+    // The account is exposed to this symbol right now: a live position, or a
+    // resting order that can open one. Exclusion is a REFUSAL TO TRADE, and it
+    // was being applied as "delete the tab" — which for an exposed symbol means
+    // either market-closing the position (begin_lineup_swap flattens every
+    // dropped symbol, bypassing hold-until-profitable) or, with no session
+    // running, orphaning it: absent from cfg.symbols it is never adopted at
+    // reconciliation, never appears in /diag, and is invisible to both the
+    // orphan watchdog and the 15:57 EOD backstop. Neither is an improvement on
+    // the borrowed-parameter bug this file exists to fix.
+    bool holds_position = false;
 };
 
 enum class LineupAdmit {
     Admit,             // this morning's tournament spoke for it
-    AdmitOwnPrevious,  // no result today, but it still has its OWN earlier fit
-    Exclude,           // no result and nothing of its own — do not trade it
+    AdmitOwnPrevious,  // no fit today, but it still has its OWN earlier fit
+    // Nothing of its own, but we are exposed. Keeping it puts it in cfg.symbols,
+    // where reconciliation adopts the position and adopt_hold pauses its
+    // strategy until the position goes flat — so for as long as the exposure
+    // lasts, the symbol is managed and cannot enter on borrowed parameters.
+    // KNOWN RESIDUAL: once it IS flat, adopt_hold lifts and the strategy resumes
+    // on inherited values like any adopted symbol. Closing that needs a
+    // per-symbol "no new entries" gate in the engine, which does not exist yet;
+    // the alternative — dropping the tab — is strictly worse, because it either
+    // market-closes the position or orphans it entirely.
+    AdmitHoldingOnly,
+    Exclude,           // no fit, nothing of its own, no exposure — sit it out
 };
 
-// The rule: a symbol may trade only on parameters fitted to ITSELF. Today's
-// champion is best; its own earlier fit is stale but still fitted to this
-// instrument; another instrument's fit is never acceptable, so a symbol left
-// with nothing of its own sits the session out.
+// The rule: a symbol may trade only on parameters fitted to ITSELF. This
+// morning's champion is best; its own earlier fit is stale but still fitted to
+// this instrument; another instrument's fit is never acceptable, so a symbol
+// left with nothing of its own sits the session out — unless we are already in
+// it, in which case it stays so the position can be managed to flat.
 inline LineupAdmit admit_lineup_symbol(const SymbolOutcome& o) {
     if (!o.tournament_ran) return LineupAdmit::Admit;   // hand-added tab: not ours to judge
-    if (o.produced_result) return LineupAdmit::Admit;
-    return o.has_own_params ? LineupAdmit::AdmitOwnPrevious : LineupAdmit::Exclude;
+    if (o.fitted_this_build) return LineupAdmit::Admit;
+    if (o.has_own_params) return LineupAdmit::AdmitOwnPrevious;
+    return o.holds_position ? LineupAdmit::AdmitHoldingOnly : LineupAdmit::Exclude;
 }
 
 struct LineupPlan {
     std::vector<std::string> admitted;       // symbols the session will trade
     std::vector<std::string> own_previous;   // subset of admitted, on a stale own fit
+    std::vector<std::string> holding_only;   // subset of admitted, kept only to go flat
     std::vector<std::string> excluded;       // dropped: no validated set of their own
     // False = start NOTHING. Every pick failed, and a session of borrowed
     // parameters is worse than no session; the caller logs loudly instead.
@@ -141,6 +181,10 @@ inline LineupPlan plan_lineup(
         case LineupAdmit::AdmitOwnPrevious:
             p.admitted.push_back(sym);
             p.own_previous.push_back(sym);
+            break;
+        case LineupAdmit::AdmitHoldingOnly:
+            p.admitted.push_back(sym);
+            p.holding_only.push_back(sym);
             break;
         case LineupAdmit::Exclude:
             p.excluded.push_back(sym);

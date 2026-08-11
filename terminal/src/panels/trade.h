@@ -87,20 +87,44 @@ public:
     void set_symbol_strategy(const std::string& symbol, const std::string& key,
                              const std::map<std::string, double>& params);
 
-    // Store a fit against an EXISTING tab that already runs `key`; returns false
+    // Merge a fit into an EXISTING tab that already runs `key`; returns false
     // otherwise. A plain Optimizer sweep must not conjure a Trade tab for a
     // symbol you only meant to optimize, nor silently re-point a tab at the
     // strategy you were experimenting with — but its winner still belongs to
     // that symbol rather than to the shared per-strategy map (symbol_params.h).
-    bool store_symbol_params(const std::string& symbol, const std::string& key,
+    //
+    // MERGE, not replace: the caller passes only the names its sweep actually
+    // tuned. A sweep never tunes the sizing and session-shape knobs
+    // (sweep_param_is_fixed skips qty, alloc_pct, risk_pct, enter_from_h, ...),
+    // so its winner still carries the STRATEGY-WIDE value for each of those —
+    // and replacing the whole map would quietly overwrite this symbol's own
+    // sizing with another symbol's.
+    bool merge_symbol_params(const std::string& symbol, const std::string& key,
                              const std::map<std::string, double>& params);
 
     // Lineup admission (symbol_params.h): the pending symbols, whether one
     // carries a parameter set of its own, and dropping the ones that earned no
     // validated set this morning. remove_symbols returns how many tabs went.
     std::vector<std::string> pending_symbols() const;
-    bool has_own_params(const std::string& symbol) const;
+    // "Of its own" means: a value for at least one name the strategy this tab is
+    // CURRENTLY set to declares. A bare !params.empty() test let a tab whose
+    // strategy had been changed under its old params report true, get admitted
+    // as AdmitOwnPrevious, and then resolve to ParamSource::Inherited in
+    // build_start_opts — which drops every undeclared key. That is the exact
+    // "trades a set that was never fitted to it" outcome this rule exists to
+    // stop, reached through the admission rule meant to prevent it.
+    bool has_own_params(const std::string& symbol,
+                        const ParamSpecsFn& strat_params) const;
     int remove_symbols(const std::vector<std::string>& symbols);
+
+    // Suppress the scheduled auto-start for the rest of today. The daily lineup
+    // calls this when it refuses to start a session: the auto-start below is
+    // level-triggered on (sched_on_, pending_, clock) alone and knows nothing
+    // about the lineup, so "we started nothing" would otherwise be undone a
+    // frame later by the scheduler starting those same tabs on the borrowed
+    // parameters the lineup just rejected. The manual Start button still works —
+    // this blocks the unattended path, not the operator.
+    void block_scheduled_start();
 
     // Replace all pending tabs with exactly `symbols`, each a fresh tab seeded
     // from the panel's per-symbol defaults (built-in strategy until a
@@ -139,7 +163,11 @@ public:
     bool sched_on() const { return sched_on_; }
     std::string sched_start() const { return sched_start_; }
     std::string sched_stop() const { return sched_stop_; }
-    void restore_schedule(bool on, const std::string& start, const std::string& stop);
+    void restore_schedule(bool on, const std::string& start, const std::string& stop,
+                          int blocked_day = -1);
+    // tm_yday the lineup blocked the auto-start on; -1 = not blocked. Persisted
+    // so a restart cannot resurrect a session the lineup refused.
+    int sched_blocked_day() const { return sched_blocked_day_; }
 
     // Persisted default risk limits, seeded into each new symbol card.
     const RiskLimits& risk() const { return def_risk_; }
@@ -197,6 +225,10 @@ private:
     char sched_stop_[8] = "15:55";
     int sched_last_start_day_ = -1;   // tm_yday: one auto-start per day
     int sched_prev_min_ = -1;         // edge detector for the scheduled stop
+    // tm_yday the daily lineup refused to start on; the auto-start stands down
+    // for that day (block_scheduled_start). Persisted with the schedule — a
+    // restart inside the session window would otherwise re-enable it.
+    int sched_blocked_day_ = -1;
 };
 
 } // namespace tt::ui

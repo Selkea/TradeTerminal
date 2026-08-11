@@ -91,16 +91,68 @@ TEST_CASE("lineup: a pick whose tournament produced nothing is excluded") {
     // it had no set of its own (set_lineup had cleared the tab).
     SymbolOutcome o;
     o.tournament_ran = true;
-    o.produced_result = false;
+    o.fitted_this_build = false;
     o.has_own_params = false;
     CHECK(admit_lineup_symbol(o) == LineupAdmit::Exclude);
+}
+
+TEST_CASE("lineup: every way a tournament can end without a fit excludes") {
+    // The rule is driven by a POSITIVE record of "this build installed a fit on
+    // this tab", so it does not need to enumerate failures — but these are the
+    // ones the 0.16.0 draft's "not in the failed list" inference read as
+    // SUCCESS, because only one of them ever appended to that list:
+    //   - every candidate's candle fetch timed out   (the only one it caught)
+    //   - the champion scored <= 0 and was rejected, so nothing was installed
+    //   - start_tournament bailed: engine busy / every strategy excluded
+    //   - "engine stayed busy, aborting" never reached finish_tournament
+    //   - the operator hit Cancel in the Optimizer panel
+    // All five leave fitted_this_build false, which is the whole point.
+    SymbolOutcome o;
+    o.tournament_ran = true;
+    o.fitted_this_build = false;
+    o.has_own_params = false;
+    o.holds_position = false;
+    CHECK(admit_lineup_symbol(o) == LineupAdmit::Exclude);
+}
+
+TEST_CASE("lineup: a symbol we still hold is kept even with nothing of its own") {
+    // Exclusion deletes the tab, and for an exposed symbol that means either
+    // market-closing the position (begin_lineup_swap flattens every dropped
+    // symbol, bypassing hold-until-profitable) or orphaning it outside
+    // cfg.symbols where reconciliation, /diag, the orphan watchdog and the EOD
+    // backstop all miss it. It stays, to be adopted and held until flat.
+    SymbolOutcome o;
+    o.tournament_ran = true;
+    o.fitted_this_build = false;
+    o.has_own_params = false;
+    o.holds_position = true;
+    CHECK(admit_lineup_symbol(o) == LineupAdmit::AdmitHoldingOnly);
+
+    const LineupPlan p = plan_lineup({{"KORU", o}});
+    CHECK(p.start);
+    CHECK(p.excluded.empty());
+    REQUIRE(p.admitted.size() == 1);
+    CHECK(p.admitted[0] == "KORU");
+    REQUIRE(p.holding_only.size() == 1);
+    CHECK(p.holding_only[0] == "KORU");
+}
+
+TEST_CASE("lineup: its own previous fit outranks the holding exemption") {
+    // Holding-only is the last resort: a symbol with a fit of its own trades on
+    // it normally, position or not.
+    SymbolOutcome o;
+    o.tournament_ran = true;
+    o.fitted_this_build = false;
+    o.has_own_params = true;
+    o.holds_position = true;
+    CHECK(admit_lineup_symbol(o) == LineupAdmit::AdmitOwnPrevious);
 }
 
 TEST_CASE("lineup: no result but its OWN previous fit keeps it in") {
     // Stale, but fitted to THIS instrument — which another symbol's fit never is.
     SymbolOutcome o;
     o.tournament_ran = true;
-    o.produced_result = false;
+    o.fitted_this_build = false;
     o.has_own_params = true;
     CHECK(admit_lineup_symbol(o) == LineupAdmit::AdmitOwnPrevious);
 }
@@ -108,7 +160,7 @@ TEST_CASE("lineup: no result but its OWN previous fit keeps it in") {
 TEST_CASE("lineup: a tournament that produced a result admits the symbol") {
     SymbolOutcome o;
     o.tournament_ran = true;
-    o.produced_result = true;
+    o.fitted_this_build = true;
     o.has_own_params = true;
     CHECK(admit_lineup_symbol(o) == LineupAdmit::Admit);
 }
@@ -118,7 +170,7 @@ TEST_CASE("lineup: a hand-added tab is never judged by the lineup") {
     // it would delete a tab the user typed in.
     SymbolOutcome o;
     o.tournament_ran = false;
-    o.produced_result = false;
+    o.fitted_this_build = false;
     o.has_own_params = false;
     CHECK(admit_lineup_symbol(o) == LineupAdmit::Admit);
 }
@@ -127,7 +179,7 @@ TEST_CASE("lineup: the 2026-08-10 morning drops four and starts two") {
     auto ran = [](bool result, bool own) {
         SymbolOutcome o;
         o.tournament_ran = true;
-        o.produced_result = result;
+        o.fitted_this_build = result;
         o.has_own_params = own;
         return o;
     };
@@ -150,7 +202,7 @@ TEST_CASE("lineup: every pick failing starts nothing at all") {
     // session, and "start whatever is left" would have been exactly that.
     SymbolOutcome dead;
     dead.tournament_ran = true;
-    dead.produced_result = false;
+    dead.fitted_this_build = false;
     dead.has_own_params = false;
     const LineupPlan p = plan_lineup(
         {{"MUU", dead}, {"SOXS", dead}, {"KORU", dead}, {"SOXL", dead}});
@@ -159,10 +211,25 @@ TEST_CASE("lineup: every pick failing starts nothing at all") {
     CHECK(p.excluded.size() == 4);
 }
 
+TEST_CASE("lineup: an open position alone is enough to start the session") {
+    // start=false means the caller starts NOTHING — which for a symbol we are
+    // holding would leave the position with no session watching it. One
+    // holding-only admission has to be enough to bring the session up.
+    SymbolOutcome dead, held;
+    dead.tournament_ran = held.tournament_ran = true;
+    held.holds_position = true;
+    const LineupPlan p = plan_lineup({{"MUU", dead}, {"SOXL", held}});
+    CHECK(p.start);
+    REQUIRE(p.admitted.size() == 1);
+    CHECK(p.admitted[0] == "SOXL");
+    REQUIRE(p.excluded.size() == 1);
+    CHECK(p.excluded[0] == "MUU");
+}
+
 TEST_CASE("lineup: a survivor on its own previous fit still starts the session") {
     SymbolOutcome dead, stale;
     dead.tournament_ran = stale.tournament_ran = true;
-    dead.produced_result = stale.produced_result = false;
+    dead.fitted_this_build = stale.fitted_this_build = false;
     dead.has_own_params = false;
     stale.has_own_params = true;
     const LineupPlan p = plan_lineup({{"MUU", dead}, {"SOXS", stale}});
@@ -235,6 +302,46 @@ TEST_CASE("config: an old config with empty params still loads and inherits") {
         select_symbol_params(back.trade_symbols[0].params, declared());
     CHECK(s.source == ParamSource::Inherited);
     CHECK(s.params.at("rsi_len") == doctest::Approx(2.0));
+}
+
+TEST_CASE("config: a refused trading day survives a restart") {
+    // The Trade panel's auto-start is level-triggered anywhere inside the
+    // session window, and the VPS relaunches unattended. If the lineup's block
+    // lived only in memory, any restart between 09:25 and 15:55 would start
+    // exactly the tabs it refused, on the parameters it refused them for.
+    TempCfg f("tt_test_sched_block.json");
+    AppConfig c;
+    c.trade_sched_on = true;
+    c.trade_sched_blocked_day = 221;
+    c.save(f.str());
+    CHECK(AppConfig::load(f.str()).trade_sched_blocked_day == 221);
+    // Default is "not blocked", so a config that never saw a refusal starts
+    // normally rather than sitting out every day.
+    CHECK(AppConfig().trade_sched_blocked_day == -1);
+}
+
+TEST_CASE("config: the 0.16.1 strategy-param purge runs once and only once") {
+    // Every build up to 0.16.0 let each tournament CANDIDATE write the shared
+    // per-strategy map, so an existing install's saved values are fits on
+    // whatever symbol was optimized last. A config with no marker must report
+    // "not purged" (so the upgrade fires); once written, it must stay true (so
+    // deliberate values set afterwards are never discarded again).
+    TempCfg f("tt_test_param_purge.json");
+    {
+        std::FILE* fp = std::fopen(f.str().c_str(), "wb");
+        REQUIRE(fp != nullptr);
+        const char* legacy = R"({"strategy_params":{"orb.cpp":{"risk_pct":0.05}}})";
+        std::fwrite(legacy, 1, std::strlen(legacy), fp);
+        std::fclose(fp);
+    }
+    AppConfig old = AppConfig::load(f.str());
+    CHECK_FALSE(old.strategy_params_purged);
+    CHECK(old.strategy_params.at("orb.cpp").at("risk_pct") == doctest::Approx(0.05));
+
+    old.strategy_params.clear();
+    old.strategy_params_purged = true;
+    old.save(f.str());
+    CHECK(AppConfig::load(f.str()).strategy_params_purged);
 }
 
 TEST_CASE("config: a trade_symbols entry with no params key at all loads") {
