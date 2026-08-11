@@ -8,6 +8,7 @@
 //   - a symbol that has never been answered is stale, not absent.
 #include "doctest.h"
 
+#include "market_calendar.h"   // the RTH gate the watchdog is armed by
 #include "net/hist_freshness.h"
 
 using namespace tt::net;
@@ -167,20 +168,138 @@ TEST_CASE("stale: a fresh delivery clears the whole condition") {
 
 TEST_CASE("stale: a stopped session's deliveries do not follow it into the next") {
     // The terminal stays up across the 15:55 scheduled stop and the 09:25
-    // auto-start, and an answered symbol is aged ABSOLUTELY — the settle-in
-    // window only ever covers a symbol that has never been answered. Without
-    // the reset, yesterday's 15:32 delivery pages ~17 hours of staleness on the
-    // first frame of a healthy morning, twice, every day.
+    // auto-start. Without the reset, yesterday's 15:32 delivery is ~17 hours old
+    // on the first frame of a healthy morning — and while armed_ms now caps that
+    // (below), clear() is what keeps /diag's age and refreshing()'s evidence
+    // honest, so both properties are pinned.
     HistoryFreshness f;
     f.record("SOXS", "5m", 392 * kMin);   // 15:32, counting minutes from 09:00
     const auto syms = every30({"SOXS"});
     const int64_t next_open = 1'465 * kMin;   // 09:25 the next morning
-    CHECK(f.stale(syms, "5m", next_open, 1 * kMin).size() == 1);
+    // A fresh session is one minute old, so nothing is judged yet either way.
+    CHECK(f.stale(syms, "5m", next_open, 1 * kMin).empty());
+    // ...but the carried-over delivery is still visible as an age, and would
+    // still be offered as proof the session is serving history if it were recent.
+    CHECK(f.age_ms("SOXS", "5m", next_open) == 1'073 * kMin);
     f.clear();
     CHECK(f.age_ms("SOXS", "5m", next_open) == -1);
     // Now it reads as never-answered and the grace acts as the settle-in window.
     CHECK(f.stale(syms, "5m", next_open, 1 * kMin).empty());
     CHECK(f.stale(syms, "5m", next_open, 91 * kMin).size() == 1);
+}
+
+// ---- the RTH gate ----------------------------------------------------------
+// 2026-08-11: a live session was left running past the 15:55 auto-stop and this
+// watchdog paged Critical at 18:40 and 19:10 ("strategies are trading on stale
+// candles") with the market shut since 16:00 and the book flat, and would have
+// gone on every 30 minutes until morning. The gate is armed_ms: the shorter of
+// the session's age and the time the market has been open.
+
+TEST_CASE("armed: the shorter of the two windows wins") {
+    CHECK(hist_armed_ms(600 * kMin, 45 * kMin) == 45 * kMin);   // long session, fresh open
+    CHECK(hist_armed_ms(1 * kMin, 300 * kMin) == 1 * kMin);     // just started mid-session
+    CHECK(hist_armed_ms(600 * kMin, 0) == 0);                   // market shut
+    CHECK(hist_armed_ms(0, 300 * kMin) == 0);
+}
+
+TEST_CASE("armed: outside market hours nothing is overdue, however old") {
+    // The exact 19:10 page: MUU 120m, SOXS/KORU/SOXL 119m, all four genuinely
+    // not refreshing, all four meaningless — every order the engine emits is
+    // outside_rth = 0, so a strategy acting on a stale candle cannot fill.
+    HistoryFreshness f;
+    f.record("MUU", "5m", 0);
+    f.record("SOXS", "5m", 1 * kMin);
+    const auto syms = every30({"MUU", "SOXS", "KORU", "SOXL"});
+    const int64_t now = 120 * kMin;
+    // Armed (mid-session), this is exactly what the operator was paged about.
+    CHECK(f.stale(syms, "5m", now, 400 * kMin).size() == 4);
+    // Closed: the same evidence, judged against a shut market.
+    CHECK(f.stale(syms, "5m", now, 0).empty());
+    // ...and it stays empty as the night wears on, which is the whole point:
+    // the 30-minute re-alert cannot find anything to re-page.
+    CHECK(f.stale(syms, "5m", 900 * kMin, 0).empty());
+}
+
+TEST_CASE("armed: the open boundary does not page an overnight-stale symbol") {
+    // The case the gate is most likely to get wrong. A session that was never
+    // stopped is still holding yesterday's deliveries, so at 09:30:01 a symbol
+    // last served at 17:00 is sixteen hours old — and the morning's first
+    // autopilot cycle has not run yet. Minutes from yesterday 09:00.
+    HistoryFreshness f;
+    f.record("MUU", "5m", 480 * kMin);   // 17:00 yesterday
+    const auto syms = every30({"MUU"});   // production cadence: a 90-minute grace
+    // Minutes from yesterday 09:00, so TODAY 09:30 is t = 1470.
+    auto today = [](int hh, int mm) {
+        return static_cast<int64_t>(1440 + hh * 60 + mm - 540) * kMin;
+    };
+    auto armed_at = [&](int hh, int mm) {
+        std::tm tm{};
+        tm.tm_year = 2026 - 1900; tm.tm_mon = 7; tm.tm_mday = 12;   // Wednesday
+        tm.tm_wday = tt::weekday_of(2026, 8, 12);
+        tm.tm_hour = hh; tm.tm_min = mm;
+        // Live since yesterday 09:25 (t = 25) and never stopped.
+        return hist_armed_ms(today(hh, mm) - 25 * kMin, tt::rth_open_elapsed_ms(tm));
+    };
+    auto at = [&](int hh, int mm) {
+        return f.stale(syms, "5m", today(hh, mm), armed_at(hh, mm));
+    };
+    CHECK(at(9, 30).empty());    // the instant the gate opens: 16.5 h "stale"
+    CHECK(at(10, 59).empty());   // 89 minutes of open market, inside the grace
+    // 91 minutes of open market with nothing delivered IS the failure, so it
+    // pages then — and reports the TRUE age, not the 91 minutes it judged on.
+    const auto out = at(11, 1);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].ever);
+    CHECK(out[0].age_ms == 1'081 * kMin);   // just over 18 h, honestly reported
+}
+
+TEST_CASE("armed: the cap costs at most one grace period, once, at the open") {
+    // The whole price of the gate, stated exactly. The cap can only bite while
+    // the market has been open for less than the grace period, so the only page
+    // it can ever move is a session's FIRST one, and only when the last delivery
+    // predates the open. Everything after that is untouched.
+    //
+    // 2026-08-07 replayed, minutes from 09:00: last good SOXS refresh 09:17, a
+    // 90-minute grace, and the market open at 09:30 (t = 30).
+    HistoryFreshness f;
+    f.record("SOXS", "5m", 17 * kMin);
+    const auto syms = every30({"SOXS"});
+    auto armed_at = [](int64_t t) { return hist_armed_ms(t, t - 30 * kMin); };
+    // Ungated it would have paged at 10:48, a grace period past the last delivery.
+    CHECK(f.stale(syms, "5m", 108 * kMin, 108 * kMin).size() == 1);
+    // Gated, that moment is a grace period of OPEN MARKET instead: 11:01.
+    CHECK(f.stale(syms, "5m", 108 * kMin, armed_at(108 * kMin)).empty());
+    CHECK(f.stale(syms, "5m", 121 * kMin, armed_at(121 * kMin)).size() == 1);
+    // Thirteen minutes, on a stall that ran until 14:01 before anyone saw it.
+    CHECK(f.stale(syms, "5m", 301 * kMin, armed_at(301 * kMin)).size() == 1);
+    // A stall that starts after the open pays nothing at all: last delivery
+    // 11:30 (t = 150), grace 90, so it pages at 13:00 (t = 240) either way.
+    HistoryFreshness g;
+    g.record("SOXS", "5m", 150 * kMin);
+    CHECK(g.stale(syms, "5m", 239 * kMin, armed_at(239 * kMin)).empty());
+    CHECK(g.stale(syms, "5m", 241 * kMin, armed_at(241 * kMin)).size() == 1);
+    CHECK(g.stale(syms, "5m", 241 * kMin, 241 * kMin).size() == 1);   // ungated: same
+}
+
+TEST_CASE("armed: a half-day shuts the gate at 13:00") {
+    // Three days a year the NYSE closes at 1pm. Without the early-close rule the
+    // watchdog pages through the afternoon on each of them.
+    HistoryFreshness f;
+    f.record("MUU", "5m", 0);
+    const auto syms = every30({"MUU"});
+    auto armed = [&](int y, int m, int d, int hh, int mm) {
+        std::tm tm{};
+        tm.tm_year = y - 1900; tm.tm_mon = m - 1; tm.tm_mday = d;
+        tm.tm_wday = tt::weekday_of(y, m, d);
+        tm.tm_hour = hh; tm.tm_min = mm;
+        return hist_armed_ms(600 * kMin, tt::rth_open_elapsed_ms(tm));
+    };
+    const int64_t now = 200 * kMin;   // MUU is 200 minutes stale either way
+    // 2026-11-27, the Friday after Thanksgiving: still open at 12:30...
+    CHECK(f.stale(syms, "5m", now, armed(2026, 11, 27, 12, 30)).size() == 1);
+    CHECK(f.stale(syms, "5m", now, armed(2026, 11, 27, 14, 30)).empty());
+    // ...while the ordinary Friday a week later runs to 16:00.
+    CHECK(f.stale(syms, "5m", now, armed(2026, 12, 4, 14, 30)).size() == 1);
 }
 
 // ---- the page text ---------------------------------------------------------

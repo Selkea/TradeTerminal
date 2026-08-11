@@ -21,6 +21,17 @@ static std::tm mk(int y, int m, int d) {
     return tm;
 }
 
+// ...and the same with a time of day, for the session-hours half.
+static std::tm at(int y, int m, int d, int hh, int mm) {
+    std::tm tm = mk(y, m, d);
+    tm.tm_hour = hh;
+    tm.tm_min = mm;
+    return tm;
+}
+
+static constexpr int64_t kMin = 60'000;
+static constexpr int64_t kHour = 60 * kMin;
+
 TEST_CASE("calendar: weekday arithmetic") {
     CHECK(weekday_of(1970, 1, 1) == 4);    // Thursday
     CHECK(weekday_of(2000, 2, 29) == 2);   // Tuesday, leap day
@@ -93,4 +104,104 @@ TEST_CASE("calendar: ordinary trading days are not holidays") {
     CHECK(trading == 230);
     CHECK(is_us_trading_day(mk(2026, 8, 10)));   // the Monday after the incident
     CHECK_FALSE(is_us_trading_day(mk(2026, 8, 9)));
+}
+
+// ---- session hours ---------------------------------------------------------
+// Added 0.21.0 for the history-staleness watchdog, which paged Critical at
+// 18:40 and 19:10 on 2026-08-11 — "strategies are trading on stale candles" —
+// with the market shut since 16:00 and the book flat. Both directions matter as
+// much as they do above: a wrong "closed" silences the watchdog during the
+// hours the 2026-08-07 outage happened in.
+
+TEST_CASE("hours: an ordinary trading day opens at 09:30 and shuts at 16:00") {
+    // 2026-08-11, the incident day: a Tuesday, not a holiday, not a half day.
+    CHECK(us_market_close_h(mk(2026, 8, 11)) == 16.0);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 9, 29)) == 0);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 9, 30)) == 0);   // open, nothing late yet
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 10, 15)) == 45 * kMin);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 12, 0)) == 2 * kHour + 30 * kMin);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 15, 59)) == 6 * kHour + 29 * kMin);
+    // The close is the gate closing, to the minute.
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 16, 0)) == 0);
+}
+
+TEST_CASE("hours: the two pages of 2026-08-11 land outside the session") {
+    // The regression, stated as the two alert timestamps from the operator's
+    // phone. A live session was left running past the 15:55 auto-stop; these
+    // were 30 minutes apart and would have repeated until morning.
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 18, 40)) == 0);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 11, 19, 10)) == 0);
+    // ...and the small hours of a session that never stopped.
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 12, 3, 0)) == 0);
+    // But the morning after re-arms: the same session, 45 minutes past the open.
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 12, 10, 15)) == 45 * kMin);
+}
+
+TEST_CASE("hours: nothing is open on a weekend or a holiday") {
+    CHECK(us_market_close_h(mk(2026, 8, 8)) == 0.0);           // Saturday
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 8, 11, 0)) == 0);
+    CHECK(rth_open_elapsed_ms(at(2026, 8, 9, 11, 0)) == 0);    // Sunday
+    CHECK(rth_open_elapsed_ms(at(2026, 9, 7, 11, 0)) == 0);    // Labor Day
+    CHECK(rth_open_elapsed_ms(at(2026, 11, 26, 11, 0)) == 0);  // Thanksgiving
+    CHECK(rth_open_elapsed_ms(at(2026, 4, 3, 11, 0)) == 0);    // Good Friday
+}
+
+TEST_CASE("hours: the three NYSE half-days shut at 13:00") {
+    // Without these the watchdog pages for three hours on each of them — the
+    // same false page, three more days a year.
+    CHECK(is_us_early_close(2026, 11, 27));   // the Friday after Thanksgiving
+    CHECK(is_us_early_close(2026, 12, 24));   // Christmas Eve, a Thursday
+    CHECK(is_us_early_close(2025, 7, 3));     // July 3, a Thursday
+    CHECK(is_us_early_close(2024, 7, 3));     // ...a Wednesday
+    CHECK(is_us_early_close(2023, 7, 3));     // ...a Monday
+    CHECK(is_us_early_close(2019, 12, 24));
+    CHECK(us_market_close_h(mk(2026, 11, 27)) == 13.0);
+    CHECK(rth_open_elapsed_ms(at(2026, 11, 27, 12, 59)) == 3 * kHour + 29 * kMin);
+    CHECK(rth_open_elapsed_ms(at(2026, 11, 27, 13, 0)) == 0);
+    CHECK(rth_open_elapsed_ms(at(2026, 11, 27, 15, 30)) == 0);
+    CHECK(rth_open_elapsed_ms(at(2026, 12, 24, 14, 0)) == 0);
+}
+
+TEST_CASE("hours: a half-day that the adjacent holiday swallowed is not one") {
+    // When July 4 falls on a Saturday the NYSE shuts ALL DAY on Friday July 3,
+    // and likewise Christmas Eve when Christmas falls on a Saturday. Calling
+    // those "early closes" would be harmless here but wrong, and is_us_early_
+    // close is the kind of predicate that gets reused.
+    CHECK(is_us_market_holiday(2026, 7, 3));         // July 4 2026 is a Saturday
+    CHECK_FALSE(is_us_early_close(2026, 7, 3));
+    CHECK(is_us_market_holiday(2021, 12, 24));       // Christmas 2021 was a Saturday
+    CHECK_FALSE(is_us_early_close(2021, 12, 24));
+    CHECK(rth_open_elapsed_ms(at(2026, 7, 3, 11, 0)) == 0);
+}
+
+TEST_CASE("hours: a full day next to a holiday keeps its full session") {
+    // The direction that costs coverage. When the July 4 holiday lands on a
+    // MONDAY the preceding Friday is a normal 16:00 session, and so is the
+    // Friday before a Monday-observed Christmas — the NYSE grants no early
+    // close there, and inventing one would blind the watchdog for three hours.
+    CHECK_FALSE(is_us_early_close(2021, 7, 2));   // July 4 2021 fell on a Sunday
+    CHECK(us_market_close_h(mk(2021, 7, 2)) == 16.0);
+    CHECK_FALSE(is_us_early_close(2022, 12, 23));   // Christmas 2022 fell on a Sunday
+    CHECK(us_market_close_h(mk(2022, 12, 23)) == 16.0);
+    CHECK_FALSE(is_us_early_close(2016, 12, 23));
+    // A weekend "half day" is just a weekend.
+    CHECK_FALSE(is_us_early_close(2021, 7, 3));   // a Saturday
+    CHECK_FALSE(is_us_early_close(2022, 12, 24));   // a Saturday
+}
+
+TEST_CASE("hours: an ordinary day is never an early close") {
+    // Over-flagging is the expensive mistake: three silent hours on a day the
+    // 2026-08-07 stall could be running. Exactly three half-days in 2026.
+    int early = 0;
+    for (int m = 1; m <= 12; ++m)
+        for (int d = 1; d <= 31; ++d)
+            if (is_us_early_close(2026, m, d)) ++early;
+    CHECK(early == 2);   // 2026 loses July 3 to the Saturday-July-4 closure
+    int early25 = 0;
+    for (int m = 1; m <= 12; ++m)
+        for (int d = 1; d <= 31; ++d)
+            if (is_us_early_close(2025, m, d)) ++early25;
+    CHECK(early25 == 3);   // Jul 3, Nov 28, Dec 24
+    CHECK(is_us_early_close(2025, 11, 28));
+    CHECK(is_us_early_close(2025, 12, 24));
 }

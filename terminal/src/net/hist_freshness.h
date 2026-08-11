@@ -36,7 +36,10 @@ namespace tt::net {
 // A traded symbol whose bars have gone past the grace period.
 struct StaleBars {
     std::string symbol;
-    int64_t age_ms = 0;   // effective staleness (see stale() for never-answered)
+    // TRUE staleness, reported to the operator as-is — never the capped figure
+    // stale() judges against, so a page still says "16h" when it means 16h.
+    // For a never-answered symbol there is no such age, so it carries armed_ms.
+    int64_t age_ms = 0;
     bool ever = false;    // false = no bar set has EVER arrived for this symbol
 };
 
@@ -91,6 +94,23 @@ inline int64_t bar_stale_grace_ms(double refresh_interval_min) {
     return slack > static_cast<double>(kBarStaleGraceFloorMs)
                ? static_cast<int64_t>(slack)
                : kBarStaleGraceFloorMs;
+}
+
+// The window this watchdog is entitled to judge a symbol against: the later of
+// the live session's start and today's market open — i.e. the SHORTER of the
+// two elapsed times. Both terms earn their place:
+//
+//   - session_ms alone was the rule until 0.21.0, and it pages an operator at
+//     19:10 about candles that stopped because the market did (2026-08-11).
+//   - rth_open_ms alone would page at 09:31 on a session that auto-started at
+//     09:25, one minute in, before anything has had a chance to deliver.
+//
+// A one-line function so that the gating decision itself is a thing the tests
+// can drive, rather than an expression buried in a 60-line pump. Pass
+// tt::rth_open_elapsed_ms(localtime) for the second argument; it is 0 outside
+// regular hours, which is what closes the gate.
+inline int64_t hist_armed_ms(int64_t session_ms, int64_t rth_open_ms) {
+    return rth_open_ms < session_ms ? rth_open_ms : session_ms;
 }
 
 // The page text for a history stall, built where it can be tested rather than
@@ -188,20 +208,38 @@ public:
 
     // Symbols past their OWN grace period, worst first. A symbol that has NEVER
     // been answered is not healthy — the failure can just as easily start before
-    // a symbol's first refresh lands — so it is aged from `session_ms`, how long
-    // the live session has been running. That is also what makes the grace
-    // period double as a settle-in window at session start.
+    // a symbol's first refresh lands — so it is aged from `armed_ms`.
+    //
+    // `armed_ms` is how long this watchdog has been ENTITLED to expect
+    // deliveries: the caller passes the time since the LATER of the live
+    // session's start and today's market open (App::pump_history_watchdog,
+    // tt::rth_open_elapsed_ms). Nothing can be more overdue than that, so it
+    // caps every symbol's age and not just the never-answered ones.
+    //
+    // Until 0.21.0 it was session-since-start and applied only to the
+    // never-answered case, which was correct while every delivery necessarily
+    // landed inside the session. Two things broke that. A session left running
+    // overnight carries yesterday afternoon's deliveries into this morning, so
+    // an ANSWERED symbol can be sixteen hours old on the first frame after the
+    // open with nothing wrong; and outside market hours no symbol can be
+    // meaningfully overdue at all, so the caller passes 0 and this returns
+    // empty — the 2026-08-11 gate, expressed as arithmetic rather than as a
+    // second branch that could disagree with the first.
+    //
+    // The TRUE age is still what goes in StaleBars, and /diag's worst_age_ms
+    // never sees this cap at all: the alert is gated, the measurement is not.
     std::vector<StaleBars> stale(const std::vector<WatchedSymbol>& watched,
                                  const std::string& interval, int64_t now_ms,
-                                 int64_t session_ms) const {
+                                 int64_t armed_ms) const {
         std::vector<StaleBars> out;
         {
             std::lock_guard<std::mutex> g(mu_);
             for (const WatchedSymbol& w : watched) {
                 const auto it = last_.find(key(w.symbol, interval));
                 const bool ever = it != last_.end();
-                const int64_t age = ever ? now_ms - it->second : session_ms;
-                if (age > bar_stale_grace_ms(w.refresh_interval_min))
+                const int64_t age = ever ? now_ms - it->second : armed_ms;
+                const int64_t overdue = age < armed_ms ? age : armed_ms;
+                if (overdue > bar_stale_grace_ms(w.refresh_interval_min))
                     out.push_back({w.symbol, age, ever});
             }
         }
@@ -231,13 +269,17 @@ public:
     }
 
     // Forget every delivery. Freshness belongs to a live SESSION, not to the
-    // process: stale() ages an answered symbol absolutely, and the settle-in
-    // window covers only symbols that have never been answered, so a delivery
-    // carried over from a session that has since stopped reads as hours of
-    // staleness on the first frame of the next one. The terminal is meant to
-    // stay up across the nightly 15:55 stop / 09:25 start, so that is the
-    // ordinary case rather than a corner. Called every idle frame, so it must
-    // stay cheap on an already-empty map.
+    // process: a delivery carried over from a session that has since stopped
+    // reads as hours of staleness on the first frame of the next one, and the
+    // terminal is meant to stay up across the nightly 15:55 stop / 09:25 start,
+    // so that is the ordinary case rather than a corner.
+    //
+    // 0.21.0's armed_ms cap now also stops that carry-over from PAGING, but
+    // this is still the thing that keeps the numbers honest: /diag's
+    // worst_age_ms and age_ms are uncapped by design, and refreshing() would
+    // otherwise let a delivery from a dead session stand as evidence that this
+    // one is being served. Called every idle frame, so it must stay cheap on an
+    // already-empty map.
     void clear() {
         std::lock_guard<std::mutex> g(mu_);
         last_.clear();
