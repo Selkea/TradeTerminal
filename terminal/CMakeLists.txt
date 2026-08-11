@@ -163,6 +163,11 @@ foreach(_src ${TT_TESTED_STRATEGIES})
         COMPILE_DEFINITIONS "TT_STRATEGY_STATIC_LINK;TT_STRATEGY_STATIC_KEY=\"${_key}\"")
 endforeach()
 target_include_directories(tt_terminal_tests PRIVATE src)
+# test_bar_cache audits the ONE line of tws_data.cpp that decides where a cache
+# fetch is counted. The call site needs a live socket and a gateway to execute,
+# so it is checked as source text — which needs to know where the source is.
+target_compile_definitions(tt_terminal_tests PRIVATE
+    TT_REPO_DIR="${CMAKE_SOURCE_DIR}")
 # tt_engine: sweep.h scores a BacktestResult, declared in engine/engine.h.
 target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine
                                                 nlohmann_json)

@@ -18,6 +18,13 @@
          upstream) and force a COLD relaunch when a live session genuinely can't
          reach the broker. See [[tt-gateway-overnight-reauth]].
 
+         "Genuinely" excludes one case, added in 0.20.1: /diag's
+         client_id_conflict says the gateway is healthy and is refusing the app
+         its API client id (IB error 326). Nothing this script does can hand the
+         id back, so a relaunch there is a gateway restart every BrokerGraceSec
+         for the rest of the day. It logs the real cause and leaves the gateway
+         alone; the app retries on its own.
+
     The port check is PASSIVE (Get-NetTCPConnection) rather than a TCP connect:
     connecting without sending the API version made the gateway log "Client
     disconnected before version was sent" on every poll - pure noise.
@@ -95,15 +102,28 @@ function Test-GatewayUp {
 # /diag. Stuck ONLY when a live session is running yet broker_connected is false
 # (socket up but no IBKR upstream) - so this never fires on a healthy gateway or
 # when idle. Unreachable/unknown => not stuck (fall back to the port check).
-function Test-BrokerStuck {
-    if (-not $diagToken) { return $false }
+#
+# EXCEPT when the app says it is being REFUSED its API client id (IB error 326,
+# reported in /diag as client_id_conflict). That is the one broker_connected=false
+# whose cause is not the gateway: the gateway is healthy and has given the id to
+# something else. A cold relaunch there kills a working gateway, disconnects
+# whatever legitimately holds the id, and spends one of the day's few login
+# attempts on a fault the app's own retry loop is already working on - every
+# BrokerGraceSec, for the rest of the trading day. Returns "conflict" so the
+# caller can log the real cause instead of "the gateway is stuck".
+function Get-BrokerState {
+    if (-not $diagToken) { return 'unknown' }
     try {
         $body = (Invoke-WebRequest -Uri "http://127.0.0.1:$diagPort/diag?token=$diagToken" `
                     -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop).Content
-    } catch { return $false }
+    } catch { return 'unknown' }
     $live = $body -match '"live_running"\s*:\s*true'
     $brokerUp = $body -match '"broker_connected"\s*:\s*true'
-    return ($live -and -not $brokerUp)
+    if (-not $live -or $brokerUp) { return 'ok' }
+    # "client_id_conflict":["orders","feed"] - a non-empty ARRAY. The empty
+    # array is the healthy case and must not match, so require a quote inside.
+    if ($body -match '"client_id_conflict"\s*:\s*\[\s*"') { return 'conflict' }
+    return 'stuck'
 }
 
 # The app closed if that pid is gone, OR was reused by a different process
@@ -120,6 +140,7 @@ Log "keepalive start: AppPid=$AppPid poll=${PollSec}s portGrace=${DownGraceSec}s
 
 $downSince = $null         # API port down
 $brokerDownSince = $null   # port up but the app can't reach the broker
+$conflictLogged = $false   # say "refused our client id" once per episode, not every poll
 while ($true) {
     if (-not (Test-AppAlive)) {
         Log "app (pid $AppPid) gone - keepalive exiting; gateway left running"
@@ -130,7 +151,22 @@ while ($true) {
         if (Test-GatewayUp) {
             if ($downSince) { Log 'gateway API port back up'; $downSince = $null }
             # Port is up - but is the gateway actually usable (reaching IBKR)?
-            if (Test-BrokerStuck) {
+            $state = Get-BrokerState
+            if ($state -eq 'conflict') {
+                # NOT a gateway fault: it is up, logged in, and has handed our
+                # API client id to something else (IB error 326). Restarting it
+                # would be an unbreakable loop - the app cannot get the id back
+                # any faster for it, so broker_connected stays false and the next
+                # window restarts it again. The app retries on its own and logs
+                # "API CLIENT ID IN USE" / "API CLIENT ID FREE AGAIN"; all this
+                # loop should do is not make it worse, and say so once.
+                if (-not $conflictLogged) {
+                    $conflictLogged = $true
+                    Log 'app reports IB error 326 (another program holds its API client id) - NOT restarting the gateway; it is healthy. See the app log for which client and what to close.'
+                }
+                $brokerDownSince = $null
+            } elseif ($state -eq 'stuck') {
+                $conflictLogged = $false
                 if (-not $brokerDownSince) {
                     $brokerDownSince = Get-Date
                     Log 'gateway port up but the app cannot reach the broker - watching'
@@ -139,9 +175,15 @@ while ($true) {
                     & $script -Restart *>&1 | ForEach-Object { Log "relogin> $_" }
                     $brokerDownSince = $null
                 }
-            } elseif ($brokerDownSince) {
-                Log 'broker reachable again'
-                $brokerDownSince = $null
+            } else {
+                if ($conflictLogged) {
+                    Log 'app is no longer reporting a client-id conflict'
+                    $conflictLogged = $false
+                }
+                if ($brokerDownSince) {
+                    Log 'broker reachable again'
+                    $brokerDownSince = $null
+                }
             }
         } else {
             $brokerDownSince = $null   # the port-down path owns recovery now

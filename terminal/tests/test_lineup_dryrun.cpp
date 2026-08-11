@@ -131,8 +131,9 @@ TEST_CASE("dryrun: the summary reports counters, per-symbol outcomes and totals"
     s.pool = 30;
     s.delivered = 28;
     s.picks = 6;
-    s.hist.cache_hits = 18;
-    s.hist.cache_misses = 42;
+    s.hist.cache_served = 18;
+    s.hist.cache_fetched = 42;
+    s.hist.cache_lookups = 967;
     s.hist.requests_sent = 42;
     s.hist.held_min_gap = 7;
     s.hist.held_identical = 1;
@@ -151,8 +152,16 @@ TEST_CASE("dryrun: the summary reports counters, per-symbol outcomes and totals"
     CHECK(field(l, "fitted") == "2");
     CHECK(field(l, "excluded") == "1");
     CHECK(field(l, "candidates_ok") == "9/15");
-    CHECK(field(l, "cache_hits") == "18");
-    CHECK(field(l, "cache_misses") == "42");
+    // cache_served/cache_fetched, NOT the old cache_hits/cache_misses. The
+    // rename is the point: the old cache_misses counted lookups (967 of them
+    // against 36 fetches on 2026-08-11), so a field with the old name and new
+    // arithmetic would let two incomparable runs be compared. cache_lookups
+    // carries the old number under a name that describes it.
+    CHECK(field(l, "cache_hits") == "<missing>");
+    CHECK(field(l, "cache_misses") == "<missing>");
+    CHECK(field(l, "cache_served") == "18");
+    CHECK(field(l, "cache_fetched") == "42");
+    CHECK(field(l, "cache_lookups") == "967");
     CHECK(field(l, "hist_requests") == "42");
     // held is the sum of the three reasons, so a reader can take one number or
     // the breakdown without adding them up wrong.

@@ -8,19 +8,68 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <vector>
 
 namespace tt::ui {
 
+// Rotation on startup, to a name that CANNOT collide with an earlier rotation.
+//
+// WHY NOT "<path>.1". It was, until 0.20.0, and on 2026-08-11 that cost the
+// investigation its evidence. A GUI launched while a dry run was in progress
+// found an 11.25 MB optimizer.log, renamed it to optimizer.log.1 — over the
+// previous optimizer.log.1 — and the 2026-08-10 baseline, the whole reason the
+// build was being profiled, was gone. A fixed rotation name means rotation N+1
+// silently destroys rotation N, and rotation happens on EVERY startup that finds
+// an oversized file, including a mistaken second launch: the two events that
+// most want the old log are exactly the two that delete it.
+//
+// A timestamp makes each rotation its own file, so a rotation can only ever
+// ADD. kKeepRotations then prunes the oldest by name — which sorts
+// chronologically, because the stamp is fixed-width and big-endian.
 void LogConsole::set_log_file(std::string path) {
     std::lock_guard lock(mu_);
     file_path_ = std::move(path);
     std::error_code ec;
     namespace fs = std::filesystem;
-    fs::create_directories(fs::path(file_path_).parent_path(), ec);
-    if (fs::exists(file_path_, ec) &&
-        fs::file_size(file_path_, ec) > static_cast<uintmax_t>(kRotateBytes)) {
-        fs::rename(file_path_, file_path_ + ".1", ec);  // simple 1-deep rotation
+    const fs::path p(file_path_);
+    fs::create_directories(p.parent_path(), ec);
+    if (!fs::exists(file_path_, ec) ||
+        fs::file_size(file_path_, ec) <= static_cast<uintmax_t>(kRotateBytes))
+        return;
+
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char stamp[24];
+    std::snprintf(stamp, sizeof stamp, ".%04d%02d%02d-%02d%02d%02d",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+                  tm.tm_min, tm.tm_sec);
+    std::string rotated = file_path_ + stamp;
+    // Two launches inside the same second is not a real scenario, but a rename
+    // ONTO an existing file is precisely the data loss this function exists to
+    // stop, so refuse rather than overwrite.
+    if (fs::exists(rotated, ec)) return;
+    fs::rename(file_path_, rotated, ec);
+    if (ec) return;
+
+    // Prune: keep the newest kKeepRotations. Collected by prefix and sorted by
+    // name — the stamp above is zero-padded and most-significant-first, so
+    // lexicographic order IS chronological order.
+    const std::string base = p.filename().string() + ".";
+    std::vector<std::string> old;
+    for (const auto& e : fs::directory_iterator(p.parent_path(), ec)) {
+        const std::string name = e.path().filename().string();
+        // The stamp is exactly ".YYYYMMDD-HHMMSS": prefix plus 15 characters.
+        // Length-checked so an unrelated sibling (optimizer.log.err, or the
+        // pre-0.20.0 optimizer.log.1) is never a pruning candidate — this
+        // function deletes files, and it may only ever delete its own.
+        if (name.size() == base.size() + 15 && name.rfind(base, 0) == 0)
+            old.push_back(e.path().string());
     }
+    if (old.size() <= kKeepRotations) return;
+    std::sort(old.begin(), old.end());
+    for (size_t i = 0; i + kKeepRotations < old.size(); ++i)
+        fs::remove(old[i], ec);
 }
 
 void LogConsole::add(std::string line) {

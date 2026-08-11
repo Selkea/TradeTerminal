@@ -118,21 +118,31 @@ public:
     const std::vector<Candle>* get(const std::string& symbol,
                                    const std::string& bar_size,
                                    const std::string& duration, int64_t now_ms) {
+        ++lookups_;
         const auto it = map_.find(key(symbol, bar_size, duration));
-        if (it == map_.end()) {
-            ++misses_;
-            return nullptr;
-        }
+        if (it == map_.end()) return nullptr;
         if (now_ms - it->second.stamp_ms > kBarCacheTtlMs) {
             candles_ -= it->second.candles.size();
             map_.erase(it);
-            ++misses_;
             return nullptr;
         }
         it->second.used_ms = now_ms;
-        ++hits_;
+        // Counted HERE and not on the nullptr paths above, because a hit is the
+        // end of a request (the caller answers from it and stops) while a
+        // nullptr is not: a request that finds nothing is handed to the pacing
+        // gate, which may hold it and hand it back on the next pass, and the
+        // next, until either the in-flight original delivers — and this line
+        // runs — or it is sent. See served()/fetched() below.
+        ++served_;
         return &it->second.candles;
     }
+
+    // The caller is putting this series on the wire because get() had nothing.
+    // Call it once, at the send, NOT at the failed lookup: see served().
+    // Retries of an already-sent request are NOT fetches — the series was
+    // already counted when it first went out, and counting the re-issue would
+    // make a flaky session look like a cold cache.
+    void record_fetch() { ++fetched_; }
 
     // Record a delivered series. An UNUSABLE delivery is not cached: on the
     // ibkr_web route a gateway that has lost an instrument's market-data
@@ -160,18 +170,41 @@ public:
         candles_ = 0;
     }
 
-    // Observability. Logged by the caller on every lookup so the next
-    // investigation can see, in the terminal log, whether the build was
-    // re-fetching — the 2026-08-10 profile had to be reconstructed from
-    // delivery timestamps because nothing said it directly.
+    // Observability, in the ONE unit that makes a cache's numbers mean anything:
+    // REQUESTS. served() + fetched() is how many candle requests this cache
+    // RESOLVED — answered from memory, or put on the wire.
     //
-    // These count LOOKUPS, not requests. A request the pacing gate holds back is
-    // re-checked against the cache on every io_loop pass, so it can log several
-    // misses and then a hit when the in-flight original delivers. That is the
-    // truthful reading and it is the useful one: it says the duplicate was
-    // waiting rather than being sent.
-    uint64_t hits() const { return hits_; }
-    uint64_t misses() const { return misses_; }
+    // It is not the whole denominator of a hit rate. A request the pacing gate
+    // abandons (kHistQueueMaxWaitMs) is resolved by being errored back to its
+    // caller having only missed, so it appears in neither counter and this class
+    // never learns of it; HistStats::abandoned is the term that closes the sum.
+    // See net/market_source.h, which states the full formula next to the fields
+    // a dry run actually prints.
+    //
+    // THE BUG THIS REPLACES. Until 0.20.0 the counters were hits()/misses(),
+    // both incremented inside get() — and get() is called on every io_loop pass
+    // for every request the pacing gate is holding, not once per request. So
+    // "misses" counted PASSES. The 2026-08-11 lineup dry run reported
+    //
+    //     cache_hits=24 cache_misses=967 hist_requests=36
+    //
+    // and 967 misses against 36 fetches is not a contradiction, it is the gate
+    // re-offering ~31 held requests about thirty times each while the io_loop
+    // spun on inbound quote messages. The number could never be reconciled with
+    // anything, which made it worse than absent: it was read as evidence the
+    // cache was thrashing when in fact 24 of 60 requests — 40% — were served
+    // without touching the wire.
+    //
+    // hits() was always honest (a hit ends the request), and it is served()
+    // now under a name that says what it is. The old miss count survives as
+    // lookups(), which is what it actually measured.
+    uint64_t served() const { return served_; }    // fetches AVOIDED
+    uint64_t fetched() const { return fetched_; }  // series pulled over the wire
+    // Raw get() calls. Not a cache metric — a PACING metric: lookups() minus
+    // (served() + fetched()) is how many times a queued request was re-offered
+    // and held. Kept because it is a cheap read on how much the gate is
+    // deferring, which is the thing that actually dominated the 2026-08-11 run.
+    uint64_t lookups() const { return lookups_; }
     size_t entries() const { return map_.size(); }
     size_t candles() const { return candles_; }
 
@@ -218,7 +251,10 @@ private:
 
     std::unordered_map<std::string, Entry> map_;
     size_t candles_ = 0;
-    uint64_t hits_ = 0, misses_ = 0;
+    // Deliberately NOT reset by clear(): these are process-lifetime accounting
+    // and a dry run brackets them as a delta. clear() drops the session's bars,
+    // not the record of what the process did.
+    uint64_t served_ = 0, fetched_ = 0, lookups_ = 0;
 };
 
 } // namespace tt::net

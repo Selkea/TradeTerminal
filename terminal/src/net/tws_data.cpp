@@ -4,6 +4,8 @@
 #include "net/hist_pacing.h"
 #include "net/hist_requests.h"
 
+#include "engine/tws_client_id.h"   // error 326: what it means, in words
+
 #include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
 #include "DefaultEWrapper.h"
@@ -41,6 +43,20 @@ constexpr int kScanReqId = 400'000;
 // kHistTimeoutMs, kBigBatchBars and the send/retry predicates live in
 // net/hist_pacing.h, with the measurements that justify them.
 constexpr auto kHistResetCooldown = std::chrono::seconds(60);
+
+// How long a client-id conflict (IB error 326) must persist before queued
+// candle requests are errored back to their callers instead of waiting for the
+// session to return. See io_loop.
+//
+// 60 s, chosen from the two ways this app produces a 326. Our own just-reaped
+// socket at the gateway is released in seconds, and a plain reconnect rides
+// that out silently — which is what 0.19.1 did and what every caller is built
+// for, so settling inside that window would fail a lineup's fetches for a blip.
+// A holder that is still there after a minute is a different animal: something
+// a human has to close, or a dry run that will hold it for the length of a full
+// build, and leaving charts and tournaments waiting on it is the half-dead
+// state that got 2026-08-11 reported as "it crashed".
+constexpr int64_t kConflictSettleMs = 60'000;
 
 // TickType ids on the reqMktData stream (live + delayed variants).
 constexpr int kTickBid = 1, kTickDelayedBid = 66;
@@ -236,8 +252,12 @@ struct TwsData::Io final : DefaultEWrapper {
         }
         reader = std::make_unique<EReader>(client.get(), &signal);
         reader->start();
-        d.log("connecting to IB Gateway at " + d.host_ + ":" +
-              std::to_string(d.port_));
+        // Silent while a client-id conflict is being retried. This line, the
+        // 326 and "connection closed" were the three-line-every-3s stanza of
+        // 2026-08-11; the conflict line replaced it and must not be re-buried.
+        if (!d.client_id_conflict_.load(std::memory_order_acquire))
+            d.log("connecting to IB Gateway at " + d.host_ + ":" +
+                  std::to_string(d.port_));
         return true;
     }
 
@@ -339,11 +359,6 @@ struct TwsData::Io final : DefaultEWrapper {
             // own request id — so the routing in App is identical either way.
             const std::vector<Candle>* hit =
                 bars.get(r.symbol, wire.bar, wire.dur, now_steady);
-            // Publish the cache's OWN counters rather than keeping a second
-            // tally beside them — one lookup must never be able to read as a hit
-            // here and a miss there. See HistStats.
-            d.hs_cache_hits_.store(bars.hits(), std::memory_order_relaxed);
-            d.hs_cache_misses_.store(bars.misses(), std::memory_order_relaxed);
             if (hit) {
                 CandleBatch b;
                 b.id = r.id;
@@ -351,11 +366,18 @@ struct TwsData::Io final : DefaultEWrapper {
                 b.interval = r.interval;
                 b.cached = true;   // NOT proof the session works — see App::on_candles
                 b.candles = *hit;
+                // The running rate quotes the FULL denominator, abandoned
+                // requests included (see net/market_source.h). Those missed and
+                // were then errored back by the pacing gate, so leaving them out
+                // — as this line did when it shipped — flatters the cache in
+                // exactly the saturated builds where its value is in question.
+                const uint64_t resolved = bars.served() + bars.fetched() +
+                                          d.hs_abandoned_.load(std::memory_order_relaxed);
                 d.log(r.symbol + " " + r.interval + " " + r.range + ": served " +
                       std::to_string(b.candles.size()) +
-                      " bars from cache, no IB request (cache " +
-                      std::to_string(bars.hits()) + " hit / " +
-                      std::to_string(bars.misses()) + " miss)");
+                      " bars from cache, no IB request (" +
+                      std::to_string(bars.served()) + " of " +
+                      std::to_string(resolved) + " requests served from cache)");
                 if (d.cbs_.on_candles) d.cbs_.on_candles(std::move(b));
                 continue;
             }
@@ -445,6 +467,14 @@ struct TwsData::Io final : DefaultEWrapper {
             }
             gate.record(gkey, now_steady);
             d.hs_requests_sent_.fetch_add(1, std::memory_order_relaxed);
+            // The cache's OTHER half of the accounting, counted HERE — at the
+            // send — and not at the failed lookup above. This request consumed
+            // one IB fetch; the lookup that preceded it may have been the
+            // thirtieth this request made while the gate held it. Counting the
+            // lookup is the defect that produced cache_misses=967 against
+            // hist_requests=36 on 2026-08-11. retry_dead_history does NOT call
+            // this: a retry re-sends a series already counted.
+            bars.record_fetch();
             held_logged_.erase(gkey);
             if (wire.clamped)
                 d.log(r.symbol + ": " + r.range + " of " + r.interval +
@@ -464,12 +494,18 @@ struct TwsData::Io final : DefaultEWrapper {
             p.sent_ms = p.first_sent_ms = steady_ms();
             hist.add(req_id, std::move(p));
             d.log(r.symbol + " " + r.interval + " " + r.range +
-                  ": fetching from IB (cache miss, req " + std::to_string(req_id) +
+                  ": fetching from IB (not cached, req " + std::to_string(req_id) +
                   ", " + std::to_string(gate.window_sends(steady_ms())) + "/" +
                   std::to_string(HistSendGate::budget_cap(r.prio)) +
                   " in the 10-minute budget)");
             send_history(req_id, *hist.find(req_id));
         }
+        // Publish the cache's OWN counters, once per pass rather than at each
+        // decision, so /diag and the dry-run summary can never read a hit here
+        // and a fetch there for the same request. See HistStats.
+        d.hs_cache_served_.store(bars.served(), std::memory_order_relaxed);
+        d.hs_cache_fetched_.store(bars.fetched(), std::memory_order_relaxed);
+        d.hs_cache_lookups_.store(bars.lookups(), std::memory_order_relaxed);
         if (!deferred.empty()) {
             std::lock_guard lock(d.mu_);
             d.reqs_.insert(d.reqs_.begin(), deferred.begin(), deferred.end());
@@ -530,6 +566,13 @@ struct TwsData::Io final : DefaultEWrapper {
             const int64_t now = steady_ms();
             for (CandleReq& q : d.reqs_) q.queued_ms = now;
         }
+        // The handshake completing is the proof the id is ours again. Clearing
+        // the 326 latch here (and only here) is what makes the conflict an
+        // EPISODE rather than a death sentence: /diag stops reporting it, the
+        // retry returns to 3 s, and the operator who was paged Critical gets
+        // told, in the log, that they no longer have anything to do.
+        if (d.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
+            d.log(tws_client_id_cleared_line("market data", d.client_id_));
         if (!d.connected_.exchange(true, std::memory_order_acq_rel)) {
             d.conn_gen_.fetch_add(1, std::memory_order_relaxed);
             d.log("session up (IB Gateway " + d.host_ + ":" +
@@ -562,7 +605,8 @@ struct TwsData::Io final : DefaultEWrapper {
         d.connected_.store(false, std::memory_order_release);
         d.account_kind_.store(AccountKind::Unknown, std::memory_order_release);
         d.auth_.session_lost();   // see drop_connection
-        d.log("connection closed");
+        if (!d.client_id_conflict_.load(std::memory_order_acquire))
+            d.log("connection closed");   // see connect_gateway: no stanza
     }
 
     void error(int id, int errorCode, const std::string& errorString,
@@ -605,6 +649,24 @@ struct TwsData::Io final : DefaultEWrapper {
             // gateway boots races it. Back off and reconnect.
             d.log("gateway still accepting the paper disclaimer - retrying shortly");
             reset_conn = true;
+            return;
+        }
+        if (errorCode == kTwsClientIdInUse) {
+            // See engine/tws_client_id.h. Latch, say it ONCE, and let io_loop
+            // slow its retry to kTwsClientIdRetrySec — that is what turns the
+            // 2026-08-11 three-line-every-3s stanza into one sentence. The
+            // latch is NOT the end of this client: it is cleared by the next
+            // completed handshake in nextValidId, because this id (9, the only
+            // fixed one of the three) is just as likely to be held by a bounded
+            // holder — the dry-run child the .ps1 kills, our own just-reaped
+            // session — as by a program a human must go and close.
+            //
+            // The exchange also dedups: the gateway answers every connect
+            // attempt already in flight, so several 326s arrive per episode.
+            if (!d.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
+                d.log(tws_client_id_conflict_line(
+                    "market data", "no charts, no warmup, no daily lineup",
+                    d.host_, d.port_, d.client_id_));
             return;
         }
         // A request WE cancelled to retry it. IB answers cancelHistoricalData
@@ -856,6 +918,33 @@ void TwsData::wake() {
         s->issueSignal();
 }
 
+// Hand every queued request back to its caller as an error. The callbacks fire
+// on the I/O thread, which is where every other delivery on this source fires,
+// and the queue is emptied under the lock before any of them run so a callback
+// that queues a fresh request cannot be swallowed by this same sweep.
+void TwsData::settle_orphaned_requests() {
+    std::vector<CandleReq> orphaned;
+    ScanReq orphan_scan;
+    bool had_scan = false;
+    {
+        std::lock_guard lock(mu_);
+        orphaned.swap(reqs_);
+        if (scan_pending_) {
+            orphan_scan = std::move(scan_req_);
+            scan_pending_ = false;
+            had_scan = true;
+        }
+    }
+    for (const CandleReq& r : orphaned)
+        if (cbs_.on_error)
+            cbs_.on_error(r.id, "tws",
+                          r.symbol + ": no market-data session - something else "
+                          "holds this gateway's API client id (still retrying)");
+    // The scanner's caller waits on its callback, not on an error, so it gets
+    // the empty result an in-flight scan gets on a session teardown.
+    if (had_scan && orphan_scan.cb) orphan_scan.cb({});
+}
+
 void TwsData::io_loop() {
     Io io(*this);
     wake_.store(&io.signal, std::memory_order_release);
@@ -863,11 +952,29 @@ void TwsData::io_loop() {
     auto last_connect = std::chrono::steady_clock::time_point{};
     auto last_hist_reset = std::chrono::steady_clock::time_point{};
     int64_t last_nag_ms = 0;
+    // Steady ms at which THIS loop first saw the client-id latch set, 0 while
+    // there is no conflict. Local rather than a member: only this thread needs
+    // it, and it must reset on every recovery.
+    int64_t conflict_since = 0;
     while (running_.load(std::memory_order_acquire)) {
+        const bool conflict = client_id_conflict_.load(std::memory_order_acquire);
+        if (!conflict) conflict_since = 0;
+        else if (conflict_since == 0) conflict_since = steady_ms();
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = std::chrono::steady_clock::now();
-            if (now - last_connect >= std::chrono::seconds(3)) {
+            // Client id already taken (IB error 326, see engine/tws_client_id.h):
+            // retry far more slowly, but keep retrying. Trying harder cannot win
+            // the id, and the 3 s loop is what buried the one explanatory line on
+            // 2026-08-11 — but the holder is very often bounded (the dry-run
+            // child the .ps1 kills, our own just-reaped session at the gateway),
+            // and a data client that never came back means no charts, no warmup
+            // and no daily lineup for the rest of the day. Io::connect_gateway
+            // and connectionClosed stay silent while the latch is set, so these
+            // attempts cost nothing in the log.
+            const auto gap = conflict ? std::chrono::seconds(kTwsClientIdRetrySec)
+                                      : std::chrono::seconds(3);
+            if (now - last_connect >= gap) {
                 last_connect = now;
                 if (!io.connect_gateway()) {
                     const int64_t ms = now_ms();
@@ -881,6 +988,19 @@ void TwsData::io_loop() {
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
+            // A conflict nobody is going to resolve for us: stop letting callers
+            // wait on an answer that is not coming. pump_requests does not run
+            // while disconnected, so a chart, a warmup or a tournament candidate
+            // queued here would otherwise wait forever — the half-dead state the
+            // 0.20.0 work exists to replace. Errors carry the cause, so App
+            // routes each one to the exact pending sweep/backtest by request id.
+            //
+            // Only after kConflictSettleMs, though. The common 326 is our own
+            // previous session's id, released within seconds; settling instantly
+            // would fail a lineup's fetches for a blip that a plain reconnect
+            // rides out silently — and that reconnect is what 0.19.1 did.
+            if (conflict && steady_ms() - conflict_since > kConflictSettleMs)
+                settle_orphaned_requests();
         } else {
             io.signal.waitForSignal();
             if (io.reader) io.reader->processMsgs();

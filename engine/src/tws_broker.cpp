@@ -2,6 +2,7 @@
 
 #include "engine/clock.h"
 #include "engine/price_tick.h"
+#include "engine/tws_client_id.h"   // error 326: what it means, in words
 
 // TWS API (fetched at configure time; see third_party/CMakeLists.txt).
 #include "CommissionReport.h"
@@ -120,8 +121,14 @@ struct TwsBroker::Io final : DefaultEWrapper {
         }
         reader = std::make_unique<EReader>(client.get(), &signal);
         reader->start();
-        b.log("connecting to IB Gateway at " + b.cfg_.host + ":" +
-              std::to_string(b.cfg_.port));
+        // Silent while a client-id conflict is being retried: this line and the
+        // "connection closed" below are two thirds of the three-line-every-3s
+        // stanza that buried the one sentence that mattered on 2026-08-11. The
+        // conflict line said what is happening and the cleared line will say
+        // when it ends; nothing in between is worth a word.
+        if (!b.client_id_conflict_.load(std::memory_order_acquire))
+            b.log("connecting to IB Gateway at " + b.cfg_.host + ":" +
+                  std::to_string(b.cfg_.port));
         return true;
     }
 
@@ -140,6 +147,14 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // Assume the fresh session has upstream until a 1100 says otherwise (a
         // gateway that came up disconnected sends one within seconds).
         b.upstream_ok_.store(true, std::memory_order_release);
+        // The handshake completing IS the proof the id is ours, so it is the one
+        // honest place to clear the 326 latch. Without a clear, /diag and
+        // /metrics would keep reporting a conflict that ended, and — worse —
+        // Watch-IbGateway.ps1 keys its cold relaunch off broker_connected, so a
+        // latch that outlived the condition is what turns one gateway restart
+        // into one every four minutes for the rest of the day.
+        if (b.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
+            b.log(tws_client_id_cleared_line("the ORDER path", b.cfg_.client_id));
         b.log("connected (socket API), orders ready");
         // Adopt existing account state on the FIRST connect of the session only;
         // a later reconnect must not re-seed a position the engine now tracks
@@ -149,7 +164,8 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
     void connectionClosed() override {
         b.ready_.store(false, std::memory_order_release);
-        b.log("connection closed");
+        if (!b.client_id_conflict_.load(std::memory_order_acquire))
+            b.log("connection closed");   // see connect_gateway: no stanza
     }
 
     void managedAccounts(const std::string& accounts) override {
@@ -172,6 +188,27 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (errorCode == 10141) {   // paper disclaimer dialog not clicked yet (IBC lags login)
             b.log("gateway still accepting the paper disclaimer - retrying shortly");
             reset_conn = true;
+            return;
+        }
+        if (errorCode == kTwsClientIdInUse) {
+            // Something else already holds this session's orders client id. See
+            // engine/tws_client_id.h: the latch makes the explanation appear
+            // ONCE and slows io_loop's retry to kTwsClientIdRetrySec; it does
+            // NOT end the client. App::start_live_session hands out 20-39 in
+            // rotation precisely because the id we collide with is often our
+            // own previous session's, still being released by the gateway.
+            //
+            // We do NOT quietly reconnect on some other id. TWS scopes an API
+            // client's view of OPEN ORDERS to the id that placed them, so
+            // drifting off the id would hand the connect-time reconciliation a
+            // different set of resting orders to adopt than the one this app
+            // has always adopted — on the order path, on a restart, which is
+            // the single place this codebase can least afford a surprise.
+            if (!b.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
+                b.log(tws_client_id_conflict_line(
+                    "the ORDER path",
+                    "nothing this session submits can reach the market",
+                    b.cfg_.host, b.cfg_.port, b.cfg_.client_id));
             return;
         }
         b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
@@ -726,7 +763,19 @@ void TwsBroker::io_loop() {
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = Clock::now();
-            if (now - last_connect >= std::chrono::seconds(3)) {
+            // A client-id collision (IB error 326) is refused instantly and
+            // cannot be helped by trying harder, so back the retry right off —
+            // but NEVER stop. The id we collide with is usually this app's own
+            // previous session (App hands out 20-39 in rotation for exactly that
+            // reason), and the gateway releases it on its own; a client that
+            // gave up would leave a live session with no order path at all,
+            // while positions are open, until a human noticed. Io::error logged
+            // the one sentence that explains this; connect_gateway and
+            // connectionClosed stay silent meanwhile, so the retry costs no log.
+            const auto gap = client_id_conflict_.load(std::memory_order_acquire)
+                                 ? std::chrono::seconds(kTwsClientIdRetrySec)
+                                 : std::chrono::seconds(3);
+            if (now - last_connect >= gap) {
                 last_connect = now;
                 if (!io.connect_gateway())
                     log("cannot reach IB Gateway at " + cfg_.host + ":" +

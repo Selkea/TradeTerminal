@@ -60,6 +60,16 @@ public:
     // restored) so /diag and the watchdog reflect whether orders can ACTUALLY
     // reach IBKR, not just that the socket is open. True until a 1100 says else.
     bool upstream_connected() const { return upstream_ok_.load(std::memory_order_acquire); }
+    // Something already holds this adapter's TWS API client id (IB error 326).
+    // Latched for the length of the EPISODE, not the process: the I/O loop is
+    // still reconnecting, every kTwsClientIdRetrySec, and a completed handshake
+    // clears this. So it means "not connected, and here is the reason", never
+    // "gave up" — distinct from "gateway unreachable", where the gateway is the
+    // thing at fault rather than us being the second comer.
+    // See engine/tws_client_id.h.
+    bool client_id_conflict() const {
+        return client_id_conflict_.load(std::memory_order_acquire);
+    }
     // Replays existing positions, resting orders, and cash once on connect so a
     // restarted session adopts them (reqPositions/reqAllOpenOrders/account cash
     // -> PosSnap/OrderNew/AcctSnap, then ReconcileEnd). See the Io reconcile path.
@@ -124,6 +134,13 @@ private:
     std::atomic<uint64_t> next_id_{1};
     std::atomic<bool> ready_{false};
     std::atomic<bool> upstream_ok_{true};   // gateway<->IBKR link (error 1100/1102)
+    // IB error 326. Set by the I/O thread on the refusal and cleared by it on
+    // the next completed handshake; read by the I/O loop (which slows its retry)
+    // and the UI thread (/diag, /metrics). An order path that comes back
+    // mid-session does NOT re-run reconciliation — Io::nextValidId gates that on
+    // recon_ever, i.e. the first connect of the session only — so recovering is
+    // strictly better than staying down, which is why this is not one-way.
+    std::atomic<bool> client_id_conflict_{false};
     std::atomic<bool> stop_{false};
     std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh: drop + reconnect
     // The I/O thread's reader signal while it exists (EReaderOSSignal*);

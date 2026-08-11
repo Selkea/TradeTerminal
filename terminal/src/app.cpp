@@ -430,7 +430,16 @@ App::App(std::string gateway_url)
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
     net::IMarketData::Callbacks cbs;
-    cbs.on_log = [this](std::string line) { route(std::move(line)); };
+    // alert_scan FIRST, exactly as every other adapter's pop_log pump does. The
+    // market-data source was the ONE adapter whose log lines bypassed the alert
+    // classifier, which is why the 2026-08-11 client-id collision — seven
+    // repetitions of a fatal, permanent error — reached the log file and
+    // nothing else. There is no webhook, no /events entry and no beep for a
+    // failure that leaves the app with no candles at all.
+    cbs.on_log = [this](std::string line) {
+        alert_scan(line);
+        route(std::move(line));
+    };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
         // When the real-time feed owns the session, delayed sidecar quotes
@@ -2281,8 +2290,9 @@ void App::dryrun_finish(const std::string& abort) {
     // charge this build for requests it never made.
     const net::HistStats h1 = data_.hist_stats();
     auto delta = [](uint64_t now, uint64_t then) { return now >= then ? now - then : 0; };
-    dry_.sum.hist.cache_hits = delta(h1.cache_hits, dry_.hist0.cache_hits);
-    dry_.sum.hist.cache_misses = delta(h1.cache_misses, dry_.hist0.cache_misses);
+    dry_.sum.hist.cache_served = delta(h1.cache_served, dry_.hist0.cache_served);
+    dry_.sum.hist.cache_fetched = delta(h1.cache_fetched, dry_.hist0.cache_fetched);
+    dry_.sum.hist.cache_lookups = delta(h1.cache_lookups, dry_.hist0.cache_lookups);
     dry_.sum.hist.requests_sent = delta(h1.requests_sent, dry_.hist0.requests_sent);
     dry_.sum.hist.held_min_gap = delta(h1.held_min_gap, dry_.hist0.held_min_gap);
     dry_.sum.hist.held_identical = delta(h1.held_identical, dry_.hist0.held_identical);
@@ -2656,6 +2666,28 @@ std::string App::build_diag_json() {
     const bool broker_upstream = tws_ ? tws_->upstream_connected() : true;
     j["broker_connected"] = broker_ready && broker_upstream;
     j["broker_upstream"] = broker_upstream;
+    // Which of our three TWS clients is being refused because something already
+    // holds its API client id (IB error 326 — engine/tws_client_id.h). A
+    // non-empty list means those clients are DOWN AND RETRYING (slowly), not
+    // that they gave up: the entry disappears when the handshake completes.
+    // Read together with broker_connected it is the difference between "the
+    // gateway is unreachable" and "the gateway is fine and refusing us", which
+    // is exactly the distinction Watch-IbGateway.ps1 needs before it cold-
+    // restarts a healthy gateway. Named rather than a bare bool because "orders"
+    // and "market data" are very different days, and reported as a list so a
+    // reader sees at a glance whether the collision took one client or all three.
+    //
+    // It exists here because on 2026-08-11 this failure was invisible outside
+    // the log file: broker_connected read false, data.connected read false, and
+    // nothing anywhere said the cause was a second TradeTerminal rather than a
+    // gateway that was down.
+    {
+        json conflict = json::array();
+        if (data_.client_id_conflict()) conflict.push_back("data");
+        if (tws_ && tws_->client_id_conflict()) conflict.push_back("orders");
+        if (tws_feed_ && tws_feed_->client_id_conflict()) conflict.push_back("feed");
+        j["client_id_conflict"] = std::move(conflict);
+    }
 
     // ---- session state ----
     j["live_running"] = s.running;
@@ -2689,6 +2721,12 @@ std::string App::build_diag_json() {
         json d;
         d["source"] = use_tws_data_ ? "tws" : "ibkr_web";
         d["connected"] = data_.connected();
+        // connected=false has two very different causes and they need different
+        // hands: a gateway that is down (wait / restart it) versus something
+        // else holding our client id (find it and close it). This one is still
+        // retrying every kTwsClientIdRetrySec, so it can clear on its own — a
+        // reader must not treat it as a permanent state.
+        d["client_id_conflict"] = data_.client_id_conflict();
         d["pending_history"] = data_.pending_history();
         d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
         // Is the GATEWAY logged in to IBKR, as opposed to merely listening?
@@ -2910,6 +2948,16 @@ std::string App::build_metrics() {
     g("tt_connect_aborts", "connect-timeout watchdog force-aborts (broker+feed)",
       (tws_ ? tws_->connect_aborts() : 0) +
           (tws_feed_ ? tws_feed_->connect_aborts() : 0));
+    // How many of the three TWS clients are currently being refused because
+    // something already holds their API client id (IB error 326). They are still
+    // retrying, so this is a gauge and not a death count — but a nonzero that
+    // does NOT return to 0 within a minute or two needs a human, which is why it
+    // belongs on a dashboard next to the gauges above rather than only in a log
+    // file, where the whole of the 2026-08-11 incident lived.
+    g("tt_client_id_conflicts", "TWS clients refused an in-use API client id",
+      (data_.client_id_conflict() ? 1 : 0) +
+          (tws_ && tws_->client_id_conflict() ? 1 : 0) +
+          (tws_feed_ && tws_feed_->client_id_conflict() ? 1 : 0));
     g("tt_ack_latency_p50_ms", "order submit->ack p50", ack.base_ns / 1'000'000.0);
     g("tt_ack_latency_p90_ms", "order submit->ack p90",
       (ack.base_ns + ack.jitter_ns) / 1'000'000.0);
@@ -4268,6 +4316,13 @@ void App::draw_data_menu() {
 // Route noteworthy engine/broker/feed log lines to the alert channel.
 // Critical = money is at risk right now; Warning = something needs a look;
 // Info = fills (webhook only, no beep — they can be frequent).
+//
+// Callable from ANY thread since 0.20.0: the market-data source's on_log fires
+// on its own I/O thread and now goes through here (before that it was the one
+// adapter whose lines never reached the alert channel). That is safe because
+// classify_alert is pure, AlertNotifier::notify is mutex-guarded, and
+// dry_.active is written once in the constructor — before any of those threads
+// exists — and never again.
 void App::alert_scan(const std::string& l) {
     // A dry run runs the REAL lineup, so it emits the real verdicts — including
     // "lineup: ABORTED", which classify_alert rates Critical and which would page
@@ -4603,16 +4658,35 @@ void App::pump_preopen_gateway_check() {
     // the gateway (the keepalive's port-down path owns that recovery, and it
     // must not be raced). Socket up = the 2026-08-09 shape exactly.
     const bool socket_up = data_.connected();
+    // THIRD cause, and the app can prove this one outright: the gateway is up
+    // and answering, and it is refusing US (IB error 326). Checked first because
+    // the "cannot reach the gateway" sentence below is flatly false in that
+    // case, and it would send the operator to hand-restart a healthy gateway —
+    // minutes after the API CLIENT ID IN USE line paged them with the truth.
+    // Two contradictory Critical pages is worse than one.
+    const bool id_conflict = data_.client_id_conflict();
     std::string msg =
-        socket_up
+        id_conflict
+            ? "WATCHDOG PRE-OPEN IB Gateway is UP and healthy but is REFUSING our "
+              "market-data client id - something else is connected with it (IB "
+              "error 326; see the API CLIENT ID IN USE line for which id and what "
+              "to close). We are still retrying. "
+            : socket_up
             ? "WATCHDOG PRE-OPEN IB Gateway is UP but NOT logged in to IBKR - it "
               "has told the data client " + since + ". "
             : "WATCHDOG PRE-OPEN cannot reach IB Gateway on the API port at all "
               "(no data session; it has said " + since + "). ";
-    msg += "The 09:25 auto-start will bring up a session that cannot reach the "
-           "market. The CREDENTIALS ARE PROBABLY FINE: IBKR answers 'unrecognized "
-           "username or password' during its maintenance window (2026-08-09 lost "
-           "13 hours to exactly that). ";
+    // The consequence differs, and saying the wrong one wastes the operator's
+    // ~40 minutes. A refused DATA client costs candles; it does not by itself
+    // stop orders, because the broker takes a rotating id of its own (20-39).
+    msg += id_conflict
+               ? "The 09:25 auto-start will bring up a session with no candles - "
+                 "no warmup, no lineup, no charts - even if its order path "
+                 "connects on its own client id. "
+               : "The 09:25 auto-start will bring up a session that cannot reach "
+                 "the market. The CREDENTIALS ARE PROBABLY FINE: IBKR answers "
+                 "'unrecognized username or password' during its maintenance "
+                 "window (2026-08-09 lost 13 hours to exactly that). ";
 
     // ---- at most one recovery attempt, ever, per day ----
     //
@@ -4630,7 +4704,12 @@ void App::pump_preopen_gateway_check() {
     //      the keepalive's own port-down relaunch, and the keepalive cannot see
     //      an in-process day stamp. That collision is what would actually have
     //      locked the account.
-    bool relaunch = socket_up && preopen_relaunch_day_ != day;
+    // !id_conflict is belt-and-braces (socket_up is already false when we are
+    // being refused), but it is stated because the consequence is severe: a
+    // cold relaunch aimed at a 326 kills a gateway that is working, drops
+    // whatever legitimately holds the id, and spends one of the day's very few
+    // login attempts on a fault the retry loop is already handling.
+    bool relaunch = socket_up && !id_conflict && preopen_relaunch_day_ != day;
     // A LIVE cold re-login may demand a TOTP that IBC cannot type, and would
     // then wedge on the 2FA dialog with no login at all — strictly worse than
     // the state being recovered from, and unfixable without RDP. This is the
@@ -4642,7 +4721,12 @@ void App::pump_preopen_gateway_check() {
         msg += "NOT relaunching: this is a LIVE account and a cold re-login can "
                "stop on a 2FA prompt IBC cannot answer. LOG IN BY HAND (RDP)";
     } else if (!relaunch) {
-        msg += "Not relaunching automatically - LOG IN BY HAND (RDP)";
+        // "Log in by hand" is the wrong instruction for a client-id collision:
+        // the gateway IS logged in, and a second login would achieve nothing.
+        msg += id_conflict
+                   ? "Not relaunching: the gateway is fine and the login is not "
+                     "the problem. CLOSE WHATEVER HOLDS THE CLIENT ID"
+                   : "Not relaunching automatically - LOG IN BY HAND (RDP)";
     }
 
 #ifdef _WIN32

@@ -68,10 +68,17 @@ public:
     int oldest_history_age_ms() const override {
         return oldest_hist_ms_.load(std::memory_order_relaxed);
     }
+    // Something already owns this client id on the gateway (IB error 326).
+    // Latched for the EPISODE: io_loop keeps reconnecting (slowly) and the next
+    // completed handshake clears it. See engine/tws_client_id.h.
+    bool client_id_conflict() const override {
+        return client_id_conflict_.load(std::memory_order_acquire);
+    }
     HistStats hist_stats() const override {
         HistStats s;
-        s.cache_hits = hs_cache_hits_.load(std::memory_order_relaxed);
-        s.cache_misses = hs_cache_misses_.load(std::memory_order_relaxed);
+        s.cache_served = hs_cache_served_.load(std::memory_order_relaxed);
+        s.cache_fetched = hs_cache_fetched_.load(std::memory_order_relaxed);
+        s.cache_lookups = hs_cache_lookups_.load(std::memory_order_relaxed);
         s.requests_sent = hs_requests_sent_.load(std::memory_order_relaxed);
         s.held_min_gap = hs_held_min_gap_.load(std::memory_order_relaxed);
         s.held_identical = hs_held_identical_.load(std::memory_order_relaxed);
@@ -130,6 +137,10 @@ private:
     void io_loop();
     void log(std::string msg);
     void wake();   // nudge the I/O thread so queued requests go out promptly
+    // Error every queued candle request (and any pending scan) back to its
+    // caller. Called from the I/O thread only, and only once a client-id
+    // conflict has outlasted kConflictSettleMs — see io_loop.
+    void settle_orphaned_requests();
 
     Callbacks cbs_;
 
@@ -141,6 +152,16 @@ private:
     std::thread io_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
+    // Something holds client_id_ on this gateway (IB error 326). Set by the I/O
+    // thread on the refusal, cleared by it on the next completed handshake; read
+    // by the UI thread (/diag) and by io_loop, which slows its retry while it is
+    // set. NOT one-way, because "another program" is only one of the two causes:
+    // the other is our own just-reaped socket, which the gateway releases by
+    // itself — and a client that had given up would then stay dead for the rest
+    // of the trading day for no reason at all. The recovery is logged
+    // (tws_client_id_cleared_line), which is what keeps this from being the
+    // silent-comeback lie: nothing changes state here without saying so.
+    std::atomic<bool> client_id_conflict_{false};
     std::atomic<uint64_t> conn_gen_{0};
     std::atomic<uint32_t> next_id_{1};
     std::atomic<void*> wake_{nullptr};   // EReaderOSSignal* while I/O thread runs
@@ -157,8 +178,9 @@ private:
     // exactly one thread, so relaxed ordering is enough: nothing else is
     // published through them and a reader that sees a counter one increment
     // stale has read a number that was true a moment ago.
-    std::atomic<uint64_t> hs_cache_hits_{0};
-    std::atomic<uint64_t> hs_cache_misses_{0};
+    std::atomic<uint64_t> hs_cache_served_{0};
+    std::atomic<uint64_t> hs_cache_fetched_{0};
+    std::atomic<uint64_t> hs_cache_lookups_{0};
     std::atomic<uint64_t> hs_requests_sent_{0};
     std::atomic<uint64_t> hs_held_min_gap_{0};
     std::atomic<uint64_t> hs_held_identical_{0};
