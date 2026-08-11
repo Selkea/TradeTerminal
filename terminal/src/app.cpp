@@ -1,5 +1,6 @@
 #include "app.h"
 #include "alert_rules.h"   // classify_alert: what pages the phone
+#include "block_wait.h"    // wait_off_core: sub-ms sleep_for does not sleep here
 #include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
 #include "dev_paths.h"
 #include "market_calendar.h"   // is_us_trading_day: the pre-open check may not act on a holiday
@@ -1075,10 +1076,18 @@ void App::pump_sweep() {
     //
     // consume_sweep_result() starts the next cell, so the poll below is waiting
     // on a backtest that is already in flight; kSweepDrainBudgetMs bounds how
-    // much of the frame that may take, and is deliberately LONGER than one
+    // much of the tick that may take, and is deliberately LONGER than one
     // backtest (see the constant) — a budget shorter than that would just move
-    // the one-per-frame ceiling from 30 ms to 16.7 ms. It sleeps rather than
-    // spins: the engine is on another thread and this box has few cores to spare.
+    // the one-per-tick ceiling from 30 ms to 16.7 ms.
+    //
+    // The wait must BLOCK, not spin — the engine is on another thread and this
+    // box has few cores to spare. That was written of a
+    // std::this_thread::sleep_for(250us) which does not sleep at all here; see
+    // block_wait.h. Measured on a replica of this loop (5.84 ms cells, the
+    // 10 ms tick period, 8 ms budget): spinning cost 73.8% of a core for
+    // 6.18 ms/result, blocking costs 0.0% for 6.78 ms/result. Nine percent of
+    // drain throughput is the right trade for a whole core handed back to the
+    // engine thread running those backtests and to the live session beside it.
     const auto drain_start = std::chrono::steady_clock::now();
     auto drain_spent_ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1095,9 +1104,9 @@ void App::pump_sweep() {
             continue;
         }
         // Nothing ready. If nothing is running either, there is nothing to wait
-        // for — the sweep is between states and the next frame will move it on.
+        // for — the sweep is between states and the next tick will move it on.
         if (!engine_.running() || drain_spent_ms() >= kSweepDrainBudgetMs) break;
-        std::this_thread::sleep_for(std::chrono::microseconds(250));
+        wait_off_core();
     }
 }
 
@@ -1299,7 +1308,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
     } else {
         tourn_.candidates = std::move(candidates);
     }
-    tourn_.stamp_s = tourn_.start_s = ImGui::GetTime();
+    tourn_.stamp_s = tourn_.start_s = mono_s();
 
     sweep_.tourney = {};
     sweep_.tourney.active = true;
@@ -1312,7 +1321,7 @@ void App::start_tournament(SweepPanel::Request rq, const std::string& target_sym
 
 void App::pump_tournament() {
     if (!tourn_.active) return;
-    const double now = ImGui::GetTime();
+    const double now = mono_s();
     sweep_.tourney.idx = static_cast<int>(tourn_.idx);
     sweep_.tourney.current = strat_mgr_.display_name(tourn_.candidates[tourn_.idx]);
 
@@ -1677,7 +1686,7 @@ void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
     }
     swap_opts_ = next;
     swap_stage_ = SwapStage::Flatten;
-    swap_deadline_s_ = ImGui::GetTime() + 30.0;   // give the closes 30s to fill
+    swap_deadline_s_ = mono_s() + 30.0;   // give the closes 30s to fill
     route("lineup swap: closing " + std::to_string(swap_flatten_ids_.size()) +
           " dropped position(s), cancelled " + std::to_string(cancelled) +
           " resting order(s); keeping the rest");
@@ -1698,7 +1707,7 @@ void App::pump_lineup_swap() {
                 all_flat = false;
                 break;
             }
-        if (!all_flat && ImGui::GetTime() < swap_deadline_s_) return;   // still closing
+        if (!all_flat && mono_s() < swap_deadline_s_) return;   // still closing
         if (!all_flat)
             route("lineup swap: dropped positions didn't flatten in time - stopping "
                   "with a full flatten (kill switch) instead of keeping positions");
@@ -1722,7 +1731,7 @@ void App::pump_lineup_swap() {
 }
 
 // How long the ranking pass may go without a single arrival, and how long the
-// whole pass may take. Seconds, on ImGui::GetTime(). Both replace a flat 15 s
+// whole pass may take. Seconds, on mono_s(). Both replace a flat 15 s
 // quiet timer that was SHORTER than the deliberate pacing of the pass's own
 // requests, which is what made a paced pass indistinguishable from a failed one.
 //
@@ -1785,7 +1794,7 @@ void App::start_daily_lineup(bool autostart_when_done) {
         lineup_hits_ready_ = true;
     });
     lineup_.phase = DailyLineup::Phase::Scanning;
-    lineup_.stamp_s = ImGui::GetTime();
+    lineup_.stamp_s = mono_s();
     route("lineup: scanning IBKR for high-volatility movers...");
 }
 
@@ -1844,7 +1853,7 @@ bool symbol_has_exposure(const LiveSnapshot& s, const std::string& symbol) {
 
 void App::pump_daily_lineup() {
     using Phase = DailyLineup::Phase;
-    const double now = ImGui::GetTime();
+    const double now = mono_s();
     switch (lineup_.phase) {
     case Phase::Idle:
         return;
@@ -2304,7 +2313,7 @@ void App::pump_autopilot() {
         return;
     }
     if (ap_.syms.empty()) return;
-    const double now = ImGui::GetTime();
+    const double now = mono_s();
 
     // Session-equity high for the drawdown trigger (session-level proxy until
     // per-symbol portfolios exist).
@@ -2590,8 +2599,9 @@ void App::start_diag_server() {
                  " already in use?)");
 }
 
-// UI thread, per frame: re-render the /diag body at ~1 Hz into diag_json_, which
-// the server thread copies out under diag_mu_.
+// UI thread, per TICK (no frame in progress — the 1 Hz gate is on mono_s(), not
+// ImGui's clock): re-render the /diag body into diag_json_, which the server
+// thread copies out under diag_mu_.
 void App::pump_diag() {
     // Execute a remote kill request here, on the UI thread — the only producer
     // allowed to touch the engine's SPSC command ring (the diag server thread
@@ -2605,7 +2615,7 @@ void App::pump_diag() {
         }
     }
     if (!diag_srv_.running()) return;
-    const double now = ImGui::GetTime();
+    const double now = mono_s();
     if (now < diag_next_build_s_) return;
     diag_next_build_s_ = now + 1.0;
     std::string body = build_diag_json();
@@ -2981,18 +2991,38 @@ std::string App::build_logs_sse(uint64_t& cursor) {
     return out;
 }
 
-void App::draw() {
-    const ImGuiID dockspace_id =
-        ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_NoWindowMenuButton);
-    if (ImGui::GetTime() - last_cfg_save_ > 60.0) {
-        last_cfg_save_ = ImGui::GetTime();
+// One scheduling tick. NO ImGui, NO rendering, NO frame in progress.
+//
+// This is everything App::draw() used to do before it drew anything, and it is
+// here rather than there because main.cpp used to skip draw() entirely whenever
+// the window was ICONIFIED — so on a VPS operated over RDP, where a minimized
+// window is an ordinary state, minimizing froze the 09:35 lineup build, the
+// 09:25 auto-start, the 15:55 auto-stop, all four watchdogs and the autopilot at
+// once. Silently: the gateway's own thread kept logging so the log looked alive,
+// and /diag kept serving its last-built body with HTTP 200 (only the "now" field
+// gave it away, and nothing compares that to real time). Observed 2026-08-11,
+// three minutes into a dry run's build.
+//
+// TWO RULES hold this function together, and both are easy to break by accident:
+//
+//   - Nothing called from here may touch ImGui. There is no frame. Panel
+//     ACCESSORS are fine (they read plain members); panel draw() methods are not.
+//   - Every deadline evaluated here is on mono_s(), never ImGui::GetTime().
+//     ImGui's clock does not advance without a NewFrame and then jumps by the
+//     whole gap on the next one, so leaving a pump on it would swap this freeze
+//     for every deadline in the app expiring at the same instant on restore —
+//     including pump_lineup_swap's flatten give-up, whose branch kill-switches.
+//     See tick_clock.h.
+//
+// Returns how long the host may sleep before the next tick (tick_sleep_ms).
+int App::tick() {
+    const int64_t t0 = mono_ms();
+    const double now = mono_s();
+    if (now - last_cfg_save_ > 60.0) {
+        last_cfg_save_ = now;
         save_config();
     }
     pump_diag();   // re-render the /diag body (throttled) for the remote monitor
-    if (!layout_checked_) {
-        layout_checked_ = true;
-        if (!had_ini_) setup_default_layout(dockspace_id);
-    }
 
     // Surface engine/strategy/broker/feed log lines in the console; scan
     // them for alert-worthy events on the way through.
@@ -3136,7 +3166,137 @@ void App::draw() {
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
-    pump_background();        // 08:45 window: is the gateway actually LOGGED IN?
+    pump_preopen_gateway_check();   // 08:45 window: is the gateway actually LOGGED IN?
+
+    // Deferred strategy loads, strategy-switch backtests, and finished-run
+    // instance cleanup advance every tick, independent of open panels.
+    strat_mgr_.pump();
+    pump_pending_run();
+    pump_leases();
+
+    // The session schedule: auto-start at 09:25, auto-stop (kill switch) at 15:55.
+    //
+    // Lifted out of TradePanel::draw(), where it sat AFTER
+    // `if (!ImGui::Begin("Trade", open)) return;`. Begin reports false for a
+    // collapsed window AND for a docked tab that is not the selected one — and
+    // setup_default_layout docks Trade into the same node as Backtest and
+    // Strategy. So clicking either neighbouring tab silently disabled both the
+    // auto-start and the auto-stop on a maximized, fully visible window, with
+    // nothing anywhere to say the schedule had stopped running. Same defect
+    // class as the iconify freeze, but it needed no minimize at all.
+    //
+    // The lambda BUILDS the options as well as starting: everything
+    // build_start_opts needs is expensive to produce and was being produced on
+    // every tick as call arguments, ahead of pump_schedule's own `if (!sched_on_)
+    // return;`. trade_account_info() re-reads and JSON-parses ibkr-accounts.json
+    // from disk; polygon_key()/finnhub_key() each run CryptUnprotectData twice
+    // over the stored credential. At the 100 Hz tick that is millions of file
+    // opens and decryptions a session, all of it discarded — and on the rendered
+    // path it duplicated the read draw() already does below. Now it costs
+    // nothing until the day's one 09:25 crossing actually fires.
+    trade_.pump_schedule([this] {
+        start_live_session(trade_.build_start_opts(
+            trade_account_info(), param_specs_fn(), !polygon_key().empty(),
+            !finnhub_key().empty(), data_.connected()));
+    });
+
+    // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
+    // so start the live session through the exact path the Start button uses.
+    if (lineup_autostart_pending_) {
+        lineup_autostart_pending_ = false;
+        if (!trade_.has_symbols()) {
+            route("lineup: no symbols to auto-start");
+        } else {
+            TradePanel::StartOpts opts = trade_.build_start_opts(
+                trade_account_info(), param_specs_fn(),
+                !polygon_key().empty(), !finnhub_key().empty(), data_.connected());
+            if (engine_.live_running()) {
+                // A session is already live: cycle onto the new picks, keeping
+                // the symbols that carry over (only the drops get flattened).
+                begin_lineup_swap(opts);
+            } else {
+                route("lineup: auto-starting the live session");
+                start_live_session(opts);
+            }
+        }
+    }
+
+#ifdef TT_DEBUG
+    // Debug menu (or TT_SIM_TICKS=1): synthesize a 2 Hz random walk for the
+    // live session — demo/verification when the market is closed.
+    if (engine_.live_running() && sim_ticks_) {
+        if (now >= sim_tick_next_s_) {
+            sim_tick_next_s_ = now + 0.5;
+            if (sim_tick_px_ <= 0.0) sim_tick_px_ = 100.0;
+            sim_tick_rng_ = sim_tick_rng_ * 1664525u + 1013904223u;
+            sim_tick_px_ += (static_cast<double>(sim_tick_rng_ >> 8 & 0xffff) / 65535.0 - 0.5);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            for (const std::string& sym : engine_.live_symbols())
+                engine_.push_live_tick(sym, ms, sim_tick_px_, 0.0);
+        }
+    }
+#endif
+
+    // TT_AUTORUN_LIVE=1: start a session, manual buy, kill switch — headless
+    // verification of the whole live path.
+    //
+    // Not while TT_AUTORUN_LINEUP is set. This one calls engine_.start_live()
+    // directly, so it is the one live-start path that does NOT go through
+    // start_live_session()'s dry-run refusal — and "propose-only" has to mean it
+    // whatever else the environment asks for.
+    if (!dry_.active && std::getenv("TT_AUTORUN_LIVE")) {
+        const LiveSnapshot s = engine_.live_snapshot();
+        if (autorun_live_stage_ == 0) {
+            autorun_live_stage_ = 1;
+            LiveConfig cfg;
+            cfg.symbols = {"SIMTEST", "SIMTEST2"};   // proves multi-symbol routing headlessly
+            cfg.params = strat_mgr_.param_values("");   // built-in SMA
+            cfg.bar_seconds = 2;
+            if (IStrategy* strat = acquire_strategy("")) {
+                // Both SIMTEST symbols run the same one strategy instance here.
+                if (engine_.start_live(std::move(cfg),
+                                       std::vector<IStrategy*>{strat, strat}))
+                    leases_.push_back({strat, "", StrategyLease::Live});
+                else
+                    release_strategy({strat, "", StrategyLease::Live});
+            }
+            route("autorun-live: session started");
+        } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {
+            autorun_live_stage_ = 2;
+            engine_.submit_manual(1, true, 10);
+            route("autorun-live: manual BUY 10 SIMTEST submitted");
+        } else if (autorun_live_stage_ == 2 && !s.symbols.empty() &&
+                  s.symbols[0].position.qty > 0) {
+            autorun_live_stage_ = 3;
+            route("autorun-live: position open, firing kill switch");
+            engine_.kill_switch();
+        } else if (autorun_live_stage_ == 3 && s.halted) {
+            bool all_flat = true;
+            for (const SymbolState& sym : s.symbols)
+                if (sym.position.qty != 0) all_flat = false;
+            if (all_flat) {
+                autorun_live_stage_ = 4;
+                route("autorun-live: FLAT after kill switch — live path verified");
+            }
+        }
+    }
+
+    return tick_sleep_ms(mono_ms() - t0);
+}
+
+// One frame of UI. Everything with a clock on it already ran in tick(); this
+// only presents. main.cpp is free to skip it (iconified window) and the app must
+// keep behaving identically — that invariant is the fix, so guard it: anything
+// added here that DECIDES something rather than displaying it belongs in tick().
+void App::draw() {
+    const ImGuiID dockspace_id =
+        ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_NoWindowMenuButton);
+    if (!layout_checked_) {
+        layout_checked_ = true;
+        if (!had_ini_) setup_default_layout(dockspace_id);
+    }
 
     draw_menu_bar();
     draw_account_modal();
@@ -3173,12 +3333,6 @@ void App::draw() {
             chart_.show_symbol(sym);
             backtest_.set_symbol(sym);
         });
-    // Deferred strategy loads, strategy-switch backtests, and finished-run
-    // instance cleanup advance every frame, independent of open panels.
-    strat_mgr_.pump();
-    pump_pending_run();
-    pump_leases();
-
     if (show_backtest_)
         backtest_.draw(&show_backtest_, strat_mgr_.all_keys(),
                        [this](const std::string& k) { return strat_mgr_.display_name(k); },
@@ -3291,26 +3445,6 @@ void App::draw() {
                         backtest_.set_symbol(sym);
                         show_chart_ = true;
                     });
-    // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
-    // so start the live session through the exact path the Start button uses.
-    if (lineup_autostart_pending_) {
-        lineup_autostart_pending_ = false;
-        if (!trade_.has_symbols()) {
-            route("lineup: no symbols to auto-start");
-        } else {
-            TradePanel::StartOpts opts = trade_.build_start_opts(
-                trade_account_info(), param_specs_fn(),
-                !polygon_key().empty(), !finnhub_key().empty(), data_.connected());
-            if (engine_.live_running()) {
-                // A session is already live: cycle onto the new picks, keeping
-                // the symbols that carry over (only the drops get flattened).
-                begin_lineup_swap(opts);
-            } else {
-                route("lineup: auto-starting the live session");
-                start_live_session(opts);
-            }
-        }
-    }
     if (show_blotter_) blotter_.draw(&show_blotter_);
     if (show_positions_) positions_.draw(&show_positions_);
     if (show_journal_) journal_panel_.draw(&show_journal_);
@@ -3333,68 +3467,6 @@ void App::draw() {
         }
     }
 
-#ifdef TT_DEBUG
-    // Debug menu (or TT_SIM_TICKS=1): synthesize a 2 Hz random walk for the
-    // live session — demo/verification when the market is closed.
-    if (engine_.live_running() && sim_ticks_) {
-        const double now = ImGui::GetTime();
-        if (now >= sim_tick_next_s_) {
-            sim_tick_next_s_ = now + 0.5;
-            if (sim_tick_px_ <= 0.0) sim_tick_px_ = 100.0;
-            sim_tick_rng_ = sim_tick_rng_ * 1664525u + 1013904223u;
-            sim_tick_px_ += (static_cast<double>(sim_tick_rng_ >> 8 & 0xffff) / 65535.0 - 0.5);
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-            for (const std::string& sym : engine_.live_symbols())
-                engine_.push_live_tick(sym, ms, sim_tick_px_, 0.0);
-        }
-    }
-#endif
-
-    // TT_AUTORUN_LIVE=1: start a session, manual buy, kill switch — headless
-    // verification of the whole live path.
-    //
-    // Not while TT_AUTORUN_LINEUP is set. This one calls engine_.start_live()
-    // directly, so it is the one live-start path that does NOT go through
-    // start_live_session()'s dry-run refusal — and "propose-only" has to mean it
-    // whatever else the environment asks for.
-    if (!dry_.active && std::getenv("TT_AUTORUN_LIVE")) {
-        const LiveSnapshot s = engine_.live_snapshot();
-        if (autorun_live_stage_ == 0) {
-            autorun_live_stage_ = 1;
-            LiveConfig cfg;
-            cfg.symbols = {"SIMTEST", "SIMTEST2"};   // proves multi-symbol routing headlessly
-            cfg.params = strat_mgr_.param_values("");   // built-in SMA
-            cfg.bar_seconds = 2;
-            if (IStrategy* strat = acquire_strategy("")) {
-                // Both SIMTEST symbols run the same one strategy instance here.
-                if (engine_.start_live(std::move(cfg),
-                                       std::vector<IStrategy*>{strat, strat}))
-                    leases_.push_back({strat, "", StrategyLease::Live});
-                else
-                    release_strategy({strat, "", StrategyLease::Live});
-            }
-            route("autorun-live: session started");
-        } else if (autorun_live_stage_ == 1 && s.ticks >= 3) {
-            autorun_live_stage_ = 2;
-            engine_.submit_manual(1, true, 10);
-            route("autorun-live: manual BUY 10 SIMTEST submitted");
-        } else if (autorun_live_stage_ == 2 && !s.symbols.empty() &&
-                  s.symbols[0].position.qty > 0) {
-            autorun_live_stage_ = 3;
-            route("autorun-live: position open, firing kill switch");
-            engine_.kill_switch();
-        } else if (autorun_live_stage_ == 3 && s.halted) {
-            bool all_flat = true;
-            for (const SymbolState& sym : s.symbols)
-                if (sym.position.qty != 0) all_flat = false;
-            if (all_flat) {
-                autorun_live_stage_ = 4;
-                route("autorun-live: FLAT after kill switch — live path verified");
-            }
-        }
-    }
     if (show_imgui_demo_) ImGui::ShowDemoWindow(&show_imgui_demo_);
     if (show_implot_demo_) ImPlot::ShowDemoWindow(&show_implot_demo_);
 }
@@ -3782,7 +3854,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
             aps.interval_min = so.ap_interval_min;
             aps.dd_pct = so.ap_dd_pct;
             aps.key = so.strat_key;
-            aps.last_cycle_s = ImGui::GetTime();
+            aps.last_cycle_s = mono_s();
             ap_.syms.push_back(std::move(aps));
         }
         if (!ap_.syms.empty())
@@ -4050,13 +4122,13 @@ void App::draw_update_panel() {
         update_check_click_ = false;
         update_check_wait_ = true;
         update_check_gen_ = update_.check_count();
-        update_check_started_ = ImGui::GetTime();
+        update_check_started_ = mono_s();
         update_dismissed_commit_.clear();   // an explicit check re-shows a dismissed update
         update_.check_now();
     }
     if (update_check_wait_) {
         const bool done = update_.check_count() != update_check_gen_;
-        const bool timed_out = ImGui::GetTime() - update_check_started_ > 20.0;
+        const bool timed_out = mono_s() - update_check_started_ > 20.0;
         if (done || timed_out) {
             update_check_wait_ = false;
             if (!done)
@@ -4219,13 +4291,18 @@ void App::alert_scan(const std::string& l) {
 // order path stays not-ready past kBrokerDownAlertSec, raise a critical alert
 // (webhook), and re-raise every kBrokerDownReAlertSec while it's still down so a
 // persistent outage keeps nagging. On recovery, one Warning that it's back.
+//
+// The grace/re-alert bookkeeping is WatchdogTimer's (watchdog_timer.h) — shared
+// with pump_orphan_watchdog and, unlike this function, unit-testable. It runs on
+// mono_s(): on ImGui::GetTime() an outage that began before the window was
+// minimized simply stopped ageing, so the 60 s threshold was unreachable for as
+// long as nobody was looking.
 void App::pump_broker_watchdog() {
     static constexpr double kBrokerDownAlertSec = 60.0;
     static constexpr double kBrokerDownReAlertSec = 600.0;   // re-ping every 10 min while down
     const bool have_broker = (tws_ != nullptr) || (ibkr_ != nullptr);
     if (!engine_.live_running() || !have_broker) {   // nothing to guard (idle / sim broker)
-        broker_down_since_s_ = 0.0;
-        broker_down_last_alert_s_ = 0.0;
+        broker_wd_.reset();
         return;
     }
     // "Up" = the order path can actually reach IBKR: the local API socket is up
@@ -4236,21 +4313,17 @@ void App::pump_broker_watchdog() {
     const bool socket_ready = ibkr_ ? ibkr_->ready() : tws_->ready();
     const bool upstream_ok = tws_ ? tws_->upstream_connected() : true;
     const bool ready = socket_ready && upstream_ok;
-    const double now = ImGui::GetTime();
-    if (ready) {
-        if (broker_down_last_alert_s_ != 0.0)   // we alerted on an outage that's now cleared
-            alerts_.notify(AlertNotifier::Warning, "broker: reconnected to IBKR");
-        broker_down_since_s_ = 0.0;
-        broker_down_last_alert_s_ = 0.0;
+    const double now = mono_s();
+    switch (broker_wd_.update(!ready, now, kBrokerDownAlertSec, kBrokerDownReAlertSec)) {
+    case WatchdogTimer::Action::None:
         return;
+    case WatchdogTimer::Action::Recovered:
+        alerts_.notify(AlertNotifier::Warning, "broker: reconnected to IBKR");
+        return;
+    case WatchdogTimer::Action::Page:
+        break;
     }
-    if (broker_down_since_s_ == 0.0) broker_down_since_s_ = now;   // start of a down episode
-    const double down_s = now - broker_down_since_s_;
-    if (down_s < kBrokerDownAlertSec) return;
-    if (broker_down_last_alert_s_ != 0.0 &&
-        now - broker_down_last_alert_s_ < kBrokerDownReAlertSec)
-        return;
-    broker_down_last_alert_s_ = now;
+    const double down_s = broker_wd_.age_s(now);   // a Page leaves the episode open
     // Distinguish the two failure modes so the alert points at the right thing.
     const char* what = socket_ready
                            ? "gateway lost its connection to IBKR (error 1100)"
@@ -4280,8 +4353,7 @@ void App::pump_orphan_watchdog() {
     static constexpr double kOrphanAlertSec = 120.0;    // let a restart settle
     static constexpr double kOrphanReAlertSec = 900.0;  // re-page every 15 min
     if (!engine_.live_running()) {
-        orphan_since_s_ = 0.0;
-        orphan_last_alert_s_ = 0.0;
+        orphan_wd_.reset();
         return;
     }
     const LiveSnapshot s = engine_.live_snapshot();
@@ -4301,22 +4373,16 @@ void App::pump_orphan_watchdog() {
         orphans += ss.symbol + " " +
                    std::to_string(static_cast<long long>(ss.position.qty));
     }
-    const double now = ImGui::GetTime();
-    if (orphans.empty()) {
-        if (orphan_last_alert_s_ != 0.0)
-            alerts_.notify(AlertNotifier::Warning,
-                           "positions: no orphaned positions left");
-        orphan_since_s_ = 0.0;
-        orphan_last_alert_s_ = 0.0;
+    switch (orphan_wd_.update(!orphans.empty(), mono_s(), kOrphanAlertSec,
+                              kOrphanReAlertSec)) {
+    case WatchdogTimer::Action::None:
         return;
+    case WatchdogTimer::Action::Recovered:
+        alerts_.notify(AlertNotifier::Warning, "positions: no orphaned positions left");
+        return;
+    case WatchdogTimer::Action::Page:
+        break;
     }
-    if (orphan_since_s_ == 0.0) orphan_since_s_ = now;
-    const double age_s = now - orphan_since_s_;
-    if (age_s < kOrphanAlertSec) return;
-    if (orphan_last_alert_s_ != 0.0 &&
-        now - orphan_last_alert_s_ < kOrphanReAlertSec)
-        return;
-    orphan_last_alert_s_ = now;
     const std::string msg =
         "WATCHDOG adopted position(s) with NO protective stop and a paused "
         "strategy - nothing will close them: " + orphans;
@@ -4364,7 +4430,7 @@ void App::pump_history_watchdog() {
         hist_stale_last_alert_s_ = 0.0;
         return;
     }
-    const double now = ImGui::GetTime();
+    const double now = mono_s();
     if (hist_live_since_s_ == 0.0) hist_live_since_s_ = now;
     if (ap_.syms.empty()) return;
 
@@ -4424,34 +4490,6 @@ void App::pump_history_watchdog() {
         data_.connected());
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
-}
-
-// Monotonic seconds since this App was constructed. NOT ImGui::GetTime(): that
-// clock only advances inside NewFrame, and the whole point of pump_background()
-// is to keep running when no frame is being built (see main.cpp's iconified
-// branch). Steady, so an NTP correction around the nightly gateway restart
-// cannot make a settle window look satisfied or a deadline look expired.
-double App::mono_s() const {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                         mono_epoch_).count();
-}
-
-int64_t App::mono_ms() const {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - mono_epoch_)
-        .count();
-}
-
-// Everything that must keep ticking on a frame that is never drawn.
-//
-// main.cpp skips App::draw() entirely while the window is iconified, and the
-// VPS is operated over RDP, where minimizing the terminal is the normal thing
-// to do. A wall-clock check that only runs while a window is visible is a check
-// an operator can switch off by accident — and the one below exists precisely
-// because nobody was watching. Nothing called from here may touch ImGui: there
-// is no frame in progress.
-void App::pump_background() {
-    pump_preopen_gateway_check();
 }
 
 // Pre-open gateway AUTHENTICATION check — a WINDOW, 08:45-09:15 local, on days
@@ -4700,7 +4738,7 @@ void App::draw_account_modal() {
     refresh_ibkr_accounts();   // pick up accounts added via "Add New"
 
     const bool up = data_.connected();
-    const bool initializing = !up && ImGui::GetTime() < gateway_starting_until_;
+    const bool initializing = !up && mono_s() < gateway_starting_until_;
 
     // Kick off a sign-in (disconnected) or switch (connected, different
     // account) for `name`. Both run Switch-IbkrAccount, which tears the old
@@ -4715,7 +4753,7 @@ void App::draw_account_modal() {
         const std::string args = switch_args(name);
         if (args.empty()) return;
         run_hidden(args);
-        gateway_starting_until_ = ImGui::GetTime() + 90.0;
+        gateway_starting_until_ = mono_s() + 90.0;
         route(std::string("account: ") +
                  (up ? "switching to IBKR '" : "signing in to IBKR '") + name + "'");
     };
@@ -4996,7 +5034,7 @@ void App::draw_menu_bar() {
 
     // Right-aligned gateway session indicator.
     const bool up = data_.connected();
-    const bool initializing = !up && ImGui::GetTime() < gateway_starting_until_;
+    const bool initializing = !up && mono_s() < gateway_starting_until_;
     const char* label = up ? "GATEWAY UP" : (initializing ? "INITIALIZING" : "GATEWAY DOWN");
     const ImVec4 col = up ? ImVec4(0.25f, 0.85f, 0.45f, 1.0f)
                           : (initializing ? ImVec4(0.95f, 0.80f, 0.25f, 1.0f)

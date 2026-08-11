@@ -212,19 +212,26 @@ int main() {
             glfwSetWindowShouldClose(window, GLFW_FALSE);
             app.request_quit();
         }
-        // app.headless_run(): a scripted run (TT_AUTORUN_LINEUP=1) keeps drawing
-        // whatever the window does. draw() is the only thing that advances the
-        // daily lineup's state machine, so skipping the frame does not just stop
-        // rendering — it freezes the build the run exists to measure, silently.
-        // Nobody is watching a headless run's window, so the frame is free.
-        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) && !app.headless_run()) {
-            // Not drawing is not the same as not watching. The pre-open gateway
-            // check is wall-clock driven and its whole job is to fire in an
-            // unattended morning window; a minimized window used to disable it
-            // silently, which is the 2026-08-09 blindness reinstated by a click.
-            // pump_background() touches no ImGui state — there is no frame here.
-            app.pump_background();
-            ImGui_ImplGlfw_Sleep(10);
+        // TICK, ALWAYS. Unconditional and before the iconified test on purpose:
+        // App::tick() carries every scheduler, state machine and watchdog in the
+        // app, and this loop used to skip all of it — via App::draw() — whenever
+        // the window was minimized. This box is a Windows Server VPS driven over
+        // RDP, where a minimized or disconnected session is an ordinary state, so
+        // that made the 09:35 lineup build, the 09:25 auto-start, the 15:55
+        // auto-stop, the broker/orphan/history/pre-open watchdogs and the
+        // autopilot all switchable off by clicking the minimize button. It was
+        // silent too: the gateway's own thread kept logging, so the log looked
+        // alive (2026-08-11).
+        //
+        // Rendering may still be skipped — nobody is looking at a hidden window
+        // and llvmpipe software-renders every pixel on the CPU here — but the
+        // SCHEDULING may not be. tick() touches no ImGui and needs no frame.
+        const int sleep_ms = app.tick();
+        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+            // tick_sleep_ms paces this to a fixed period rather than a fixed
+            // delay, so a tick that ran long (the optimizer's 8 ms result drain)
+            // goes straight into the next one. See tick_clock.h.
+            if (sleep_ms > 0) ImGui_ImplGlfw_Sleep(sleep_ms);
             continue;
         }
 
