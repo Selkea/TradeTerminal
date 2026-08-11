@@ -68,6 +68,17 @@ public:
     int oldest_history_age_ms() const override {
         return oldest_hist_ms_.load(std::memory_order_relaxed);
     }
+    HistStats hist_stats() const override {
+        HistStats s;
+        s.cache_hits = hs_cache_hits_.load(std::memory_order_relaxed);
+        s.cache_misses = hs_cache_misses_.load(std::memory_order_relaxed);
+        s.requests_sent = hs_requests_sent_.load(std::memory_order_relaxed);
+        s.held_min_gap = hs_held_min_gap_.load(std::memory_order_relaxed);
+        s.held_identical = hs_held_identical_.load(std::memory_order_relaxed);
+        s.held_budget = hs_held_budget_.load(std::memory_order_relaxed);
+        s.abandoned = hs_abandoned_.load(std::memory_order_relaxed);
+        return s;
+    }
 
     // Gateway login state, from the data farms (see net/gateway_auth.h). NOT
     // inline: the age is measured off a steady clock owned by the .cpp, and the
@@ -108,6 +119,12 @@ private:
         // wait indefinitely and then spend a send slot on an answer nobody is
         // waiting for any more. See kHistQueueMaxWaitMs.
         int64_t queued_ms = 0;
+        // Which SendHold reasons this request has already been COUNTED under
+        // (bit 1<<int(SendHold)). A held request is re-offered to the gate on
+        // every io_loop pass, so without this the hold counters in HistStats
+        // would measure how long a hold lasted rather than how many requests it
+        // held. The field rides the request back onto reqs_ with the rest of it.
+        uint8_t held_mask = 0;
     };
 
     void io_loop();
@@ -134,6 +151,19 @@ private:
     // gateway restart) shows oldest_hist_ms_ climbing without bound.
     std::atomic<int> pending_hist_{0};
     std::atomic<int> oldest_hist_ms_{0};
+
+    // Cumulative fetch accounting, published by the I/O thread as it happens and
+    // read from the UI thread (see HistStats in net/market_source.h). Written by
+    // exactly one thread, so relaxed ordering is enough: nothing else is
+    // published through them and a reader that sees a counter one increment
+    // stale has read a number that was true a moment ago.
+    std::atomic<uint64_t> hs_cache_hits_{0};
+    std::atomic<uint64_t> hs_cache_misses_{0};
+    std::atomic<uint64_t> hs_requests_sent_{0};
+    std::atomic<uint64_t> hs_held_min_gap_{0};
+    std::atomic<uint64_t> hs_held_identical_{0};
+    std::atomic<uint64_t> hs_held_budget_{0};
+    std::atomic<uint64_t> hs_abandoned_{0};
 
     std::atomic<AccountKind> account_kind_{AccountKind::Unknown};
 

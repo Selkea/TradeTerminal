@@ -27,6 +27,29 @@ struct CandleBatch {
 // Paper/live flag of the connected brokerage session; Unknown = no session.
 enum class AccountKind { Unknown, Paper, Live };
 
+// Cumulative history-fetch accounting for the life of the process.
+//
+// Everything here already existed inside the TWS source's I/O thread — the bar
+// cache's hit/miss counters (net/bar_cache.h) and the send gate's decisions
+// (net/hist_pacing.h) — but only as log prose, so measuring a lineup build meant
+// re-deriving it from delivery timestamps afterwards. That is exactly how the
+// 2026-08-10 profile had to be reconstructed. Published as numbers so a headless
+// dry run (TT_AUTORUN_LINEUP=1) can state them instead of implying them.
+//
+// held_* count REQUESTS, not passes: a held request is re-offered to the gate on
+// every io_loop pass (~1 Hz) and a budget hold can last minutes, so counting
+// decisions would report the duration of the hold rather than how much work was
+// held. Each request is counted at most once per reason.
+struct HistStats {
+    uint64_t cache_hits = 0;      // series served from the bar cache, no IB request
+    uint64_t cache_misses = 0;    // cache lookups that had to go to IB
+    uint64_t requests_sent = 0;   // reqHistoricalData actually put on the wire (incl. retries)
+    uint64_t held_min_gap = 0;    // SendHold::MinGap    — 500 ms spacing
+    uint64_t held_identical = 0;  // SendHold::Identical — IB's 15 s identical-request rule
+    uint64_t held_budget = 0;     // SendHold::Budget    — 50/10 min bulk ceiling
+    uint64_t abandoned = 0;       // held past kHistQueueMaxWaitMs and errored back
+};
+
 class IMarketData {
 public:
     // Callbacks fire on the source's worker thread; consumers are already
@@ -53,6 +76,12 @@ public:
     // track it (only TwsData does today).
     virtual int pending_history() const { return 0; }
     virtual int oldest_history_age_ms() const { return 0; }
+
+    // Cumulative fetch accounting (see HistStats). Only the TWS route caches or
+    // paces history, so every other source reports zeroes — a reader must treat
+    // an all-zero struct as "this source does not account for it", not as "no
+    // fetching happened".
+    virtual HistStats hist_stats() const { return {}; }
 
     // Is the upstream gateway LOGGED IN to the broker, as opposed to merely
     // reachable? connected() above cannot answer that — an IB Gateway parked on

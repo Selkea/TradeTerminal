@@ -94,12 +94,41 @@ connect-time check against the broker endpoints. Every step is idempotent.
 `TT_LOG_STDOUT=1` mirrors the log console to stdout · `TT_AUTORUN_BACKTEST=1`
 runs an AAPL backtest at startup · `TT_AUTORUN_SWEEP=1` runs a headless
 optimizer grid · `TT_AUTORUN_LIVE=1` runs a scripted live-session check ·
+`TT_AUTORUN_LINEUP=1` runs one full daily-lineup build headlessly (see below) ·
 `TT_SIM_TICKS=1` feeds a synthetic 2 Hz walk to live sessions (markets closed)
 · `TT_IBKR_GATEWAY` overrides the gateway URL · `TT_POLYGON_WS` overrides the
 Polygon websocket URL · `TT_PIN_ENGINE` / `TT_PIN_FEED` pin engine/feed
 threads to cores · `TT_FEED_SPIN=1` busy-polls the feed thread ·
 `TT_ALERT_WEBHOOK` sets the alert webhook · `TT_GXX` overrides the strategy
 compiler path.
+
+### Daily-lineup dry run
+
+`TT_AUTORUN_LINEUP=1` builds the day's lineup once, headlessly, through the same
+`start_daily_lineup()` call the 09:35 schedule fires — IBKR scan, volatility
+rank, one strategy tournament per pick — then exits. It is **propose-only and
+the app forces that**: no live session is started and no order is ever
+submitted, whatever `config.json` says about `lineup_propose_only` or the
+session schedule (`App::start_live_session` refuses for the whole run).
+
+    scripts\Invoke-LineupDryRun.ps1                    # release exe, 20-min wall
+    scripts\Invoke-LineupDryRun.ps1 -DataDir C:\tmp\tt  # throwaway config
+
+Exit 0 = at least one symbol came out fitted; 1 = none did; 2 = refused or timed
+out; 3 = a `tt_terminal` was already running. The run writes greppable lines —
+field 0 is the tag, every other field is `key=value`:
+
+    dryrun: kind=phase phase=scan ms=1180 pool=30
+    dryrun: kind=phase phase=fetch_bars ms=15021 delivered=28/30 awaiting=2
+    dryrun: kind=tournament symbol=TQQQ idx=2/6 ms=48210 candidates=4/5 outcome=fitted
+    dryrun: kind=summary result=PASS total_ms=345678 abort=- pool=30 ... exit=0
+
+The summary carries total wall ms, per-symbol outcome (`fitted` /
+`own-previous` / `holding-only` / `no-candidate` / `excluded`), candidate
+success counts, bar-cache hits/misses, history requests issued, and how many
+were held by IB's pacing gate and why. It leaves the proposed tabs in
+`config.json` exactly as a propose-only 09:35 build would — use `-DataDir` if
+that matters.
 
 ---
 

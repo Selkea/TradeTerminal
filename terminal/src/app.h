@@ -14,11 +14,13 @@
 #include "engine/symbol_rank.h"
 #include "tt/strategy_registry.h"
 #include "journal.h"
+#include "lineup_dryrun.h"
 #include "market_data.h"
 #include "net/diag_server.h"
 #include "net/gateway_data.h"
 #include "net/hist_freshness.h"
 #include "net/tws_data.h"
+#include "symbol_params.h"   // LineupPlan, in the dry run's admission hook
 #include "update_check.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
@@ -65,6 +67,32 @@ public:
     // trading; otherwise pops a confirm dialog and quits only once confirmed.
     void request_quit();
     bool should_quit() const { return should_quit_; }
+
+    // True while this process is a headless run that must keep drawing even with
+    // no window on screen.
+    //
+    // The host loop skips App::draw() entirely when the window is iconified, and
+    // pump_daily_lineup() — the lineup's whole state machine — runs ONLY from
+    // draw(). So an iconified window does not merely stop rendering, it freezes
+    // the build: measured on 2026-08-11, a dry run's window was iconified about
+    // three minutes in and the lineup stopped advancing on the spot, with
+    // nothing in the log to say why (the gateway's own thread kept logging, so
+    // the log looked alive). Nobody is looking at a headless run's window by
+    // definition, so drawing the frame costs one vsync and buys a build that
+    // actually finishes.
+    //
+    // Deliberately scoped to the dry run. The same hazard applies to the real
+    // 09:35 build on a minimized VPS window, but fixing that changes behaviour
+    // for every ordinary run, and this hook is required to be inert when
+    // TT_AUTORUN_LINEUP is unset.
+    bool headless_run() const { return dry_.active; }
+
+    // Process exit status. Zero for every ordinary run; the headless dry run
+    // (TT_AUTORUN_LINEUP=1) sets it so a scheduled job can branch on the build's
+    // verdict without parsing the log. main() must return THIS, including from
+    // its shutdown watchdog — a watchdog that force-exits 0 would turn every
+    // slow teardown into a green run.
+    int exit_code() const { return exit_code_; }
 
     // Whether an imgui.ini existed at startup; if not, a default dock layout
     // is built on the first frame.
@@ -366,6 +394,48 @@ private:
     bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
     char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 
+    // ---- TT_AUTORUN_LINEUP=1: headless daily-lineup dry run ----------------
+    // Drives ONE full build — scan, volatility rank, per-symbol tournaments —
+    // through start_daily_lineup(), the same call the 09:35 schedule makes, then
+    // reports it in machine-readable "dryrun:" lines (see lineup_dryrun.h) and
+    // exits with the build's verdict. It is a pure OBSERVER of the lineup state
+    // machine: it triggers the build and measures it, and every decision it
+    // reports was made by the production code. A dry run that ran its own copy
+    // of the logic would be evidence about the copy.
+    //
+    // PROPOSE-ONLY IS FORCED, not configured. start_daily_lineup is called with
+    // autostart_when_done=false, pump_lineup_schedule() is off for the run (it
+    // honours cfg_.lineup_propose_only and would auto-start), and
+    // start_live_session() — the one choke point every start path goes through —
+    // refuses outright. config.json cannot make this run trade.
+    struct LineupDryRun {
+        bool active = false;      // TT_AUTORUN_LINEUP was set at construction
+        bool triggered = false;   // the build has been kicked off (once per process)
+        bool running = false;     // a build is in flight and being measured
+        int64_t start_ms = 0;     // mono ms at the trigger, for total_ms
+        int64_t phase_ms = 0;     // mono ms the current lineup phase was entered
+        DailyLineup::Phase phase = DailyLineup::Phase::Idle;   // last phase observed
+        std::vector<DryRunSymbol> syms;   // one per pick, in tournament order
+        std::string tourn_symbol;         // pick whose tournament is in flight ("" = none)
+        int64_t tourn_start_ms = 0;
+        // Admission ran and refused the whole day (LineupPlan::start false). It
+        // reaches Phase::Done like a good build does, so "which phase did it die
+        // in" cannot see it — and a build that runs every tournament and then
+        // starts nothing is the single most important thing a dry run can find.
+        bool admission_refused = false;
+        // Fetch counters at the trigger. The source's counters are
+        // process-lifetime (a chart or warmup fetch spends them too), so the
+        // summary reports the DELTA across the build rather than the totals.
+        net::HistStats hist0;
+        DryRunSummary sum;
+    };
+    LineupDryRun dry_;
+    static const char* dryrun_phase_name(DailyLineup::Phase p);
+    void pump_lineup_dryrun();          // UI thread, per frame: trigger, then observe
+    void dryrun_tournament_settled();   // pump_daily_lineup: a pick's tournament ended
+    void dryrun_record_plan(const LineupPlan& plan);   // pump_daily_lineup: admission
+    void dryrun_finish(const std::string& abort);      // summary + exit code + quit
+
     // Broker-disconnect watchdog: fire a webhook alert when the order path is
     // down for more than a minute during a live session. STATE-based (not a log
     // scan), so it catches even a silent freeze where nothing is logged — the
@@ -414,6 +484,11 @@ private:
     // Steady seconds since construction — the clock for anything that must keep
     // time on a frame that is never drawn, where ImGui::GetTime() stands still.
     double mono_s() const;
+    // Same clock in milliseconds — what the dry run's timings are measured on.
+    // Steady, not wall: the VPS re-syncs NTP overnight and a build straddling
+    // that would report a negative phase, which is what HistoryFreshness and
+    // BarCache already refuse to trust the wall clock for.
+    int64_t mono_ms() const;
     std::chrono::steady_clock::time_point mono_epoch_ = std::chrono::steady_clock::now();
 
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
@@ -618,6 +693,7 @@ private:
     // thread (the sole producer to the engine's SPSC command ring).
     std::atomic<bool> diag_kill_requested_{false};
 
+    int exit_code_ = 0;               // process status; see exit_code()
     bool should_quit_ = false;        // host loop exits when true
     bool pending_quit_ = false;       // quit awaiting the "live trading" confirm
     bool pending_signout_ = false;    // sign-out awaiting the "live trading" confirm

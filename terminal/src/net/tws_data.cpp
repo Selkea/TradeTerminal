@@ -181,6 +181,10 @@ struct TwsData::Io final : DefaultEWrapper {
             const std::string gkey =
                 hist_key(dead->symbol, dead->bar, dead->dur);
             if (!gate.try_send(gkey, now_ms, dead->prio)) continue;
+            // A retry is a send: it spends the budget and it shows up in IB's
+            // request count, so it has to show up in ours (0.15.0 shipped
+            // forgetting that once already).
+            d.hs_requests_sent_.fetch_add(1, std::memory_order_relaxed);
             const int64_t age = now_ms - dead->sent_ms;
             const int new_id =
                 static_cast<int>(d.next_id_.fetch_add(1, std::memory_order_relaxed));
@@ -313,7 +317,7 @@ struct TwsData::Io final : DefaultEWrapper {
         // that is free to go.
         std::vector<CandleReq> deferred;
         for (size_t ri = 0; ri < reqs.size(); ++ri) {
-            const CandleReq& r = reqs[ri];
+            CandleReq& r = reqs[ri];   // non-const: held_mask is updated in place
             // Resolve to IB's own terms FIRST. The clamp is part of the request's
             // identity — 1h/"5y" and 1h/"max" are one request to IB — so both the
             // cache lookup and the pacing gate below have to see the resolved
@@ -333,8 +337,14 @@ struct TwsData::Io final : DefaultEWrapper {
             // series into one fetch (net/bar_cache.h). Delivered on THIS thread,
             // through the same callback a real delivery uses, under the caller's
             // own request id — so the routing in App is identical either way.
-            if (const std::vector<Candle>* hit =
-                    bars.get(r.symbol, wire.bar, wire.dur, now_steady)) {
+            const std::vector<Candle>* hit =
+                bars.get(r.symbol, wire.bar, wire.dur, now_steady);
+            // Publish the cache's OWN counters rather than keeping a second
+            // tally beside them — one lookup must never be able to read as a hit
+            // here and a miss there. See HistStats.
+            d.hs_cache_hits_.store(bars.hits(), std::memory_order_relaxed);
+            d.hs_cache_misses_.store(bars.misses(), std::memory_order_relaxed);
+            if (hit) {
                 CandleBatch b;
                 b.id = r.id;
                 b.symbol = r.symbol;
@@ -358,6 +368,7 @@ struct TwsData::Io final : DefaultEWrapper {
             // backtest by request id) instead of waiting out its own timeout too.
             if (r.queued_ms != 0 && now_steady - r.queued_ms > kHistQueueMaxWaitMs) {
                 held_logged_.erase(gkey);
+                d.hs_abandoned_.fetch_add(1, std::memory_order_relaxed);
                 d.log(r.symbol + " " + r.interval + " " + r.range + ": giving up on a "
                       "request held " + std::to_string((now_steady - r.queued_ms) / 1000) +
                       "s by IB pacing - nobody is still waiting for it");
@@ -385,6 +396,27 @@ struct TwsData::Io final : DefaultEWrapper {
             // -minutes budget before the tournaments had started.
             const SendHold hold = gate.hold(gkey, now_steady, r.prio);
             if (hold != SendHold::None) {
+                // Count the REQUEST once per reason, not once per pass — see
+                // CandleReq::held_mask. Same idea as held_logged_ below, but
+                // per-request rather than per-key, and it covers MinGap too.
+                const uint8_t bit =
+                    static_cast<uint8_t>(1u << static_cast<int>(hold));
+                if (!(r.held_mask & bit)) {
+                    r.held_mask |= bit;
+                    switch (hold) {
+                    case SendHold::MinGap:
+                        d.hs_held_min_gap_.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case SendHold::Identical:
+                        d.hs_held_identical_.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case SendHold::Budget:
+                        d.hs_held_budget_.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case SendHold::None:
+                        break;   // unreachable: guarded above
+                    }
+                }
                 // Logged once per hold, not once per pass: the io_loop re-enters
                 // roughly every second, and the Budget case can persist for
                 // minutes. Only Identical and Budget are worth a line — MinGap is
@@ -412,6 +444,7 @@ struct TwsData::Io final : DefaultEWrapper {
                 continue;
             }
             gate.record(gkey, now_steady);
+            d.hs_requests_sent_.fetch_add(1, std::memory_order_relaxed);
             held_logged_.erase(gkey);
             if (wire.clamped)
                 d.log(r.symbol + ": " + r.range + " of " + r.interval +
