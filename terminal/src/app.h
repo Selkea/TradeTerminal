@@ -21,7 +21,9 @@
 #include "net/hist_freshness.h"
 #include "net/tws_data.h"
 #include "symbol_params.h"   // LineupPlan, in the dry run's admission hook
+#include "tick_clock.h"      // MonoClock — the clock every deadline below is on
 #include "update_check.h"
+#include "watchdog_timer.h"
 #include "panels/backtest.h"
 #include "panels/blotter.h"
 #include "panels/replay.h"
@@ -55,37 +57,33 @@ public:
     explicit App(std::string gateway_url);
     ~App();
 
-    void draw();
+    // ---- the two halves of a host-loop iteration --------------------------
+    //
+    // TICK the app, then (only if there is any point) DRAW it. The split is the
+    // 2026-08-11 fix: every scheduler, state machine and watchdog lives in
+    // tick(), which main.cpp calls unconditionally, so none of them can be
+    // switched off by minimizing the window, docking a panel behind a sibling
+    // tab, or disconnecting the RDP session that owns the display.
+    //
+    // Everything reachable from tick() is ImGui-FREE — there is no frame in
+    // progress when it runs — and every deadline it evaluates is on mono_s()
+    // rather than ImGui::GetTime(). Both halves are load-bearing; see
+    // tick_clock.h for what happens if only one of them is done.
+    //
+    // Returns how many milliseconds the host may sleep before ticking again
+    // (tick_sleep_ms): a period, so a tick that overran its slot returns 0. The
+    // rendering path ignores it — the vsynced swap paces that loop already.
+    int tick();
 
-    // Host-loop hook for iterations that draw NO frame (the window is
-    // iconified). Runs the wall-clock work that must not be skipped just
-    // because nobody is looking; touches no ImGui state. draw() calls it too,
-    // so it is the single list of "must tick regardless".
-    void pump_background();
+    // Draw one frame. PURELY presentation: reads state tick() advanced, submits
+    // widgets, and decides nothing that has a clock on it. Skipping it must
+    // never change what the app does, only what is on screen.
+    void draw();
 
     // Window-close request from the host loop. Quits immediately if nothing is
     // trading; otherwise pops a confirm dialog and quits only once confirmed.
     void request_quit();
     bool should_quit() const { return should_quit_; }
-
-    // True while this process is a headless run that must keep drawing even with
-    // no window on screen.
-    //
-    // The host loop skips App::draw() entirely when the window is iconified, and
-    // pump_daily_lineup() — the lineup's whole state machine — runs ONLY from
-    // draw(). So an iconified window does not merely stop rendering, it freezes
-    // the build: measured on 2026-08-11, a dry run's window was iconified about
-    // three minutes in and the lineup stopped advancing on the spot, with
-    // nothing in the log to say why (the gateway's own thread kept logging, so
-    // the log looked alive). Nobody is looking at a headless run's window by
-    // definition, so drawing the frame costs one vsync and buys a build that
-    // actually finishes.
-    //
-    // Deliberately scoped to the dry run. The same hazard applies to the real
-    // 09:35 build on a minimized VPS window, but fixing that changes behaviour
-    // for every ordinary run, and this hook is required to be inert when
-    // TT_AUTORUN_LINEUP is unset.
-    bool headless_run() const { return dry_.active; }
 
     // Process exit status. Zero for every ordinary run; the headless dry run
     // (TT_AUTORUN_LINEUP=1) sets it so a scheduled job can branch on the build's
@@ -441,11 +439,9 @@ private:
     // scan), so it catches even a silent freeze where nothing is logged — the
     // gap that let a gateway outage go unnoticed for hours. See pump_broker_watchdog.
     void pump_broker_watchdog();
-    double broker_down_since_s_ = 0.0;       // GetTime when the broker first went down (0 = up)
-    double broker_down_last_alert_s_ = 0.0;  // GetTime of the last down-alert (0 = none this episode)
+    WatchdogTimer broker_wd_;                // grace + re-alert bookkeeping (mono_s)
     void pump_orphan_watchdog();
-    double orphan_since_s_ = 0.0;            // GetTime an adopted position first showed up naked
-    double orphan_last_alert_s_ = 0.0;       // GetTime of the last orphan alert (0 = none)
+    WatchdogTimer orphan_wd_;                // ditto, for adopted-but-naked positions
 
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07
@@ -459,8 +455,11 @@ private:
     // age, and a symbol that has never been answered at all has to be aged from
     // something — session start is the only honest anchor (and makes the grace
     // period double as a settle-in window after a restart).
-    double hist_live_since_s_ = 0.0;         // GetTime the current live session was first seen
-    double hist_stale_last_alert_s_ = 0.0;   // GetTime of the last stale-bars alert (0 = none)
+    //
+    // Not a WatchdogTimer: `since` here is the SESSION clock rather than the
+    // start of a stale episode, and the clear path deliberately leaves it alone.
+    double hist_live_since_s_ = 0.0;         // mono_s the current live session was first seen
+    double hist_stale_last_alert_s_ = 0.0;   // mono_s of the last stale-bars alert (0 = none)
     // The interval the autopilot re-fetches, i.e. the series that is supposed
     // to stay fresh. Shared by /diag, /metrics and the watchdog so all three
     // report the same thing.
@@ -473,7 +472,7 @@ private:
     // burned 13 hours on 2026-08-09. Pages if the gateway is up but not logged
     // in, then makes AT MOST ONE relaunch attempt (day stamp + paper only + the
     // script's own governor: IBKR locks accounts on repeated failed logins) and
-    // polls the outcome. Runs from pump_background(), NOT only from draw().
+    // polls the outcome. Runs from tick(), so no frame is needed.
     void pump_preopen_gateway_check();
     bool preopen_authed() const;             // farms up, or a live order path reaching IBKR
     int64_t preopen_day_ = -1;               // tm_year*400+tm_yday of the last check
@@ -481,15 +480,13 @@ private:
     double preopen_bad_since_ = 0.0;         // mono_s when it first read not-authed (0 = it doesn't)
     double preopen_verdict_until_ = 0.0;     // mono_s deadline for the post-relaunch verdict (0 = none)
 
-    // Steady seconds since construction — the clock for anything that must keep
-    // time on a frame that is never drawn, where ImGui::GetTime() stands still.
-    double mono_s() const;
-    // Same clock in milliseconds — what the dry run's timings are measured on.
-    // Steady, not wall: the VPS re-syncs NTP overnight and a build straddling
-    // that would report a negative phase, which is what HistoryFreshness and
-    // BarCache already refuse to trust the wall clock for.
-    int64_t mono_ms() const;
-    std::chrono::steady_clock::time_point mono_epoch_ = std::chrono::steady_clock::now();
+    // Steady seconds/ms since construction — THE clock for every deadline in
+    // this class, because tick() runs on iterations where no frame is built and
+    // ImGui::GetTime() stands still there (and then jumps by the whole gap on
+    // the next frame). See tick_clock.h for the incident this replaced.
+    double mono_s() const { return mono_.now_s(); }
+    int64_t mono_ms() const { return mono_.now_ms(); }
+    MonoClock mono_;
 
     // Daily-lineup live swap: when a scheduled (auto-start) build finishes while
     // a session is already running, cycle the session onto the new picks WITHOUT
@@ -502,7 +499,7 @@ private:
     void begin_lineup_swap(const TradePanel::StartOpts& next);  // kick off the cycle
     void pump_lineup_swap();                 // UI thread, per frame: drive it
     SwapStage swap_stage_ = SwapStage::None;
-    double swap_deadline_s_ = 0.0;           // ImGui::GetTime() give-up for the flatten
+    double swap_deadline_s_ = 0.0;           // mono_s() give-up for the flatten
     std::vector<uint32_t> swap_flatten_ids_; // dropped symbol_ids being closed
     TradePanel::StartOpts swap_opts_;        // the new lineup to restart on
 
@@ -675,11 +672,11 @@ private:
     } signin_;
 
     // While the gateway is being launched, show "INITIALIZING" until it is up.
-    // Holds an ImGui::GetTime() deadline; 0 = not starting.
+    // Holds a mono_s() deadline; 0 = not starting.
     double gateway_starting_until_ = 0.0;
 
-    // Last periodic config save (ImGui::GetTime()); saves run once a minute
-    // so a force-killed process loses at most a minute of settings.
+    // Last periodic config save (mono_s()); saves run once a minute so a
+    // force-killed process loses at most a minute of settings.
     double last_cfg_save_ = 0.0;
 
     // ---- diagnostics endpoint (net/diag_server.h) ----
@@ -687,7 +684,7 @@ private:
     std::mutex diag_mu_;
     std::string diag_json_ = "{}";     // published by pump_diag(), read by the server
     std::string metrics_text_;         // Prometheus /metrics body, published alongside
-    double diag_next_build_s_ = 0.0;   // next UI-thread re-render (ImGui::GetTime())
+    double diag_next_build_s_ = 0.0;   // next UI-thread re-render (mono_s())
     std::time_t session_start_ = 0;    // wall-clock app start, for /diag uptime
     // Set by the diag server thread on POST /control/kill; consumed on the UI
     // thread (the sole producer to the engine's SPSC command ring).
@@ -702,7 +699,7 @@ private:
     bool update_check_click_ = false;   // Help > Check for updates clicked this frame
     bool update_check_wait_ = false;    // a manual check is in flight
     uint32_t update_check_gen_ = 0;     // check_count() snapshot when it started
-    double update_check_started_ = 0.0; // GetTime() at start, for a timeout
+    double update_check_started_ = 0.0; // mono_s() at start, for a timeout
 
     bool had_ini_ = false;
     bool layout_checked_ = false;

@@ -182,6 +182,60 @@ TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
     return opts;
 }
 
+// The session schedule, driven from App::tick() so it cannot be switched off by
+// the Trade panel being hidden, collapsed, or docked behind a sibling tab (see
+// the declaration for the incident). Touches no ImGui — there is no frame here.
+void TradePanel::pump_schedule(const AccountInfo& account,
+                               const ParamSpecsFn& strat_params, bool polygon_available,
+                               bool finnhub_available, bool ibkr_ready,
+                               const StartFn& start) {
+    if (!sched_on_) return;
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    const int now_min = tm.tm_hour * 60 + tm.tm_min;
+
+    if (eng_.live_snapshot().running) {
+        // Scheduled stop: cancel + flatten + stop when the local clock crosses
+        // the stop time. Edge-triggered, so a session started manually after
+        // hours is left alone. While anything runs, mark today as "started" so a
+        // manual stop is not followed by a same-day auto-restart.
+        //
+        // The edge detector is exactly why this could not stay in draw(): with
+        // sched_prev_min_ only sampled on drawn frames, a window minimized at
+        // 15:40 and restored at 16:10 steps the detector straight past the
+        // crossing, so the stop is not merely late — it never fires at all.
+        const int stop_min = parse_hhmm(sched_stop_);
+        sched_last_start_day_ = tm.tm_yday;
+        if (stop_min >= 0 && sched_prev_min_ >= 0 && sched_prev_min_ < stop_min &&
+            now_min >= stop_min) {
+            eng_.kill_switch();   // cancel all orders + flatten positions
+            eng_.stop_live();     // graceful stop, joins the live thread
+        }
+        sched_prev_min_ = now_min;
+        return;
+    }
+
+    // Auto-start: level-triggered inside the window so a reboot mid-morning
+    // still brings the session up; the once-per-day guard (also set while a
+    // session runs, above) keeps a manual stop from bouncing right back.
+    if (pending_.empty() || !start || eng_.running()) return;
+    const int start_min = parse_hhmm(sched_start_);
+    const int stop_min = parse_hhmm(sched_stop_);
+    const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
+    // sched_blocked_day_: the daily lineup already decided today's tabs must not
+    // trade (block_scheduled_start). Without this test the lineup's "starting
+    // NOTHING" was purely advisory — this branch would start the very tabs it
+    // rejected, on the very parameters it rejected them for.
+    if (start_min >= 0 && stop_min >= 0 && weekday &&
+        tm.tm_yday != sched_last_start_day_ && tm.tm_yday != sched_blocked_day_ &&
+        now_min >= start_min && now_min < stop_min) {
+        sched_last_start_day_ = tm.tm_yday;
+        start(build_start_opts(account, strat_params, polygon_available,
+                               finnhub_available, ibkr_ready));
+    }
+}
+
 void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                       const ParamSpecsFn& strat_params, const StratNameFn& strat_name,
                       const AutoPickFn& autopick, bool polygon_available,
@@ -537,30 +591,9 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         ImGui::SetNextItemWidth(48);
         ImGui::InputText("##schedstop", sched_stop_, sizeof sched_stop_);
 
-        // Auto-start: level-triggered inside the window so a reboot mid-morning
-        // still brings the session up; the once-per-day guard (also set while a
-        // session runs, below) keeps a manual stop from bouncing right back.
-        if (sched_on_ && !pending_.empty() && start && !eng_.running()) {
-            const int start_min = parse_hhmm(sched_start_);
-            const int stop_min = parse_hhmm(sched_stop_);
-            std::time_t now_tt = std::time(nullptr);
-            std::tm tm{};
-            localtime_s(&tm, &now_tt);
-            const int now_min = tm.tm_hour * 60 + tm.tm_min;
-            const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
-            // sched_blocked_day_: the daily lineup already decided today's tabs
-            // must not trade (block_scheduled_start). Without this test the
-            // lineup's "starting NOTHING" was purely advisory — this branch
-            // would start the very tabs it rejected, on the very parameters it
-            // rejected them for.
-            if (start_min >= 0 && stop_min >= 0 && weekday &&
-                tm.tm_yday != sched_last_start_day_ &&
-                tm.tm_yday != sched_blocked_day_ && now_min >= start_min &&
-                now_min < stop_min) {
-                sched_last_start_day_ = tm.tm_yday;
-                do_start();
-            }
-        }
+        // The schedule ITSELF lives in pump_schedule(), off App::tick(). Only its
+        // controls are here: a scheduler that runs from draw() is one an operator
+        // switches off by clicking a neighbouring dock tab.
         if (sched_on_) {
             std::time_t now_tt = std::time(nullptr);
             std::tm tm{};
@@ -578,25 +611,8 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     }
 
     // ---- running session ----
-    // Scheduled stop: cancel + flatten + stop when the local clock crosses the
-    // stop time. Edge-triggered, so a session started manually after hours is
-    // left alone. While anything runs, mark today as "started" so a manual
-    // stop is not followed by a same-day auto-restart.
-    if (sched_on_) {
-        std::time_t now_tt = std::time(nullptr);
-        std::tm tm{};
-        localtime_s(&tm, &now_tt);
-        const int now_min = tm.tm_hour * 60 + tm.tm_min;
-        const int stop_min = parse_hhmm(sched_stop_);
-        sched_last_start_day_ = tm.tm_yday;
-        if (stop_min >= 0 && sched_prev_min_ >= 0 && sched_prev_min_ < stop_min &&
-            now_min >= stop_min) {
-            eng_.kill_switch();   // cancel all orders + flatten positions
-            eng_.stop_live();     // graceful stop, joins the live thread
-        }
-        sched_prev_min_ = now_min;
-    }
-
+    // The scheduled stop is in pump_schedule(), off App::tick(): its edge
+    // detector steps straight past 15:55 if it is only sampled on drawn frames.
     // ---- line 1: account + PAPER/LIVE tag (left), equity/cash (mid), feed (right) ----
     ImGui::TextUnformatted(account.label.empty() ? "Simulator" : account.label.c_str());
     ImGui::SameLine();
