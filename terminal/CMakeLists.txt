@@ -140,6 +140,7 @@ add_executable(tt_terminal_tests
     tests/test_market_calendar.cpp
     tests/test_strategies.cpp
     tests/test_symbol_params.cpp
+    tests/test_lineup_dryrun.cpp
     src/panels/log_console.cpp
     src/journal.cpp
     src/config.cpp   # test_symbol_params round-trips per-symbol params through it

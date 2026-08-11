@@ -550,6 +550,10 @@ App::App(std::string gateway_url)
         cfg_.lineup_build_time.size() < sizeof lineup_build_buf_)
         std::snprintf(lineup_build_buf_, sizeof lineup_build_buf_, "%s",
                       cfg_.lineup_build_time.c_str());
+    // TT_AUTORUN_LINEUP=1: this process is a propose-only daily-lineup DRY RUN.
+    // Latched once, here, so every guard downstream tests one flag rather than
+    // re-reading the environment (and so the mode cannot change mid-run).
+    dry_.active = std::getenv("TT_AUTORUN_LINEUP") != nullptr;
     {
         RiskLimits r;
         r.max_order_qty = cfg_.risk_max_order_qty;
@@ -1589,6 +1593,12 @@ TradePanel::AccountInfo App::trade_account_info() {
 // launch still catches it. On a non-propose-only build the lineup arms its own
 // auto-start when it reaches Done (see pump_daily_lineup / start_live_session).
 void App::pump_lineup_schedule() {
+    // A dry run drives its OWN build (pump_lineup_dryrun) and must never trade.
+    // The clock-driven build is the same start_daily_lineup call, but it passes
+    // autostart_when_done = !cfg_.lineup_propose_only — so on a box configured
+    // to auto-start, letting this fire would hand a dry run a live session. Off
+    // for the whole run, regardless of what config.json says.
+    if (dry_.active) return;
     if (!cfg_.lineup_enabled) return;
     // Never interrupt a running session or an in-flight build/optimize.
     if (lineup_active() || engine_.running() || tourn_.active || sweep_.running) return;
@@ -1977,6 +1987,11 @@ void App::pump_daily_lineup() {
 
     case Phase::Tournaments: {
         if (tourn_.active || sweep_.running) return;   // let the current one finish
+        // Past that guard, any tournament this build launched has ENDED — this
+        // is the only point in the frame where that is true, and tourn_.results
+        // is still the field that just ran (start_tournament clears it). A dry
+        // run has to read it here or not at all. No-op unless one is active.
+        dryrun_tournament_settled();
         if (lineup_.tourn_idx >= lineup_.picks.size()) {
             lineup_.phase = Phase::Done;
             return;
@@ -1994,6 +2009,14 @@ void App::pump_daily_lineup() {
         route("lineup: tournament " + std::to_string(lineup_.tourn_idx) + "/" +
                  std::to_string(lineup_.picks.size()) + " - " + sym);
         start_tournament(rq, sym, {}, /*for_lineup=*/true);
+        // Stamp the pick even if start_tournament refused: a refusal is one of
+        // the ways a pick ends the build with no fit, and a dry run that only
+        // timed the tournaments that STARTED would report a shorter build with
+        // fewer symbols than it actually had.
+        if (dry_.running) {
+            dry_.tourn_symbol = sym;
+            dry_.tourn_start_ms = mono_ms();
+        }
         return;
     }
 
@@ -2019,6 +2042,9 @@ void App::pump_daily_lineup() {
             outcomes.emplace_back(sym, o);
         }
         const LineupPlan plan = plan_lineup(outcomes);
+        // The dry run's per-symbol verdicts come from THIS plan, not from a
+        // second reading of the same inputs. No-op unless one is active.
+        dryrun_record_plan(plan);
         for (const std::string& sym : plan.own_previous)
             route_operator("lineup: " + sym +
                      " has no fit from this morning's tournament - trading its OWN "
@@ -2070,6 +2096,196 @@ void App::pump_daily_lineup() {
         return;
     }
     }
+}
+
+// ---- headless daily-lineup dry run (TT_AUTORUN_LINEUP=1) ------------------
+//
+// See App::LineupDryRun. This is instrumentation around the production lineup,
+// not a second implementation of it: the only thing here that CAUSES anything is
+// the one start_daily_lineup() call below, which is the same call the 09:35
+// schedule makes. Everything else reads state the build has already produced.
+
+// Phase names for the "dryrun: phase=" lines. Short, stable, no spaces —
+// scripts group on these.
+const char* App::dryrun_phase_name(DailyLineup::Phase p) {
+    switch (p) {
+    case DailyLineup::Phase::Scanning:     return "scan";
+    case DailyLineup::Phase::FetchingBars: return "fetch_bars";
+    case DailyLineup::Phase::Ranking:      return "rank";
+    case DailyLineup::Phase::Tournaments:  return "tournaments";
+    case DailyLineup::Phase::Done:         return "admit";
+    case DailyLineup::Phase::Idle:         break;
+    }
+    return "idle";
+}
+
+// How long the dry run waits for a data session before giving up. The app
+// launches IB Gateway itself on the TWS route and a cold login is minutes, so
+// this has to be generous — but it has to EXIST: without it a box whose gateway
+// never comes up leaves the process sitting at a hidden window forever, and the
+// only thing that would ever notice is the caller's kill timeout, which cannot
+// say why. This exits non-zero with a reason instead.
+static constexpr int64_t kDryRunConnectWaitMs = 5 * 60 * 1000;
+
+void App::pump_lineup_dryrun() {
+    if (!dry_.active) return;
+    using Phase = DailyLineup::Phase;
+    const int64_t now = mono_ms();
+
+    // ---- trigger: once, as soon as the data session can serve a scan --------
+    if (!dry_.triggered) {
+        if (!data_.connected()) {
+            if (now > kDryRunConnectWaitMs) {
+                dry_.triggered = dry_.running = true;   // so finish will report
+                dry_.start_ms = 0;
+                route_operator(dryrun_start_line());
+                dryrun_finish("no-data-session");
+            }
+            return;
+        }
+        dry_.triggered = true;
+        dry_.running = true;
+        dry_.start_ms = dry_.phase_ms = now;
+        dry_.hist0 = data_.hist_stats();   // counters are process-lifetime; bracket them
+        route_operator(dryrun_start_line());
+        // autostart_when_done = FALSE, hard-coded. Not cfg_.lineup_propose_only:
+        // the persisted config is exactly what a dry run must not be able to
+        // trade on. start_live_session() refuses for the whole run as well, so
+        // this is belt and braces rather than the only guard.
+        start_daily_lineup(/*autostart_when_done=*/false);
+        if (lineup_.phase == Phase::Idle) {
+            // Refused before it began (wrong data route, session not up,
+            // optimizer busy). start_daily_lineup already logged which.
+            dryrun_finish("not-started");
+            return;
+        }
+        dry_.phase = lineup_.phase;
+        dry_.phase_ms = now;
+        return;
+    }
+    if (!dry_.running) return;
+
+    // ---- observe: one line per phase, as the phase ENDS --------------------
+    if (lineup_.phase == dry_.phase) return;
+    std::string detail;
+    switch (dry_.phase) {
+    case Phase::Scanning:
+        dry_.sum.pool = lineup_.pool.size();
+        detail = "pool=" + std::to_string(lineup_.pool.size());
+        break;
+    case Phase::FetchingBars:
+        dry_.sum.delivered = lineup_.bars.size();
+        detail = "delivered=" + std::to_string(lineup_.bars.size()) + '/' +
+                 std::to_string(lineup_.pool.size()) +
+                 " awaiting=" + std::to_string(lineup_.awaiting.size());
+        break;
+    case Phase::Ranking:
+        dry_.sum.picks = lineup_.picks.size();
+        detail = "picks=" + std::to_string(lineup_.picks.size());
+        break;
+    case Phase::Tournaments:
+        detail = "symbols=" + std::to_string(dry_.syms.size());
+        break;
+    case Phase::Done:
+        detail = "fitted=" +
+                 std::to_string(dryrun_count(dry_.syms, DryRunOutcome::Fitted));
+        break;
+    case Phase::Idle:
+        break;   // never the phase that "ended"
+    }
+    route_operator(dryrun_phase_line(dryrun_phase_name(dry_.phase),
+                                     now - dry_.phase_ms, detail));
+    const Phase ended = dry_.phase;
+    dry_.phase = lineup_.phase;
+    dry_.phase_ms = now;
+    if (lineup_.phase != Phase::Idle) return;
+    // Back to Idle = the build settled. Reaching Idle from anywhere but Done is
+    // one of the lineup's early exits, and the phase it died in is the one thing
+    // that tells them apart; the lineup logs its own reason in prose, this makes
+    // it a token. Reaching it from Done is a build that ran to completion —
+    // which is NOT the same as a build that produced something, so admission's
+    // own refusal gets a token of its own.
+    dryrun_finish(ended != Phase::Done
+                      ? std::string("gave-up-in-") + dryrun_phase_name(ended)
+                      : (dry_.admission_refused ? std::string("admission-refused")
+                                                : std::string()));
+}
+
+// A pick's tournament has ended (or never started). Called from
+// pump_daily_lineup at the one point in the frame where the field that just ran
+// is still readable.
+void App::dryrun_tournament_settled() {
+    if (!dry_.running || dry_.tourn_symbol.empty()) return;
+    DryRunSymbol s;
+    s.symbol = dry_.tourn_symbol;
+    s.tournament_ms = mono_ms() - dry_.tourn_start_ms;
+    // Only read the tournament if it is still OURS. Nothing else should be able
+    // to run one here (the autopilot is gated on a live session, and a dry run
+    // has none), but attributing another target's field to this pick would be a
+    // silent lie of exactly the kind Tournament::for_lineup exists to prevent.
+    if (tourn_.target_symbol == s.symbol) {
+        s.candidates_total = static_cast<int>(tourn_.candidates.size());
+        for (const Tournament::Entry& e : tourn_.results)
+            if (e.valid) ++s.candidates_ok;
+    }
+    // Provisional: what the TOURNAMENT achieved. Admission has not run yet, so
+    // a symbol with no fit today may still turn out to be admitted on its own
+    // earlier fit or excluded — dryrun_record_plan refines this, and the summary
+    // is what carries the final verdict.
+    s.outcome = lineup_.fitted.count(s.symbol) ? DryRunOutcome::Fitted
+                                               : DryRunOutcome::NoCandidate;
+    dry_.syms.push_back(s);
+    route_operator(dryrun_tournament_line(s, dry_.syms.size(),
+                                          lineup_.picks.size()));
+    dry_.tourn_symbol.clear();
+}
+
+// Admission decided. Copy its verdicts onto the picks we timed — the plan is the
+// production rule (symbol_params.h), and re-deriving it here would let the
+// report drift from what the build actually did.
+void App::dryrun_record_plan(const LineupPlan& plan) {
+    if (!dry_.running) return;
+    auto mark = [&](const std::vector<std::string>& list, DryRunOutcome o) {
+        for (const std::string& sym : list)
+            for (DryRunSymbol& s : dry_.syms)
+                // Fitted is this build's own achievement and outranks every
+                // admission verdict: a fitted symbol appears in plan.admitted
+                // and must not be relabelled by it.
+                if (s.symbol == sym && s.outcome != DryRunOutcome::Fitted)
+                    s.outcome = o;
+    };
+    mark(plan.own_previous, DryRunOutcome::OwnPrevious);
+    mark(plan.holding_only, DryRunOutcome::HoldingOnly);
+    mark(plan.excluded, DryRunOutcome::Excluded);
+    dry_.admission_refused = !plan.start;
+}
+
+// The build settled: emit the one line a monitor keeps, set the process status,
+// and quit. `abort` is "" for a build that ran through to admission.
+void App::dryrun_finish(const std::string& abort) {
+    if (!dry_.running) return;
+    dry_.running = false;
+    dry_.sum.total_ms = mono_ms() - dry_.start_ms;
+    dry_.sum.abort = abort;
+    // The DELTA across the build. The source's counters are process-lifetime and
+    // a chart or warmup fetch spends them too, so reporting the totals would
+    // charge this build for requests it never made.
+    const net::HistStats h1 = data_.hist_stats();
+    auto delta = [](uint64_t now, uint64_t then) { return now >= then ? now - then : 0; };
+    dry_.sum.hist.cache_hits = delta(h1.cache_hits, dry_.hist0.cache_hits);
+    dry_.sum.hist.cache_misses = delta(h1.cache_misses, dry_.hist0.cache_misses);
+    dry_.sum.hist.requests_sent = delta(h1.requests_sent, dry_.hist0.requests_sent);
+    dry_.sum.hist.held_min_gap = delta(h1.held_min_gap, dry_.hist0.held_min_gap);
+    dry_.sum.hist.held_identical = delta(h1.held_identical, dry_.hist0.held_identical);
+    dry_.sum.hist.held_budget = delta(h1.held_budget, dry_.hist0.held_budget);
+    dry_.sum.hist.abandoned = delta(h1.abandoned, dry_.hist0.abandoned);
+    route_operator(dryrun_summary_line(dry_.sum, dry_.syms));
+    exit_code_ = dryrun_exit_code(dry_.syms);
+    // request_quit(), not should_quit_ = true: it is the path that refuses to
+    // quit out from under a live session. Nothing should be live here — the
+    // start guard above makes sure of it — but the dry run is not the place to
+    // invent a second way out of the app.
+    request_quit();
 }
 
 namespace {
@@ -2913,6 +3129,10 @@ void App::draw() {
     pump_lineup_schedule();   // fire the daily build on the clock (before its pump)
     pump_lineup_swap();       // drive an in-progress live swap onto new picks
     pump_daily_lineup();
+    // AFTER pump_daily_lineup, deliberately: the dry run reports the phase that
+    // just ended, so it has to see this frame's transition rather than last
+    // frame's. No-op unless TT_AUTORUN_LINEUP is set.
+    pump_lineup_dryrun();
     pump_broker_watchdog();   // alert (webhook) if the order path drops mid-session
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
@@ -3134,7 +3354,12 @@ void App::draw() {
 
     // TT_AUTORUN_LIVE=1: start a session, manual buy, kill switch — headless
     // verification of the whole live path.
-    if (std::getenv("TT_AUTORUN_LIVE")) {
+    //
+    // Not while TT_AUTORUN_LINEUP is set. This one calls engine_.start_live()
+    // directly, so it is the one live-start path that does NOT go through
+    // start_live_session()'s dry-run refusal — and "propose-only" has to mean it
+    // whatever else the environment asks for.
+    if (!dry_.active && std::getenv("TT_AUTORUN_LIVE")) {
         const LiveSnapshot s = engine_.live_snapshot();
         if (autorun_live_stage_ == 0) {
             autorun_live_stage_ = 1;
@@ -3241,6 +3466,22 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // was reordered while cfg.symbol_params and the strategy vector were not:
     // AMIX ran ORB with RSI-2's parameters and SNDQ ran RSI-2 with ORB's.
     // Reordering the one list every loop reads makes that impossible.
+    // TT_AUTORUN_LINEUP=1 is a PROPOSE-ONLY dry run: build the lineup, report
+    // it, trade nothing. Enforced here rather than at the call sites because
+    // this is the single choke point every start path goes through — the Trade
+    // panel's Start button, its scheduled auto-start, the daily lineup's own
+    // auto-start, and pump_lineup_swap's restart. Forcing it here means the
+    // guarantee holds REGARDLESS of what the persisted config says about
+    // lineup_propose_only or the session schedule, which is the whole point: a
+    // dry run on the production box must not be able to trade because
+    // config.json happens to be set to auto-start.
+    if (dry_.active) {
+        route_operator(std::string(kDryRunTag) +
+                       " REFUSED a live-session start - TT_AUTORUN_LINEUP is a "
+                       "propose-only dry run; no session is started and no order "
+                       "is ever submitted");
+        return;
+    }
     TradePanel::StartOpts opts = opts_in;
     order_by_feed_fidelity(opts.symbols,
                            [](const TradePanel::SymbolOpt& s) { return s.strat_key; });
@@ -3956,6 +4197,13 @@ void App::draw_data_menu() {
 // Critical = money is at risk right now; Warning = something needs a look;
 // Info = fills (webhook only, no beep — they can be frequent).
 void App::alert_scan(const std::string& l) {
+    // A dry run runs the REAL lineup, so it emits the real verdicts — including
+    // "lineup: ABORTED", which classify_alert rates Critical and which would page
+    // the operator as though the morning's production build had refused the
+    // trading day. It didn't; a scheduled rehearsal did. The line still reaches
+    // the log ring, /logs and /events, so nothing is hidden — only the phone is
+    // spared. The dry run's own verdict travels in its exit code.
+    if (dry_.active) return;
     switch (classify_alert(l)) {
     case AlertClass::Critical: alerts_.notify(AlertNotifier::Critical, l); break;
     case AlertClass::Warning:  alerts_.notify(AlertNotifier::Warning, l); break;
@@ -4186,6 +4434,12 @@ void App::pump_history_watchdog() {
 double App::mono_s() const {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                          mono_epoch_).count();
+}
+
+int64_t App::mono_ms() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - mono_epoch_)
+        .count();
 }
 
 // Everything that must keep ticking on a frame that is never drawn.

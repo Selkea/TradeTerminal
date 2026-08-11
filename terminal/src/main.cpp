@@ -212,7 +212,12 @@ int main() {
             glfwSetWindowShouldClose(window, GLFW_FALSE);
             app.request_quit();
         }
-        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+        // app.headless_run(): a scripted run (TT_AUTORUN_LINEUP=1) keeps drawing
+        // whatever the window does. draw() is the only thing that advances the
+        // daily lineup's state machine, so skipping the frame does not just stop
+        // rendering — it freezes the build the run exists to measure, silently.
+        // Nobody is watching a headless run's window, so the frame is free.
+        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) && !app.headless_run()) {
             // Not drawing is not the same as not watching. The pre-open gateway
             // check is wall-clock driven and its whole job is to fire in an
             // unattended morning window; a minimized window used to disable it
@@ -243,6 +248,13 @@ int main() {
         }
     }
 
+    // The app's verdict on this run. Captured BEFORE teardown so the watchdog
+    // below can force-exit with it: a watchdog that always exits 0 would turn
+    // every slow teardown into a green run, which for a scripted dry run
+    // (TT_AUTORUN_LINEUP=1) means reporting a lineup that produced nothing as a
+    // success. Zero for every ordinary run.
+    const int exit_status = app.exit_code();
+
 #ifdef _WIN32
     // Shutdown watchdog. The broker/data I/O threads can block for many seconds
     // tearing down — a blocking eConnect to a down IB Gateway (~20 s OS timeout,
@@ -252,9 +264,9 @@ int main() {
     // failure. Guarantee death: if teardown isn't done within the deadline, force
     // exit. Settings are safe — imgui.ini is flushed just below and config.json
     // is saved first thing in ~App, both well inside the window.
-    std::thread([] {
+    std::thread([exit_status] {
         std::this_thread::sleep_for(std::chrono::seconds(8));
-        TerminateProcess(GetCurrentProcess(), 0);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(exit_status));
     }).detach();
 #endif
 
@@ -272,5 +284,5 @@ int main() {
     glfwDestroyWindow(window);
     glfwTerminate();
     timeEndPeriod(1);
-    return 0;
+    return exit_status;
 }
