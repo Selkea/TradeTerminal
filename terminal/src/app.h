@@ -147,8 +147,11 @@ private:
     void pump_pending_run();   // UI thread, per frame
 
     // ---- parameter sweep (all state UI-thread only unless noted) ----
-    void queue_sweep(const SweepPanel::Request& rq);
+    void queue_sweep(const SweepPanel::Request& rq, bool for_tournament = false);
     void stash_pending_sweep(net::CandleBatch& batch);   // IPC thread
+    // Drop a candle request the caller has given up waiting for, so a late batch
+    // cannot start a sweep whose owner is gone (see SweepSetup::for_tournament).
+    void cancel_pending_sweep();
     void pump_sweep();                                   // UI thread, per frame
     void start_sweep_cell();
     void start_opt_param();   // begin the current param's 1-D sweep
@@ -172,12 +175,20 @@ private:
         std::vector<Entry> results;
         SweepPanel::Request base;
         std::string target_symbol;   // Trade tab row the champion applies to
+        // The daily lineup started this one, so its outcome is the lineup's to
+        // record. Asking "is lineup_.phase == Tournaments?" instead was wrong:
+        // pump_autopilot runs BEFORE pump_daily_lineup in the frame and has no
+        // lineup guard, so on the frame a lineup tournament ends the autopilot
+        // can grab the free optimizer and its failure would be filed against the
+        // lineup's pick. Who STARTED it is the only thing that answers this.
+        bool for_lineup = false;
         double stamp_s = 0;          // phase-entry time, for timeouts
     };
     Tournament tourn_;
     // candidates: explicit strategy keys to race; empty = built-in + all loaded.
     void start_tournament(SweepPanel::Request rq, const std::string& target_symbol,
-                          std::vector<std::string> candidates = {});
+                          std::vector<std::string> candidates = {},
+                          bool for_lineup = false);
     void pump_tournament();      // UI thread, per frame
     void finish_tournament();
 
@@ -226,6 +237,13 @@ private:
         std::map<std::string, std::vector<tt::RankBar>> bars;  // fetched, per pool sym
         std::set<std::string> awaiting;      // pool syms whose bars aren't in yet
         std::vector<std::string> picks;      // ranked winners (installed as tabs)
+        // Picks whose tournament crowned a champion and INSTALLED it on their
+        // own tab. Recorded positively, by finish_tournament at the install
+        // line: a pick missing from this set has no parameters fitted to itself,
+        // so Phase::Done refuses to let it trade another symbol's set (see
+        // SymbolOutcome::fitted_this_build for why the failed-list inverse was
+        // wrong — most failure paths never reach finish_tournament at all).
+        std::set<std::string> fitted;
         std::size_t tourn_idx = 0;           // next pick to run a tournament for
         bool autostart = false;              // on Done, start the live session
     };
@@ -265,6 +283,22 @@ private:
     // daily-lineup scheduler (extracted from the panel start callback so the
     // scheduler can't drift from the manual path).
     void start_live_session(const TradePanel::StartOpts& opts);
+    // The strategy's declared parameter specs, in the shape the Trade panel
+    // wants. One definition instead of the identical lambda every call site was
+    // spelling out — admission now needs it too, and it must not drift.
+    TradePanel::ParamSpecsFn param_specs_fn();
+    // Lineup verdicts the operator has to be able to read REMOTELY. route()
+    // files anything prefixed "lineup:" into optimizer.log, which /logs, /events
+    // and the alert channel never see — the same trap that hid the live output
+    // during the zero-live-trades investigation. Before 0.16.0 the lineup always
+    // started something, so "no session today" was not even a reachable outcome;
+    // now it is, and it must not be reachable silently.
+    void route_operator(std::string line);
+    // symbol -> "own" / "mixed" / "inherited" / "none": where the RUNNING
+    // session's parameters for that symbol came from, latched at start and
+    // reported by /diag. On 2026-08-10 all six symbols inherited one SSPC fit
+    // and no field anywhere said so (see symbol_params.h).
+    std::map<std::string, std::string> live_param_source_;
     // The active-account snapshot the Trade panel header shows; also feeds the
     // scheduler's auto-start so it routes to the same broker/sub-accounts.
     TradePanel::AccountInfo trade_account_info();
@@ -431,12 +465,34 @@ private:
         IStrategy* strategy = nullptr;   // leased instance
         std::string key;                 // strategy key, for the label
         std::map<std::string, double> params;   // captured at queue time
+        // Who asked for this sweep, decided when it was QUEUED. Reading
+        // tourn_.active at completion instead was the 0.16.0 blocker: a
+        // candidate abandoned at the 60s Queued timeout leaves its candle
+        // request outstanding, and stash_pending_sweep matches on symbol +
+        // interval only, so a late batch could still fire that sweep long after
+        // the tournament ended — and it then completed as a "manual run",
+        // writing an unadjudicated in-sample winner into the shared map. That is
+        // exactly defect A, back again by the very timeouts that caused it.
+        bool for_tournament = false;
     };
     SweepSetup sweep_setup_;
     SweepPanel::State sweep_;
     BacktestConfig sweep_base_;          // train slice
     std::vector<Bar> sweep_test_bars_;   // holdout slice (never optimized on)
     bool sweep_holdout_phase_ = false;
+    // SweepSetup::for_tournament, latched onto the RUNNING sweep when its bars
+    // are consumed (sweep_setup_ is reusable the moment that happens).
+    bool sweep_for_tournament_ = false;
+    // A manual sweep's winner, waiting on its holdout run before it is written
+    // to the swept symbol's tab. Only the names the sweep actually TUNED: the
+    // rest of opt_.best is just the strategy-wide starting point, and writing
+    // those onto the symbol would silently overwrite ten per-symbol values the
+    // sweep is forbidden to touch (sweep_param_is_fixed). Held back until the
+    // holdout scores because AdmitOwnPrevious will trade this set unattended
+    // tomorrow morning — an in-sample winner that then fails its holdout must
+    // not become the symbol's "own" fit.
+    std::string sweep_fit_symbol_;
+    std::map<std::string, double> sweep_fit_params_;
     IStrategy* sweep_strategy_ = nullptr;
 
     std::mutex pending_bt_mu_;

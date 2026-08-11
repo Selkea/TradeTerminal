@@ -61,6 +61,21 @@ TEST_CASE("classify_alert: a genuine half-open ORDER still pages as Warning") {
     CHECK(classify_alert("tws-feed: stream lost, reconnecting") == AlertClass::Warning);
 }
 
+TEST_CASE("classify_alert: a refused trading day reaches the operator") {
+    // Before 0.16.0 the lineup always started SOMETHING, so "no session today"
+    // was not a reachable outcome. It is now, and it must not be silent — these
+    // lines also bypass route() (which files anything "lineup:" into
+    // optimizer.log, which /logs and /events never serve).
+    CHECK(classify_alert("lineup: ABORTED - not one of 6 picks produced a usable "
+                         "parameter set.") == AlertClass::Critical);
+    CHECK(classify_alert("lineup: EXCLUDED MUU, SOXS - no fit from this morning's "
+                         "tournament") == AlertClass::Warning);
+    // Ordinary lineup prose must stay quiet, or the daily build pages six times.
+    CHECK(classify_alert("lineup: ready - 6 symbols loaded into the Trade tabs") ==
+          AlertClass::None);
+    CHECK(classify_alert("lineup: tournament 3/6 - KORU") == AlertClass::None);
+}
+
 TEST_CASE("classify_alert: fills are Info, plain lines are None") {
     CHECK(classify_alert("live: fill #7 BUY 100 @ 12.34") == AlertClass::Info);
     CHECK(classify_alert("candles: SOXL 5m x9750") == AlertClass::None);

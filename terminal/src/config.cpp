@@ -32,6 +32,8 @@ AppConfig AppConfig::load(const std::string& path) {
     c.trade_sched_on = j.value("trade_sched_on", c.trade_sched_on);
     c.trade_sched_start = j.value("trade_sched_start", c.trade_sched_start);
     c.trade_sched_stop = j.value("trade_sched_stop", c.trade_sched_stop);
+    c.trade_sched_blocked_day =
+        j.value("trade_sched_blocked_day", c.trade_sched_blocked_day);
     c.lineup_enabled = j.value("lineup_enabled", c.lineup_enabled);
     c.lineup_build_time = j.value("lineup_build_time", c.lineup_build_time);
     c.lineup_propose_only = j.value("lineup_propose_only", c.lineup_propose_only);
@@ -110,6 +112,8 @@ AppConfig AppConfig::load(const std::string& path) {
             if (pv.is_object())
                 for (const auto& [k, v] : pv.items())
                     if (v.is_number()) c.strategy_params[key][k] = v.get<double>();
+    c.strategy_params_purged =
+        j.value("strategy_params_purged", c.strategy_params_purged);
     if (j.contains("strategy_tourn_excluded") && j["strategy_tourn_excluded"].is_array())
         for (const auto& s : j["strategy_tourn_excluded"])
             if (s.is_string()) c.strategy_tourn_excluded.push_back(s.get<std::string>());
@@ -131,6 +135,7 @@ void AppConfig::save(const std::string& path) const {
         {"trade_sched_on", trade_sched_on},
         {"trade_sched_start", trade_sched_start},
         {"trade_sched_stop", trade_sched_stop},
+        {"trade_sched_blocked_day", trade_sched_blocked_day},
         {"lineup_enabled", lineup_enabled},
         {"lineup_build_time", lineup_build_time},
         {"lineup_propose_only", lineup_propose_only},
@@ -194,6 +199,7 @@ void AppConfig::save(const std::string& path) const {
     j["active_log"] = active_log;
     j["strategy_loaded"] = strategy_loaded;
     j["strategy_params"] = strategy_params;
+    j["strategy_params_purged"] = strategy_params_purged;
     j["strategy_tourn_excluded"] = strategy_tourn_excluded;
 
     std::ofstream f(path);
