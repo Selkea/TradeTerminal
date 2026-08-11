@@ -102,3 +102,163 @@ TEST_CASE("the quiet window stays clear of the death timeout") {
     // mark it dead.
     CHECK(kBigBatchQuietMs < kHistTimeoutMs);
 }
+
+// ---- aggregate send rate ---------------------------------------------------
+//
+// The 2026-08-10 lineup build opened with 30 'candles: SYM 1d x21' deliveries
+// stamped in the SAME SECOND and put ~60 historical requests into a window IB
+// caps at 60 per 10 minutes. The data session went silent at 09:40:41 and stayed
+// silent for 20 minutes; a fresh client at 10:00:43 was served instantly.
+
+TEST_CASE("the first request of a session goes straight out") {
+    HistSendGate g;
+    CHECK(g.hold("SPY\x1f""5m\x1f""6mo", 0) == SendHold::None);
+    CHECK(g.try_send("SPY\x1f""5m\x1f""6mo", 0));
+    CHECK(g.window_sends(0) == 1);
+}
+
+TEST_CASE("the 30-request opening burst is spread, not sent in one second") {
+    HistSendGate g;
+    // The literal shape of the burst: 30 different symbols queued together.
+    int64_t now = 0;
+    int sent_in_first_second = 0;
+    for (int i = 0; i < 30; ++i)
+        if (g.try_send("SYM" + std::to_string(i), now)) ++sent_in_first_second;
+    CHECK(sent_in_first_second == 1);
+    // Walking the clock forward at the minimum gap gets all 30 out, in order,
+    // across 15 seconds rather than 30 in one.
+    int sent = 1;
+    for (int i = 1; i < 30; ++i) {
+        now += kHistMinGapMs;
+        if (g.try_send("SYM" + std::to_string(i), now)) ++sent;
+    }
+    CHECK(sent == 30);
+    CHECK(now == 29 * kHistMinGapMs);
+    CHECK(now <= 15'000);
+}
+
+TEST_CASE("the minimum gap is enforced between any two requests") {
+    HistSendGate g;
+    REQUIRE(g.try_send("A", 1'000));
+    CHECK(g.hold("B", 1'000) == SendHold::MinGap);
+    CHECK(g.hold("B", 1'000 + kHistMinGapMs - 1) == SendHold::MinGap);
+    CHECK_FALSE(g.try_send("B", 1'000 + kHistMinGapMs - 1));
+    CHECK(g.hold("B", 1'000 + kHistMinGapMs) == SendHold::None);
+    CHECK(g.try_send("B", 1'000 + kHistMinGapMs));
+}
+
+TEST_CASE("a held request records nothing, so it does not shift the next gap") {
+    HistSendGate g;
+    REQUIRE(g.try_send("A", 0));
+    CHECK_FALSE(g.try_send("B", 100));    // rejected...
+    CHECK_FALSE(g.try_send("B", 200));    // ...and did not restart the clock
+    CHECK(g.try_send("B", kHistMinGapMs));
+    CHECK(g.window_sends(kHistMinGapMs) == 2);
+}
+
+TEST_CASE("an IDENTICAL request inside 15s is refused, per IB's own rule") {
+    // SSPC 5m/6mo, twice, 12 seconds apart — the exact violation in the build.
+    HistSendGate g;
+    const std::string sspc = "SSPC\x1f""5m\x1f""6mo";
+    REQUIRE(g.try_send(sspc, 0));
+    // Well past the minimum gap, so this is the identical rule and nothing else.
+    CHECK(g.hold(sspc, 12'000) == SendHold::Identical);
+    CHECK_FALSE(g.try_send(sspc, 12'000));
+    CHECK(g.hold(sspc, kHistIdenticalGapMs - 1) == SendHold::Identical);
+    CHECK(g.hold(sspc, kHistIdenticalGapMs) == SendHold::None);
+    CHECK(g.try_send(sspc, kHistIdenticalGapMs));
+}
+
+TEST_CASE("a DIFFERENT request is not blocked by the identical rule") {
+    HistSendGate g;
+    REQUIRE(g.try_send("SSPC\x1f""5m\x1f""6mo", 0));
+    // Same symbol, different series: a warmup fetch is not the 6-month fetch.
+    CHECK(g.hold("SSPC\x1f""5m\x1f""1d", 12'000) == SendHold::None);
+    CHECK(g.try_send("SSPC\x1f""5m\x1f""1d", 12'000));
+}
+
+TEST_CASE("the identical window is at least IB's documented 15 seconds") {
+    // Pinned as a value, not just as behaviour: this one is IBKR's number, and
+    // editing it downward is a pacing violation however reasonable it looks.
+    CHECK(kHistIdenticalGapMs >= 15'000);
+}
+
+TEST_CASE("the rolling 10-minute budget stops at IB's ceiling, with headroom") {
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindow; ++i) {
+        REQUIRE(g.try_send("SYM" + std::to_string(i), now));
+        now += kHistMinGapMs;
+    }
+    CHECK(g.window_sends(now) == kHistMaxPerWindow);
+    CHECK(g.hold("ONE_MORE", now) == SendHold::Budget);
+    CHECK_FALSE(g.try_send("ONE_MORE", now));
+    // Retries and a reconnect's re-queue are sends too, so the ceiling must sit
+    // BELOW the number IB actually counts.
+    CHECK(kHistMaxPerWindow < 60);
+}
+
+TEST_CASE("the budget frees up as sends age out of the window") {
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindow; ++i) {
+        REQUIRE(g.try_send("SYM" + std::to_string(i), now));
+        now += kHistMinGapMs;
+    }
+    REQUIRE(g.hold("LATER", now) == SendHold::Budget);
+    // The first send ages out one window after it was made, not after the last.
+    CHECK(g.hold("LATER", kHistWindowMs) == SendHold::Budget);
+    CHECK(g.hold("LATER", kHistWindowMs + 1) == SendHold::None);
+    CHECK(g.try_send("LATER", kHistWindowMs + 1));
+}
+
+TEST_CASE("the minimum gap is checked before the budget") {
+    // Ordering matters for the log line the operator reads: "already used 50 of
+    // IB's 60" is a real diagnosis and "500 ms early" is noise, so the cheap
+    // ordinary case must not be reported as the alarming one.
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindow; ++i) {
+        REQUIRE(g.try_send("SYM" + std::to_string(i), now));
+        now += kHistMinGapMs;
+    }
+    CHECK(g.hold("X", now - kHistMinGapMs + 1) == SendHold::MinGap);
+}
+
+TEST_CASE("a session teardown clears the budget but keeps the identical window") {
+    // The budget is IB's accounting for a client that no longer exists, so a
+    // reconnect starts clean. The identical-request window is not about the
+    // client at all — and drop_connection re-queues everything that was in
+    // flight, so a teardown is exactly when duplicates appear.
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindow; ++i) {
+        REQUIRE(g.try_send("SYM" + std::to_string(i), now));
+        now += kHistMinGapMs;
+    }
+    REQUIRE(g.hold("FRESH", now) == SendHold::Budget);
+    g.session_lost();
+    CHECK(g.window_sends(now) == 0);
+    CHECK(g.hold("FRESH", now) == SendHold::None);      // budget released
+    CHECK(g.hold("SYM0", now) == SendHold::None);       // sent long ago, aged out
+    // SYM49 went out on the last tick before the teardown; still inside 15s.
+    CHECK(g.hold("SYM" + std::to_string(kHistMaxPerWindow - 1), now) ==
+          SendHold::Identical);
+}
+
+TEST_CASE("the minimum gap cannot exceed the identical window") {
+    // If it did, the identical rule would be unreachable — every request would
+    // already have been held by the cheaper check, and the log would never name
+    // the pacing rule that was actually being broken.
+    CHECK(kHistMinGapMs < kHistIdenticalGapMs);
+    // And the spacing must stay far under a fetch's own death timeout, or
+    // pacing a request would be what kills it.
+    CHECK(kHistMinGapMs < kHistTimeoutMs);
+}
+
+TEST_CASE("the whole build's request load fits inside one window") {
+    // A lineup build is 30 daily-bar requests for the ranking pass plus one 5m
+    // series per pick (6), once the cache removes the duplicates. If that did not
+    // fit in the budget, the build would stall on its own pacing.
+    CHECK(30 + 6 < kHistMaxPerWindow);
+}

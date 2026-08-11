@@ -56,6 +56,11 @@ struct HistPending {
     // about the TWS-side id we swap underneath it.
     uint32_t pub_id = 0;
     std::string symbol, interval;
+    // The CALLER's range ("6mo", "1mo", ...), kept unclamped. It is the third
+    // component of the net/bar_cache.h key, and the delivery is the only place
+    // the cache can be filled — see BarCacheKey for why a series must never be
+    // keyed by symbol + interval alone.
+    std::string range;
     std::string dur, bar;        // resolved IB strings, kept so we can re-issue
     std::vector<Candle> candles;
     // Last issue, in steady ms: this is what the timeout classifier measures,

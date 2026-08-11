@@ -1,5 +1,6 @@
 #include "net/tws_data.h"
 
+#include "net/bar_cache.h"
 #include "net/hist_pacing.h"
 #include "net/hist_requests.h"
 
@@ -123,6 +124,16 @@ int64_t steady_ms() {
         .count();
 }
 
+// The identity of a historical request, for BOTH the bar cache and the pacing
+// gate. One function so the two can never disagree about what "the same
+// request" means — IB's 15-second identical-request rule and the cache's
+// "already have this series" answer have to be about the same thing.
+// '\x1f' (unit separator) is not legal in a ticker, an interval or a range.
+std::string req_key(const std::string& symbol, const std::string& interval,
+                    const std::string& range) {
+    return symbol + '\x1f' + interval + '\x1f' + range;
+}
+
 } // namespace
 
 struct TwsData::Io final : DefaultEWrapper {
@@ -136,6 +147,19 @@ struct TwsData::Io final : DefaultEWrapper {
     // caller's id across the swap. See net/hist_requests.h for why (a retry that
     // reused its own id was destroyed by its own cancel acknowledgement).
     HistRequests hist;
+    // Delivered series, replayed instead of re-fetched (net/bar_cache.h). This
+    // is the single biggest lever on the daily lineup build: 97.3% of the
+    // 2026-08-10 build's 1543 s was dead IO wait, and a tournament's five
+    // candidates were each fetching the same symbol's same series.
+    BarCache bars;
+    // Aggregate send rate (net/hist_pacing.h): minimum spacing, IB's 15s
+    // identical-request rule, and the rolling 60-per-10-minutes budget the same
+    // build exhausted.
+    HistSendGate gate;
+    // Request keys we have already logged a pacing hold for. pump_requests runs
+    // every io_loop pass (~1/s) and a budget hold can last minutes, so without
+    // this one held request would write hundreds of identical log lines.
+    std::unordered_set<std::string> held_logged_;
     // Distinct farm-status codes already reported (the stream repeats them).
     std::unordered_set<int> farm_codes_seen;
     // When the last historicalDataEnd landed, and how big it was. IB stops
@@ -183,6 +207,14 @@ struct TwsData::Io final : DefaultEWrapper {
         for (const int id : hist.dead_ids(now_ms, blocked)) {
             const HistPending* dead = hist.find(id);
             if (!dead) continue;
+            // A retry is a send, so it spends the same budget and obeys the same
+            // minimum spacing as a first issue (net/hist_pacing.h). It cannot be
+            // held by the 15s identical rule — the request it repeats went out at
+            // least kHistTimeoutMs (20s) ago — but it CAN be held by a budget the
+            // build has already spent, which is precisely when re-sending would
+            // be the thing that keeps the session silent.
+            const std::string gkey = req_key(dead->symbol, dead->interval, dead->range);
+            if (!gate.try_send(gkey, now_ms)) continue;
             const int64_t age = now_ms - dead->sent_ms;
             const int new_id =
                 static_cast<int>(d.next_id_.fetch_add(1, std::memory_order_relaxed));
@@ -259,6 +291,15 @@ struct TwsData::Io final : DefaultEWrapper {
                 d.cbs_.on_error(p.pub_id, "tws",
                                 "connection lost fetching " + p.symbol);
         hist.clear();
+        // Cached bars belong to the SESSION that delivered them (see
+        // kBarCacheTtlMs), the same rule auth_.session_lost() above follows: the
+        // reason we are here is usually that history stopped being answered, and
+        // replaying that session's last answers across the reconnect would hide
+        // exactly the failure the reconnect exists to clear. The send budget goes
+        // with it — it is IB's accounting for a client that no longer exists.
+        bars.clear();
+        gate.session_lost();
+        held_logged_.clear();
         // An in-flight scan will never complete; deliver empty so the caller
         // (which is waiting on its callback) isn't left hanging.
         if (scan.running) {
@@ -300,22 +341,13 @@ struct TwsData::Io final : DefaultEWrapper {
                 have_scan = true;
             }
         }
+        // Requests we could not send on this pass. Held individually rather than
+        // "everything from here on", so one series waiting out IB's 15s
+        // identical-request window cannot head-of-line-block a different symbol
+        // that is free to go.
+        std::vector<CandleReq> deferred;
         for (size_t ri = 0; ri < reqs.size(); ++ri) {
             const CandleReq& r = reqs[ri];
-            // Quiet window after a large delivery (see kBigBatchBars): sending
-            // into it is what gets a request silently dropped. Put the rest back
-            // and come round again — the io_loop re-enters within ~1s.
-            const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::steady_clock::now() - last_hist_end)
-                                       .count();
-            if (history_send_blocked(last_hist_bars, since_end)) {
-                {
-                    std::lock_guard lock(d.mu_);
-                    d.reqs_.insert(d.reqs_.begin(),
-                                   reqs.begin() + static_cast<ptrdiff_t>(ri), reqs.end());
-                }
-                break;   // NOT return: the stream/scan work below was already drained
-            }
             const char* bar = tws_bar_size(r.interval);
             int di = dur_idx(r.range);
             if (!bar || di < 0) {
@@ -324,6 +356,70 @@ struct TwsData::Io final : DefaultEWrapper {
                                     "cannot fetch " + r.symbol + " " + r.interval);
                 continue;
             }
+            const int64_t now_steady = steady_ms();
+            const std::string gkey = req_key(r.symbol, r.interval, r.range);
+            // Already have it: answer without touching the wire. This is what
+            // turns a tournament's five candidate fetches of one symbol's one
+            // series into one fetch (net/bar_cache.h). Delivered on THIS thread,
+            // through the same callback a real delivery uses, under the caller's
+            // own request id — so the routing in App is identical either way.
+            if (const std::vector<Candle>* hit =
+                    bars.get(r.symbol, r.interval, r.range, now_steady)) {
+                CandleBatch b;
+                b.id = r.id;
+                b.symbol = r.symbol;
+                b.interval = r.interval;
+                b.cached = true;   // NOT proof the session works — see App::on_candles
+                b.candles = *hit;
+                d.log(r.symbol + " " + r.interval + " " + r.range + ": served " +
+                      std::to_string(b.candles.size()) +
+                      " bars from cache, no IB request (cache " +
+                      std::to_string(bars.hits()) + " hit / " +
+                      std::to_string(bars.misses()) + " miss)");
+                if (d.cbs_.on_candles) d.cbs_.on_candles(std::move(b));
+                continue;
+            }
+            // Quiet window after a large delivery (see kBigBatchBars): sending
+            // into it is what gets a request silently dropped. Put the rest back
+            // and come round again — the io_loop re-enters within ~1s. This one
+            // IS all-or-nothing: the window is a property of the socket, not of
+            // the request, so nothing queued behind it can go either.
+            const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - last_hist_end)
+                                       .count();
+            if (history_send_blocked(last_hist_bars, since_end)) {
+                deferred.insert(deferred.end(),
+                                reqs.begin() + static_cast<ptrdiff_t>(ri), reqs.end());
+                break;   // NOT return: the stream/scan work below was already drained
+            }
+            // Aggregate rate (net/hist_pacing.h). The 2026-08-10 build put 30
+            // requests on the wire inside one second and spent IB's 60-per-10
+            // -minutes budget before the tournaments had started.
+            const SendHold hold = gate.hold(gkey, now_steady);
+            if (hold != SendHold::None) {
+                // Logged once per hold, not once per pass: the io_loop re-enters
+                // roughly every second, and the Budget case can persist for
+                // minutes. Only Identical and Budget are worth a line — MinGap is
+                // the ordinary 500 ms spacing and would say nothing.
+                // The dedup set is emptied on a session teardown and on each
+                // successful send, so it tracks only currently-held keys — but
+                // a request abandoned while held would leave one behind, so cap
+                // it rather than trust that.
+                if (held_logged_.size() > 512) held_logged_.clear();
+                if (hold != SendHold::MinGap && held_logged_.insert(gkey).second)
+                    d.log(r.symbol + " " + r.interval + " " + r.range + ": holding "
+                          "the request back - " +
+                          (hold == SendHold::Identical
+                               ? "identical request sent less than 15s ago (IB pacing "
+                                 "rule)"
+                               : "already used " +
+                                     std::to_string(gate.window_sends(now_steady)) +
+                                     " of IB's 60 historical requests per 10 minutes"));
+                deferred.push_back(r);
+                continue;
+            }
+            gate.record(gkey, now_steady);
+            held_logged_.erase(gkey);
             const int cap = max_dur_idx(r.interval);
             if (di > cap) {
                 d.log(r.symbol + ": " + r.range + " of " + r.interval +
@@ -342,11 +438,20 @@ struct TwsData::Io final : DefaultEWrapper {
             p.pub_id = r.id;
             p.symbol = r.symbol;
             p.interval = r.interval;
+            p.range = r.range;   // the cache key's third component
             p.dur = dur;
             p.bar = bar;
             p.sent_ms = p.first_sent_ms = steady_ms();
             hist.add(req_id, std::move(p));
+            d.log(r.symbol + " " + r.interval + " " + r.range +
+                  ": fetching from IB (cache miss, req " + std::to_string(req_id) +
+                  ", " + std::to_string(gate.window_sends(steady_ms())) + "/" +
+                  std::to_string(kHistMaxPerWindow) + " in the 10-minute budget)");
             send_history(req_id, *hist.find(req_id));
+        }
+        if (!deferred.empty()) {
+            std::lock_guard lock(d.mu_);
+            d.reqs_.insert(d.reqs_.begin(), deferred.begin(), deferred.end());
         }
         if (dirty) {
             for (auto it = streams.begin(); it != streams.end();) {
@@ -527,6 +632,12 @@ struct TwsData::Io final : DefaultEWrapper {
         b.symbol = p->symbol;
         b.interval = p->interval;
         b.candles = std::move(p->candles);
+        // Fill the cache under the caller's OWN range, which the request has
+        // carried since it was queued. The next consumer of this exact series —
+        // the tournament's next candidate, four of which asked for it four times
+        // on 2026-08-10 — is answered from here instead of from IB.
+        // put() ignores an empty delivery; see net/bar_cache.h.
+        bars.put(p->symbol, p->interval, p->range, b.candles, steady_ms());
         hist.erase(reqId);
         // Remember how much just landed: the next request must not follow a big
         // batch too closely (see kBigBatchBars).

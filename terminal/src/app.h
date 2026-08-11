@@ -108,6 +108,10 @@ private:
     // when the matching candle response arrives.
     struct PendingBacktest {
         bool active = false;
+        // The id request_candles handed back. A delivery is OURS only if it
+        // carries this id — see SweepSetup::req_id for the 2026-08-10 incident
+        // that matching on symbol + interval caused.
+        uint32_t req_id = 0;
         std::string symbol, interval;
         std::map<std::string, double> params;
         double cash = 0.0;
@@ -152,7 +156,15 @@ private:
     // Drop a candle request the caller has given up waiting for, so a late batch
     // cannot start a sweep whose owner is gone (see SweepSetup::for_tournament).
     void cancel_pending_sweep();
+    // Is a queued sweep still waiting on (or holding) its bars? False means the
+    // fetch is settled one way or the other, so pump_tournament can stop
+    // burning its fetch budget on a request the feed has already errored out.
+    bool sweep_fetch_pending() const;
     void pump_sweep();                                   // UI thread, per frame
+    // One finished backtest, in the sweep state machine. Called in a loop by
+    // pump_sweep under a frame budget — the one-result-per-frame version made
+    // every cell cost a whole vsync period (see kSweepDrainBudgetMs).
+    void consume_sweep_result(BacktestResult& r);
     void start_sweep_cell();
     void start_opt_param();   // begin the current param's 1-D sweep
 
@@ -183,6 +195,11 @@ private:
         // lineup's pick. Who STARTED it is the only thing that answers this.
         bool for_lineup = false;
         double stamp_s = 0;          // phase-entry time, for timeouts
+        double start_s = 0;          // tournament-entry time, for the hard deadline
+        // Candidates already given a second turn at the back of the field, so a
+        // fetch that keeps timing out cannot be requeued forever. See
+        // kTournFetchTimeoutS.
+        std::set<std::string> requeued;
     };
     Tournament tourn_;
     // candidates: explicit strategy keys to race; empty = built-in + all loaded.
@@ -253,10 +270,16 @@ private:
     std::mutex lineup_mu_;
     std::vector<net::ScanHit> lineup_hits_;
     bool lineup_hits_ready_ = false;
-    // Symbols the FetchingBars phase is collecting, and the I/O thread's inbox
-    // of arrived bars — both guarded by lineup_mu_ so on_candles never touches
-    // the UI-thread DailyLineup directly.
-    std::set<std::string> lineup_want_bars_;
+    // Requests the FetchingBars phase is collecting (request id -> pool symbol),
+    // and the I/O thread's inbox of arrived bars — both guarded by lineup_mu_ so
+    // on_candles never touches the UI-thread DailyLineup directly.
+    //
+    // Keyed by REQUEST ID rather than by symbol, for the reason SweepSetup::req_id
+    // gives: a chart or warmup fetch of the same symbol's daily bars over a
+    // different span would otherwise be ranked as if it were the ranking pass's
+    // own 1mo fetch, and realized volatility computed off the wrong window picks
+    // the wrong symbols for the whole day.
+    std::map<uint32_t, std::string> lineup_want_bars_;
     std::vector<std::pair<std::string, std::vector<tt::RankBar>>> lineup_bar_inbox_;
     void start_daily_lineup(bool autostart_when_done = false);  // Trade menu / schedule
     void pump_daily_lineup();                      // UI thread, per frame
@@ -460,6 +483,22 @@ private:
     // pending_bt_mu_; everything else runs on the UI thread.
     struct SweepSetup {
         bool ready = false, waiting = false;
+        // The id request_candles handed back for THIS sweep's bars, and the only
+        // thing a delivery is matched on.
+        //
+        // Matching on symbol + interval instead is how, on 2026-08-10, a sweep
+        // labelled "SOXL 5m 6mo" ran on 1567 bars — a live-warmup fetch of the
+        // same symbol and the same interval over a completely different span (a
+        // real 6mo request returns ~2966-9517 bars). It optimized on the wrong
+        // dataset, silently, and finished 3 seconds after its tournament had
+        // already declared "no candidate produced a result", so its +0.1213
+        // holdout Sharpe — the only positive score in the entire build — was
+        // thrown away. Nothing in the log said the data was wrong, because as far
+        // as every label was concerned it was not.
+        //
+        // 0 = no request outstanding, which never matches a delivery: request ids
+        // start at 1 (TwsData::next_id_).
+        uint32_t req_id = 0;
         SweepPanel::Request req;
         std::vector<Bar> bars;
         IStrategy* strategy = nullptr;   // leased instance
@@ -495,7 +534,7 @@ private:
     std::map<std::string, double> sweep_fit_params_;
     IStrategy* sweep_strategy_ = nullptr;
 
-    std::mutex pending_bt_mu_;
+    mutable std::mutex pending_bt_mu_;   // mutable: sweep_fetch_pending() is const
     PendingBacktest pending_bt_;
 
     // ---- Account menu / Sign In modal ----
