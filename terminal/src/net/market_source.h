@@ -36,13 +36,23 @@ enum class AccountKind { Unknown, Paper, Live };
 // 2026-08-10 profile had to be reconstructed. Published as numbers so a headless
 // dry run (TT_AUTORUN_LINEUP=1) can state them instead of implying them.
 //
-// held_* count REQUESTS, not passes: a held request is re-offered to the gate on
-// every io_loop pass (~1 Hz) and a budget hold can last minutes, so counting
-// decisions would report the duration of the hold rather than how much work was
-// held. Each request is counted at most once per reason.
+// EVERYTHING HERE COUNTS REQUESTS, NOT PASSES — the one rule that makes these
+// numbers comparable to each other. A request the pacing gate holds is put back
+// on the queue and re-offered on every io_loop pass, so any counter incremented
+// where the decision is *evaluated* measures how long a hold lasted rather than
+// how much work it held.
+//
+// cache_misses got that wrong and shipped. The 2026-08-11 dry run reported
+// cache_hits=24 cache_misses=967 hist_requests=36: 967 "misses" against 36
+// actual fetches, because the miss was counted at the cache LOOKUP, which a
+// pacing-held request repeats every pass. cache_fetched below is counted at the
+// send instead, so cache_served + cache_fetched is the number of requests that
+// were resolved and the ratio is the real hit rate. cache_lookups keeps the old
+// number, correctly named: it measures gate churn, not caching.
 struct HistStats {
-    uint64_t cache_hits = 0;      // series served from the bar cache, no IB request
-    uint64_t cache_misses = 0;    // cache lookups that had to go to IB
+    uint64_t cache_served = 0;    // requests answered from cache — fetches AVOIDED
+    uint64_t cache_fetched = 0;   // requests that had to go to the wire (first issues)
+    uint64_t cache_lookups = 0;   // raw cache consultations, incl. one per pacing-held pass
     uint64_t requests_sent = 0;   // reqHistoricalData actually put on the wire (incl. retries)
     uint64_t held_min_gap = 0;    // SendHold::MinGap    — 500 ms spacing
     uint64_t held_identical = 0;  // SendHold::Identical — IB's 15 s identical-request rule
@@ -82,6 +92,13 @@ public:
     // an all-zero struct as "this source does not account for it", not as "no
     // fetching happened".
     virtual HistStats hist_stats() const { return {}; }
+
+    // True when this source gave up connecting because another program already
+    // holds its TWS API client id (IB error 326 — see engine/tws_client_id.h).
+    // It is LATCHED and terminal: nothing here will reconnect, so a reader must
+    // treat it as "this source is off until the app is restarted", not as a
+    // transient. Only the TWS route can report it; every other source says no.
+    virtual bool client_id_conflict() const { return false; }
 
     // Is the upstream gateway LOGGED IN to the broker, as opposed to merely
     // reachable? connected() above cannot answer that — an IB Gateway parked on

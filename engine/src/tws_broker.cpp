@@ -2,6 +2,7 @@
 
 #include "engine/clock.h"
 #include "engine/price_tick.h"
+#include "engine/tws_client_id.h"   // error 326: what it means, in words
 
 // TWS API (fetched at configure time; see third_party/CMakeLists.txt).
 #include "CommissionReport.h"
@@ -172,6 +173,25 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (errorCode == 10141) {   // paper disclaimer dialog not clicked yet (IBC lags login)
             b.log("gateway still accepting the paper disclaimer - retrying shortly");
             reset_conn = true;
+            return;
+        }
+        if (errorCode == kTwsClientIdInUse) {
+            // Another program owns client id 7 on this gateway. See
+            // engine/tws_client_id.h: permanent for as long as that program
+            // lives, so io_loop parks instead of retrying every 3 s.
+            //
+            // We do NOT quietly reconnect on some other id. The ids are a fixed
+            // allocation (orders 7, feed 8, data 9) and TWS scopes an API
+            // client's view of OPEN ORDERS to the id that placed them, so
+            // drifting off 7 would hand the connect-time reconciliation a
+            // different set of resting orders to adopt than the one this app
+            // has always adopted — on the order path, on a restart, which is
+            // the single place this codebase can least afford a surprise.
+            if (!b.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
+                b.log(tws_client_id_conflict_line("the ORDER path (nothing can "
+                                                  "reach the market)",
+                                                  b.cfg_.host, b.cfg_.port,
+                                                  b.cfg_.client_id));
             return;
         }
         b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
@@ -722,8 +742,25 @@ void TwsBroker::io_loop() {
     wake_.store(&io.signal, std::memory_order_release);
 
     auto last_connect = Clock::time_point{};
+    // See the kTwsClientIdInUse branch in Io::error: torn down once, then parked.
+    bool conflict_settled = false;
     while (!stop_.load(std::memory_order_acquire)) {
-        if (!io.client || !io.client->isConnected()) {
+        // Client id already taken by another program (IB error 326). Park —
+        // reconnecting cannot succeed while that program lives, and hammering it
+        // every 3 s is what buried the explanation on 2026-08-11. ready() stays
+        // false, so App::pump_broker_watchdog raises its own critical alert if a
+        // live session is running: the operator hears about it twice, which for
+        // the order path is correct.
+        if (client_id_conflict_.load(std::memory_order_acquire)) {
+            if (!conflict_settled) {
+                conflict_settled = true;
+                io.drop_connection();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            // Still drain the command ring below, or an engine that keeps
+            // submitting would block on a full SPSC ring rather than getting
+            // its orders back as rejects.
+        } else if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = Clock::now();
             if (now - last_connect >= std::chrono::seconds(3)) {

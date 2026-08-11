@@ -32,14 +32,19 @@ std::vector<tt::Candle> series(size_t n, double first_close = 1.0) {
 TEST_CASE("an empty cache misses, and a delivered series then hits") {
     BarCache c;
     CHECK(c.get("SSPC", "5m", "6mo", 0) == nullptr);
-    CHECK(c.misses() == 1);
-    CHECK(c.hits() == 0);
+    CHECK(c.served() == 0);
+    CHECK(c.lookups() == 1);
+    // A failed lookup on its own is NOT a fetch. It becomes one when the caller
+    // actually sends, and only then.
+    CHECK(c.fetched() == 0);
+    c.record_fetch();
+    CHECK(c.fetched() == 1);
 
     c.put("SSPC", "5m", "6mo", series(9'000), 0);
     const std::vector<tt::Candle>* hit = c.get("SSPC", "5m", "6mo", 1'000);
     REQUIRE(hit != nullptr);
     CHECK(hit->size() == 9'000);
-    CHECK(c.hits() == 1);
+    CHECK(c.served() == 1);
     CHECK(c.entries() == 1);
     CHECK(c.candles() == 9'000);
 }
@@ -52,14 +57,17 @@ TEST_CASE("the four SSPC fetches collapse to one") {
     BarCache c;
     int64_t t = 0;
     CHECK(c.get("SSPC", "5m", "6mo", t) == nullptr);   // the one real fetch
+    c.record_fetch();
     c.put("SSPC", "5m", "6mo", series(2'966), t);
     for (const int64_t at : {12'000, 75'000, 80'000}) {
         const std::vector<tt::Candle>* hit = c.get("SSPC", "5m", "6mo", at);
         REQUIRE(hit != nullptr);
         CHECK(hit->size() == 2'966);
     }
-    CHECK(c.hits() == 3);
-    CHECK(c.misses() == 1);
+    CHECK(c.served() == 3);
+    CHECK(c.fetched() == 1);
+    // Four requests in, one fetch out: the counters add up to the work done.
+    CHECK(c.served() + c.fetched() == 4);
 }
 
 TEST_CASE("the key separates symbol, bar size AND duration") {
@@ -236,6 +244,125 @@ TEST_CASE("expired entries are evicted ahead of live ones") {
     CHECK(c.entries() == 2);
     CHECK(c.get("STALE", "5m", "6mo", kBarCacheTtlMs + 1) == nullptr);
     CHECK(c.get("FRESH", "5m", "6mo", kBarCacheTtlMs + 1) != nullptr);
+}
+
+// ------------------------------------------------------------------ accounting
+//
+// The counters shipped broken and the numbers were read as evidence. These pin
+// the ONE property that makes them mean anything: a served() is a fetch that did
+// not happen, and served() + fetched() is the number of REQUESTS resolved.
+
+TEST_CASE("a pacing-held request counts ONCE, not once per io_loop pass") {
+    // The 2026-08-11 defect in miniature, and the reason the counter moved out
+    // of get(). TwsData::Io::pump_requests re-offers every queued request to the
+    // cache on EVERY io_loop pass, and that loop spins on inbound quote
+    // messages rather than on a timer — so one request the pacing gate holds for
+    // a few seconds consults the cache dozens of times. Counting the failed
+    // lookup made that ONE request read as dozens of cache misses, which is how
+    // the dry run came to report
+    //
+    //     cache_hits=24 cache_misses=967 hist_requests=36
+    //
+    // 967 against 36 was not a contradiction to be explained away; it was the
+    // gate's churn wearing the cache's label.
+    BarCache c;
+    const std::string sym = "TQQQ", bar = "5 mins", dur = "6 M";
+
+    // Candidate 1 asks. Nothing cached, so it goes on the wire.
+    int64_t t = 0;
+    CHECK(c.get(sym, bar, dur, t) == nullptr);
+    c.record_fetch();
+
+    // Candidates 2-5 are queued behind it. Until the delivery lands they are
+    // held by the gate and re-offered on every pass — each re-offer is another
+    // get() that finds nothing.
+    constexpr int kDuplicates = 4;
+    constexpr int kPassesInFlight = 40;
+    for (int p = 0; p < kPassesInFlight; ++p)
+        for (int d = 0; d < kDuplicates; ++d)
+            CHECK(c.get(sym, bar, dur, ++t) == nullptr);
+
+    // The answer arrives; every waiting candidate is served from it.
+    c.put(sym, bar, dur, series(9'517), ++t);
+    for (int d = 0; d < kDuplicates; ++d) REQUIRE(c.get(sym, bar, dur, ++t) != nullptr);
+
+    // Five requests. ONE fetch. That is the whole claim.
+    CHECK(c.fetched() == 1);
+    CHECK(c.served() == kDuplicates);
+    CHECK(c.served() + c.fetched() == 1 + kDuplicates);
+
+    // And the number that used to be called "misses", correctly labelled: it
+    // measures how hard the gate was deferring, not how badly the cache missed.
+    CHECK(c.lookups() == 1 + kDuplicates * kPassesInFlight + kDuplicates);
+    CHECK(c.lookups() > 10 * (c.served() + c.fetched()));
+}
+
+TEST_CASE("a request that misses and is later served is served, not both") {
+    // The reason the fetch is counted at the SEND and not at the failed lookup.
+    // Counting a miss the first time a request consults the cache would still be
+    // wrong for the commonest case in a tournament: the duplicate misses while
+    // the original is in flight, then hits. It would score one miss AND one hit
+    // for a single request, and hits + misses would exceed the requests made.
+    BarCache c;
+    CHECK(c.get("SOXL", "5 mins", "6 M", 0) == nullptr);   // in flight, held
+    CHECK(c.get("SOXL", "5 mins", "6 M", 1) == nullptr);   // still held
+    c.put("SOXL", "5 mins", "6 M", series(9'000), 2);
+    REQUIRE(c.get("SOXL", "5 mins", "6 M", 3) != nullptr);
+    CHECK(c.served() == 1);
+    CHECK(c.fetched() == 0);   // this request never reached the wire
+    CHECK(c.served() + c.fetched() == 1);
+}
+
+TEST_CASE("a cold build is all fetches and a warm one is all serves") {
+    // The two ends of the scale, so the ratio is anchored: nothing cached means
+    // fetched() == requests and a 0% hit rate; everything cached means
+    // served() == requests and 100%. Neither is expressible if a "miss" can be
+    // logged more than once per request.
+    BarCache cold;
+    for (int i = 0; i < 30; ++i) {   // the lineup's 30-symbol ranking pass
+        const std::string s = "SYM" + std::to_string(i);
+        CHECK(cold.get(s, "1 day", "1 M", 0) == nullptr);
+        cold.record_fetch();
+        cold.put(s, "1 day", "1 M", series(21), 0);
+    }
+    CHECK(cold.fetched() == 30);
+    CHECK(cold.served() == 0);
+
+    // Same 30 symbols again, inside the TTL: not one request reaches IB.
+    for (int i = 0; i < 30; ++i)
+        REQUIRE(cold.get("SYM" + std::to_string(i), "1 day", "1 M", 1'000) != nullptr);
+    CHECK(cold.fetched() == 30);
+    CHECK(cold.served() == 30);
+}
+
+TEST_CASE("an expired entry is a fetch again, not a free serve") {
+    // A hit must mean a fetch AVOIDED. An entry past its TTL avoids nothing —
+    // the caller has to go to IB — so it must not be counted as served.
+    BarCache c;
+    c.put("MUU", "5m", "6mo", series(4'000), 0);
+    REQUIRE(c.get("MUU", "5m", "6mo", kBarCacheTtlMs) != nullptr);
+    CHECK(c.served() == 1);
+    CHECK(c.get("MUU", "5m", "6mo", kBarCacheTtlMs + 1) == nullptr);
+    CHECK(c.served() == 1);   // unchanged: nothing was avoided
+    c.record_fetch();
+    CHECK(c.fetched() == 1);
+}
+
+TEST_CASE("clear() drops the bars but not the record of what the process did") {
+    // drop_connection() calls clear() on every data-session teardown, and the
+    // dry run brackets these counters as a delta across the build. Resetting
+    // them there would silently subtract every request made before a mid-build
+    // reconnect — and a reconnect is exactly when the numbers matter most.
+    BarCache c;
+    CHECK(c.get("SOXS", "5m", "6mo", 0) == nullptr);
+    c.record_fetch();
+    c.put("SOXS", "5m", "6mo", series(5'000), 0);
+    REQUIRE(c.get("SOXS", "5m", "6mo", 0) != nullptr);
+    c.clear();
+    CHECK(c.entries() == 0);
+    CHECK(c.served() == 1);
+    CHECK(c.fetched() == 1);
+    CHECK(c.lookups() == 2);
 }
 
 TEST_CASE("clear() drops everything, because bars belong to a session") {

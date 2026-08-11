@@ -58,6 +58,14 @@ public:
     // (see watchdog_loop). Surfaced in /diag alongside the broker's.
     int connect_aborts() const { return connect_aborts_.load(std::memory_order_relaxed); }
 
+    // Another program already holds this feed's TWS API client id (IB error
+    // 326). LATCHED and terminal: the I/O loop has stopped reconnecting, so
+    // connected() stays false until the app is restarted.
+    // See engine/tws_client_id.h.
+    bool client_id_conflict() const {
+        return client_id_conflict_.load(std::memory_order_acquire);
+    }
+
 private:
     struct Io;   // defined in tws_feed.cpp; owns all TWS API state
 
@@ -72,6 +80,9 @@ private:
     TwsFeedConfig cfg_;
     Sink sink_;
     std::atomic<bool> connected_{false};
+    // IB error 326, written once by the I/O thread. Never cleared — only a human
+    // closing the other program can end it. See engine/tws_client_id.h.
+    std::atomic<bool> client_id_conflict_{false};
     std::atomic<bool> stop_{false};
     std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh
     std::atomic<uint64_t> dropped_{0};

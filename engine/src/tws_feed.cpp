@@ -1,6 +1,7 @@
 #include "engine/tws_feed.h"
 
 #include "engine/clock.h"
+#include "engine/tws_client_id.h"   // error 326: what it means, in words
 
 #include "Contract.h"
 #include "Decimal.h"
@@ -148,6 +149,20 @@ struct TwsFeed::Io final : DefaultEWrapper {
             reset_conn = true;
             return;
         }
+        if (errorCode == kTwsClientIdInUse) {
+            // Another program owns client id 8. See engine/tws_client_id.h —
+            // permanent while that program lives, so io_loop parks rather than
+            // retrying every 3 s. Not silently re-homed onto a spare id either:
+            // 7/8/9 are adjacent, so an "id + 1" scheme walks straight into
+            // another TradeTerminal's clients and turns one legible failure into
+            // three.
+            if (!f.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
+                f.log(tws_client_id_conflict_line("the live tick stream (the "
+                                                  "session gets no prices)",
+                                                  f.cfg_.host, f.cfg_.port,
+                                                  f.cfg_.client_id));
+            return;
+        }
         // Tick-by-tick refused (no subscription / stream limit): fall back to
         // streaming market data for that symbol. BidAsk refusals just leave
         // bid/ask at 0 if the Last fallback already runs.
@@ -286,7 +301,20 @@ void TwsFeed::io_loop() {
     wake_.store(&io.signal, std::memory_order_release);
 
     auto last_connect = std::chrono::steady_clock::time_point{};
+    // See the kTwsClientIdInUse branch in Io::error: torn down once, then parked.
+    bool conflict_settled = false;
     while (!stop_.load(std::memory_order_acquire)) {
+        // Client id already taken by another program (IB error 326). Park:
+        // reconnecting cannot succeed while that program lives. connected()
+        // stays false, which is what the session's own staleness checks read.
+        if (client_id_conflict_.load(std::memory_order_acquire)) {
+            if (!conflict_settled) {
+                conflict_settled = true;
+                io.drop_connection();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = std::chrono::steady_clock::now();

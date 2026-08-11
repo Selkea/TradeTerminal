@@ -68,10 +68,16 @@ public:
     int oldest_history_age_ms() const override {
         return oldest_hist_ms_.load(std::memory_order_relaxed);
     }
+    // Another program owns this client id on the gateway (IB error 326). Latched
+    // for the life of the process: see engine/tws_client_id.h and io_loop.
+    bool client_id_conflict() const override {
+        return client_id_conflict_.load(std::memory_order_acquire);
+    }
     HistStats hist_stats() const override {
         HistStats s;
-        s.cache_hits = hs_cache_hits_.load(std::memory_order_relaxed);
-        s.cache_misses = hs_cache_misses_.load(std::memory_order_relaxed);
+        s.cache_served = hs_cache_served_.load(std::memory_order_relaxed);
+        s.cache_fetched = hs_cache_fetched_.load(std::memory_order_relaxed);
+        s.cache_lookups = hs_cache_lookups_.load(std::memory_order_relaxed);
         s.requests_sent = hs_requests_sent_.load(std::memory_order_relaxed);
         s.held_min_gap = hs_held_min_gap_.load(std::memory_order_relaxed);
         s.held_identical = hs_held_identical_.load(std::memory_order_relaxed);
@@ -141,6 +147,14 @@ private:
     std::thread io_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
+    // Another program holds client_id_ on this gateway (IB error 326). Written
+    // once by the I/O thread, read by the UI thread (/diag) and by io_loop,
+    // which parks instead of reconnecting. Never cleared: the condition can only
+    // end when a HUMAN closes the other program, and an app that silently came
+    // back to life at an unobserved moment would be the third variant of the
+    // lie this project has already shipped twice (oldest_history_age_ms pinned
+    // at 0 through a 5-hour outage; data.connected true against a login modal).
+    std::atomic<bool> client_id_conflict_{false};
     std::atomic<uint64_t> conn_gen_{0};
     std::atomic<uint32_t> next_id_{1};
     std::atomic<void*> wake_{nullptr};   // EReaderOSSignal* while I/O thread runs
@@ -157,8 +171,9 @@ private:
     // exactly one thread, so relaxed ordering is enough: nothing else is
     // published through them and a reader that sees a counter one increment
     // stale has read a number that was true a moment ago.
-    std::atomic<uint64_t> hs_cache_hits_{0};
-    std::atomic<uint64_t> hs_cache_misses_{0};
+    std::atomic<uint64_t> hs_cache_served_{0};
+    std::atomic<uint64_t> hs_cache_fetched_{0};
+    std::atomic<uint64_t> hs_cache_lookups_{0};
     std::atomic<uint64_t> hs_requests_sent_{0};
     std::atomic<uint64_t> hs_held_min_gap_{0};
     std::atomic<uint64_t> hs_held_identical_{0};

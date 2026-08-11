@@ -71,9 +71,17 @@ struct DryRunSymbol {
 
 // Cumulative history-fetch accounting for the build, sampled as a DELTA across
 // it (the source's counters are process-lifetime; the run brackets them).
+// cache_served/cache_fetched replaced cache_hits/cache_misses in 0.20.0, and the
+// rename is deliberate rather than cosmetic: the old cache_misses counted CACHE
+// LOOKUPS, which a pacing-held request repeats on every io_loop pass, so the
+// 2026-08-11 run reported cache_misses=967 against hist_requests=36. Renaming
+// rather than redefining means an old dry-run line and a new one cannot be
+// silently compared — the fields have different names, so the break is visible.
+// See net/bar_cache.h.
 struct DryRunCounters {
-    uint64_t cache_hits = 0;
-    uint64_t cache_misses = 0;
+    uint64_t cache_served = 0;    // requests answered from cache (fetches avoided)
+    uint64_t cache_fetched = 0;   // requests that went to the wire
+    uint64_t cache_lookups = 0;   // cache consultations, incl. pacing-held repeats
     uint64_t requests_sent = 0;
     uint64_t held_min_gap = 0;
     uint64_t held_identical = 0;
@@ -202,8 +210,9 @@ inline std::string dryrun_summary_line(const DryRunSummary& sum,
                     static_cast<int64_t>(dryrun_count(syms, DryRunOutcome::Excluded)));
     out += " candidates_ok=" + std::to_string(cand_ok) + '/' +
            std::to_string(cand_total);
-    out += ' ' + kv("cache_hits", sum.hist.cache_hits);
-    out += ' ' + kv("cache_misses", sum.hist.cache_misses);
+    out += ' ' + kv("cache_served", sum.hist.cache_served);
+    out += ' ' + kv("cache_fetched", sum.hist.cache_fetched);
+    out += ' ' + kv("cache_lookups", sum.hist.cache_lookups);
     out += ' ' + kv("hist_requests", sum.hist.requests_sent);
     out += ' ' + kv("held", sum.hist.held_total());
     out += ' ' + kv("held_min_gap", sum.hist.held_min_gap);

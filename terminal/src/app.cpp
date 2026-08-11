@@ -430,7 +430,16 @@ App::App(std::string gateway_url)
       sweep_panel_(engine_),
       accounts_((data_dir() / "accounts.json").string()) {
     net::IMarketData::Callbacks cbs;
-    cbs.on_log = [this](std::string line) { route(std::move(line)); };
+    // alert_scan FIRST, exactly as every other adapter's pop_log pump does. The
+    // market-data source was the ONE adapter whose log lines bypassed the alert
+    // classifier, which is why the 2026-08-11 client-id collision — seven
+    // repetitions of a fatal, permanent error — reached the log file and
+    // nothing else. There is no webhook, no /events entry and no beep for a
+    // failure that leaves the app with no candles at all.
+    cbs.on_log = [this](std::string line) {
+        alert_scan(line);
+        route(std::move(line));
+    };
     cbs.on_tick = [this](const std::string& sym, const Quote& q) {
         quotes_.set(sym, q);
         // When the real-time feed owns the session, delayed sidecar quotes
@@ -2281,8 +2290,9 @@ void App::dryrun_finish(const std::string& abort) {
     // charge this build for requests it never made.
     const net::HistStats h1 = data_.hist_stats();
     auto delta = [](uint64_t now, uint64_t then) { return now >= then ? now - then : 0; };
-    dry_.sum.hist.cache_hits = delta(h1.cache_hits, dry_.hist0.cache_hits);
-    dry_.sum.hist.cache_misses = delta(h1.cache_misses, dry_.hist0.cache_misses);
+    dry_.sum.hist.cache_served = delta(h1.cache_served, dry_.hist0.cache_served);
+    dry_.sum.hist.cache_fetched = delta(h1.cache_fetched, dry_.hist0.cache_fetched);
+    dry_.sum.hist.cache_lookups = delta(h1.cache_lookups, dry_.hist0.cache_lookups);
     dry_.sum.hist.requests_sent = delta(h1.requests_sent, dry_.hist0.requests_sent);
     dry_.sum.hist.held_min_gap = delta(h1.held_min_gap, dry_.hist0.held_min_gap);
     dry_.sum.hist.held_identical = delta(h1.held_identical, dry_.hist0.held_identical);
@@ -2656,6 +2666,24 @@ std::string App::build_diag_json() {
     const bool broker_upstream = tws_ ? tws_->upstream_connected() : true;
     j["broker_connected"] = broker_ready && broker_upstream;
     j["broker_upstream"] = broker_upstream;
+    // Which of our three TWS clients gave up because another program already
+    // holds its API client id (IB error 326 — engine/tws_client_id.h). A
+    // non-empty list is TERMINAL: those clients will not reconnect in this
+    // process. Named rather than a bare bool because "orders" and "market data"
+    // are very different days, and reported as a list so a reader sees at a
+    // glance whether the collision took one client or all three.
+    //
+    // It exists here because on 2026-08-11 this failure was invisible outside
+    // the log file: broker_connected read false, data.connected read false, and
+    // nothing anywhere said the cause was a second TradeTerminal rather than a
+    // gateway that was down.
+    {
+        json conflict = json::array();
+        if (data_.client_id_conflict()) conflict.push_back("data");
+        if (tws_ && tws_->client_id_conflict()) conflict.push_back("orders");
+        if (tws_feed_ && tws_feed_->client_id_conflict()) conflict.push_back("feed");
+        j["client_id_conflict"] = std::move(conflict);
+    }
 
     // ---- session state ----
     j["live_running"] = s.running;
@@ -2689,6 +2717,11 @@ std::string App::build_diag_json() {
         json d;
         d["source"] = use_tws_data_ ? "tws" : "ibkr_web";
         d["connected"] = data_.connected();
+        // connected=false has two very different causes and they need different
+        // hands: a gateway that is down (wait / restart it) versus another
+        // program holding our client id (close it, then restart this app). This
+        // one is LATCHED — nothing is retrying.
+        d["client_id_conflict"] = data_.client_id_conflict();
         d["pending_history"] = data_.pending_history();
         d["oldest_history_age_ms"] = data_.oldest_history_age_ms();
         // Is the GATEWAY logged in to IBKR, as opposed to merely listening?
@@ -2910,6 +2943,15 @@ std::string App::build_metrics() {
     g("tt_connect_aborts", "connect-timeout watchdog force-aborts (broker+feed)",
       (tws_ ? tws_->connect_aborts() : 0) +
           (tws_feed_ ? tws_feed_->connect_aborts() : 0));
+    // How many of the three TWS clients gave up because another program already
+    // holds their API client id (IB error 326). Nonzero is TERMINAL — nothing is
+    // retrying — and it needs a human, so it belongs on a dashboard next to the
+    // gauges above rather than only in a log file, which is where the whole of
+    // the 2026-08-11 incident lived.
+    g("tt_client_id_conflicts", "TWS clients parked on an in-use API client id",
+      (data_.client_id_conflict() ? 1 : 0) +
+          (tws_ && tws_->client_id_conflict() ? 1 : 0) +
+          (tws_feed_ && tws_feed_->client_id_conflict() ? 1 : 0));
     g("tt_ack_latency_p50_ms", "order submit->ack p50", ack.base_ns / 1'000'000.0);
     g("tt_ack_latency_p90_ms", "order submit->ack p90",
       (ack.base_ns + ack.jitter_ns) / 1'000'000.0);
@@ -4268,6 +4310,13 @@ void App::draw_data_menu() {
 // Route noteworthy engine/broker/feed log lines to the alert channel.
 // Critical = money is at risk right now; Warning = something needs a look;
 // Info = fills (webhook only, no beep — they can be frequent).
+//
+// Callable from ANY thread since 0.20.0: the market-data source's on_log fires
+// on its own I/O thread and now goes through here (before that it was the one
+// adapter whose lines never reached the alert channel). That is safe because
+// classify_alert is pure, AlertNotifier::notify is mutex-guarded, and
+// dry_.active is written once in the constructor — before any of those threads
+// exists — and never again.
 void App::alert_scan(const std::string& l) {
     // A dry run runs the REAL lineup, so it emits the real verdicts — including
     // "lineup: ABORTED", which classify_alert rates Critical and which would page

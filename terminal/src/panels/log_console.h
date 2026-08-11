@@ -14,7 +14,14 @@ namespace tt::ui {
 // engine via ui_ring later) can log directly; draw() runs on the UI thread.
 class LogConsole {
 public:
-    // Also append to a file (5 MB rotation to <path>.1). Call once at startup.
+    // Also append to a file. If it is already over 5 MB it is rotated aside to
+    // <path>.YYYYMMDD-HHMMSS first, and the oldest rotations beyond
+    // kKeepRotations are pruned. Call once at startup.
+    //
+    // The stamp is not decoration: rotating to a fixed "<path>.1" meant every
+    // rotation destroyed the previous one, and on 2026-08-11 an accidental
+    // second launch of the GUI wiped the 11.25 MB optimizer.log baseline that an
+    // in-flight investigation depended on.
     void set_log_file(std::string path);
 
     void add(std::string line);
@@ -48,6 +55,10 @@ private:
     static constexpr size_t kMaxLines = 5000;
     static constexpr size_t kTailLines = 500;   // first-poll / resync tail
     static constexpr long kRotateBytes = 5 * 1024 * 1024;
+    // How many rotated files survive. Five 5 MB+ logs is ~60 MB worst case for
+    // the optimizer log, which is the price of being able to look at last
+    // week's build after this week's has already rotated twice.
+    static constexpr size_t kKeepRotations = 5;
 };
 
 } // namespace tt::ui

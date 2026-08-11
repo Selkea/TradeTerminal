@@ -4,6 +4,8 @@
 #include "net/hist_pacing.h"
 #include "net/hist_requests.h"
 
+#include "engine/tws_client_id.h"   // error 326: what it means, in words
+
 #include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
 #include "DefaultEWrapper.h"
@@ -339,11 +341,6 @@ struct TwsData::Io final : DefaultEWrapper {
             // own request id — so the routing in App is identical either way.
             const std::vector<Candle>* hit =
                 bars.get(r.symbol, wire.bar, wire.dur, now_steady);
-            // Publish the cache's OWN counters rather than keeping a second
-            // tally beside them — one lookup must never be able to read as a hit
-            // here and a miss there. See HistStats.
-            d.hs_cache_hits_.store(bars.hits(), std::memory_order_relaxed);
-            d.hs_cache_misses_.store(bars.misses(), std::memory_order_relaxed);
             if (hit) {
                 CandleBatch b;
                 b.id = r.id;
@@ -353,9 +350,10 @@ struct TwsData::Io final : DefaultEWrapper {
                 b.candles = *hit;
                 d.log(r.symbol + " " + r.interval + " " + r.range + ": served " +
                       std::to_string(b.candles.size()) +
-                      " bars from cache, no IB request (cache " +
-                      std::to_string(bars.hits()) + " hit / " +
-                      std::to_string(bars.misses()) + " miss)");
+                      " bars from cache, no IB request (" +
+                      std::to_string(bars.served()) + " of " +
+                      std::to_string(bars.served() + bars.fetched()) +
+                      " requests served from cache)");
                 if (d.cbs_.on_candles) d.cbs_.on_candles(std::move(b));
                 continue;
             }
@@ -445,6 +443,14 @@ struct TwsData::Io final : DefaultEWrapper {
             }
             gate.record(gkey, now_steady);
             d.hs_requests_sent_.fetch_add(1, std::memory_order_relaxed);
+            // The cache's OTHER half of the accounting, counted HERE — at the
+            // send — and not at the failed lookup above. This request consumed
+            // one IB fetch; the lookup that preceded it may have been the
+            // thirtieth this request made while the gate held it. Counting the
+            // lookup is the defect that produced cache_misses=967 against
+            // hist_requests=36 on 2026-08-11. retry_dead_history does NOT call
+            // this: a retry re-sends a series already counted.
+            bars.record_fetch();
             held_logged_.erase(gkey);
             if (wire.clamped)
                 d.log(r.symbol + ": " + r.range + " of " + r.interval +
@@ -464,12 +470,18 @@ struct TwsData::Io final : DefaultEWrapper {
             p.sent_ms = p.first_sent_ms = steady_ms();
             hist.add(req_id, std::move(p));
             d.log(r.symbol + " " + r.interval + " " + r.range +
-                  ": fetching from IB (cache miss, req " + std::to_string(req_id) +
+                  ": fetching from IB (not cached, req " + std::to_string(req_id) +
                   ", " + std::to_string(gate.window_sends(steady_ms())) + "/" +
                   std::to_string(HistSendGate::budget_cap(r.prio)) +
                   " in the 10-minute budget)");
             send_history(req_id, *hist.find(req_id));
         }
+        // Publish the cache's OWN counters, once per pass rather than at each
+        // decision, so /diag and the dry-run summary can never read a hit here
+        // and a fetch there for the same request. See HistStats.
+        d.hs_cache_served_.store(bars.served(), std::memory_order_relaxed);
+        d.hs_cache_fetched_.store(bars.fetched(), std::memory_order_relaxed);
+        d.hs_cache_lookups_.store(bars.lookups(), std::memory_order_relaxed);
         if (!deferred.empty()) {
             std::lock_guard lock(d.mu_);
             d.reqs_.insert(d.reqs_.begin(), deferred.begin(), deferred.end());
@@ -605,6 +617,22 @@ struct TwsData::Io final : DefaultEWrapper {
             // gateway boots races it. Back off and reconnect.
             d.log("gateway still accepting the paper disclaimer - retrying shortly");
             reset_conn = true;
+            return;
+        }
+        if (errorCode == kTwsClientIdInUse) {
+            // See engine/tws_client_id.h. Latch and STOP: this is the one error
+            // in this handler that a retry cannot fix, because what refuses us
+            // is another process's live socket. io_loop stops calling
+            // connect_gateway() while the latch is set, which is what turns the
+            // 2026-08-11 three-line-every-3s stanza into one sentence.
+            //
+            // Logged before the latch is set so exactly one line is emitted no
+            // matter how many 326s the gateway sends (it answers every connect
+            // attempt already in flight).
+            if (!d.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
+                d.log(tws_client_id_conflict_line("market data (charts, "
+                                                  "backtests and the daily lineup)",
+                                                  d.host_, d.port_, d.client_id_));
             return;
         }
         // A request WE cancelled to retry it. IB answers cancelHistoricalData
@@ -863,7 +891,59 @@ void TwsData::io_loop() {
     auto last_connect = std::chrono::steady_clock::time_point{};
     auto last_hist_reset = std::chrono::steady_clock::time_point{};
     int64_t last_nag_ms = 0;
+    // Set once the client-id conflict has been torn down, so drop_connection()
+    // (which clears the cache, the gate and every waiter) runs ONCE and not on
+    // every pass of the parked loop below.
+    bool conflict_settled = false;
     while (running_.load(std::memory_order_acquire)) {
+        // Client id already taken by another program (IB error 326, see
+        // engine/tws_client_id.h). Park: reconnecting cannot succeed while that
+        // program lives, and the 3 s loop below is exactly what buried the one
+        // explanatory line on 2026-08-11. The thread stays alive so stop() joins
+        // promptly and so the UI, /diag and the alert webhook keep working —
+        // clearly dataless beats half-dead.
+        if (client_id_conflict_.load(std::memory_order_acquire)) {
+            if (!conflict_settled) {
+                conflict_settled = true;
+                io.drop_connection();   // settle every waiter, then stay down
+                // Publish the truth once rather than leaving the last pre-
+                // conflict values frozen in /diag. drop_connection() errored
+                // every in-flight fetch back to its caller, so there genuinely
+                // are none — and a stale "1 pending, 8000 ms old" would be the
+                // same species of lie as oldest_history_age_ms pinned at 0.
+                pending_hist_.store(0, std::memory_order_relaxed);
+                oldest_hist_ms_.store(0, std::memory_order_relaxed);
+            }
+            // Settle everything the UI queues from here on. pump_requests no
+            // longer runs, so without this a chart, a warmup or a tournament
+            // candidate waits forever for an answer that can never come — and
+            // "waiting forever" is precisely the half-dead state this whole
+            // change exists to replace. Errors carry the cause, so App routes
+            // them to the exact pending sweep/backtest by request id and each
+            // one settles instead of timing out on its own.
+            std::vector<CandleReq> orphaned;
+            ScanReq orphan_scan;
+            bool had_scan = false;
+            {
+                std::lock_guard lock(mu_);
+                orphaned.swap(reqs_);
+                if (scan_pending_) {
+                    orphan_scan = std::move(scan_req_);
+                    scan_pending_ = false;
+                    had_scan = true;
+                }
+            }
+            for (const CandleReq& r : orphaned)
+                if (cbs_.on_error)
+                    cbs_.on_error(r.id, "tws",
+                                  r.symbol + ": no market-data session - another "
+                                  "program holds this gateway's API client id");
+            // The scanner's caller waits on its callback, not on an error, so it
+            // gets the empty result an in-flight scan gets on a session teardown.
+            if (had_scan && orphan_scan.cb) orphan_scan.cb({});
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = std::chrono::steady_clock::now();

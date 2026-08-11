@@ -8,6 +8,8 @@
 #include "alert_rules.h"
 #include "alerts.h"
 
+#include "engine/tws_client_id.h"
+
 using tt::ui::AlertClass;
 using tt::ui::classify_alert;
 using tt::ui::detail::ascii_fold;
@@ -80,4 +82,39 @@ TEST_CASE("classify_alert: fills are Info, plain lines are None") {
     CHECK(classify_alert("live: fill #7 BUY 100 @ 12.34") == AlertClass::Info);
     CHECK(classify_alert("candles: SOXL 5m x9750") == AlertClass::None);
     CHECK(classify_alert("tws: reconcile: complete") == AlertClass::None);
+}
+
+TEST_CASE("classify_alert: a client-id collision pages, from all three clients") {
+    // 2026-08-11: the GUI was started while a headless dry run held the TWS
+    // client ids, and IB error 326 repeated every 3 s for seven attempts with no
+    // session, no alert and no explanation. The operator reported it as a crash.
+    //
+    // The line is BUILT here rather than pasted, so the tag classify_alert
+    // matches and the tag the adapters emit cannot drift apart: if
+    // tws_client_id_conflict_line stops carrying kTwsClientIdConflictTag, this
+    // fails instead of the alert silently going quiet again.
+    for (const char* who : {"market data", "the ORDER path", "the live tick stream"}) {
+        const std::string l =
+            tt::tws_client_id_conflict_line(who, "127.0.0.1", 4002, 9);
+        CHECK(classify_alert(l) == AlertClass::Critical);
+    }
+    // ...and it says, in words, what is wrong and what to do about it. IB's own
+    // wording ("the client id is already in use") is jargon to whoever is
+    // looking at the log at 16:33 on a Tuesday.
+    const std::string l = tt::tws_client_id_conflict_line("market data", "127.0.0.1", 4002, 9);
+    CHECK(l.find("another program is already connected") != std::string::npos);
+    CHECK(l.find("Close it") != std::string::npos);
+    CHECK(l.find("Not retrying") != std::string::npos);
+    CHECK(l.find("127.0.0.1:4002") != std::string::npos);
+}
+
+TEST_CASE("classify_alert: ordinary talk about client ids does NOT page") {
+    // The tag is uppercase and specific for the same reason the lineup's
+    // verdicts are: a routine line that happens to mention a client id must not
+    // wake anyone at 3am. Only the conflict line carries the tag.
+    CHECK(classify_alert("tws: connecting to IB Gateway at 127.0.0.1:4002") ==
+          AlertClass::None);
+    CHECK(classify_alert("tws-data: using client id 9") == AlertClass::None);
+    CHECK(classify_alert("tws-feed: client id in use by this session") ==
+          AlertClass::None);
 }
