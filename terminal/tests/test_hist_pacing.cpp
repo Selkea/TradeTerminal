@@ -86,7 +86,7 @@ TEST_CASE("a request inside its normal turnaround is left alone") {
 
 TEST_CASE("a first death is retried in place, not escalated") {
     CHECK(history_action(kHistTimeoutMs + 1, false) == HistAction::Retry);
-    CHECK(history_action(60'000, false) == HistAction::Retry);
+    CHECK(history_action(kHistEscalateMs, false) == HistAction::Retry);
 }
 
 TEST_CASE("a second death escalates to a session teardown") {
@@ -94,6 +94,25 @@ TEST_CASE("a second death escalates to a session teardown") {
     // suspect — that is what the (expensive) drop_connection is reserved for.
     CHECK(history_action(kHistTimeoutMs + 1, true) == HistAction::Escalate);
     CHECK(history_action(60'000, true) == HistAction::Escalate);
+}
+
+TEST_CASE("silence long enough to have died twice escalates even with no retry") {
+    // The retry is not the point; the RECOVERY is. `already_retried` is set only
+    // when HistRequests::begin_retry runs, and retry_dead_history has to get past
+    // HistSendGate first. A SendHold::Budget hold lasts until sends age out of a
+    // ten-minute window, so keying the escalation purely off `already_retried`
+    // meant a spent budget suppressed the data-session reconnect as well as the
+    // retry — and a degraded lineup build is precisely what spends the budget.
+    // Recovery went from ~40s to ~10 minutes in the one scenario it exists for.
+    CHECK(history_action(kHistEscalateMs + 1, false) == HistAction::Escalate);
+    CHECK(history_action(600'000, false) == HistAction::Escalate);
+    // The escalation age is the natural timeline it replaces: one timeout to die,
+    // one more to die again after an immediate retry. Anything shorter would
+    // escalate a request whose retry is simply still in flight.
+    CHECK(kHistEscalateMs == 2 * kHistTimeoutMs);
+    // ...and it must be comfortably past the longest legitimate deferral, or
+    // waiting out the big-batch quiet window would itself tear the session down.
+    CHECK(kHistEscalateMs > kHistTimeoutMs + kBigBatchQuietMs);
 }
 
 TEST_CASE("the quiet window stays clear of the death timeout") {
@@ -261,4 +280,103 @@ TEST_CASE("the whole build's request load fits inside one window") {
     // series per pick (6), once the cache removes the duplicates. If that did not
     // fit in the budget, the build would stall on its own pacing.
     CHECK(30 + 6 < kHistMaxPerWindow);
+}
+
+// ---- what makes two requests "the same request" ----------------------------
+
+TEST_CASE("the request identity is the RESOLVED duration, not the caller's range") {
+    // max_dur_idx caps 1h bars at 2 years, so a chart asking for "5y" and one
+    // asking for "max" send the SAME reqHistoricalData: dur="2 Y", bar="1 hour".
+    // Keyed on the caller's label they looked like different requests, so the
+    // gate cleared the second and two byte-identical calls went out kHistMinGapMs
+    // apart — IB's own definition of a pacing violation, committed by the gate
+    // that exists to prevent it.
+    const HistWire five_y = hist_wire("1h", "5y");
+    const HistWire maximum = hist_wire("1h", "max");
+    REQUIRE(five_y.ok());
+    REQUIRE(maximum.ok());
+    CHECK(std::string(five_y.dur) == "2 Y");
+    CHECK(std::string(maximum.dur) == "2 Y");
+    CHECK(five_y.clamped);
+    CHECK(maximum.clamped);
+    CHECK(hist_key("SPY", five_y) == hist_key("SPY", maximum));
+
+    HistSendGate g;
+    REQUIRE(g.try_send(hist_key("SPY", five_y), 0));
+    CHECK(g.hold(hist_key("SPY", maximum), kHistMinGapMs) == SendHold::Identical);
+}
+
+TEST_CASE("requests that resolve differently stay different") {
+    // The mirror-image danger, and the worse one: a warmup fetch and a six-month
+    // optimization of the same symbol at the same interval are NOT the same
+    // series (1567 bars against ~2966-9517 on 2026-08-10), and answering one with
+    // the other is how the optimizer crowns a champion on the wrong data.
+    const HistWire warmup = hist_wire("5m", "1mo");
+    const HistWire opt = hist_wire("5m", "6mo");
+    REQUIRE(warmup.ok());
+    REQUIRE(opt.ok());
+    CHECK(std::string(warmup.dur) == "1 M");
+    CHECK(std::string(opt.dur) == "6 M");
+    CHECK(hist_key("SOXL", warmup) != hist_key("SOXL", opt));
+    // Different bar size, same span: also different.
+    CHECK(hist_key("SOXL", hist_wire("1d", "6mo")) != hist_key("SOXL", opt));
+    // Different symbol, everything else equal.
+    CHECK(hist_key("KORU", opt) != hist_key("SOXL", opt));
+    // A range under the cap is not clamped and keeps its own duration.
+    CHECK_FALSE(opt.clamped);
+}
+
+TEST_CASE("an unknown interval or range resolves to nothing") {
+    CHECK_FALSE(hist_wire("7m", "6mo").ok());
+    CHECK_FALSE(hist_wire("5m", "3mo").ok());
+    CHECK(hist_wire("5m", "6mo").ok());
+}
+
+// ---- the reserve -----------------------------------------------------------
+
+TEST_CASE("a live warmup fetch is not starved by a bulk pass that spent the budget") {
+    // The failure this exists for: the lineup's 30-request ranking pass fills the
+    // window, then a live session starts cold and its warmup fetches are held
+    // until sends age out — up to ten minutes. A strategy with a several-hundred
+    // -bar lookback and no warmup cannot trade at all that session, which is a
+    // far worse outcome than one 21-bar ranking series arriving late.
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindow; ++i) {
+        REQUIRE(g.try_send("BULK" + std::to_string(i), now, ReqPriority::Bulk));
+        now += kHistMinGapMs;
+    }
+    CHECK(g.hold("SOXL", now, ReqPriority::Bulk) == SendHold::Budget);
+    CHECK(g.hold("SOXL", now, ReqPriority::Live) == SendHold::None);
+    CHECK(g.try_send("SOXL", now, ReqPriority::Live));
+}
+
+TEST_CASE("the reserve is finite, and bulk work can never reach into it") {
+    HistSendGate g;
+    int64_t now = 0;
+    for (int i = 0; i < kHistMaxPerWindowLive; ++i) {
+        REQUIRE(g.try_send("SYM" + std::to_string(i), now, ReqPriority::Live));
+        now += kHistMinGapMs;
+    }
+    // Even a live request stops at the reserve ceiling.
+    CHECK(g.hold("ONE_MORE", now, ReqPriority::Live) == SendHold::Budget);
+    // Bulk stopped 6 sends ago and stays stopped.
+    CHECK(g.hold("BULK", now, ReqPriority::Bulk) == SendHold::Budget);
+    // The ceilings bracket correctly: bulk below live, live below IB's 60.
+    CHECK(kHistMaxPerWindow < kHistMaxPerWindowLive);
+    CHECK(kHistMaxPerWindowLive < 60);
+    // And Bulk is the default, so a caller that says nothing cannot take reserve.
+    CHECK(HistSendGate::budget_cap(ReqPriority::Bulk) == kHistMaxPerWindow);
+    CHECK(HistSendGate::budget_cap(ReqPriority::Live) == kHistMaxPerWindowLive);
+}
+
+TEST_CASE("a held request is abandoned before it outlives everyone waiting on it") {
+    // A gate hold puts the request back on the queue every pass, with no bound.
+    // The budget it eventually spends would then go on an answer whose caller
+    // gave up long ago — the budget the NEXT symbol's tournament needed. The cut
+    // -off has to sit ABOVE the tournament's own 75s fetch budget so nothing is
+    // abandoned while its caller is still waiting, and below the ten-minute
+    // window so a spent budget cannot spend itself twice.
+    CHECK(kHistQueueMaxWaitMs > 75'000);
+    CHECK(kHistQueueMaxWaitMs < kHistWindowMs);
 }

@@ -151,7 +151,10 @@ private:
     void pump_pending_run();   // UI thread, per frame
 
     // ---- parameter sweep (all state UI-thread only unless noted) ----
-    void queue_sweep(const SweepPanel::Request& rq, bool for_tournament = false);
+    // True iff a candle fetch is now outstanding for this sweep. False means
+    // nothing was armed and sweep_setup_ was left untouched — which the caller
+    // MUST NOT read as "the fetch settled with nothing" (see queue_sweep).
+    bool queue_sweep(const SweepPanel::Request& rq, bool for_tournament = false);
     void stash_pending_sweep(net::CandleBatch& batch);   // IPC thread
     // Drop a candle request the caller has given up waiting for, so a late batch
     // cannot start a sweep whose owner is gone (see SweepSetup::for_tournament).
@@ -200,6 +203,9 @@ private:
         // fetch that keeps timing out cannot be requeued forever. See
         // kTournFetchTimeoutS.
         std::set<std::string> requeued;
+        // "waiting for the data session" is logged once per wait, not once per
+        // frame: Phase::Launch runs every frame and a reconnect takes seconds.
+        bool feed_wait_logged = false;
     };
     Tournament tourn_;
     // candidates: explicit strategy keys to race; empty = built-in + all loaded.
@@ -263,6 +269,13 @@ private:
         std::set<std::string> fitted;
         std::size_t tourn_idx = 0;           // next pick to run a tournament for
         bool autostart = false;              // on Done, start the live session
+        // When FetchingBars was ENTERED, as opposed to stamp_s which every
+        // arrival resets. The quiet timer alone could not tell "these requests
+        // failed" from "these requests are being paced": a send gate holding the
+        // ranking pass produces no arrivals at all, so the quiet timer expired
+        // with the pool unfetched and the day's symbols got picked from whichever
+        // handful had already been sent. See kLineupFetchDeadlineS.
+        double fetch_start_s = 0;
     };
     DailyLineup lineup_;
     // The scanner delivers hits on the I/O thread; hand them to the UI thread
@@ -281,6 +294,12 @@ private:
     // the wrong symbols for the whole day.
     std::map<uint32_t, std::string> lineup_want_bars_;
     std::vector<std::pair<std::string, std::vector<tt::RankBar>>> lineup_bar_inbox_;
+    // Pool symbols whose ranking fetch was ERRORED out by the feed (I/O thread,
+    // on_error). Without this the FetchingBars phase could only learn that a
+    // request had failed by waiting for a quiet timer — which is also what fires
+    // when requests are merely being PACED, and the two are indistinguishable
+    // from the UI thread. See pump_daily_lineup.
+    std::vector<std::string> lineup_dropped_;
     void start_daily_lineup(bool autostart_when_done = false);  // Trade menu / schedule
     void pump_daily_lineup();                      // UI thread, per frame
     void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
@@ -288,13 +307,28 @@ private:
     // Replayed through the strategy after on_init so lookback indicators are
     // warm — a live session's only other bar source is tick aggregation.
     std::vector<tt::Bar> seed_bars(const std::string& symbol, int bar_sec) const;
-    // Symbols whose warmup history was not cached when the live session
-    // started, mapped to their engine symbol id. The candle cache is
-    // memory-only, so the first session after launch always finds it cold; we
-    // fetch the bars and re-seed those symbols when they land. Touched from the
-    // UI thread (session start) and the data thread (on_candles).
+    // Warmup fetches outstanding for symbols whose history was not cached when
+    // the live session started: REQUEST ID -> the symbol and its engine symbol
+    // id. The candle cache is memory-only, so the first session after launch
+    // always finds it cold; we fetch the bars and re-seed those symbols when they
+    // land. Touched from the UI thread (session start) and the data thread
+    // (on_candles, on_error).
+    //
+    // Keyed by request id, like lineup_want_bars_ and SweepSetup::req_id, and for
+    // the same reason. Keyed by SYMBOL, ANY delivery of that symbol consumed the
+    // ticket — a chart re-request at a different interval, which a data-session
+    // reconnect triggers on its own (ChartPanel::draw re-fetches on a
+    // connection_generation bump). seed_bars only reads the WARMUP interval, so
+    // the stolen ticket reseeded nothing and the real warmup batch, arriving
+    // afterwards, found no entry and was ignored. The strategy then ran the whole
+    // session with zero warmup bars against a several-hundred-bar lookback: the
+    // documented root cause of a day with no live trades.
+    struct WarmupWant {
+        std::string symbol;
+        uint32_t sid = 0;   // engine symbol id, for reseed_symbol
+    };
     std::mutex warmup_mu_;
-    std::map<std::string, uint32_t> warmup_want_;
+    std::map<uint32_t, WarmupWant> warmup_want_;
     bool lineup_active() const { return lineup_.phase != DailyLineup::Phase::Idle; }
     // True while any backtest/optimizer/tournament/lineup work is in flight —
     // gates the engine's strategy-log flood to the optimizer panel instead of

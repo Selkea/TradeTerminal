@@ -21,7 +21,9 @@
 
 using tt::net::HistPending;
 using tt::net::HistRequests;
+using tt::net::kBigBatchQuietMs;
 using tt::net::kCancelAckGraceMs;
+using tt::net::kHistEscalateMs;
 using tt::net::kHistTimeoutMs;
 
 namespace {
@@ -210,10 +212,11 @@ TEST_CASE("hist ids: a retry waits out the big-batch quiet window") {
     const int64_t dead_at = kT0 + kHistTimeoutMs + 1;
     CHECK(h.dead_ids(dead_at, /*send_blocked=*/true).empty());
 
-    // Deferring is safe: an un-retried request classifies as Retry however long
-    // it waits, never as Escalate, so nothing can tear the session down while
-    // the window is open.
-    CHECK_FALSE(h.has_twice_dead(dead_at + 10 * kHistTimeoutMs));
+    // Deferring is safe for as long as the quiet window can last: the window is
+    // kBigBatchQuietMs (10s) and escalation on age alone starts at
+    // kHistEscalateMs (40s), so a deferred retry cannot tear the session down
+    // while the window is legitimately open.
+    CHECK_FALSE(h.has_twice_dead(dead_at + kBigBatchQuietMs));
     CHECK(h.pending() == 1);
     CHECK(h.awaiting_ack() == 0);   // nothing was cancelled, so nothing is owed
 
@@ -221,6 +224,33 @@ TEST_CASE("hist ids: a retry waits out the big-batch quiet window") {
     const auto dead = h.dead_ids(dead_at + 1'000, false);
     REQUIRE(dead.size() == 1);
     CHECK(dead[0] == 88);
+}
+
+TEST_CASE("hist ids: a retry that is never allowed out still escalates") {
+    // The counterpart to the test above, and the reason history_action grew an
+    // age-based arm. `retried` is set ONLY by begin_retry, and retry_dead_history
+    // must clear the send gate before it may call it. A SendHold::Budget hold
+    // lasts until sends age out of a ten-minute window, so a retry held there
+    // left the request classified Retry FOREVER: has_twice_dead never fired, and
+    // io_loop's data-session reconnect — the only recovery from the half-open
+    // session, restored in 0.15.1 — was unreachable in exactly the state that
+    // spends the budget in the first place. The gate may delay a retry; it must
+    // never delay the recovery.
+    HistRequests h;
+    add(h, 88, "MUU", kT0);
+    // Dead, and every attempt to retry it is refused by the gate: nothing ever
+    // calls begin_retry, so pending stays 1 under its original id and retried
+    // stays false.
+    CHECK(h.dead_ids(kT0 + kHistTimeoutMs + 1, false).size() == 1);
+    CHECK_FALSE(h.has_twice_dead(kT0 + kHistTimeoutMs + 1));
+    CHECK(h.pending() == 1);
+    CHECK(h.awaiting_ack() == 0);
+    // Two timeouts in: the age a request reaches when it dies, is retried at
+    // once, and dies again. It escalates whether or not the retry ever went out.
+    CHECK(h.has_twice_dead(kT0 + kHistEscalateMs + 1));
+    // ...and it is no longer offered up for retrying, so the escalation is the
+    // only thing left that can act on it.
+    CHECK(h.dead_ids(kT0 + kHistEscalateMs + 1, false).empty());
 }
 
 TEST_CASE("hist ids: a request inside its window is left alone") {

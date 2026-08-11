@@ -62,25 +62,44 @@ TEST_CASE("the four SSPC fetches collapse to one") {
     CHECK(c.misses() == 1);
 }
 
-TEST_CASE("the key separates symbol, interval AND range") {
+TEST_CASE("the key separates symbol, bar size AND duration") {
+    // The key is the request's identity ON THE WIRE — what TwsData actually sends
+    // — so these are IB's own strings, not the caller's ("5m", "6mo") labels.
     BarCache c;
-    c.put("SOXL", "5m", "6mo", series(9'517), 0);
+    c.put("SOXL", "5 mins", "6 M", series(9'517), 0);
     // The one that matters. A 5m/6mo series and a 5m warmup series are not the
     // same data: on 2026-08-10 a sweep labelled "5m 6mo" optimized on 1567
     // warmup bars because a delivery was matched by symbol alone. A cache keyed
-    // without the range would make that the DESIGNED behaviour.
-    CHECK(c.get("SOXL", "5m", "1d", 0) == nullptr);
-    CHECK(c.get("SOXL", "1d", "6mo", 0) == nullptr);
-    CHECK(c.get("KORU", "5m", "6mo", 0) == nullptr);
+    // without the duration would make that the DESIGNED behaviour.
+    CHECK(c.get("SOXL", "5 mins", "1 D", 0) == nullptr);
+    CHECK(c.get("SOXL", "1 day", "6 M", 0) == nullptr);
+    CHECK(c.get("KORU", "5 mins", "6 M", 0) == nullptr);
     // ...and the exact triple still hits.
-    REQUIRE(c.get("SOXL", "5m", "6mo", 0) != nullptr);
+    REQUIRE(c.get("SOXL", "5 mins", "6 M", 0) != nullptr);
     // Separate entries, not one overwritten entry.
-    c.put("SOXL", "5m", "1d", series(78), 0);
+    c.put("SOXL", "5 mins", "1 D", series(78), 0);
     CHECK(c.entries() == 2);
-    REQUIRE(c.get("SOXL", "5m", "6mo", 0) != nullptr);
-    CHECK(c.get("SOXL", "5m", "6mo", 0)->size() == 9'517);
-    REQUIRE(c.get("SOXL", "5m", "1d", 0) != nullptr);
-    CHECK(c.get("SOXL", "5m", "1d", 0)->size() == 78);
+    REQUIRE(c.get("SOXL", "5 mins", "6 M", 0) != nullptr);
+    CHECK(c.get("SOXL", "5 mins", "6 M", 0)->size() == 9'517);
+    REQUIRE(c.get("SOXL", "5 mins", "1 D", 0) != nullptr);
+    CHECK(c.get("SOXL", "5 mins", "1 D", 0)->size() == 78);
+}
+
+TEST_CASE("two caller ranges that clamp to one duration are ONE entry") {
+    // The cache is keyed by the same hist_key() the pacing gate uses, so a fetch
+    // answers every caller IB could not have told apart. 1h/"5y" and 1h/"max"
+    // both send dur="2 Y": before this the second was a cache MISS whose request
+    // the gate could only delay by 15 s and then let through, so a duplicate
+    // still reached the wire.
+    BarCache c;
+    const HistWire five_y = hist_wire("1h", "5y");
+    const HistWire maximum = hist_wire("1h", "max");
+    REQUIRE(five_y.ok());
+    REQUIRE(maximum.ok());
+    c.put("SPY", five_y.bar, five_y.dur, series(3'400), 0);
+    REQUIRE(c.get("SPY", maximum.bar, maximum.dur, 0) != nullptr);
+    CHECK(c.get("SPY", maximum.bar, maximum.dur, 0)->size() == 3'400);
+    CHECK(c.entries() == 1);
 }
 
 TEST_CASE("the key cannot be forged by pasting fields together") {
@@ -119,6 +138,30 @@ TEST_CASE("an empty delivery is not cached") {
     c.put("DEAD", "5m", "6mo", {}, 0);
     CHECK(c.entries() == 0);
     CHECK(c.get("DEAD", "5m", "6mo", 0) == nullptr);
+}
+
+TEST_CASE("a delivery too thin to optimize on is not cached either") {
+    // Guarding only against EMPTY was not enough. App rejects a series under 3
+    // bars in both consumers ("not enough data"), so a 1- or 2-bar answer — a
+    // halted or newly-listed pick, or a partial answer during a data-farm hiccup
+    // — is nothing usable wearing a different shape. Cached, it is replayed for
+    // five minutes, and it silently defeats the tournament's one recovery: a
+    // requeued candidate re-asks for the series, is answered from this entry, and
+    // fails identically. Before the cache existed each candidate's own fetch
+    // could still succeed, so caching this would be a REGRESSION.
+    BarCache c;
+    for (size_t n = 0; n < kBarCacheMinBars; ++n) {
+        c.put("HALTED", "5 mins", "6 M", series(n), 0);
+        CHECK(c.entries() == 0);
+        CHECK(c.get("HALTED", "5 mins", "6 M", 0) == nullptr);
+    }
+    // At the threshold it caches normally: the cut-off is the app's own.
+    c.put("HALTED", "5 mins", "6 M", series(kBarCacheMinBars), 0);
+    CHECK(c.entries() == 1);
+    REQUIRE(c.get("HALTED", "5 mins", "6 M", 0) != nullptr);
+    // ...and it is the same threshold App::pump_sweep / start_pending_backtest
+    // use, so the cache can never hold a series they would refuse.
+    CHECK(kBarCacheMinBars == 3);
 }
 
 TEST_CASE("a re-delivery replaces the entry without double-counting its bars") {

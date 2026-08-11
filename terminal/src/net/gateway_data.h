@@ -52,9 +52,11 @@ public:
         return account_kind_.load(std::memory_order_acquire);
     }
 
-    // Thread-safe; return the request id used (0 if not running).
+    // Thread-safe; return the request id used (0 if not running). `prio` is
+    // ignored: this route has no send gate to reach into (see IMarketData).
     uint32_t request_candles(const std::string& symbol, const std::string& interval,
-                             const std::string& range) override;
+                             const std::string& range,
+                             ReqPriority prio = ReqPriority::Bulk) override;
     uint32_t subscribe_quotes(const std::vector<std::string>& symbols,
                               int poll_s) override;
     void unsubscribe(uint32_t sub_id) override;

@@ -8,6 +8,7 @@
 // under the same login endlessly kick each other if both are held.
 
 #include "market_data.h"
+#include "net/hist_pacing.h"   // ReqPriority
 
 #include <cstdint>
 #include <functional>
@@ -66,9 +67,19 @@ public:
     virtual int gateway_farms_ok() const { return 0; }
 
     // Thread-safe; return the request id used (0 if not running).
+    //
+    // `prio` is what the CALLER knows and the source cannot infer: whether
+    // anything is blocked on the answer. The TWS route paces historical requests
+    // against IB's 60-per-10-minutes ceiling, and a hold there lasts until sends
+    // age out of that window — long enough that a bulk pass (the lineup's 30
+    // ranking fetches) would otherwise starve a live session's warmup or a chart
+    // the operator is looking at. ReqPriority::Live may draw on a small reserve
+    // above the bulk ceiling; see net/hist_pacing.h. Sources that do not pace
+    // ignore it.
     virtual uint32_t request_candles(const std::string& symbol,
                                      const std::string& interval,
-                                     const std::string& range) = 0;
+                                     const std::string& range,
+                                     ReqPriority prio = ReqPriority::Bulk) = 0;
     // Subscribe the given set; the newest subscription defines what streams.
     // poll_s is advisory (polling sources only).
     virtual uint32_t subscribe_quotes(const std::vector<std::string>& symbols,

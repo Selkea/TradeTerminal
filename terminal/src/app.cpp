@@ -439,7 +439,6 @@ App::App(std::string gateway_url)
     };
     cbs.on_error = [this](uint32_t id, std::string code, std::string msg) {
         route("feed error (req " + std::to_string(id) + ") " + code + ": " + msg);
-        std::lock_guard lock(pending_bt_mu_);
         // Only the request that actually failed. This used to clear the pending
         // backtest on ANY feed error, which was both too broad (an unrelated
         // symbol's error cancelled the panel's run) and too narrow: it never
@@ -448,11 +447,40 @@ App::App(std::string gateway_url)
         // never arrive until its whole 60s budget expired. Six of those in a row
         // is five wasted minutes per symbol, and the 2026-08-10 build spent most
         // of its 25 minutes exactly that way.
-        if (pending_bt_.active && pending_bt_.req_id == id) pending_bt_.active = false;
-        if (sweep_setup_.waiting && sweep_setup_.req_id == id) {
-            sweep_setup_.waiting = false;
-            sweep_setup_.ready = false;
-            sweep_setup_.req_id = 0;
+        {
+            std::lock_guard lock(pending_bt_mu_);
+            if (pending_bt_.active && pending_bt_.req_id == id)
+                pending_bt_.active = false;
+            if (sweep_setup_.waiting && sweep_setup_.req_id == id) {
+                sweep_setup_.waiting = false;
+                sweep_setup_.ready = false;
+                sweep_setup_.req_id = 0;
+            }
+        }
+        // Every OTHER waiter on a request id, for the same reason. Each of these
+        // used to be released only by a timer, so a request the feed had already
+        // given up on still cost its waiter the full wait. Separate scopes, never
+        // nested: these locks have no ordering relationship with each other.
+        {
+            std::lock_guard<std::mutex> g(lineup_mu_);
+            const auto it = lineup_want_bars_.find(id);
+            if (it != lineup_want_bars_.end()) {
+                lineup_dropped_.push_back(it->second);
+                lineup_want_bars_.erase(it);
+            }
+        }
+        {
+            std::lock_guard lock(warmup_mu_);
+            // A warmup that will never arrive. Dropping the ticket is the whole
+            // fix: left in place it is claimed by the NEXT delivery of some other
+            // request, which reseeds from whatever that one happened to fetch.
+            const auto it = warmup_want_.find(id);
+            if (it != warmup_want_.end()) {
+                route("live: WARNING " + it->second.symbol +
+                      " warmup history failed - it trades this session on "
+                      "tick-aggregated bars only");
+                warmup_want_.erase(it);
+            }
         }
     };
     cbs.on_candles = [this](net::CandleBatch&& b) {
@@ -476,15 +504,25 @@ App::App(std::string gateway_url)
         collect_lineup_bars(b);   // before the move: needs b.candles
         const std::string sym = b.symbol;
         const std::string ivl = b.interval;
+        const uint32_t bid = b.id;
         series_.put(b.symbol, b.interval, std::move(b.candles), b.cached);
         // A live symbol that started cold can now be warmed (after the put, so
-        // seed_bars sees this batch).
+        // seed_bars sees this batch). Matched on the REQUEST ID this warmup was
+        // asked under — see App::warmup_want_ for the ticket a same-symbol chart
+        // fetch used to steal.
         uint32_t want_sid = 0;
         {
             std::lock_guard lock(warmup_mu_);
-            const auto it = warmup_want_.find(sym);
+            const auto it = warmup_want_.find(bid);
             if (it != warmup_want_.end()) {
-                want_sid = it->second;
+                // The symbol check is belt and braces: an id that is ours cannot
+                // carry another symbol unless the id space is corrupt, and
+                // reseeding the wrong symbol's engine slot would be far worse
+                // than not reseeding at all.
+                if (it->second.symbol == sym) want_sid = it->second.sid;
+                else
+                    route("live: DISCARDING warmup req " + std::to_string(bid) +
+                          " - asked for " + it->second.symbol + ", got " + sym);
                 warmup_want_.erase(it);
             }
         }
@@ -807,20 +845,27 @@ void App::pump_pending_run() {
 // ------------------------------------------------------------------ sweep
 
 // UI thread: capture the request + strategy and fetch the data.
-void App::queue_sweep(const SweepPanel::Request& rq, bool for_tournament) {
+//
+// Returns TRUE only when a fetch is genuinely outstanding — i.e. sweep_setup_ is
+// armed and waiting. Every `return false` below leaves sweep_setup_ exactly as it
+// was, which pump_tournament has to be able to tell apart from "the fetch came
+// back with nothing": its Queued phase reads !sweep_fetch_pending() as "settled",
+// and the previous candidate left waiting==false, so a candidate that was never
+// requested at all was written off on the very next frame.
+bool App::queue_sweep(const SweepPanel::Request& rq, bool for_tournament) {
     if (!data_.connected()) {
         route("sweep: feed is down, cannot fetch data");
-        return;
+        return false;
     }
     if (sweep_.running || engine_.running()) {
         route("sweep: engine busy, try again");
-        return;
+        return false;
     }
     const std::string key = rq.strat_key;
     IStrategy* inst = acquire_strategy(key);
     if (!inst) {
         route("sweep: strategy '" + strat_mgr_.display_name(key) + "' is not loaded");
-        return;
+        return false;
     }
     leases_.push_back({inst, key, StrategyLease::Sweep});
     // Held ACROSS request_candles: the id has to be recorded before the data
@@ -840,6 +885,7 @@ void App::queue_sweep(const SweepPanel::Request& rq, bool for_tournament) {
         sweep_setup_.waiting = false;
         route("sweep: feed would not accept the request for " + rq.symbol);
     }
+    return sweep_setup_.waiting;
 }
 
 // The caller gave up on the candles it asked for. Clear the wait so a late
@@ -1295,9 +1341,35 @@ void App::pump_tournament() {
             break;
         }
         if (!sweep_.running && !engine_.running()) {
+            // Do not even ask while the feed is down. queue_sweep would refuse
+            // without arming anything, and Phase::Queued reads an unarmed
+            // sweep_setup_ as "the fetch settled with nothing usable" — so a
+            // routine data-session reconnect (drop_connection then a >=3 s
+            // backoff before connect_gateway, which the died-twice escalation
+            // performs by design) burned every candidate of every symbol in about
+            // two seconds, and the whole lineup aborted for the day. WAITING here
+            // is bounded by kTournDeadlineS above, which is what that wall is for.
+            if (!data_.connected()) {
+                if (!tourn_.feed_wait_logged) {
+                    tourn_.feed_wait_logged = true;
+                    route("tournament: " + tourn_.base.symbol +
+                             " waiting for the data session before launching " +
+                             strat_mgr_.display_name(tourn_.candidates[tourn_.idx]));
+                }
+                break;
+            }
+            tourn_.feed_wait_logged = false;
             SweepPanel::Request rq = tourn_.base;
             rq.strat_key = tourn_.candidates[tourn_.idx];
-            queue_sweep(rq, /*for_tournament=*/true);
+            if (!queue_sweep(rq, /*for_tournament=*/true)) {
+                // Refused for a reason waiting cannot fix (the strategy is not
+                // loaded, or the source is shutting down). Score it as a
+                // non-starter and move on rather than spin on it every frame.
+                Tournament::Entry e;
+                e.key = tourn_.candidates[tourn_.idx];
+                advance(std::move(e));
+                break;
+            }
             // Keep the tournament banner alive (queue_sweep reset sweep_ state
             // when its candles arrive — re-assert below in Queued/Running).
             tourn_.phase = Tournament::Phase::Queued;
@@ -1639,6 +1711,23 @@ void App::pump_lineup_swap() {
     }
 }
 
+// How long the ranking pass may go without a single arrival, and how long the
+// whole pass may take. Seconds, on ImGui::GetTime(). Both replace a flat 15 s
+// quiet timer that was SHORTER than the deliberate pacing of the pass's own
+// requests, which is what made a paced pass indistinguishable from a failed one.
+//
+// THE QUIET STRETCH. Thirty requests at kHistMinGapMs (500 ms) occupy 15 s of
+// spacing on their own; a straggler that IB silently declines is classified dead
+// at kHistTimeoutMs (20 s) and retried once, so its answer can legitimately land
+// 40 s after the previous symbol's. 60 s clears that with margin.
+static constexpr double kLineupFetchQuietS = 60.0;
+// THE HARD DEADLINE, from phase entry. It has to outlast the longest a request
+// can legitimately be in the system: kHistQueueMaxWaitMs (90 s) of pacing hold
+// plus a fetch's own death-and-retry. Reaching it means the data session is not
+// answering, which the log now says explicitly rather than silently ranking
+// whatever turned up.
+static constexpr double kLineupFetchDeadlineS = 150.0;
+
 void App::start_daily_lineup(bool autostart_when_done) {
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         route("lineup: already building");
@@ -1792,6 +1881,7 @@ void App::pump_daily_lineup() {
             std::lock_guard<std::mutex> g(lineup_mu_);
             lineup_want_bars_.clear();
             lineup_bar_inbox_.clear();
+            lineup_dropped_.clear();
             for (const std::string& sym : lineup_.pool) {
                 const uint32_t rid = data_.request_candles(sym, "1d", "1mo");
                 if (rid) lineup_want_bars_[rid] = sym;
@@ -1799,29 +1889,57 @@ void App::pump_daily_lineup() {
             }
         }
         lineup_.phase = Phase::FetchingBars;
-        lineup_.stamp_s = now;
+        lineup_.stamp_s = lineup_.fetch_start_s = now;
         return;
     }
 
     case Phase::FetchingBars: {
         std::vector<std::pair<std::string, std::vector<tt::RankBar>>> arrived;
+        std::vector<std::string> dropped;
         {
             std::lock_guard<std::mutex> g(lineup_mu_);
             arrived.swap(lineup_bar_inbox_);
+            dropped.swap(lineup_dropped_);
         }
         for (auto& [sym, bars] : arrived) {
             lineup_.bars[sym] = std::move(bars);
             lineup_.awaiting.erase(sym);
         }
-        if (!arrived.empty()) lineup_.stamp_s = now;   // reset the quiet timer
-        // Proceed once every symbol answered, or after a quiet stretch — some
-        // history requests error out and their bars never arrive.
-        const bool quiet = now - lineup_.stamp_s > 15.0;
-        if (!lineup_.awaiting.empty() && !quiet) return;
+        // A request the feed errored out is ANSWERED, just not with bars. Before
+        // this the only way to notice was the quiet timer below, which cannot
+        // tell a failure from a request that is merely being paced.
+        for (const std::string& sym : dropped) lineup_.awaiting.erase(sym);
+        if (!arrived.empty() || !dropped.empty())
+            lineup_.stamp_s = now;                     // reset the quiet timer
+        // Proceed once every symbol has answered one way or the other. The two
+        // backstops behind that are both LONGER than the pacing that legitimately
+        // delays this pass — see the constants. The old 15 s quiet timer was
+        // shorter than the deliberate spacing of the pass's own 30 requests, so a
+        // held ranking pass advanced with the pool unfetched and the day's
+        // symbols were chosen from whichever few had been sent.
+        const bool quiet = now - lineup_.stamp_s > kLineupFetchQuietS;
+        const bool expired = now - lineup_.fetch_start_s > kLineupFetchDeadlineS;
+        if (!lineup_.awaiting.empty() && !quiet && !expired) return;
         {
             std::lock_guard<std::mutex> g(lineup_mu_);
             lineup_want_bars_.clear();
         }
+        // Say it when the pool is short. Ranking a partial pool is a legitimate
+        // outcome — one dead ticker must not cost the whole day — but it is NOT
+        // the same build as a complete one, and nothing in the log used to
+        // distinguish "the 6 most volatile of 30" from "the 6 that answered".
+        if (!lineup_.awaiting.empty())
+            route("lineup: WARNING ranking a PARTIAL pool - " +
+                     std::to_string(lineup_.bars.size()) + " of " +
+                     std::to_string(lineup_.pool.size()) +
+                     " symbols delivered bars (" +
+                     (expired ? "hit the " +
+                                    std::to_string(static_cast<int>(kLineupFetchDeadlineS)) +
+                                    "s fetch deadline"
+                              : "no arrivals for " +
+                                    std::to_string(static_cast<int>(kLineupFetchQuietS)) +
+                                    "s") +
+                     ") - today's picks come from that subset, not the full scan");
         lineup_.phase = Phase::Ranking;
         lineup_.stamp_s = now;
         return;
@@ -3294,6 +3412,10 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // symbol -> "own" / "mixed" / "inherited" / "none", published to /diag once
     // the session actually starts (see symbol_params.h).
     std::map<std::string, std::string> param_src;
+    // Symbols whose warmup history was not in the cache, with the engine symbol
+    // id to reseed. Local, not warmup_want_: this list is built while the session
+    // is still only a plan, and start_live can still fail below.
+    std::vector<WarmupWant> cold_warmup;
     bool acq_ok = true;
     for (const auto& so : opts.symbols) {
         IStrategy* inst = acquire_strategy(so.strat_key);
@@ -3345,8 +3467,12 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
             // "1mo" of 5m bars is ~1,640 - comfortably more than the largest
             // lookback the sweep can elect, and deliberately under the ~3,000-bar
             // batch size that makes IB drop the NEXT request (see hist_pacing.h).
-            std::lock_guard lock(warmup_mu_);
-            warmup_want_[so.symbol] = static_cast<uint32_t>(cfg.symbol_warmup.size() + 1);
+            //
+            // Only noted here; the fetch (and the ticket that claims its
+            // delivery) is issued below, once start_live has actually succeeded —
+            // a request id cannot be recorded before the request is made.
+            cold_warmup.push_back(
+                {so.symbol, static_cast<uint32_t>(cfg.symbol_warmup.size() + 1)});
         }
         cfg.symbol_warmup.push_back(std::move(seed));
         new_leases.push_back({inst, so.strat_key, StrategyLease::Live});
@@ -3380,11 +3506,23 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         live_param_source_ = std::move(param_src);
         for (const auto& l : new_leases) leases_.push_back(l);
         // Pull history for any symbol that started cold; on_candles re-seeds it.
+        // ReqPriority::Live, not Bulk: an unseeded strategy cannot satisfy a
+        // several-hundred-bar lookback inside one session, so these six requests
+        // are the ones that must never queue behind a lineup's thirty ranking
+        // fetches (see net/hist_pacing.h). Under the lock across every call, so
+        // no delivery can arrive before the id that claims it is on record.
         {
             std::lock_guard lock(warmup_mu_);
-            for (const auto& [sym, sid] : warmup_want_) {
-                (void)sid;
-                data_.request_candles(sym, warmup_interval(warm_bar_sec), "1mo");
+            warmup_want_.clear();   // a previous session's tickets are not ours
+            for (const WarmupWant& w : cold_warmup) {
+                const uint32_t rid =
+                    data_.request_candles(w.symbol, warmup_interval(warm_bar_sec),
+                                          "1mo", net::ReqPriority::Live);
+                if (rid) warmup_want_[rid] = w;
+                else
+                    route("live: WARNING " + w.symbol +
+                          " starts cold and the feed would not accept its warmup "
+                          "request - it will trade on tick-aggregated bars only");
             }
             if (!warmup_want_.empty())
                 route("live: fetching warmup history for " +

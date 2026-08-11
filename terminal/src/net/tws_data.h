@@ -77,7 +77,8 @@ public:
     int gateway_farms_ok() const override;
 
     uint32_t request_candles(const std::string& symbol, const std::string& interval,
-                             const std::string& range) override;
+                             const std::string& range,
+                             ReqPriority prio = ReqPriority::Bulk) override;
     uint32_t subscribe_quotes(const std::vector<std::string>& symbols,
                               int poll_s) override;
     void unsubscribe(uint32_t sub_id) override;
@@ -101,6 +102,12 @@ private:
     struct CandleReq {
         uint32_t id;
         std::string symbol, interval, range;
+        ReqPriority prio = ReqPriority::Bulk;
+        // When the UI thread queued it (steady ms). A request the pacing gate
+        // holds is put BACK on this queue every pass, so without a stamp it can
+        // wait indefinitely and then spend a send slot on an answer nobody is
+        // waiting for any more. See kHistQueueMaxWaitMs.
+        int64_t queued_ms = 0;
     };
 
     void io_loop();

@@ -27,7 +27,8 @@
 // from the I/O thread (same ownership as Io::hist), so it carries no mutex.
 // Anything reading it from the UI thread would need one — don't.
 
-#include "market_data.h"   // tt::Candle
+#include "market_data.h"      // tt::Candle
+#include "net/hist_pacing.h"  // hist_key: one definition of "the same request"
 
 #include <cstddef>
 #include <cstdint>
@@ -71,23 +72,38 @@ inline constexpr size_t kBarCacheMaxCandles = 250'000;
 // candle ceiling.
 inline constexpr size_t kBarCacheMaxEntries = 64;
 
-// The cache key.
+// Not cached at all: a delivery too thin for anything downstream to use.
 //
-// It includes the RANGE, not just symbol + interval, because those are
-// genuinely different datasets and conflating them is a defect this codebase
-// has already shipped once: on 2026-08-10 a sweep labelled "5m 6mo" ran on 1567
+// App rejects a series under 3 bars in both consumers (start_pending_backtest
+// and pump_sweep log "not enough data"), so a 1- or 2-bar delivery is "nothing
+// usable" by the app's own definition. Caching it would turn one bad answer —
+// a halted or newly-listed pick, or a partial answer during a data-farm hiccup —
+// into five minutes of confidently-served nothing, and it would defeat the one
+// recovery the tournament has: a requeued candidate re-asks for the series, and
+// if the answer came from this cache it fails identically every time, where
+// before the cache each candidate's own fetch could still succeed.
+inline constexpr size_t kBarCacheMinBars = 3;
+
+// The cache key: (symbol, IB bar size, IB duration) — the request's identity ON
+// THE WIRE, built by net/hist_pacing.h's hist_key() so the pacing gate and this
+// cache can never disagree about what "the same request" is.
+//
+// It includes the DURATION, not just symbol + bar size, because those are
+// genuinely different datasets and conflating them is a defect this codebase has
+// already shipped once: on 2026-08-10 a sweep labelled "5m 6mo" ran on 1567
 // live-warmup bars (a real 6mo request returns ~2966-9517), because candle
 // deliveries were routed to a waiting sweep by SYMBOL alone. A cache keyed
-// without the range would institutionalise exactly that — serving a warmup
-// series to an optimizer asking for six months, every time, silently.
+// without the span would institutionalise exactly that — serving a warmup series
+// to an optimizer asking for six months, every time, silently.
 //
-// The range string is the caller's ("6mo", "1mo", ...), taken BEFORE
-// max_dur_idx clamps it. Two ranges that clamp to the same IB duration (a
-// "5y" of 5m bars and a "6mo" of 5m bars both send "6 M") therefore get
-// separate entries. That is a wasted fetch at worst; the reverse — one key
-// covering two requests that are not the same request — is a wrong answer.
+// It is the RESOLVED duration, after max_dur_idx clamps the caller's range, not
+// the caller's label. Two ranges that clamp to the same duration (1h/"5y" and
+// 1h/"max" both send dur="2 Y") are one request as far as IB is concerned: it
+// returns the same series for both, and issuing the second inside 15 s is a
+// pacing violation. Keying on the caller's label made them two entries, so the
+// cache could not answer the duplicate and the gate could only delay it.
 struct BarCacheKey {
-    std::string symbol, interval, range;
+    std::string symbol, bar_size, duration;
 };
 
 class BarCache {
@@ -100,9 +116,9 @@ public:
     // wall-clock jump would either resurrect an expired entry or expire a fresh
     // one.
     const std::vector<Candle>* get(const std::string& symbol,
-                                   const std::string& interval,
-                                   const std::string& range, int64_t now_ms) {
-        const auto it = map_.find(key(symbol, interval, range));
+                                   const std::string& bar_size,
+                                   const std::string& duration, int64_t now_ms) {
+        const auto it = map_.find(key(symbol, bar_size, duration));
         if (it == map_.end()) {
             ++misses_;
             return nullptr;
@@ -118,17 +134,16 @@ public:
         return &it->second.candles;
     }
 
-    // Record a delivered series. An EMPTY delivery is not cached: on the
+    // Record a delivered series. An UNUSABLE delivery is not cached: on the
     // ibkr_web route a gateway that has lost an instrument's market-data
     // entitlement answers with no bars at all, and on the TWS route a request
-    // IB declines can end the same way. Caching that would turn one bad
-    // delivery into five minutes of confidently-served nothing, and every
-    // consumer downstream reads "not enough data" rather than retrying.
-    void put(const std::string& symbol, const std::string& interval,
-             const std::string& range, std::vector<Candle> candles,
+    // IB declines can end the same way — or come back with one or two bars,
+    // which is the same nothing wearing a different shape. See kBarCacheMinBars.
+    void put(const std::string& symbol, const std::string& bar_size,
+             const std::string& duration, std::vector<Candle> candles,
              int64_t now_ms) {
-        if (candles.empty()) return;
-        const std::string k = key(symbol, interval, range);
+        if (candles.size() < kBarCacheMinBars) return;
+        const std::string k = key(symbol, bar_size, duration);
         const auto it = map_.find(k);
         if (it != map_.end()) candles_ -= it->second.candles.size();
         candles_ += candles.size();
@@ -167,11 +182,12 @@ private:
         int64_t used_ms = 0;    // when it was last served: what eviction ranks
     };
 
-    static std::string key(const std::string& symbol, const std::string& interval,
-                           const std::string& range) {
-        // Unit separator: not a legal character in a ticker, an interval or a
-        // range, so no two distinct triples can collide into one key.
-        return symbol + '\x1f' + interval + '\x1f' + range;
+    static std::string key(const std::string& symbol, const std::string& bar_size,
+                           const std::string& duration) {
+        // The same construction as net/hist_pacing.h's hist_key(): unit
+        // separator, which appears in no ticker, bar size or duration string, so
+        // no two distinct triples can collide into one key.
+        return hist_key(symbol, bar_size, duration);
     }
 
     // Drop expired entries first (they are worthless), then least-recently-USED
