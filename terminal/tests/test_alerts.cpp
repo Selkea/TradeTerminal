@@ -10,6 +10,10 @@
 
 #include "engine/tws_client_id.h"
 
+#include <fstream>
+#include <iterator>
+#include <string>
+
 using tt::ui::AlertClass;
 using tt::ui::classify_alert;
 using tt::ui::detail::ascii_fold;
@@ -95,17 +99,52 @@ TEST_CASE("classify_alert: a client-id collision pages, from all three clients")
     // fails instead of the alert silently going quiet again.
     for (const char* who : {"market data", "the ORDER path", "the live tick stream"}) {
         const std::string l =
-            tt::tws_client_id_conflict_line(who, "127.0.0.1", 4002, 9);
+            tt::tws_client_id_conflict_line(who, "nothing works", "127.0.0.1", 4002, 9);
         CHECK(classify_alert(l) == AlertClass::Critical);
     }
     // ...and it says, in words, what is wrong and what to do about it. IB's own
     // wording ("the client id is already in use") is jargon to whoever is
     // looking at the log at 16:33 on a Tuesday.
-    const std::string l = tt::tws_client_id_conflict_line("market data", "127.0.0.1", 4002, 9);
-    CHECK(l.find("another program is already connected") != std::string::npos);
-    CHECK(l.find("Close it") != std::string::npos);
-    CHECK(l.find("Not retrying") != std::string::npos);
+    const std::string l = tt::tws_client_id_conflict_line(
+        "market data", "no charts, no warmup, no daily lineup", "127.0.0.1", 4002, 20);
+    CHECK(l.find("already connected with it") != std::string::npos);
+    CHECK(l.find("no charts, no warmup, no daily lineup") != std::string::npos);
     CHECK(l.find("127.0.0.1:4002") != std::string::npos);
+    CHECK(l.find("client id 20") != std::string::npos);
+}
+
+TEST_CASE("classify_alert: the conflict line names BOTH causes and promises a retry") {
+    // 0.20.0 shipped a sentence that asserted one diagnosis — "It is almost
+    // certainly a second TradeTerminal ... Close it (Task Manager:
+    // tt_terminal.exe), then restart this app" — and declared "Not retrying:
+    // this cannot clear itself". Both are wrong for the 326 this app produces
+    // most often: after a hard kill (main.cpp's TerminateProcess teardown
+    // budget) or a nightly gateway restart, the id it collides with is its OWN
+    // previous session's, held by the gateway for a few seconds more. There is
+    // no second tt_terminal.exe to close, and the remedy printed would have the
+    // operator kill the running trading app.
+    const std::string l = tt::tws_client_id_conflict_line("the ORDER path", "no orders",
+                                                          "127.0.0.1", 4002, 20);
+    CHECK(l.find("second TradeTerminal") != std::string::npos);       // cause 1
+    CHECK(l.find("own previous session") != std::string::npos);       // cause 2
+    CHECK(l.find("Retrying every") != std::string::npos);
+    // The claims the app can no longer make. "Not retrying" would be a lie the
+    // moment io_loop's backoff runs, and telling an operator to restart the app
+    // is what turns a self-clearing blip into a manual outage.
+    CHECK(l.find("Not retrying") == std::string::npos);
+    CHECK(l.find("restart this app") == std::string::npos);
+}
+
+TEST_CASE("classify_alert: the all-clear is NOT a Critical page") {
+    // A conflict that can end has to be observably ended, or the operator is
+    // left acting on a page that stopped being true. But good news must not
+    // arrive as a Critical: the cleared tag is deliberately not a substring of
+    // the conflict tag, and this is what pins that apart.
+    const std::string ok = tt::tws_client_id_cleared_line("the ORDER path", 20);
+    CHECK(ok.find(tt::kTwsClientIdConflictTag) == std::string::npos);
+    CHECK(classify_alert(ok) != AlertClass::Critical);
+    CHECK(ok.find("no action needed") != std::string::npos);
+    CHECK(ok.find("client id 20") != std::string::npos);
 }
 
 TEST_CASE("classify_alert: ordinary talk about client ids does NOT page") {
@@ -117,4 +156,49 @@ TEST_CASE("classify_alert: ordinary talk about client ids does NOT page") {
     CHECK(classify_alert("tws-data: using client id 9") == AlertClass::None);
     CHECK(classify_alert("tws-feed: client id in use by this session") ==
           AlertClass::None);
+}
+
+// --------------------------------------------- the 326 state machine, audited
+//
+// The 0.20.0 branch latched IB error 326 and never cleared it. `exchange(true)`
+// appeared in all three clients and `store(false)` appeared nowhere, so the
+// first collision a client ever saw ended it for the life of the process: a
+// live session with no order path while positions were open, a data client with
+// no candles for the rest of the day, and — because Watch-IbGateway.ps1 keys its
+// cold relaunch off broker_connected, which could then never come back — IB
+// Gateway restarted every four minutes until someone noticed.
+//
+// Exercising the real state machine needs a second API client on a live gateway,
+// which no test here has. So the invariant is audited as text: a client that can
+// LATCH the condition must also be able to CLEAR it, and its I/O loop must still
+// reach a retry. It is a weaker test than driving the sockets and it is the one
+// available; without it, deleting the clear is green.
+TEST_CASE("every TWS client that latches a 326 can also clear it and retry") {
+    auto count = [](const std::string& hay, const std::string& needle) {
+        size_t n = 0;
+        for (size_t p = hay.find(needle); p != std::string::npos;
+             p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    for (const char* rel : {"/engine/src/tws_broker.cpp", "/engine/src/tws_feed.cpp",
+                            "/terminal/src/net/tws_data.cpp"}) {
+        const std::string path = std::string(TT_REPO_DIR) + rel;
+        std::ifstream in(path, std::ios::binary);
+        REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+        const std::string src{std::istreambuf_iterator<char>(in),
+                              std::istreambuf_iterator<char>()};
+        INFO("in " << rel);
+        // Set once, on the refusal...
+        CHECK(count(src, "client_id_conflict_.exchange(true") == 1);
+        // ...and cleared once, on the handshake that proves the id is ours. THIS
+        // is the assertion whose absence was the 0.20.0 defect.
+        CHECK(count(src, "client_id_conflict_.exchange(false") == 1);
+        // Nothing may pin it true by another route.
+        CHECK(count(src, "client_id_conflict_.store(true") == 0);
+        // And the I/O loop must still get to a connect attempt while it is set —
+        // slowed to kTwsClientIdRetrySec, not parked. A client that only ever
+        // slept here would satisfy the two counts above and still never recover.
+        CHECK(count(src, "kTwsClientIdRetrySec") >= 1);
+    }
 }

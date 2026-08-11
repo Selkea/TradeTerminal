@@ -17,14 +17,18 @@ inline AlertClass classify_alert(const std::string& l) {
         has("PROTECTIVE STOP REJECTED"))
         return AlertClass::Critical;
     // A TWS client-id collision (IB error 326). Critical rather than Warning
-    // because it is PERMANENT and total: the affected client never connects
-    // again in this process, so on the data client there are no candles — no
-    // charts, no warmup, no lineup — and on the orders client nothing can reach
-    // the market. On 2026-08-11 this produced a three-line stanza every 3 s and
-    // nothing else, and was reported to the operator's own eyes as "it crashed".
-    // Unlike the routine reconnects deliberately excluded below, nothing about
-    // it self-heals: a human has to close the other program.
+    // because while it lasts it is TOTAL for the client that drew it: on the
+    // data client there are no candles — no charts, no warmup, no lineup — and
+    // on the orders client nothing can reach the market. On 2026-08-11 it
+    // produced a three-line stanza every 3 s and nothing else, and was reported
+    // to the operator's own eyes as "it crashed".
+    //
+    // It may still self-heal — the id is often our own just-reaped session's,
+    // which the gateway releases on its own — so it pages once and the client
+    // keeps retrying. The all-clear below is what closes the episode; it is
+    // deliberately a different tag, so recovering cannot page Critical.
     if (has(kTwsClientIdConflictTag)) return AlertClass::Critical;
+    if (has(kTwsClientIdClearedTag)) return AlertClass::Warning;
     // NB: match "half-open ORDER" (a broker order submitted but never acked),
     // NOT bare "half-open". The routine data-feed reconnect logs "...data
     // session (half-open)" — it self-heals on every nightly gateway restart and

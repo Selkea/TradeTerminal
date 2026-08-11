@@ -46,9 +46,19 @@ enum class AccountKind { Unknown, Paper, Live };
 // cache_hits=24 cache_misses=967 hist_requests=36: 967 "misses" against 36
 // actual fetches, because the miss was counted at the cache LOOKUP, which a
 // pacing-held request repeats every pass. cache_fetched below is counted at the
-// send instead, so cache_served + cache_fetched is the number of requests that
-// were resolved and the ratio is the real hit rate. cache_lookups keeps the old
-// number, correctly named: it measures gate churn, not caching.
+// send instead. cache_lookups keeps the old number, correctly named: it measures
+// gate churn, not caching.
+//
+// THE HIT RATE IS cache_served / (cache_served + cache_fetched + abandoned),
+// and the third term is not optional. A request the pacing gate gives up on
+// (kHistQueueMaxWaitMs) is RESOLVED — errored back to its caller — having only
+// ever missed, so it lands in neither of the first two. Dividing by the first
+// two alone overstates the cache's share of demand exactly in the degraded,
+// saturated builds these counters exist to diagnose: served=24 fetched=36
+// abandoned=20 is 30% of the 80 requests made, not the 40% the shorter formula
+// reports. (A request with an interval string that will not parse is errored
+// before any lookup and is in none of the three; it is a caller bug, not
+// history-fetch work, and there has never been a non-zero one in production.)
 struct HistStats {
     uint64_t cache_served = 0;    // requests answered from cache — fetches AVOIDED
     uint64_t cache_fetched = 0;   // requests that had to go to the wire (first issues)
@@ -93,11 +103,11 @@ public:
     // fetching happened".
     virtual HistStats hist_stats() const { return {}; }
 
-    // True when this source gave up connecting because another program already
-    // holds its TWS API client id (IB error 326 — see engine/tws_client_id.h).
-    // It is LATCHED and terminal: nothing here will reconnect, so a reader must
-    // treat it as "this source is off until the app is restarted", not as a
-    // transient. Only the TWS route can report it; every other source says no.
+    // True while this source is being refused its TWS API client id because
+    // something already holds it (IB error 326 — see engine/tws_client_id.h).
+    // It means "down, and this is why" — the source is still reconnecting, just
+    // slowly, and this goes false the moment a handshake completes. Only the TWS
+    // route can report it; every other source says no.
     virtual bool client_id_conflict() const { return false; }
 
     // Is the upstream gateway LOGGED IN to the broker, as opposed to merely

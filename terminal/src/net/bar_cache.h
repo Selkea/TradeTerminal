@@ -172,7 +172,14 @@ public:
 
     // Observability, in the ONE unit that makes a cache's numbers mean anything:
     // REQUESTS. served() + fetched() is how many candle requests this cache
-    // resolved, and served() / that total is the hit rate.
+    // RESOLVED — answered from memory, or put on the wire.
+    //
+    // It is not the whole denominator of a hit rate. A request the pacing gate
+    // abandons (kHistQueueMaxWaitMs) is resolved by being errored back to its
+    // caller having only missed, so it appears in neither counter and this class
+    // never learns of it; HistStats::abandoned is the term that closes the sum.
+    // See net/market_source.h, which states the full formula next to the fields
+    // a dry run actually prints.
     //
     // THE BUG THIS REPLACES. Until 0.20.0 the counters were hits()/misses(),
     // both incremented inside get() — and get() is called on every io_loop pass

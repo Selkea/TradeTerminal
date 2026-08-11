@@ -58,7 +58,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $Exe)) {
-    Write-Error "tt_terminal not found at $Exe - build the release preset first."
+    # -ErrorAction Continue, NOT the default. $ErrorActionPreference = "Stop"
+    # above makes a plain Write-Error TERMINATING, so `exit 2` below never ran
+    # and PowerShell returned 1 - the code this file reserves for "the build
+    # fitted NONE". A scheduled job keying off the documented codes therefore
+    # read a missing or unbuilt release binary as the 2026-08-10 failure and
+    # would go looking at the optimizer instead of the deploy.
+    Write-Error "tt_terminal not found at $Exe - build the release preset first." `
+        -ErrorAction Continue
     exit 2
 }
 

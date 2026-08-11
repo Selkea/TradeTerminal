@@ -60,10 +60,12 @@ public:
     // restored) so /diag and the watchdog reflect whether orders can ACTUALLY
     // reach IBKR, not just that the socket is open. True until a 1100 says else.
     bool upstream_connected() const { return upstream_ok_.load(std::memory_order_acquire); }
-    // Another program already holds this adapter's TWS API client id (IB error
-    // 326). LATCHED and terminal: the I/O loop has stopped reconnecting, so
-    // ready() will stay false until the app is restarted. Distinct from
-    // "gateway unreachable" — the gateway is fine, we are the second comer.
+    // Something already holds this adapter's TWS API client id (IB error 326).
+    // Latched for the length of the EPISODE, not the process: the I/O loop is
+    // still reconnecting, every kTwsClientIdRetrySec, and a completed handshake
+    // clears this. So it means "not connected, and here is the reason", never
+    // "gave up" — distinct from "gateway unreachable", where the gateway is the
+    // thing at fault rather than us being the second comer.
     // See engine/tws_client_id.h.
     bool client_id_conflict() const {
         return client_id_conflict_.load(std::memory_order_acquire);
@@ -132,10 +134,12 @@ private:
     std::atomic<uint64_t> next_id_{1};
     std::atomic<bool> ready_{false};
     std::atomic<bool> upstream_ok_{true};   // gateway<->IBKR link (error 1100/1102)
-    // IB error 326. Written once by the I/O thread, read by the I/O loop (which
-    // parks) and the UI thread (/diag). Never cleared: only a human closing the
-    // other program can end the condition, and an order path that silently came
-    // back mid-session would reconnect into a reconciliation it already ran.
+    // IB error 326. Set by the I/O thread on the refusal and cleared by it on
+    // the next completed handshake; read by the I/O loop (which slows its retry)
+    // and the UI thread (/diag, /metrics). An order path that comes back
+    // mid-session does NOT re-run reconciliation — Io::nextValidId gates that on
+    // recon_ever, i.e. the first connect of the session only — so recovering is
+    // strictly better than staying down, which is why this is not one-way.
     std::atomic<bool> client_id_conflict_{false};
     std::atomic<bool> stop_{false};
     std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh: drop + reconnect

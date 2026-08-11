@@ -76,8 +76,12 @@ struct TwsFeed::Io final : DefaultEWrapper {
         }
         reader = std::make_unique<EReader>(client.get(), &signal);
         reader->start();
-        f.log("connecting to IB Gateway at " + f.cfg_.host + ":" +
-              std::to_string(f.cfg_.port));
+        // Silent while a client-id conflict is being retried — see
+        // engine/tws_client_id.h: the conflict line already said what is wrong,
+        // and this line plus "connection closed" are what made it a stanza.
+        if (!f.client_id_conflict_.load(std::memory_order_acquire))
+            f.log("connecting to IB Gateway at " + f.cfg_.host + ":" +
+                  std::to_string(f.cfg_.port));
         return true;
     }
 
@@ -133,12 +137,18 @@ struct TwsFeed::Io final : DefaultEWrapper {
     // ---- EWrapper -----------------------------------------------------------
     void nextValidId(OrderId) override {
         f.connected_.store(true, std::memory_order_release);
+        // The handshake is the proof the id is ours again; clear the 326 latch
+        // and say so, or /diag keeps reporting a conflict that has ended.
+        if (f.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
+            f.log(tws_client_id_cleared_line("the live tick stream",
+                                             f.cfg_.client_id));
         if (!subscribed && client) subscribe_all();
     }
 
     void connectionClosed() override {
         f.connected_.store(false, std::memory_order_release);
-        f.log("connection closed");
+        if (!f.client_id_conflict_.load(std::memory_order_acquire))
+            f.log("connection closed");   // see connect_gateway: no stanza
     }
 
     void error(int id, int errorCode, const std::string& errorString,
@@ -150,17 +160,17 @@ struct TwsFeed::Io final : DefaultEWrapper {
             return;
         }
         if (errorCode == kTwsClientIdInUse) {
-            // Another program owns client id 8. See engine/tws_client_id.h —
-            // permanent while that program lives, so io_loop parks rather than
-            // retrying every 3 s. Not silently re-homed onto a spare id either:
-            // 7/8/9 are adjacent, so an "id + 1" scheme walks straight into
-            // another TradeTerminal's clients and turns one legible failure into
-            // three.
+            // Something already holds this session's feed client id (App hands
+            // out 40-59 in rotation, so it is often our own previous session's,
+            // which the gateway releases on its own). See engine/tws_client_id.h:
+            // the latch makes this say itself ONCE and slows the retry; io_loop
+            // keeps trying. Not silently re-homed onto a spare id either — an
+            // "id + 1" scheme walks straight into another TradeTerminal's
+            // clients and turns one legible failure into three.
             if (!f.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
-                f.log(tws_client_id_conflict_line("the live tick stream (the "
-                                                  "session gets no prices)",
-                                                  f.cfg_.host, f.cfg_.port,
-                                                  f.cfg_.client_id));
+                f.log(tws_client_id_conflict_line(
+                    "the live tick stream", "the session gets no prices",
+                    f.cfg_.host, f.cfg_.port, f.cfg_.client_id));
             return;
         }
         // Tick-by-tick refused (no subscription / stream limit): fall back to
@@ -301,24 +311,21 @@ void TwsFeed::io_loop() {
     wake_.store(&io.signal, std::memory_order_release);
 
     auto last_connect = std::chrono::steady_clock::time_point{};
-    // See the kTwsClientIdInUse branch in Io::error: torn down once, then parked.
-    bool conflict_settled = false;
     while (!stop_.load(std::memory_order_acquire)) {
-        // Client id already taken by another program (IB error 326). Park:
-        // reconnecting cannot succeed while that program lives. connected()
-        // stays false, which is what the session's own staleness checks read.
-        if (client_id_conflict_.load(std::memory_order_acquire)) {
-            if (!conflict_settled) {
-                conflict_settled = true;
-                io.drop_connection();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = std::chrono::steady_clock::now();
-            if (now - last_connect >= std::chrono::seconds(3)) {
+            // Client id already taken (IB error 326): retry far more slowly,
+            // but keep retrying. Trying harder cannot win the id, and the log
+            // stanza was the 2026-08-11 defect — but giving up would be a worse
+            // one: the id is commonly this app's own previous session's (App
+            // hands out 40-59 in rotation for that reason), and a stream that
+            // never came back leaves the live session with no prices at all for
+            // the rest of the day. See engine/tws_client_id.h.
+            const auto gap = client_id_conflict_.load(std::memory_order_acquire)
+                                 ? std::chrono::seconds(kTwsClientIdRetrySec)
+                                 : std::chrono::seconds(3);
+            if (now - last_connect >= gap) {
                 last_connect = now;
                 if (!io.connect_gateway())
                     log("cannot reach IB Gateway at " + cfg_.host + ":" +

@@ -11,6 +11,8 @@
 
 #include "net/bar_cache.h"
 
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -375,4 +377,53 @@ TEST_CASE("clear() drops everything, because bars belong to a session") {
     CHECK(c.entries() == 0);
     CHECK(c.candles() == 0);
     CHECK(c.get("SOXS", "5m", "6mo", 0) == nullptr);
+}
+
+// ---------------------------------------------------------------- call site
+//
+// Everything above tests the CLASS, and the 2026-08-11 defect was not in the
+// class: cache_misses was counted at the failed lookup, which a pacing-held
+// request repeats on every io_loop pass, so the run reported 967 against 36
+// actual fetches. Moving the count to the send fixed it — and left a hole,
+// because every test above still passes if a later edit puts record_fetch()
+// back at the lookup, deletes it (a permanent 100% hit rate), or adds a second
+// one on the retry path (a flaky session reading as a cold cache).
+//
+// The call site lives inside TwsData::Io::pump_requests, which needs a live
+// EClientSocket and an IB Gateway to exercise, so it is audited as text. That
+// is a weaker test than running it, and it is the strongest one available here:
+// the alternative is a defect class this project has already shipped once, with
+// nothing standing in the way of shipping it again.
+TEST_CASE("record_fetch() is called at the SEND, exactly once, in the source") {
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/net/tws_data.cpp";
+    std::ifstream in(path, std::ios::binary);
+    // Loud, not skipped: an audit that quietly no-ops when it cannot find its
+    // subject is how the hole above stays open.
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+
+    // Exactly one call in the whole translation unit. Two would mean the retry
+    // path counts a re-send of a series already counted; none would mean
+    // served/(served+fetched) is 1.0 forever.
+    size_t calls = 0;
+    for (size_t p = src.find("record_fetch("); p != std::string::npos;
+         p = src.find("record_fetch(", p + 1))
+        ++calls;
+    CHECK(calls == 1);
+
+    // ...and it sits AFTER the pacing gate let the request through, not at the
+    // failed lookup that precedes the gate. These three anchors are the send
+    // sequence in pump_requests, in order.
+    const size_t gate_hold = src.find("const SendHold hold = gate.hold(");
+    const size_t gate_record = src.find("gate.record(");
+    const size_t fetch = src.find("record_fetch(");
+    const size_t send = src.find("send_history(req_id");
+    REQUIRE(gate_hold != std::string::npos);
+    REQUIRE(gate_record != std::string::npos);
+    REQUIRE(fetch != std::string::npos);
+    REQUIRE(send != std::string::npos);
+    CHECK(gate_hold < gate_record);   // the hold check comes first
+    CHECK(gate_record < fetch);       // ...then the send is committed
+    CHECK(fetch < send);              // ...and only then is it counted + sent
 }

@@ -77,7 +77,11 @@ struct DryRunSymbol {
 // 2026-08-11 run reported cache_misses=967 against hist_requests=36. Renaming
 // rather than redefining means an old dry-run line and a new one cannot be
 // silently compared — the fields have different names, so the break is visible.
-// See net/bar_cache.h.
+//
+// READING THEM: the hit rate is cache_served / (cache_served + cache_fetched +
+// held_abandoned). An abandoned request missed the cache and was then errored
+// back by the pacing gate, so it is a request the build MADE and neither of the
+// first two fields counts it. See net/market_source.h and net/bar_cache.h.
 struct DryRunCounters {
     uint64_t cache_served = 0;    // requests answered from cache (fetches avoided)
     uint64_t cache_fetched = 0;   // requests that went to the wire
