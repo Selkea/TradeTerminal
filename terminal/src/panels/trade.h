@@ -98,9 +98,17 @@ public:
     // The scheduled STOP is the dangerous half: the engine's own 15:57 EOD
     // backstop flattens but does not halt or end the session, so a stop that
     // never fires leaves the session live overnight.
-    void pump_schedule(const AccountInfo& account, const ParamSpecsFn& strat_params,
-                       bool polygon_available, bool finnhub_available, bool ibkr_ready,
-                       const StartFn& start);
+    //
+    // `start` both BUILDS the StartOpts and starts the session, instead of this
+    // taking the six inputs build_start_opts needs. Those were evaluated as call
+    // arguments, i.e. before the `if (!sched_on_) return;` below could suppress
+    // them — and one of them, App::trade_account_info(), opens and JSON-parses
+    // ibkr-accounts.json off disk (measured ~45 us). Harmless at one call per
+    // rendered frame; not harmless at the 100 Hz tick(), where it became ~100
+    // file reads a second, forever, on a schedule that is switched off. The
+    // schedule fires at most twice a day, so nothing needs building until it does.
+    using ScheduledStartFn = std::function<void()>;
+    void pump_schedule(const ScheduledStartFn& start);
 
     // Tournament champion: point this symbol's tab at a strategy + its params
     // (adds the tab if the symbol isn't pending yet).

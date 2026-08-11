@@ -497,7 +497,7 @@ private:
     // then safe_stop_live(keep) and restart on the new lineup.
     enum class SwapStage { None, Flatten, Restart };
     void begin_lineup_swap(const TradePanel::StartOpts& next);  // kick off the cycle
-    void pump_lineup_swap();                 // UI thread, per frame: drive it
+    void pump_lineup_swap();                 // UI thread, per tick: drive it
     SwapStage swap_stage_ = SwapStage::None;
     double swap_deadline_s_ = 0.0;           // mono_s() give-up for the flatten
     std::vector<uint32_t> swap_flatten_ids_; // dropped symbol_ids being closed

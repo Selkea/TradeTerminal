@@ -15,6 +15,8 @@
 // a minimize. Driving the real WatchdogTimer off it reproduces the incident.
 #include "doctest.h"
 
+#include "block_wait.h"
+#include "panels/sweep.h"   // kSweepDrainBudgetMs — the budget the drain's wait must fit
 #include "tick_clock.h"
 #include "watchdog_timer.h"
 
@@ -65,6 +67,48 @@ TEST_CASE("the tick interval is fine enough for what the pumps need") {
     // But not so fine that the loop becomes a spin. 10 ms is what the old
     // iconified branch already slept.
     CHECK(kTickIntervalMs >= 5);
+}
+
+TEST_CASE("the drain's wait blocks instead of spinning") {
+    // The other half of "the not-rendering loop costs no more CPU than the code
+    // it replaced". Pacing the LOOP is useless if a pump inside it spins, and
+    // App::pump_sweep's result drain waits on an in-flight backtest for most of
+    // its 8 ms budget on every tick a sweep is running.
+    //
+    // The trap this pins: std::this_thread::sleep_for does not sleep at all
+    // below 1 ms on this toolchain (mingw-w64 truncates nanosleep to whole
+    // milliseconds), so the sleep_for(250us) the drain used to wait on returned
+    // in ~27 ns and burned 74% of a core once tick() started calling it every
+    // 10 ms. See block_wait.h. Both checks below fail on that call and pass on
+    // wait_off_core().
+
+    // It blocks: eight waits cannot pass in the time a spin would take.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 8; ++i) wait_off_core();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        CHECK(us >= 4000);   // >= 0.5 ms each; the spin managed ~27 ns each
+    }
+
+    // And the property the drain actually depends on: one full drain budget of
+    // waiting costs a handful of iterations, not hundreds of thousands. The
+    // bound is deliberately loose (a spin hit ~263,500 per 8 ms, four hundred
+    // times this ceiling) so the test measures the defect, not the scheduler.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto spent_ms = [&] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
+        long long iters = 0;
+        while (spent_ms() < kSweepDrainBudgetMs) {
+            ++iters;
+            wait_off_core();
+        }
+        CHECK(iters > 0);
+        CHECK(iters < 1000);
+    }
 }
 
 // ---------------------------------------------------------------------------

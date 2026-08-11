@@ -41,8 +41,15 @@ namespace tt::ui {
 // 10 ms, chosen against the tightest consumer rather than the loosest:
 //
 //  - It is exactly the interval the iconified path already slept on before this
-//    fix (ImGui_ImplGlfw_Sleep(10) in main.cpp), so the not-rendering loop costs
-//    no more CPU than the code it replaces. It is a paced sleep, not a spin.
+//    fix (ImGui_ImplGlfw_Sleep(10) in main.cpp, i.e. ::Sleep on Windows), so the
+//    not-rendering loop costs no more CPU than the code it replaces. It is a
+//    paced sleep, not a spin — but that holds only as long as everything tick()
+//    calls also blocks rather than spins while it waits. Beware
+//    std::this_thread::sleep_for below 1 ms: it returns IMMEDIATELY on this
+//    toolchain (mingw-w64 truncates nanosleep to whole ms), so it reads as
+//    pacing and behaves as a spin. It made App::pump_sweep's result drain burn
+//    74% of a core here at 10 ms, invisibly, because the same code had been
+//    hidden inside a ~30 ms vsynced frame. Use wait_off_core() (block_wait.h).
 //  - It is ~3x tighter than the ~33 ms the RENDERED loop achieves on the VPS
 //    (glfwSwapInterval(1); measured ~30 ms wall against 5.84 ms of work, see
 //    App::pump_sweep), so nothing that runs today gets slower when the window is

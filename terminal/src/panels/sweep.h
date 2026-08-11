@@ -151,7 +151,8 @@ constexpr int kSweepPasses = 2;
 constexpr int kSweepSteps = 12;
 constexpr double kSweepRefineWindow = 0.25;
 
-// How long App::pump_sweep may spend draining finished backtests in one frame.
+// How long App::pump_sweep may spend draining finished backtests in one TICK
+// (App::tick, ~10 ms when not rendering, ~30 ms behind vsync when it is).
 //
 // It used to take exactly ONE result per frame, and main.cpp sets
 // glfwSwapInterval(1), so the optimizer advanced one cell per vsync: ~30 ms of
@@ -160,14 +161,21 @@ constexpr double kSweepRefineWindow = 0.25;
 // of a monitor nobody was looking at.
 //
 // 8 ms, chosen against that 5.84 ms mean rather than as a round number: a budget
-// SHORTER than one backtest collects at most one result per frame and leaves the
+// SHORTER than one backtest collects at most one result per tick and leaves the
 // ceiling exactly where it was, just at 16.7 ms instead of 30. 8 ms clears the
 // mean with margin, and still leaves half of a 16.7 ms frame for the UI — which
 // only matters at all while a sweep is running.
 constexpr int64_t kSweepDrainBudgetMs = 8;
 
 // How long one tournament candidate may wait for its bars, and how long the
-// whole tournament for one symbol may take. Seconds, on ImGui::GetTime().
+// whole tournament for one symbol may take. Seconds, on App::mono_s().
+//
+// mono_s(), NOT ImGui::GetTime(): App::pump_tournament runs from App::tick(),
+// where no frame exists. ImGui's clock only advances inside NewFrame, so on the
+// frame clock a minimized window would pause a tournament's budget outright and
+// then expire it in one unclamped step on restore. These are real-world
+// deadlines and must keep time whether or not anyone is looking (see
+// tick_clock.h for the 2026-08-11 incident).
 //
 // THE FETCH BUDGET, from the measurements in net/hist_pacing.h rather than a
 // round number: a successful fetch is median 6 s and max 17 s; a silently

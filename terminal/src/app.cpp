@@ -1,5 +1,6 @@
 #include "app.h"
 #include "alert_rules.h"   // classify_alert: what pages the phone
+#include "block_wait.h"    // wait_off_core: sub-ms sleep_for does not sleep here
 #include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
 #include "dev_paths.h"
 #include "market_calendar.h"   // is_us_trading_day: the pre-open check may not act on a holiday
@@ -1075,10 +1076,18 @@ void App::pump_sweep() {
     //
     // consume_sweep_result() starts the next cell, so the poll below is waiting
     // on a backtest that is already in flight; kSweepDrainBudgetMs bounds how
-    // much of the frame that may take, and is deliberately LONGER than one
+    // much of the tick that may take, and is deliberately LONGER than one
     // backtest (see the constant) — a budget shorter than that would just move
-    // the one-per-frame ceiling from 30 ms to 16.7 ms. It sleeps rather than
-    // spins: the engine is on another thread and this box has few cores to spare.
+    // the one-per-tick ceiling from 30 ms to 16.7 ms.
+    //
+    // The wait must BLOCK, not spin — the engine is on another thread and this
+    // box has few cores to spare. That was written of a
+    // std::this_thread::sleep_for(250us) which does not sleep at all here; see
+    // block_wait.h. Measured on a replica of this loop (5.84 ms cells, the
+    // 10 ms tick period, 8 ms budget): spinning cost 73.8% of a core for
+    // 6.18 ms/result, blocking costs 0.0% for 6.78 ms/result. Nine percent of
+    // drain throughput is the right trade for a whole core handed back to the
+    // engine thread running those backtests and to the live session beside it.
     const auto drain_start = std::chrono::steady_clock::now();
     auto drain_spent_ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1095,9 +1104,9 @@ void App::pump_sweep() {
             continue;
         }
         // Nothing ready. If nothing is running either, there is nothing to wait
-        // for — the sweep is between states and the next frame will move it on.
+        // for — the sweep is between states and the next tick will move it on.
         if (!engine_.running() || drain_spent_ms() >= kSweepDrainBudgetMs) break;
-        std::this_thread::sleep_for(std::chrono::microseconds(250));
+        wait_off_core();
     }
 }
 
@@ -2590,8 +2599,9 @@ void App::start_diag_server() {
                  " already in use?)");
 }
 
-// UI thread, per frame: re-render the /diag body at ~1 Hz into diag_json_, which
-// the server thread copies out under diag_mu_.
+// UI thread, per TICK (no frame in progress — the 1 Hz gate is on mono_s(), not
+// ImGui's clock): re-render the /diag body into diag_json_, which the server
+// thread copies out under diag_mu_.
 void App::pump_diag() {
     // Execute a remote kill request here, on the UI thread — the only producer
     // allowed to touch the engine's SPSC command ring (the diag server thread
@@ -3174,10 +3184,21 @@ int App::tick() {
     // auto-start and the auto-stop on a maximized, fully visible window, with
     // nothing anywhere to say the schedule had stopped running. Same defect
     // class as the iconify freeze, but it needed no minimize at all.
-    trade_.pump_schedule(
-        trade_account_info(), param_specs_fn(), !polygon_key().empty(),
-        !finnhub_key().empty(), data_.connected(),
-        [this](const TradePanel::StartOpts& opts) { start_live_session(opts); });
+    //
+    // The lambda BUILDS the options as well as starting: everything
+    // build_start_opts needs is expensive to produce and was being produced on
+    // every tick as call arguments, ahead of pump_schedule's own `if (!sched_on_)
+    // return;`. trade_account_info() re-reads and JSON-parses ibkr-accounts.json
+    // from disk; polygon_key()/finnhub_key() each run CryptUnprotectData twice
+    // over the stored credential. At the 100 Hz tick that is millions of file
+    // opens and decryptions a session, all of it discarded — and on the rendered
+    // path it duplicated the read draw() already does below. Now it costs
+    // nothing until the day's one 09:25 crossing actually fires.
+    trade_.pump_schedule([this] {
+        start_live_session(trade_.build_start_opts(
+            trade_account_info(), param_specs_fn(), !polygon_key().empty(),
+            !finnhub_key().empty(), data_.connected()));
+    });
 
     // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
     // so start the live session through the exact path the Start button uses.

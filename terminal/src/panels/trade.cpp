@@ -185,17 +185,17 @@ TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
 // The session schedule, driven from App::tick() so it cannot be switched off by
 // the Trade panel being hidden, collapsed, or docked behind a sibling tab (see
 // the declaration for the incident). Touches no ImGui — there is no frame here.
-void TradePanel::pump_schedule(const AccountInfo& account,
-                               const ParamSpecsFn& strat_params, bool polygon_available,
-                               bool finnhub_available, bool ibkr_ready,
-                               const StartFn& start) {
+void TradePanel::pump_schedule(const ScheduledStartFn& start) {
     if (!sched_on_) return;
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};
     localtime_s(&tm, &now_tt);
     const int now_min = tm.tm_hour * 60 + tm.tm_min;
 
-    if (eng_.live_snapshot().running) {
+    // live_running(), not live_snapshot().running: the snapshot deep-copies the
+    // session's whole order vector (up to 200 OrderRecords, engine.cpp) under a
+    // lock, and this runs every tick. The flag is a plain atomic load.
+    if (eng_.live_running()) {
         // Scheduled stop: cancel + flatten + stop when the local clock crosses
         // the stop time. Edge-triggered, so a session started manually after
         // hours is left alone. While anything runs, mark today as "started" so a
@@ -231,8 +231,7 @@ void TradePanel::pump_schedule(const AccountInfo& account,
         tm.tm_yday != sched_last_start_day_ && tm.tm_yday != sched_blocked_day_ &&
         now_min >= start_min && now_min < stop_min) {
         sched_last_start_day_ = tm.tm_yday;
-        start(build_start_opts(account, strat_params, polygon_available,
-                               finnhub_available, ibkr_ready));
+        start();
     }
 }
 
