@@ -165,15 +165,16 @@ inline double us_market_close_h(const std::tm& tm) {
 //
 //   1. It is the gate. 0 means "nothing the market does can be late right now",
 //      which is the whole 2026-08-11 fix.
-//   2. It is the settle-in window at the open, which a bare is-it-open boolean
-//      would NOT give. The terminal is meant to survive the nightly stop/start,
-//      but a session that was never stopped carries yesterday's deliveries into
-//      this morning: at 09:30:01 a symbol last served at 17:00 yesterday is
-//      sixteen hours "stale" and would page on the first frame the gate opened,
-//      before the morning's first autopilot cycle has had any chance to run.
-//      Capping staleness at this figure means no symbol can be more overdue
-//      than the market has been open — the same shape the never-answered case
-//      has always had, where a symbol is aged from session start.
+//   2. It is what the settle-in window at the open is measured off, which a
+//      bare is-it-open boolean would NOT give. The terminal is meant to survive
+//      the nightly stop/start, but a session that was never stopped carries
+//      yesterday's deliveries into this morning: at 09:30:01 a symbol last
+//      served at 17:00 yesterday is sixteen hours "stale" and would page on the
+//      first frame the gate opened. The watchdog waits net::kHistArmSettleMs of
+//      this figure before judging anything — a FIXED 45 minutes, not a cap on
+//      each symbol's age, which is the distinction 0.21.0 got wrong: a cap
+//      cannot exceed the 389 minutes a full session offers, so it silently
+//      un-watched every symbol whose grace was longer than that.
 //
 // Deliberately NOT clamped to a session's own start: the caller owns that (it
 // takes the min of the two), because "how long has the market been open" is a

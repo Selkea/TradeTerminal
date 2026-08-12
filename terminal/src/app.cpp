@@ -4486,16 +4486,28 @@ std::string App::traded_bar_interval() const {
 //
 // The price of the gate is bounded and paid once, which is the test it had to
 // pass before being allowed anywhere near the 2026-08-07 detection:
-//   - it can only delay a session's FIRST page, and only when the last delivery
-//     predates the open. Replay 2026-08-07 (last SOXS refresh 09:17, 90-minute
-//     grace) and the page moves from 10:48 to 11:01 — thirteen minutes, on a
-//     stall that ran until 14:01 before a human saw it. A stall that starts
-//     after the open pays nothing.
-//   - it gives up no evidence overnight, because none was being kept:
-//     hist_fresh_.clear() runs on every idle frame of a stopped session, and a
-//     session left live has nothing it can act on until the market reopens.
+//   - it can only delay a session's FIRST page, by at most the fixed 45-minute
+//     arming settle-in and only when the last delivery predates the open.
+//     Replay 2026-08-07 (last SOXS refresh 09:17, 90-minute grace, session live
+//     from 09:25) and the page still lands at 10:48, unmoved: the market had
+//     been open 78 minutes by then. A stall that starts after the open pays
+//     nothing at all.
+//   - overnight it defers, it does not discard. 0.21.0 claimed here that no
+//     evidence was being given up "because none was being kept", and that is
+//     simply not true of the configuration that produced the incident: the
+//     hist_fresh_.clear() it cited runs only on the !live_running() branch, and
+//     a session left running never reaches it. pump_autopilot keeps cycling all
+//     night too, so a data path that dies at 17:00 is genuinely visible at
+//     03:00. What IS true is the narrower claim: nothing can FILL — every order
+//     the engine emits carries outside_rth = 0 — so the evidence keeps until
+//     45 minutes after the open, and it is still there when the gate lifts
+//     because staleness is measured from the last delivery, not from the open.
+//     The trade is one page moved to ~10:15 against roughly forty a night that
+//     say "strategies are trading on stale candles" while no strategy can
+//     trade at all.
 // See tt::rth_open_elapsed_ms (market_calendar.h) for the arithmetic, including
-// the 1pm early closes.
+// the 1pm early closes, and net::kHistArmSettleMs for why the settle-in is a
+// fixed window rather than each symbol's own grace.
 void App::pump_history_watchdog() {
     static constexpr double kHistStaleReAlertSec = 1800.0;   // re-page every 30 min
     if (!engine_.live_running()) {
@@ -4549,12 +4561,13 @@ void App::pump_history_watchdog() {
     std::tm ltm{};
     localtime_s(&ltm, &wall);
     const int64_t open_ms = rth_open_elapsed_ms(ltm);
-    const int64_t armed_ms = net::hist_armed_ms(
-        static_cast<int64_t>((now - hist_live_since_s_) * 1000.0), open_ms);
+    const int64_t session_ms =
+        static_cast<int64_t>((now - hist_live_since_s_) * 1000.0);
+    const int64_t armed_ms = net::hist_armed_ms(session_ms, open_ms);
 
     const int64_t now_steady = steady_ms();
-    const auto stale =
-        hist_fresh_.stale(watched, traded_bar_interval(), now_steady, armed_ms);
+    const auto stale = hist_fresh_.stale(watched, traded_bar_interval(),
+                                         now_steady, session_ms, armed_ms);
 
     if (stale.empty()) {
         if (hist_stale_last_alert_s_ != 0.0) {

@@ -89,13 +89,22 @@ static std::vector<WatchedSymbol> every30(const std::vector<std::string>& syms) 
     return out;
 }
 
+// stale() takes the session's age and the ARMED window separately. Most cases
+// below are mid-session on an open market, where the two coincide; the ones
+// that pull them apart are the RTH-gate block further down.
+static std::vector<StaleBars> stale_at(const HistoryFreshness& f,
+                                       const std::vector<WatchedSymbol>& syms,
+                                       int64_t now, int64_t window) {
+    return f.stale(syms, "5m", now, window, window);
+}
+
 TEST_CASE("stale: nothing is reported while every symbol refreshes") {
     HistoryFreshness f;
     f.record("SOXS", "5m", 0);
     f.record("AAOX", "5m", 0);
     const auto syms = every30({"SOXS", "AAOX"});
     // 89 minutes old on a 90-minute grace: still quiet.
-    CHECK(f.stale(syms, "5m", 89 * kMin, 89 * kMin).empty());
+    CHECK(stale_at(f, syms, 89 * kMin, 89 * kMin).empty());
 }
 
 TEST_CASE("stale: the 2026-08-07 lineup, replayed") {
@@ -107,7 +116,7 @@ TEST_CASE("stale: the 2026-08-07 lineup, replayed") {
     f.record("SNDQ", "5m", 61 * kMin);
     f.record("SPCH", "5m", 295 * kMin);
     const auto syms = every30({"SOXS", "AAOX", "SNDQ", "SPCH"});
-    const auto out = f.stale(syms, "5m", 301 * kMin, 301 * kMin);
+    const auto out = stale_at(f, syms, 301 * kMin, 301 * kMin);
     REQUIRE(out.size() == 3);
     CHECK(out[0].symbol == "SOXS");   // worst first, so the alert leads with it
     CHECK(out[1].symbol == "AAOX");
@@ -126,12 +135,29 @@ TEST_CASE("stale: a slow symbol does not raise the bar for a fast one") {
     f.record("SOXS", "5m", 17 * kMin);   // last good refresh 09:17
     f.record("SNDQ", "5m", 17 * kMin);   // same age, but 8x the cadence
     const std::vector<WatchedSymbol> syms{{"SOXS", 30}, {"SNDQ", 240}};
-    const auto out = f.stale(syms, "5m", 301 * kMin, 301 * kMin);
+    const auto out = stale_at(f, syms, 301 * kMin, 301 * kMin);
     REQUIRE(out.size() == 1);
     CHECK(out[0].symbol == "SOXS");
     CHECK(out[0].age_ms == 284 * kMin);
-    // ...and the slow one is judged by its own cadence, not silenced forever.
-    CHECK(f.stale(syms, "5m", 800 * kMin, 800 * kMin).size() == 2);
+
+    // ...and the slow one is judged by its own cadence, NOT SILENCED FOREVER —
+    // which this case has always claimed and, between 0.21.0 and 0.21.1, did
+    // not check. It asserted it with an 800-minute armed window, and
+    // pump_history_watchdog cannot build one: the window is the time the market
+    // has been open, which peaks at 389 minutes on a full day and 209 on a 1pm
+    // half-day. 0.21.0 capped every symbol's age at that same window, so
+    // SNDQ's 720-minute grace was unreachable and it could not be reported
+    // stale at any second of any trading day — probed over all 23400 seconds of
+    // RTH with it five days dead: zero. So drive it with the widest window the
+    // real caller can ever produce, and with the narrowest kind of day too.
+    const int64_t days_live = 4 * 1440 * kMin;
+    const int64_t full_day = 389 * kMin;    // 09:30 -> 15:59
+    const int64_t half_day = 209 * kMin;    // 09:30 -> 12:59, the three 1pm closes
+    const auto both = f.stale(syms, "5m", 800 * kMin, days_live, full_day);
+    REQUIRE(both.size() == 2);
+    CHECK(both[0].symbol == "SOXS");
+    CHECK(both[1].symbol == "SNDQ");
+    CHECK(f.stale(syms, "5m", 800 * kMin, days_live, half_day).size() == 2);
 }
 
 TEST_CASE("stale: a symbol that has NEVER been answered is aged from the session") {
@@ -140,11 +166,18 @@ TEST_CASE("stale: a symbol that has NEVER been answered is aged from the session
     // as a settle-in window: nothing pages in the first 90 minutes of a session.
     HistoryFreshness f;
     const auto syms = every30({"SOXS"});
-    CHECK(f.stale(syms, "5m", 500 * kMin, 89 * kMin).empty());
-    const auto out = f.stale(syms, "5m", 500 * kMin, 91 * kMin);
+    CHECK(stale_at(f, syms, 500 * kMin, 89 * kMin).empty());
+    const auto out = stale_at(f, syms, 500 * kMin, 91 * kMin);
     REQUIRE(out.size() == 1);
     CHECK_FALSE(out[0].ever);
     CHECK(out[0].age_ms == 91 * kMin);
+    // The SESSION's age, not the armed window's: a session left running
+    // overnight is entitled to page for a symbol it has never once been served,
+    // however short today's open has been so far. 0.21.0 aged it from the armed
+    // window instead, which is why a slow-cadence symbol could never get here.
+    const auto never = f.stale(syms, "5m", 500 * kMin, 3 * 1440 * kMin, 46 * kMin);
+    REQUIRE(never.size() == 1);
+    CHECK(never[0].age_ms == 3 * 1440 * kMin);
 }
 
 TEST_CASE("stale: a symbol outside the watched set is never reported") {
@@ -154,38 +187,38 @@ TEST_CASE("stale: a symbol outside the watched set is never reported") {
     // every session. pump_history_watchdog keeps both out of this list.
     HistoryFreshness f;
     f.record("SOXS", "5m", 0);
-    CHECK(f.stale({}, "5m", 500 * kMin, 500 * kMin).empty());
+    CHECK(f.stale({}, "5m", 500 * kMin, 500 * kMin, 500 * kMin).empty());
 }
 
 TEST_CASE("stale: a fresh delivery clears the whole condition") {
     HistoryFreshness f;
     f.record("SOXS", "5m", 0);
     const auto syms = every30({"SOXS"});
-    CHECK(f.stale(syms, "5m", 200 * kMin, 200 * kMin).size() == 1);
+    CHECK(stale_at(f, syms, 200 * kMin, 200 * kMin).size() == 1);
     f.record("SOXS", "5m", 200 * kMin);
-    CHECK(f.stale(syms, "5m", 200 * kMin, 200 * kMin).empty());
+    CHECK(stale_at(f, syms, 200 * kMin, 200 * kMin).empty());
 }
 
 TEST_CASE("stale: a stopped session's deliveries do not follow it into the next") {
     // The terminal stays up across the 15:55 scheduled stop and the 09:25
     // auto-start. Without the reset, yesterday's 15:32 delivery is ~17 hours old
-    // on the first frame of a healthy morning — and while armed_ms now caps that
-    // (below), clear() is what keeps /diag's age and refreshing()'s evidence
-    // honest, so both properties are pinned.
+    // on the first frame of a healthy morning — and while the arming settle-in
+    // now holds that off the phone for 45 minutes (below), clear() is what keeps
+    // /diag's age and refreshing()'s evidence honest, so both are pinned.
     HistoryFreshness f;
     f.record("SOXS", "5m", 392 * kMin);   // 15:32, counting minutes from 09:00
     const auto syms = every30({"SOXS"});
     const int64_t next_open = 1'465 * kMin;   // 09:25 the next morning
     // A fresh session is one minute old, so nothing is judged yet either way.
-    CHECK(f.stale(syms, "5m", next_open, 1 * kMin).empty());
+    CHECK(stale_at(f, syms, next_open, 1 * kMin).empty());
     // ...but the carried-over delivery is still visible as an age, and would
     // still be offered as proof the session is serving history if it were recent.
     CHECK(f.age_ms("SOXS", "5m", next_open) == 1'073 * kMin);
     f.clear();
     CHECK(f.age_ms("SOXS", "5m", next_open) == -1);
     // Now it reads as never-answered and the grace acts as the settle-in window.
-    CHECK(f.stale(syms, "5m", next_open, 1 * kMin).empty());
-    CHECK(f.stale(syms, "5m", next_open, 91 * kMin).size() == 1);
+    CHECK(stale_at(f, syms, next_open, 1 * kMin).empty());
+    CHECK(stale_at(f, syms, next_open, 91 * kMin).size() == 1);
 }
 
 // ---- the RTH gate ----------------------------------------------------------
@@ -211,20 +244,29 @@ TEST_CASE("armed: outside market hours nothing is overdue, however old") {
     f.record("SOXS", "5m", 1 * kMin);
     const auto syms = every30({"MUU", "SOXS", "KORU", "SOXL"});
     const int64_t now = 120 * kMin;
+    const int64_t session = 400 * kMin;
     // Armed (mid-session), this is exactly what the operator was paged about.
-    CHECK(f.stale(syms, "5m", now, 400 * kMin).size() == 4);
+    CHECK(f.stale(syms, "5m", now, session, 400 * kMin).size() == 4);
     // Closed: the same evidence, judged against a shut market.
-    CHECK(f.stale(syms, "5m", now, 0).empty());
+    CHECK(f.stale(syms, "5m", now, session, 0).empty());
     // ...and it stays empty as the night wears on, which is the whole point:
     // the 30-minute re-alert cannot find anything to re-page.
-    CHECK(f.stale(syms, "5m", 900 * kMin, 0).empty());
+    CHECK(f.stale(syms, "5m", 900 * kMin, 900 * kMin, 0).empty());
 }
 
-TEST_CASE("armed: the open boundary does not page an overnight-stale symbol") {
-    // The case the gate is most likely to get wrong. A session that was never
-    // stopped is still holding yesterday's deliveries, so at 09:30:01 a symbol
-    // last served at 17:00 is sixteen hours old — and the morning's first
-    // autopilot cycle has not run yet. Minutes from yesterday 09:00.
+TEST_CASE("armed: the open boundary DEFERS an overnight-stale symbol, then says it") {
+    // The case the gate is most likely to get wrong, in both directions. A
+    // session that was never stopped is still holding yesterday's deliveries, so
+    // at 09:30:01 a symbol last served at 17:00 is sixteen hours old and a bare
+    // is-it-open boolean would page on the first frame the gate opened.
+    //
+    // But it must not be forgiven forever either, and 0.21.0 came close to
+    // doing that: pump_autopilot disarms only on !live_running, so a session
+    // left running was still cycling and still asking for MUU's bars all night.
+    // A delivery that predates the open therefore means those fetches FAILED —
+    // the 2026-08-07 stall, in the one session shape most likely to hide it.
+    // The settle-in is a fixed 45 minutes of open market, not a per-symbol
+    // grace: enough for the morning to land, not enough to swallow the failure.
     HistoryFreshness f;
     f.record("MUU", "5m", 480 * kMin);   // 17:00 yesterday
     const auto syms = every30({"MUU"});   // production cadence: a 90-minute grace
@@ -232,53 +274,78 @@ TEST_CASE("armed: the open boundary does not page an overnight-stale symbol") {
     auto today = [](int hh, int mm) {
         return static_cast<int64_t>(1440 + hh * 60 + mm - 540) * kMin;
     };
+    // Live since yesterday 09:25 (t = 25) and never stopped.
+    auto session_at = [&](int hh, int mm) { return today(hh, mm) - 25 * kMin; };
     auto armed_at = [&](int hh, int mm) {
         std::tm tm{};
         tm.tm_year = 2026 - 1900; tm.tm_mon = 7; tm.tm_mday = 12;   // Wednesday
         tm.tm_wday = tt::weekday_of(2026, 8, 12);
         tm.tm_hour = hh; tm.tm_min = mm;
-        // Live since yesterday 09:25 (t = 25) and never stopped.
-        return hist_armed_ms(today(hh, mm) - 25 * kMin, tt::rth_open_elapsed_ms(tm));
+        return hist_armed_ms(session_at(hh, mm), tt::rth_open_elapsed_ms(tm));
     };
     auto at = [&](int hh, int mm) {
-        return f.stale(syms, "5m", today(hh, mm), armed_at(hh, mm));
+        return f.stale(syms, "5m", today(hh, mm), session_at(hh, mm),
+                       armed_at(hh, mm));
     };
     CHECK(at(9, 30).empty());    // the instant the gate opens: 16.5 h "stale"
-    CHECK(at(10, 59).empty());   // 89 minutes of open market, inside the grace
-    // 91 minutes of open market with nothing delivered IS the failure, so it
-    // pages then — and reports the TRUE age, not the 91 minutes it judged on.
-    const auto out = at(11, 1);
+    CHECK(at(10, 14).empty());   // 44 minutes of open market: still settling in
+    // 46 minutes of open market with nothing delivered IS the failure, so it
+    // pages then — and reports the TRUE age, not the window it judged on.
+    const auto out = at(10, 16);
     REQUIRE(out.size() == 1);
     CHECK(out[0].ever);
-    CHECK(out[0].age_ms == 1'081 * kMin);   // just over 18 h, honestly reported
+    CHECK(out[0].age_ms == 1'036 * kMin);   // just over 17 h, honestly reported
+    // It keeps saying so all day, and stops the moment the market shuts.
+    CHECK(at(15, 59).size() == 1);
+    CHECK(at(16, 0).empty());
 }
 
-TEST_CASE("armed: the cap costs at most one grace period, once, at the open") {
-    // The whole price of the gate, stated exactly. The cap can only bite while
-    // the market has been open for less than the grace period, so the only page
-    // it can ever move is a session's FIRST one, and only when the last delivery
-    // predates the open. Everything after that is untouched.
+TEST_CASE("armed: the gate costs a fixed 45 minutes, once, at the open") {
+    // The whole price of the gate, stated exactly, because it had to be paid
+    // for before going near the 2026-08-07 detection. It is a FIXED window, so
+    // it does not scale with a symbol's grace and cannot make one unpageable —
+    // that was the 0.21.0 defect (see kHistArmSettleMs).
     //
     // 2026-08-07 replayed, minutes from 09:00: last good SOXS refresh 09:17, a
-    // 90-minute grace, and the market open at 09:30 (t = 30).
+    // 90-minute grace, market open at 09:30 (t = 30), session live from 09:25.
     HistoryFreshness f;
     f.record("SOXS", "5m", 17 * kMin);
     const auto syms = every30({"SOXS"});
-    auto armed_at = [](int64_t t) { return hist_armed_ms(t, t - 30 * kMin); };
-    // Ungated it would have paged at 10:48, a grace period past the last delivery.
-    CHECK(f.stale(syms, "5m", 108 * kMin, 108 * kMin).size() == 1);
-    // Gated, that moment is a grace period of OPEN MARKET instead: 11:01.
-    CHECK(f.stale(syms, "5m", 108 * kMin, armed_at(108 * kMin)).empty());
-    CHECK(f.stale(syms, "5m", 121 * kMin, armed_at(121 * kMin)).size() == 1);
-    // Thirteen minutes, on a stall that ran until 14:01 before anyone saw it.
-    CHECK(f.stale(syms, "5m", 301 * kMin, armed_at(301 * kMin)).size() == 1);
+    auto win = [&](int64_t t) {
+        const int64_t open = t > 30 * kMin ? t - 30 * kMin : 0;
+        return hist_armed_ms(t - 25 * kMin, open);
+    };
+    // It paged at 10:48 ungated, and it still pages at 10:48: by then the
+    // market had been open 78 minutes, so the settle-in was long since done.
+    CHECK(stale_at(f, syms, 107 * kMin, 107 * kMin).empty());
+    CHECK(stale_at(f, syms, 108 * kMin, 108 * kMin).size() == 1);
+    CHECK(f.stale(syms, "5m", 107 * kMin, 82 * kMin, win(107 * kMin)).empty());
+    CHECK(f.stale(syms, "5m", 108 * kMin, 83 * kMin, win(108 * kMin)).size() == 1);
     // A stall that starts after the open pays nothing at all: last delivery
     // 11:30 (t = 150), grace 90, so it pages at 13:00 (t = 240) either way.
     HistoryFreshness g;
     g.record("SOXS", "5m", 150 * kMin);
-    CHECK(g.stale(syms, "5m", 239 * kMin, armed_at(239 * kMin)).empty());
-    CHECK(g.stale(syms, "5m", 241 * kMin, armed_at(241 * kMin)).size() == 1);
-    CHECK(g.stale(syms, "5m", 241 * kMin, 241 * kMin).size() == 1);   // ungated: same
+    CHECK(g.stale(syms, "5m", 239 * kMin, 214 * kMin, win(239 * kMin)).empty());
+    CHECK(g.stale(syms, "5m", 241 * kMin, 216 * kMin, win(241 * kMin)).size() == 1);
+    CHECK(stale_at(g, syms, 241 * kMin, 241 * kMin).size() == 1);   // ungated: same
+
+    // Where it DOES bite: a session live since 07:00 that has never been served
+    // anything. Ungated it paged at 08:30, ninety minutes in, about a market
+    // that was shut for every one of them. The cost is 45 minutes after the
+    // open and nothing else — notably NOT a function of when the session
+    // started, which is a free-form config string (trade_sched_start).
+    HistoryFreshness h;
+    auto at = [&](int hh, int mm) {
+        const int64_t t = hh * 60 + mm;                        // local minutes
+        const int64_t session = (t - 7 * 60) * kMin;           // live since 07:00
+        const int64_t open = t > 570 ? (t - 570) * kMin : 0;   // 09:30
+        return h.stale(syms, "5m", 0, session, hist_armed_ms(session, open));
+    };
+    CHECK(stale_at(h, syms, 0, 91 * kMin).size() == 1);   // ungated: 08:31
+    CHECK(at(8, 31).empty());
+    CHECK(at(10, 14).empty());
+    REQUIRE(at(10, 16).size() == 1);
+    CHECK_FALSE(at(10, 16)[0].ever);
 }
 
 TEST_CASE("armed: a half-day shuts the gate at 13:00") {
@@ -295,11 +362,12 @@ TEST_CASE("armed: a half-day shuts the gate at 13:00") {
         return hist_armed_ms(600 * kMin, tt::rth_open_elapsed_ms(tm));
     };
     const int64_t now = 200 * kMin;   // MUU is 200 minutes stale either way
+    const int64_t session = 600 * kMin;
     // 2026-11-27, the Friday after Thanksgiving: still open at 12:30...
-    CHECK(f.stale(syms, "5m", now, armed(2026, 11, 27, 12, 30)).size() == 1);
-    CHECK(f.stale(syms, "5m", now, armed(2026, 11, 27, 14, 30)).empty());
+    CHECK(f.stale(syms, "5m", now, session, armed(2026, 11, 27, 12, 30)).size() == 1);
+    CHECK(f.stale(syms, "5m", now, session, armed(2026, 11, 27, 14, 30)).empty());
     // ...while the ordinary Friday a week later runs to 16:00.
-    CHECK(f.stale(syms, "5m", now, armed(2026, 12, 4, 14, 30)).size() == 1);
+    CHECK(f.stale(syms, "5m", now, session, armed(2026, 12, 4, 14, 30)).size() == 1);
 }
 
 // ---- the page text ---------------------------------------------------------
@@ -342,7 +410,7 @@ TEST_CASE("refreshing: a slow-cadence symbol inside its grace is not evidence") 
     f.record("MUU", "5m", 60 * kMin);
     const std::vector<WatchedSymbol> syms{{"SOXS", 30}, {"MUU", 240}};
     const int64_t now = 151 * kMin;      // 11:31
-    const auto stale = f.stale(syms, "5m", now, now);
+    const auto stale = stale_at(f, syms, now, now);
     REQUIRE(stale.size() == 1);
     CHECK(stale[0].symbol == "SOXS");    // MUU is not stale: 91m of a 720m grace
     CHECK(f.refreshing(syms, "5m", now).empty());   // ...but it is not refreshing
@@ -360,8 +428,8 @@ TEST_CASE("refreshing: a never-answered symbol cannot clear the gateway") {
     // that had delivered nothing at all.
     HistoryFreshness f;
     const std::vector<WatchedSymbol> syms{{"SOXS", 15}, {"SNDQ", 60}};
-    const int64_t now = 47 * kMin;
-    const auto stale = f.stale(syms, "5m", now, now);
+    const int64_t now = 47 * kMin;   // two minutes past the arming settle-in
+    const auto stale = stale_at(f, syms, now, now);
     REQUIRE(stale.size() == 1);
     CHECK(stale[0].symbol == "SOXS");
     CHECK_FALSE(stale[0].ever);
