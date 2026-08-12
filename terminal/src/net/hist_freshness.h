@@ -36,7 +36,10 @@ namespace tt::net {
 // A traded symbol whose bars have gone past the grace period.
 struct StaleBars {
     std::string symbol;
-    int64_t age_ms = 0;   // effective staleness (see stale() for never-answered)
+    // TRUE staleness, reported to the operator as-is, so a page still says "16h"
+    // when it means 16h. For a never-answered symbol there is no such age, so it
+    // carries the session's own age instead.
+    int64_t age_ms = 0;
     bool ever = false;    // false = no bar set has EVER arrived for this symbol
 };
 
@@ -92,6 +95,48 @@ inline int64_t bar_stale_grace_ms(double refresh_interval_min) {
                ? static_cast<int64_t>(slack)
                : kBarStaleGraceFloorMs;
 }
+
+// The window this watchdog is entitled to judge a symbol against: the later of
+// the live session's start and today's market open — i.e. the SHORTER of the
+// two elapsed times. Both terms earn their place:
+//
+//   - session_ms alone was the rule until 0.21.0, and it pages an operator at
+//     19:10 about candles that stopped because the market did (2026-08-11).
+//   - rth_open_ms alone would page at 09:31 on a session that auto-started at
+//     09:25, one minute in, before anything has had a chance to deliver.
+//
+// A one-line function so that the gating decision itself is a thing the tests
+// can drive, rather than an expression buried in a 60-line pump. Pass
+// tt::rth_open_elapsed_ms(localtime) for the second argument; it is 0 outside
+// regular hours, which is what closes the gate.
+inline int64_t hist_armed_ms(int64_t session_ms, int64_t rth_open_ms) {
+    return rth_open_ms < session_ms ? rth_open_ms : session_ms;
+}
+
+// How long the watchdog must have been ARMED — market open AND session live —
+// before it is entitled to judge any symbol. Below this, stale() reports
+// nothing at all; at zero armed_ms (the market is shut) that IS the 2026-08-11
+// gate, and just after the open it is the settle-in window.
+//
+// A FIXED settle-in, and that is the whole point of it. 0.21.0 spent the same
+// window as a per-symbol cap — `overdue = min(age, armed_ms)` — which reads
+// well and is wrong in a way that only arithmetic shows: armed_ms can never
+// exceed the length of the regular session, measured at 389 min on a full day
+// and 209 min on a 1pm half-day, so a symbol whose grace is longer than that
+// could never be reported stale at any second of any trading day. The grace is
+// 3x the autopilot cadence and the Trade panel allows a cadence up to 480 min
+// (config.json is not clamped at all), so every symbol from 130 min up was
+// silently unwatched — for 240 min, probed over all 23400 seconds of RTH with
+// the symbol five days dead: zero pages, where the pre-0.21.0 rule paged at
+// every one of them. Coverage did not even fail cleanly at a cliff; it thinned
+// out first (a 100-min cadence kept 89 pageable minutes of the day, a 125-min
+// one 14). Suppressing a real outage is a strictly worse failure than the false
+// page 0.21.0 set out to fix, and a bound that does not scale with the grace
+// cannot do it to any cadence.
+//
+// It is the grace floor because that is already the shortest silence this
+// watchdog is ever willing to call stale.
+inline constexpr int64_t kHistArmSettleMs = kBarStaleGraceFloorMs;
 
 // The page text for a history stall, built where it can be tested rather than
 // inline in App::pump_history_watchdog.
@@ -188,13 +233,36 @@ public:
 
     // Symbols past their OWN grace period, worst first. A symbol that has NEVER
     // been answered is not healthy — the failure can just as easily start before
-    // a symbol's first refresh lands — so it is aged from `session_ms`, how long
-    // the live session has been running. That is also what makes the grace
-    // period double as a settle-in window at session start.
+    // a symbol's first refresh lands — so it is aged from `session_ms`.
+    //
+    // TWO separate questions, deliberately kept apart after 0.21.0 answered
+    // them with one number and lost a symbol class doing it (kHistArmSettleMs):
+    //
+    //   1. May this watchdog judge at all right now? `armed_ms` — the time
+    //      since the LATER of the live session's start and today's market open
+    //      (App::pump_history_watchdog, tt::rth_open_elapsed_ms) — has to clear
+    //      a FIXED settle-in. Outside regular hours the caller passes 0 and
+    //      nothing is reported however old it is: the 2026-08-11 gate.
+    //   2. Is this particular symbol overdue? Its own true age against its own
+    //      grace, uncapped. A cap keyed to the arming window is what made a
+    //      long-cadence symbol permanently unpageable.
+    //
+    // The settle-in is what stops the open boundary paging on evidence the
+    // market itself explains: a session left running overnight still holds
+    // yesterday's deliveries, so at 09:30:01 a symbol last served at 17:00 is
+    // sixteen hours old. It does NOT forgive those sixteen hours indefinitely,
+    // and it must not: pump_autopilot keeps cycling all night (it disarms only
+    // on !live_running), so in a left-running session those fetches were being
+    // made and were failing. That is the 2026-08-07 stall, and after 45 minutes
+    // of open market it gets said out loud.
+    //
+    // /diag's worst_age_ms and age_ms are untouched by any of this: the alert is
+    // gated, the measurement is not.
     std::vector<StaleBars> stale(const std::vector<WatchedSymbol>& watched,
                                  const std::string& interval, int64_t now_ms,
-                                 int64_t session_ms) const {
+                                 int64_t session_ms, int64_t armed_ms) const {
         std::vector<StaleBars> out;
+        if (armed_ms <= kHistArmSettleMs) return out;   // shut, or too early to judge
         {
             std::lock_guard<std::mutex> g(mu_);
             for (const WatchedSymbol& w : watched) {
@@ -231,13 +299,17 @@ public:
     }
 
     // Forget every delivery. Freshness belongs to a live SESSION, not to the
-    // process: stale() ages an answered symbol absolutely, and the settle-in
-    // window covers only symbols that have never been answered, so a delivery
-    // carried over from a session that has since stopped reads as hours of
-    // staleness on the first frame of the next one. The terminal is meant to
-    // stay up across the nightly 15:55 stop / 09:25 start, so that is the
-    // ordinary case rather than a corner. Called every idle frame, so it must
-    // stay cheap on an already-empty map.
+    // process: a delivery carried over from a session that has since stopped
+    // reads as hours of staleness on the first frame of the next one, and the
+    // terminal is meant to stay up across the nightly 15:55 stop / 09:25 start,
+    // so that is the ordinary case rather than a corner.
+    //
+    // The arming settle-in now also holds that carry-over off the phone for the
+    // first 45 minutes of the open, but this is still the thing that keeps the
+    // numbers honest: /diag's worst_age_ms and age_ms are ungated, and refreshing() would
+    // otherwise let a delivery from a dead session stand as evidence that this
+    // one is being served. Called every idle frame, so it must stay cheap on an
+    // already-empty map.
     void clear() {
         std::lock_guard<std::mutex> g(mu_);
         last_.clear();

@@ -1627,8 +1627,15 @@ void App::pump_lineup_schedule() {
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};
     localtime_s(&tm, &now_tt);
-    const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
-    if (!weekday) return;
+    // is_us_trading_day, not a bare weekday test. A weekday test runs the whole
+    // scanner + tournament against a dead market every Thanksgiving and every
+    // Good Friday, and its verdict can page Critical ("lineup: ABORTED" —
+    // alert_rules.h), which is the same false-page-on-a-closed-market class as
+    // the 2026-08-11 history pages. market_calendar.h was written for exactly
+    // this and was only ever wired into the pre-open check; this is the second
+    // of its call sites. Doing nothing on a holiday is free — yesterday's
+    // lineup simply stands until the next real open.
+    if (!is_us_trading_day(tm)) return;
     if (tm.tm_yday == lineup_last_build_day_) return;   // one build per day
     const int now_min = tm.tm_hour * 60 + tm.tm_min;
     if (now_min < build_min || now_min > build_min + 30) return;   // in the window
@@ -4465,6 +4472,42 @@ std::string App::traded_bar_interval() const {
 // DIAGNOSTIC ONLY. It pages; it never halts, cancels or flattens. The right
 // response is a human looking at the gateway, and an automatic reaction here
 // would be a new way to stop trading on a metric that has never run in anger.
+//
+// GATED ON REGULAR TRADING HOURS since 0.21.0. On 2026-08-11 a session was left
+// running past the 15:55 auto-stop and this paged Critical at 18:40 and 19:10 —
+// "strategies are trading on stale candles" — with the market shut since 16:00
+// and the book flat, and it would have gone on every 30 minutes until morning.
+// The page's own claim is what makes it false rather than merely noisy: every
+// order the engine emits carries outside_rth = 0, so after the close a strategy
+// acting on a stale candle cannot fill anything. There is no money on the
+// outcome, and a Critical page with an imperative diagnosis and no money on it
+// trains the operator to swipe the next one away — including 2026-08-07's,
+// which this exists for.
+//
+// The price of the gate is bounded and paid once, which is the test it had to
+// pass before being allowed anywhere near the 2026-08-07 detection:
+//   - it can only delay a session's FIRST page, by at most the fixed 45-minute
+//     arming settle-in and only when the last delivery predates the open.
+//     Replay 2026-08-07 (last SOXS refresh 09:17, 90-minute grace, session live
+//     from 09:25) and the page still lands at 10:48, unmoved: the market had
+//     been open 78 minutes by then. A stall that starts after the open pays
+//     nothing at all.
+//   - overnight it defers, it does not discard. 0.21.0 claimed here that no
+//     evidence was being given up "because none was being kept", and that is
+//     simply not true of the configuration that produced the incident: the
+//     hist_fresh_.clear() it cited runs only on the !live_running() branch, and
+//     a session left running never reaches it. pump_autopilot keeps cycling all
+//     night too, so a data path that dies at 17:00 is genuinely visible at
+//     03:00. What IS true is the narrower claim: nothing can FILL — every order
+//     the engine emits carries outside_rth = 0 — so the evidence keeps until
+//     45 minutes after the open, and it is still there when the gate lifts
+//     because staleness is measured from the last delivery, not from the open.
+//     The trade is one page moved to ~10:15 against roughly forty a night that
+//     say "strategies are trading on stale candles" while no strategy can
+//     trade at all.
+// See tt::rth_open_elapsed_ms (market_calendar.h) for the arithmetic, including
+// the 1pm early closes, and net::kHistArmSettleMs for why the settle-in is a
+// fixed window rather than each symbol's own grace.
 void App::pump_history_watchdog() {
     static constexpr double kHistStaleReAlertSec = 1800.0;   // re-page every 30 min
     if (!engine_.live_running()) {
@@ -4506,16 +4549,41 @@ void App::pump_history_watchdog() {
         watched.push_back({S.symbol, S.interval_min});
     }
     if (watched.empty()) return;
+
+    // How long the watchdog has been ENTITLED to expect refreshes: time since
+    // the LATER of this session's start and today's 09:30 open. Zero outside
+    // regular hours, which is the gate — nothing can be late while the market
+    // is not running. Wall clock on purpose: the open is a wall-clock
+    // event, and unlike the staleness ages themselves (steady, so an NTP jump
+    // around a gateway restart cannot fake hours of it) this figure is bounded
+    // by a single trading day and cannot accumulate error.
+    const std::time_t wall = std::time(nullptr);
+    std::tm ltm{};
+    localtime_s(&ltm, &wall);
+    const int64_t open_ms = rth_open_elapsed_ms(ltm);
+    const int64_t session_ms =
+        static_cast<int64_t>((now - hist_live_since_s_) * 1000.0);
+    const int64_t armed_ms = net::hist_armed_ms(session_ms, open_ms);
+
     const int64_t now_steady = steady_ms();
-    const auto stale = hist_fresh_.stale(
-        watched, traded_bar_interval(), now_steady,
-        static_cast<int64_t>((now - hist_live_since_s_) * 1000.0));
+    const auto stale = hist_fresh_.stale(watched, traded_bar_interval(),
+                                         now_steady, session_ms, armed_ms);
 
     if (stale.empty()) {
-        if (hist_stale_last_alert_s_ != 0.0)
-            alerts_.notify(AlertNotifier::Warning,
-                           "history: bars are refreshing again");
-        hist_stale_last_alert_s_ = 0.0;
+        if (hist_stale_last_alert_s_ != 0.0) {
+            // "Refreshing again" is a claim about the data path, and at 16:00 it
+            // would be a false one — bars stopped because the market did. Clear
+            // the episode either way (a stall that is still there tomorrow gets
+            // a fresh page once the open has settled), but only say the cheerful
+            // thing when it is true.
+            if (open_ms > 0)
+                alerts_.notify(AlertNotifier::Warning,
+                               "history: bars are refreshing again");
+            else
+                route("history: staleness watchdog stood down - the regular "
+                      "session is closed, so nothing is overdue until the open");
+            hist_stale_last_alert_s_ = 0.0;
+        }
         return;
     }
     if (hist_stale_last_alert_s_ != 0.0 &&
