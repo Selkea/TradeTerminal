@@ -18,6 +18,7 @@
 #include "OrderState.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -95,9 +96,33 @@ struct TwsBroker::Io final : DefaultEWrapper {
     // (recon_ever guards against re-adopting on a mid-session reconnect), ending
     // with a ReconcileEnd event when all three streams have finished.
     static constexpr int kAcctReqId = 9001;   // our reqAccountSummary request id
+    // How long a reconcile may stay in flight before it is ended anyway.
+    //
+    // There was no broker-side deadline at all. recon_acct_done is set only by
+    // accountSummaryEnd for kAcctReqId, so a single missing stream-end left
+    // recon_active true for the life of the connection — which permanently
+    // disables start_audit(), i.e. the position auditor. The ENGINE lifts its
+    // own gate after 10 s (engine.cpp) and arms the auditor regardless, so the
+    // two clocks disagreed and the app reported an armed detector that could
+    // never be answered. 20 s is comfortably past a healthy replay (sub-second)
+    // and past the engine's own failsafe, so this only ever fires on a stall.
+    static constexpr int64_t kReconcileTimeoutMs = 20'000;
     bool recon_ever = false;
     bool recon_active = false;
     bool recon_pos_done = false, recon_ord_done = false, recon_acct_done = false;
+    int64_t recon_started_ms = 0;   // steady ms, for kReconcileTimeoutMs
+    // Connect-time position rows, ACCUMULATED per symbol before anything is
+    // emitted. reqPositions reports one row per account and this route does
+    // per-symbol sub-account routing (TwsConfig::symbol_accounts), so a symbol
+    // held in two sub-accounts under the same login arrives twice. Seeding from
+    // each row in turn made the engine keep the LAST row's quantity while the
+    // 60 s audit (which sums — see position()) reported the total, so the two
+    // sides disagreed by construction, identically every round: a confirmed
+    // BOOK DIVERGENCE page every 15 minutes, in the same wording a real phantom
+    // uses. Both sides sum now.
+    std::vector<double> recon_pos_qty;    // signed total per symbol id-1
+    std::vector<double> recon_pos_cost;   // sum of |qty| * avgCost
+    std::vector<double> recon_pos_abs;    // sum of |qty|, the weight
 
     // Executions wait (briefly) for their commissionReport so the fee rides
     // the fill event; flushed with fee 0 if the report never shows.
@@ -159,8 +184,8 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // mark for the account's order ids, and the ids it already spent are
         // still live at the gateway across a reconnect; throwing it away and
         // taking the reconnect's nextValidId is how a session walks backwards
-        // into "error 103: Duplicate order id". The `!client` guards below are
-        // what stop a submit while disconnected, not this sentinel.
+        // into "error 103: Duplicate order id". order_path_ready() is what stops
+        // a submit while disconnected, not this sentinel.
         handshaked = false;
         // An audit that was mid-flight when the socket went has no answer coming.
         // Leaving it "active" would make the auditor wait forever on a request
@@ -168,6 +193,30 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // the precise failure mode net/book_divergence.h exists to prevent.
         audit_active = false;
         audit_buf_.clear();
+        // Neither does a reconcile that was still in flight — and leaving THAT
+        // set is worse than losing it. start_audit() refuses to run while
+        // recon_active is true, and nothing else ever clears it: a socket drop
+        // one second into reqAllOpenOrders therefore turned the position auditor
+        // off for the entire session, silently, while the engine's own 10 s
+        // failsafe (engine.cpp) lifted `reconciling` and armed it anyway. Every
+        // request_position_audit() was then dropped, /diag sat at
+        // "unknown: no broker answer for Ns" all day and the phantom-position
+        // detector was dead. Found in review of the 2026-08-13 fix.
+        if (recon_active) {
+            recon_active = false;
+            recon_pos_done = recon_ord_done = recon_acct_done = false;
+            recon_pos_qty.clear();
+            recon_pos_cost.clear();
+            recon_pos_abs.clear();
+            // Let the reconnect try again: an incomplete reconcile adopted at
+            // most a prefix of the account, so there is real state still to
+            // pick up. Re-running is safe by construction — openOrder skips any
+            // id already in local_by_tws, and the engine ignores a PosSnap that
+            // arrives after its own reconciliation gate has lifted.
+            recon_ever = false;
+            b.log("reconcile: interrupted by the disconnect - will retry on "
+                  "reconnect (the position audit is no longer blocked)");
+        }
     }
 
     // ---- EWrapper callbacks (I/O thread, inside processMsgs) ----------------
@@ -396,15 +445,41 @@ struct TwsBroker::Io final : DefaultEWrapper {
         recon_ever = true;
         recon_active = true;
         recon_pos_done = recon_ord_done = recon_acct_done = false;
+        recon_started_ms = now_ms();
+        recon_pos_qty.assign(b.cfg_.symbols.size(), 0.0);
+        recon_pos_cost.assign(b.cfg_.symbols.size(), 0.0);
+        recon_pos_abs.assign(b.cfg_.symbols.size(), 0.0);
         client->reqPositions();
         client->reqAllOpenOrders();
         client->reqAccountSummary(kAcctReqId, "All", "TotalCashValue");
         b.log("reconcile: requesting positions, open orders, cash");
     }
 
-    void maybe_finish_reconcile() {
-        if (!recon_active || !recon_pos_done || !recon_ord_done || !recon_acct_done)
-            return;
+    // Emit the accumulated positions as PosSnap events. Called once, from
+    // whichever of positionEnd / the timeout ends the position stream.
+    void flush_reconciled_positions() {
+        for (size_t i = 0; i < recon_pos_qty.size(); ++i) {
+            const double qty = recon_pos_qty[i];
+            if (i < net_pos.size()) net_pos[i] = qty;   // seed session net
+            if (qty == 0.0) continue;
+            const double w = recon_pos_abs[i];
+            const double avg = w > 0.0 ? recon_pos_cost[i] / w : 0.0;
+            EngineEvent ev{};
+            ev.type = static_cast<uint16_t>(EvType::PosSnap);
+            ev.symbol_id = static_cast<uint32_t>(i + 1);
+            ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+            ev.u.pos.qty = qty;
+            ev.u.pos.avg_price = avg;
+            b.push_ev(ev);
+            b.log("reconcile: position " + b.cfg_.symbols[i] + " " +
+                  std::to_string(qty) + " @ " + std::to_string(avg));
+        }
+    }
+
+    // The reconcile ended — completed, or given up on. One exit, because every
+    // caller must clear recon_active (start_audit() is gated on it) and must
+    // tell the engine, or the session runs with a detector that cannot fire.
+    void finish_reconcile(const char* why) {
         recon_active = false;
         // Ask the server for its next valid id now that adoption has raised our
         // own high-water mark. It cannot hurt — tws_advance_order_id only ever
@@ -421,7 +496,37 @@ struct TwsBroker::Io final : DefaultEWrapper {
         ev.type = static_cast<uint16_t>(EvType::ReconcileEnd);
         ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
         b.push_ev(ev);
-        b.log("reconcile: complete (next order id " + std::to_string(next_tws_id) + ")");
+        b.log(std::string("reconcile: ") + why + " (next order id " +
+              std::to_string(next_tws_id) + ")");
+    }
+
+    void maybe_finish_reconcile() {
+        if (!recon_active || !recon_pos_done || !recon_ord_done || !recon_acct_done)
+            return;
+        finish_reconcile("complete");
+    }
+
+    // The deadline. Called from io_loop every iteration; see kReconcileTimeoutMs
+    // for why a stalled reconcile could not be allowed to stand.
+    void check_reconcile_timeout() {
+        if (!recon_active || !recon_started_ms) return;
+        if (now_ms() - recon_started_ms < kReconcileTimeoutMs) return;
+        // Cancel whatever is still subscribed, so a stream-end arriving later
+        // cannot be mistaken for the position AUDIT's answer (positionEnd is
+        // shared) and publish a snapshot of a book minutes in the past.
+        if (client) {
+            if (!recon_pos_done) client->cancelPositions();
+            if (!recon_acct_done) client->cancelAccountSummary(kAcctReqId);
+        }
+        if (!recon_pos_done) flush_reconciled_positions();   // partial beats none
+        b.log(std::string("reconcile: INCOMPLETE after ") +
+              std::to_string(kReconcileTimeoutMs / 1000) + "s (positions " +
+              (recon_pos_done ? "ok" : "missing") + ", orders " +
+              (recon_ord_done ? "ok" : "missing") + ", cash " +
+              (recon_acct_done ? "ok" : "missing") +
+              ") - ending it anyway so the position audit is not blocked for the "
+              "session");
+        finish_reconcile("gave up");
     }
 
     // ---- periodic position audit (net/book_divergence.h) --------------------
@@ -444,16 +549,38 @@ struct TwsBroker::Io final : DefaultEWrapper {
 
     void position(const std::string& /*account*/, const Contract& contract,
                   Decimal pos, double avgCost) override {
+        const uint32_t sid = sid_for(contract.symbol);
+        const double qty = DecimalFunctions::decimalToDouble(pos);
         if (audit_active) {
-            const uint32_t sid = sid_for(contract.symbol);
-            if (sid == 0) return;   // not a session symbol: not in the app's book
-            // Report the SESSION table's spelling, not the contract's, so the
-            // two sides of the comparison are string-identical by construction.
-            // A case or whitespace difference between the engine's symbol and
-            // IB's would otherwise read as "the app holds a position the broker
-            // has never heard of" — a Critical page, from a typo.
-            const std::string& sym = b.cfg_.symbols[sid - 1];
-            const double qty = DecimalFunctions::decimalToDouble(pos);
+            // OFF-LINEUP POSITIONS ARE REPORTED TOO. This used to drop every row
+            // whose symbol was not in cfg_.symbols — and the app-side book is
+            // built from exactly that same list (App::pump_book_audit walks
+            // snap.symbols), so the broker's set was always a SUBSET of the
+            // app's and DivergeKind::BrokerOnly was unreachable on the live wire.
+            // That is the direction net/book_divergence.h calls "the dangerous
+            // one: a REAL position with no strategy and no stop", and it is
+            // exactly how the 2026-08-06 orphan that cost $846 escaped: a lineup
+            // swap dropped the symbol, its market-close never filled, and the
+            // next session's audit could no longer see it. A position in a
+            // ticker this lineup does not trade is the case that most needs
+            // saying, so it is passed through under IB's own spelling.
+            //
+            // Two filters on the off-lineup rows, and only on those:
+            //   - zero. IB reports a closed position as 0 for the rest of the
+            //     day, and a flat symbol is not evidence of anything.
+            //   - non-stock. reqPositions also reports CASH rows for a
+            //     non-USD FX balance and anything else the account happens to
+            //     hold; this app places STK orders only, so an orphan it can
+            //     have created is a stock. Pass-through without this would page
+            //     Critical, unclearably, about a currency balance.
+            const std::string sym = sid ? b.cfg_.symbols[sid - 1] : contract.symbol;
+            // For a SESSION symbol, report the session table's spelling rather
+            // than the contract's, so the two sides of the comparison are
+            // string-identical by construction. A case or whitespace difference
+            // between the engine's symbol and IB's would otherwise read as "the
+            // app holds a position the broker has never heard of" — a Critical
+            // page, from a typo.
+            if (sid == 0 && (qty == 0.0 || contract.secType != "STK")) return;
             // SUM across accounts. reqPositions reports one row per account, and
             // this route does per-symbol sub-account routing (TwsConfig::
             // symbol_accounts), while the engine keeps ONE portfolio spanning
@@ -468,19 +595,15 @@ struct TwsBroker::Io final : DefaultEWrapper {
             return;
         }
         if (!recon_active) return;
-        const uint32_t sid = sid_for(contract.symbol);
-        if (sid == 0) return;   // not a session symbol
-        const double qty = DecimalFunctions::decimalToDouble(pos);
-        if (sid <= net_pos.size()) net_pos[sid - 1] = qty;   // seed session net
-        if (qty == 0.0) return;
-        EngineEvent ev{};
-        ev.type = static_cast<uint16_t>(EvType::PosSnap);
-        ev.symbol_id = sid;
-        ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
-        ev.u.pos.qty = qty;
-        ev.u.pos.avg_price = avgCost;
-        b.push_ev(ev);
-        b.log("reconcile: position " + contract.symbol + " " +
+        if (sid == 0) return;   // not a session symbol: nothing to adopt it into
+        // ACCUMULATE, don't emit: one row per account, summed at positionEnd.
+        // See recon_pos_qty.
+        if (sid <= recon_pos_qty.size()) {
+            recon_pos_qty[sid - 1] += qty;
+            recon_pos_cost[sid - 1] += std::fabs(qty) * avgCost;
+            recon_pos_abs[sid - 1] += std::fabs(qty);
+        }
+        b.log("reconcile: position row " + contract.symbol + " " +
               std::to_string(qty) + " @ " + std::to_string(avgCost));
     }
     void positionEnd() override {
@@ -498,6 +621,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (!recon_active) return;
         if (client) client->cancelPositions();   // one-shot: stop the stream
         recon_pos_done = true;
+        flush_reconciled_positions();
         maybe_finish_reconcile();
     }
 
@@ -505,13 +629,22 @@ struct TwsBroker::Io final : DefaultEWrapper {
                    const OrderState& /*state*/) override {
         if (!recon_active) return;
         if (local_by_tws.count(orderId)) return;   // already ours this session
-        const uint32_t sid = sid_for(contract.symbol);
-        if (sid == 0) return;
         // MECHANISM B, fixed at the source. reqAllOpenOrders is the ONLY place
         // this process learns about order ids it did not issue, and every one of
         // them is already spent at the gateway. Not advancing past them is what
         // let a session seeded at 59 collide with everything from 59 to ~76 on
-        // 2026-08-13. Do it before anything below can fail out.
+        // 2026-08-13.
+        //
+        // BEFORE THE SYMBOL FILTER, and this is the whole point: an id spent on
+        // a ticker today's lineup does not trade is exactly as spent as one on a
+        // ticker it does. The advance sat AFTER the sid-zero early return below
+        // — under a comment claiming otherwise — which reopened Mechanism B for every
+        // resting order outside the lineup: a "hold, don't halt" position from a
+        // dropped symbol, a leg whose cancel did not settle before the swap, an
+        // order typed into the Gateway GUI. A lineup swap is what CHANGES the
+        // symbol list, so the hole sat precisely where this fix is aimed, and
+        // each collision then costs an order — 103 is fatal now, so a refused
+        // protective stop trips flatten_halt_symbol on what was survivable.
         next_tws_id = tws_advance_order_id(next_tws_id, static_cast<long>(orderId) + 1);
         // PART 1's escape hatch. The orders client id is fixed
         // (kTwsOrdersClientId), so an order this app placed always reports that
@@ -532,10 +665,17 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // exactly the same way; "a human placed it" is a reason to say so, not a
         // reason to stay quiet. (reqAutoOpenOrders would bind those to us, but
         // only for client id 0, which the order path must not be.)
+        //
+        // Also before the symbol filter. A hand-entered order on a ticker the
+        // lineup dropped is the same deaf order — arguably worse, since nothing
+        // in this process is watching that symbol at all — and staying quiet
+        // about it was the other half of the early return above.
         if (order.clientId != b.cfg_.client_id)
             b.log(tws_foreign_order_line(contract.symbol, order.orderType,
                                          static_cast<long>(orderId),
                                          order.clientId, b.cfg_.client_id));
+        const uint32_t sid = sid_for(contract.symbol);
+        if (sid == 0) return;   // not a session symbol: nothing to adopt it into
         const uint64_t local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
         local_by_tws[orderId] = local;
         tws_by_local[local] = orderId;
@@ -647,8 +787,35 @@ struct TwsBroker::Io final : DefaultEWrapper {
         return tws_id;
     }
 
+    // Can this connection put an order on the wire RIGHT NOW?
+    //
+    // NOT `next_tws_id < 0`, which is what every placement path used to test.
+    // That sentinel doubled as the handshake gate only because drop_connection
+    // reset it; since 0.22.0 it is the ACCOUNT's order-id high-water mark and is
+    // deliberately kept across a reconnect (see drop_connection), so after the
+    // broker's first successful connect it is >= 0 forever. What was left of the
+    // gate — `!client` — goes true the instant connect_gateway() returns, which
+    // is BEFORE nextValidId and before an incoming "error 326: client id already
+    // in use" has even been read off the wire. A submit drained in that window
+    // (io_loop's cmd drain runs unconditionally, on the same iteration that just
+    // reconnected) was written to a socket the gateway was about to close: 326
+    // is not order-scoped and 504 is not fatal_order_error, so NOTHING rejected
+    // it and the engine left it Working forever, with check_stuck muttering once
+    // at 15 s. If that order was a bracket's stop leg the app reported the
+    // symbol protected while nothing rested at the broker — the naked-position
+    // class this whole branch exists to close.
+    //
+    // ready_ is the honest test: set only by nextValidId, cleared by both
+    // connectionClosed and drop_connection. `handshaked` is checked too because
+    // ready_ can still read true for the microseconds between a reconnect's
+    // socket coming up and its handshake completing.
+    bool order_path_ready() const {
+        return client && handshaked && next_tws_id >= 0 &&
+               b.ready_.load(std::memory_order_acquire);
+    }
+
     void handle_submit(const Cmd& cmd) {
-        if (next_tws_id < 0 || !client) {
+        if (!order_path_ready()) {
             // place() (which would tag a standalone stop protective) is never
             // reached on this early return — decide protective-ness straight
             // from the request instead: any standalone Stop (not an engine
@@ -728,19 +895,35 @@ struct TwsBroker::Io final : DefaultEWrapper {
         case Cmd::Submit:
             handle_submit(cmd);
             break;
+        // The cancels take the same gate as a placement, and say so when it
+        // stops them. A cancelOrder written to a socket that has not handshaked
+        // is discarded by the gateway in silence — nothing answers it and the
+        // engine leaves the order Working — so a kill switch could report having
+        // cancelled everything while every resting order was still live.
         case Cmd::Cancel: {
             const auto it = tws_by_local.find(cmd.local_id);
             if (it == tws_by_local.end()) {
                 b.log("cancel #" + std::to_string(cmd.local_id) + ": unknown order");
                 return;
             }
-            if (client) client->cancelOrder(it->second, OrderCancel{});
+            if (!order_path_ready()) {
+                b.log("cancel #" + std::to_string(cmd.local_id) +
+                      " IGNORED: the order path is not connected — the order is "
+                      "still live at the broker");
+                return;
+            }
+            client->cancelOrder(it->second, OrderCancel{});
             break;
         }
         case Cmd::CancelAll: {
+            if (!order_path_ready()) {
+                b.log("cancel-all IGNORED: the order path is not connected — "
+                      "resting orders are still live at the broker");
+                break;
+            }
             int n = 0;
             for (const auto& [local, tws_id] : tws_by_local)
-                if (!done.count(local) && client) {
+                if (!done.count(local)) {
                     client->cancelOrder(tws_id, OrderCancel{});
                     ++n;
                 }
@@ -748,9 +931,18 @@ struct TwsBroker::Io final : DefaultEWrapper {
             break;
         }
         case Cmd::Flatten: {
+            if (!order_path_ready()) {
+                // Same gate as handle_submit, and it matters more here: a
+                // flatten that silently places nothing looks identical to one
+                // that worked, and this is the path safe_stop_live and the
+                // kill switch rely on to leave the account flat.
+                b.log("flatten IGNORED: the order path is not connected — "
+                      "positions are still open at the broker");
+                break;
+            }
             for (size_t i = 0; i < net_pos.size(); ++i) {
                 const double pos = net_pos[i];
-                if (pos == 0.0 || !client || next_tws_id < 0) continue;
+                if (pos == 0.0) continue;
                 Order close;
                 close.action = pos > 0 ? "SELL" : "BUY";
                 close.totalQuantity = DecimalFunctions::doubleToDecimal(std::abs(pos));
@@ -1022,6 +1214,10 @@ void TwsBroker::io_loop() {
         // measures "how long since an ANSWER", and a stale request replayed on
         // reconnect would answer a question about a book minutes in the past.
         if (audit_req_.exchange(false, std::memory_order_acq_rel)) io.start_audit();
+        // Ahead of nothing in particular, but it must run on a loop that turns
+        // whether or not messages arrive: a reconcile stalls precisely BECAUSE
+        // its last stream-end never comes, so no callback will ever notice.
+        io.check_reconcile_timeout();
         io.flush_stale_execs();
         io.check_stuck();
     }

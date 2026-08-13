@@ -108,7 +108,15 @@ public:
     // file reads a second, forever, on a schedule that is switched off. The
     // schedule fires at most twice a day, so nothing needs building until it does.
     using ScheduledStartFn = std::function<void()>;
-    void pump_schedule(const ScheduledStartFn& start);
+    // `stop` is App::safe_stop_live, not Engine::stop_live. This used to call the
+    // engine directly, which stops trading but leaves the TWS adapter alive and
+    // CONNECTED — holding kTwsOrdersClientId, now that the orders id is fixed —
+    // from 15:55 until the next morning's auto-start reaped it 16 ms before
+    // dialling the same id. Going through the App tears the broker down at the
+    // stop, when there are fourteen hours of slack, instead of at the start,
+    // when there are none.
+    using ScheduledStopFn = std::function<void()>;
+    void pump_schedule(const ScheduledStartFn& start, const ScheduledStopFn& stop);
 
     // Tournament champion: point this symbol's tab at a strategy + its params
     // (adds the tab if the symbol isn't pending yet).

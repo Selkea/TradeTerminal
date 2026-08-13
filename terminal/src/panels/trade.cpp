@@ -185,7 +185,8 @@ TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
 // The session schedule, driven from App::tick() so it cannot be switched off by
 // the Trade panel being hidden, collapsed, or docked behind a sibling tab (see
 // the declaration for the incident). Touches no ImGui — there is no frame here.
-void TradePanel::pump_schedule(const ScheduledStartFn& start) {
+void TradePanel::pump_schedule(const ScheduledStartFn& start,
+                               const ScheduledStopFn& stop) {
     if (!sched_on_) return;
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};
@@ -209,8 +210,16 @@ void TradePanel::pump_schedule(const ScheduledStartFn& start) {
         sched_last_start_day_ = tm.tm_yday;
         if (stop_min >= 0 && sched_prev_min_ >= 0 && sched_prev_min_ < stop_min &&
             now_min >= stop_min) {
-            eng_.kill_switch();   // cancel all orders + flatten positions
-            eng_.stop_live();     // graceful stop, joins the live thread
+            // App::safe_stop_live: kill switch + stop_live + REAP THE BROKER.
+            // Calling the engine directly left the TWS adapter connected all
+            // night on the fixed orders client id, so the next auto-start
+            // collided with our own socket (error 326) at 09:25. See
+            // ScheduledStopFn.
+            if (stop) stop();
+            else {
+                eng_.kill_switch();
+                eng_.stop_live();
+            }
         }
         sched_prev_min_ = now_min;
         return;

@@ -174,6 +174,37 @@ inline std::vector<Divergence> compare_books(const std::vector<BookPos>& app,
     return out;
 }
 
+// How many symbols a round actually LOOKED AT — i.e. how much evidence an empty
+// compare_books() result carries.
+//
+// An empty result means one of two completely different things: "every symbol
+// agreed" or "there was nothing to compare". Recording them the same way is how
+// the auditor came to report Ok, and reset the age a remote alert rule watches,
+// on a round in which every symbol had been excluded as `settling` — a
+// one-symbol lineup with a fill in flight does exactly that. The file's own
+// contract is that it "can never report Ok without a fresh answer that agreed",
+// and a comparison of nothing is not that answer.
+inline size_t comparable_count(const std::vector<BookPos>& app,
+                               const std::vector<BookPos>& broker,
+                               const std::vector<std::string>& settling = {}) {
+    auto is_settling = [&](const std::string& s) {
+        for (const std::string& x : settling)
+            if (x == s) return true;
+        return false;
+    };
+    size_t n = 0;
+    for (const BookPos& p : app)
+        if (!is_settling(p.symbol)) ++n;
+    for (const BookPos& p : broker) {
+        if (is_settling(p.symbol)) continue;
+        bool in_app = false;
+        for (const BookPos& a : app)
+            if (a.symbol == p.symbol) { in_app = true; break; }
+        if (!in_app) ++n;   // broker-only: comparable, and the dangerous one
+    }
+    return n;
+}
+
 // ---- cadence ---------------------------------------------------------------
 
 // How often the app asks the broker what it holds.
@@ -336,7 +367,14 @@ public:
                                     int64_t now_ms) {
         if (!armed_) arm(now_ms);
         ++rounds_;
-        last_answer_ms_ = now_ms;
+        last_answer_ms_ = now_ms;   // an answer DID arrive: this is not blindness
+        // A round that compared nothing is not agreement. Everything below —
+        // the streaks, the confirmed set, and above all last_agreed_ms_, which
+        // is the number the remote alert rule watches — is a claim about
+        // evidence, and there is none here. Leave all of it exactly as the last
+        // round that did have some left it; the age simply keeps climbing,
+        // which is the correct description of what just happened.
+        if (comparable_count(app, broker, settling) == 0) return confirmed_;
         std::vector<Divergence> seen = compare_books(app, broker, settling);
 
         // Advance the streak only for a disagreement that is IDENTICAL to last
@@ -400,12 +438,25 @@ public:
 
     // ms since the last audit that came back AND agreed. The single number that
     // is meaningful in every state: it climbs when the books disagree, it climbs
-    // when nothing answers, and it is only ever reset by positive evidence. -1
-    // when there has never been one (the auditor cannot claim an age it has not
-    // measured — the mistake oldest_history_age_ms made by reporting 0).
+    // when nothing answers, and it is only ever reset by positive evidence.
+    //
+    // WITH NO AGREEMENT YET THIS SESSION IT COUNTS FROM ARMING, not -1. Reading
+    // -1 there looked like the honest answer ("we have not measured one") and
+    // was the wrong one: -1 is below every `>` threshold a remote rule can
+    // write, so in the one failure mode this gauge exists for — armed and never
+    // answered, e.g. a reconcile that wedged start_audit for the session — the
+    // metric read BETTER than healthy all day while the detector was dead, next
+    // to a divergence count also pinned at 0. That is the exact shape of
+    // oldest_history_age_ms sitting at 0 through a five-hour outage, which this
+    // file's header names as the mistake not to repeat.
+    //
+    // "No agreeing audit for 1800 s" is a fact the auditor HAS measured, from an
+    // origin it recorded itself (arm()). The only genuinely unmeasurable case is
+    // that there is no live session at all, and that is the -1 that remains — so
+    // -1 also still distinguishes a Saturday scrape from a broken weekday one.
     int64_t last_agreed_age_ms(int64_t now_ms) const {
-        if (!armed_) return -1;
-        return last_agreed_ms_ ? now_ms - last_agreed_ms_ : -1;
+        if (!armed_) return -1;   // no session: nothing to be stale about
+        return now_ms - (last_agreed_ms_ ? last_agreed_ms_ : armed_at_ms_);
     }
 
     // ms since ANY answer (agreeing or not); from arming if none has arrived.
@@ -463,6 +514,7 @@ private:
         int64_t since_ms = 0;
     };
 
+
     bool armed_ = false;
     AuditState state_ = AuditState::Off;
     std::unordered_map<std::string, Entry> streaks_;
@@ -472,6 +524,57 @@ private:
     int64_t armed_at_ms_ = 0;
     int64_t confirmed_span_ms_ = 0;   // how long the confirmed set has held still
     int rounds_ = 0;
+};
+
+// ---- what the OPERATOR was told ---------------------------------------------
+//
+// The alert's memory, deliberately separate from the auditor's state, because
+// the two answer different questions. AuditState is "what did the last round
+// show"; this is "is the operator still owed an answer".
+//
+// A confirmed divergence is latched here and cleared ONLY by an audit that comes
+// back agreeing. Driving the page's watchdog straight off `state == Diverged`
+// looked equivalent and was not: WatchdogTimer reports Recovered on any
+// transition to not-bad, and Diverged has two exits that are not recoveries.
+//   - SUSPECT. A divergence whose quantities MOVE — a resting exit the app is
+//     deaf to, filling in stages — resets the streak and empties the confirmed
+//     set. That alternated PAGE / "the books agree again" / PAGE every 60 s
+//     while /diag read "suspect: RAM app=411 broker=100 (1/2)".
+//   - BLIND. Answers simply stop after the page. The all-clear fired on a
+//     divergence nobody could see any more — and if the order socket was what
+//     went down, the compensating BOOK AUDIT BLIND page is suppressed, so
+//     "the app's book and the broker's agree again" was the operator's LAST
+//     word about a live phantom position.
+// Neither state carries evidence in either direction, so neither moves this.
+class DivergenceLatch {
+public:
+    // One round of the auditor, as reported by BookAudit.
+    void update(AuditState state, const std::vector<Divergence>& confirmed,
+                int64_t confirmed_span_ms) {
+        if (state == AuditState::Diverged) {
+            open_ = confirmed;
+            span_ms_ = confirmed_span_ms;
+        } else if (state == AuditState::Ok) {
+            clear();   // the only positive evidence there is
+        }
+    }
+
+    // The session ended. Not the same as "it cleared" — nothing is announced.
+    void clear() {
+        open_.clear();
+        span_ms_ = 0;
+    }
+
+    bool open() const { return !open_.empty(); }
+    // The set to NAME in the page. Held across Suspect/Blind on purpose: a
+    // 15-minute re-page that read BookAudit::confirmed() while the state had
+    // slipped would name no symbols at all.
+    const std::vector<Divergence>& divergences() const { return open_; }
+    int64_t span_ms() const { return span_ms_; }
+
+private:
+    std::vector<Divergence> open_;
+    int64_t span_ms_ = 0;
 };
 
 } // namespace tt::net

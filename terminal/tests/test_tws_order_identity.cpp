@@ -200,17 +200,42 @@ TEST_CASE("the lineup swap waits for its own socket to close before restarting")
     CHECK(src.find("swap_reap_deadline_s_") != std::string::npos);
 }
 
+// The text between two anchors. Bounding a source audit by a LENGTH makes it
+// silently shrink as comments are added around the code it is auditing — which
+// is how the openOrder window below stopped covering the foreign-order check
+// while still passing everything it could still see.
+static std::string between(const std::string& src, const char* from,
+                           const char* to) {
+    const size_t a = src.find(from);
+    REQUIRE_MESSAGE(a != std::string::npos, "anchor not found: " << from);
+    const size_t b = src.find(to, a);
+    REQUIRE_MESSAGE(b != std::string::npos, "end anchor not found: " << to);
+    return src.substr(a, b - a);
+}
+
 TEST_CASE("adoption advances the order-id counter, and checks who placed it") {
     const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
     // Both live in openOrder, the only place this process learns about order ids
     // it did not issue.
-    const size_t open_order = src.find("void openOrder(OrderId orderId");
-    REQUIRE(open_order != std::string::npos);
-    const std::string body = src.substr(open_order, 3000);
+    const std::string body =
+        between(src, "void openOrder(OrderId orderId", "void openOrderEnd()");
     CHECK(body.find("tws_advance_order_id(next_tws_id, static_cast<long>(orderId) + 1)") !=
           std::string::npos);
     CHECK(body.find("order.clientId != b.cfg_.client_id") != std::string::npos);
     CHECK(body.find("tws_foreign_order_line") != std::string::npos);
+    // ...and BOTH of them ahead of the symbol filter. An id spent on a ticker
+    // today's lineup does not trade is exactly as spent as one on a ticker it
+    // does, so an early return above the advance reopens Mechanism B for every
+    // resting order outside the lineup — and a lineup swap is precisely what
+    // changes that list. The advance sat after this return under a comment
+    // claiming it did not.
+    const size_t advance =
+        body.find("tws_advance_order_id(next_tws_id, static_cast<long>(orderId) + 1)");
+    const size_t foreign = body.find("tws_foreign_order_line");
+    const size_t sid_filter = body.find("if (sid == 0) return;");
+    REQUIRE(sid_filter != std::string::npos);
+    CHECK(advance < sid_filter);
+    CHECK(foreign < sid_filter);
     // nextValidId must not assign outright — that is what let a reconnect or a
     // reqIds answer pull the counter back below the account's high-water mark.
     CHECK(src.find("next_tws_id = orderId;") == std::string::npos);
@@ -223,10 +248,94 @@ TEST_CASE("the position audit seeds nothing") {
     // detector that silently re-seeded the portfolio would repair the number and
     // erase the evidence that the order path had gone deaf.
     const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
-    const size_t audit = src.find("if (audit_active) {");
-    REQUIRE(audit != std::string::npos);
-    const std::string body = src.substr(audit, 800);
+    const std::string body =
+        between(src, "if (audit_active) {", "if (!recon_active) return;");
     CHECK(body.find("push_ev") == std::string::npos);
     CHECK(body.find("PosSnap") == std::string::npos);
     CHECK(body.find("net_pos") == std::string::npos);
+}
+
+TEST_CASE("the position audit reports positions OUTSIDE the lineup") {
+    // Otherwise DivergeKind::BrokerOnly is unreachable on the live wire: the
+    // app-side book is built from the session symbol list, so if the broker side
+    // is filtered by the SAME list its symbol set is always a subset and the
+    // second pass of compare_books can never fire. That is the direction
+    // net/book_divergence.h calls the dangerous one — a real position with no
+    // strategy and no stop — and it is how the 2026-08-06 orphan that cost $846
+    // escaped: the lineup swap dropped the symbol, its close never filled, and
+    // the next session's audit could no longer see it.
+    const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
+    const std::string body =
+        between(src, "if (audit_active) {", "if (!recon_active) return;");
+    // The unconditional "not a session symbol -> drop the row" is gone; what is
+    // left drops only a ZERO row on an off-lineup symbol (IB reports closed
+    // positions as 0 all day, and those are evidence of nothing).
+    CHECK(body.find("if (sid == 0) return;") == std::string::npos);
+    // What survives filters only rows that cannot be an orphan THIS app made:
+    // a flat symbol (IB reports a closed position as 0 all day) and a non-stock
+    // row (reqPositions also reports CASH rows for an FX balance).
+    CHECK(body.find("if (sid == 0 && (qty == 0.0 || contract.secType != \"STK\")) return;") !=
+          std::string::npos);
+    // Off-lineup rows are reported under IB's own spelling; session symbols keep
+    // the session table's, so that side stays string-identical by construction.
+    CHECK(body.find("sid ? b.cfg_.symbols[sid - 1] : contract.symbol") !=
+          std::string::npos);
+}
+
+TEST_CASE("a placement is gated on the HANDSHAKE, not on the id sentinel") {
+    // `next_tws_id < 0` doubled as the handshake gate only because
+    // drop_connection reset it. It is now the account's order-id high-water mark
+    // and is deliberately kept across a reconnect, so after the first successful
+    // connect it is >= 0 forever and the only remaining gate was `!client` —
+    // which goes true the instant connect_gateway() returns, BEFORE nextValidId
+    // and before an incoming 326 has been read off the wire. An order written
+    // into that window is never acked and never rejected: the engine leaves it
+    // Working forever, and if it was a bracket's stop leg the app reports the
+    // symbol protected while nothing rests at the broker.
+    const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
+    CHECK(src.find("next_tws_id < 0 || !client") == std::string::npos);
+    CHECK(src.find("if (!order_path_ready())") != std::string::npos);
+    const std::string gate =
+        between(src, "bool order_path_ready() const {", "void handle_submit(");
+    CHECK(gate.find("handshaked") != std::string::npos);
+    CHECK(gate.find("b.ready_.load") != std::string::npos);
+}
+
+TEST_CASE("a reconcile that never finishes cannot disable the auditor") {
+    // start_audit() returns early while recon_active is true, and NOTHING else
+    // cleared it: a socket drop mid-reqAllOpenOrders, or a missing
+    // accountSummaryEnd, turned the position auditor off for the whole session
+    // while the engine's own 10 s failsafe armed it anyway. /diag then read
+    // "unknown: no broker answer for Ns" all day with the phantom detector dead.
+    const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
+    // (a) the disconnect path clears it...
+    const std::string drop =
+        between(src, "void drop_connection() {", "// ---- EWrapper callbacks");
+    CHECK(drop.find("recon_active = false;") != std::string::npos);
+    // ...and lets the reconnect run the reconcile it never completed.
+    CHECK(drop.find("recon_ever = false;") != std::string::npos);
+    // (b) and a socket that stays UP but stops answering has a deadline.
+    CHECK(src.find("void check_reconcile_timeout()") != std::string::npos);
+    CHECK(src.find("io.check_reconcile_timeout();") != std::string::npos);
+    CHECK(src.find("kReconcileTimeoutMs") != std::string::npos);
+}
+
+TEST_CASE("the direct start path WAITS for its own socket to close") {
+    // Moving the reap above the construction was not enough: reap_async detaches
+    // and returns immediately, so the next statement dialled the fixed orders
+    // client id while the old adapter still held it (~TwsBroker does not poke the
+    // reader signal, so its I/O thread waits out waitForSignal's 1 s timeout
+    // first). Only the lineup swap waited. The scheduled 15:55 stop went through
+    // Engine::stop_live rather than App::safe_stop_live, so the adapter survived
+    // the night and 09:25's auto-start hit exactly this.
+    const std::string src = read_repo_file("/terminal/src/app.cpp");
+    const size_t wait = src.find("wait_for_broker_reap(\"live\");");
+    const size_t make = src.find("tws_broker = std::make_unique<TwsBroker>");
+    REQUIRE(wait != std::string::npos);
+    REQUIRE(make != std::string::npos);
+    CHECK(wait < make);
+    // ...and the scheduled stop reaps the broker at 15:55, not at 09:25.
+    const std::string sched = read_repo_file("/terminal/src/panels/trade.cpp");
+    CHECK(sched.find("if (stop) stop();") != std::string::npos);
+    CHECK(src.find("[this] { safe_stop_live(); });") != std::string::npos);
 }

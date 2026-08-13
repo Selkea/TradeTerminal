@@ -111,6 +111,10 @@ private:
     // route, skip the flatten so open positions + resting orders stay at the
     // broker to be re-adopted on restart; ignored (flattens) on other routes.
     void safe_stop_live(bool keep_positions = false);
+    // Wait (bounded) for reap_async'd broker adapters to finish being destroyed,
+    // so a new session never dials the fixed orders client id while this process
+    // still holds it. See the definition.
+    void wait_for_broker_reap(const char* who);
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
     void save_config();              // panel state -> cfg_ -> config.json
     // Read-only diagnostics endpoint (net/diag_server.h). start_diag_server()
@@ -464,6 +468,12 @@ private:
     // net::kBookAuditConfirmRounds, which covers a fill the broker has already
     // executed but the engine has not yet drained.
     std::vector<net::BookPos> book_audit_sent_;
+    // What the operator is still owed an answer about. The page, the all-clear
+    // and tt_book_divergences all read this rather than BookAudit::confirmed(),
+    // because confirmed() empties the moment the state leaves Diverged —
+    // including into Suspect (the quantities merely moved) and Blind (nothing is
+    // answering any more), neither of which is a recovery. See DivergenceLatch.
+    net::DivergenceLatch book_div_;
 
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07

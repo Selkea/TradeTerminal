@@ -206,8 +206,101 @@ TEST_CASE("metric: armed but unanswered says starting, NOT ok") {
     BookAudit a;
     a.arm(0);
     CHECK(a.field(0) == "starting");
-    CHECK(a.last_agreed_age_ms(kSec) == -1);
     CHECK(a.tick(kSec) == AuditState::Starting);
+}
+
+TEST_CASE("metric: an armed auditor that is NEVER answered ages from arming") {
+    // The gauge's whole job is to climb in every failure mode, and it did not
+    // climb in the one it was chosen for. An auditor armed and then never
+    // answered — a reconcile that wedged start_audit for the session — reported
+    // -1 forever, which is BELOW every `>` threshold a remote rule can write,
+    // while tt_book_divergences sat at 0. Both gauges read benign for the whole
+    // trading day with the phantom detector dead: oldest_history_age_ms pinned
+    // at 0 through a five-hour outage, again.
+    BookAudit a;
+    a.arm(0);
+    CHECK(a.last_agreed_age_ms(kSec) == kSec);
+    CHECK(a.last_agreed_age_ms(30 * kMin) == 30 * kMin);   // it CLIMBS
+    // ...and a rule of the documented shape actually fires.
+    CHECK(a.last_agreed_age_ms(30 * kMin) > 5 * kMin);
+    // -1 survives for the only genuinely unmeasurable case: no live session.
+    // That is what keeps a Saturday scrape distinguishable from a broken one.
+    a.stand_down();
+    CHECK(a.last_agreed_age_ms(30 * kMin) == -1);
+}
+
+TEST_CASE("a round that compared NOTHING is not agreement") {
+    // seen.empty() had two meanings — "every symbol agreed" and "there was
+    // nothing to look at" — and recorded them the same way. A one-symbol lineup
+    // whose only symbol is excluded as `settling` (a fill landed between the
+    // request and the answer) therefore flipped /diag to "ok" and reset the age
+    // on a comparison that examined zero positions.
+    BookAudit a;
+    a.arm(0);
+    a.observe({{"RAM", 411}}, {}, {}, kMin);
+    a.observe({{"RAM", 411}}, {}, {}, 2 * kMin);
+    REQUIRE(a.state() == AuditState::Diverged);
+    // Now a round in which the only symbol is settling. It carries no evidence.
+    a.observe({{"RAM", 411}}, {{"RAM", 0}}, {"RAM"}, 3 * kMin);
+    CHECK(a.state() == AuditState::Diverged);            // NOT reset to Ok
+    CHECK(a.field(3 * kMin) != "ok");
+    CHECK(a.last_agreed_age_ms(3 * kMin) == 3 * kMin);   // the age kept climbing
+    // It still counts as an ANSWER, though: the auditor is being served, so it
+    // must not also start claiming it is blind.
+    CHECK(a.unanswered_ms(3 * kMin) == 0);
+    // comparable_count is the discriminator, and it counts the broker-only
+    // direction too — that side of the comparison is the dangerous one.
+    CHECK(comparable_count({{"RAM", 411}}, {{"RAM", 0}}, {"RAM"}) == 0);
+    CHECK(comparable_count({}, {{"SNXX", 300}}, {}) == 1);
+    CHECK(comparable_count({{"RAM", 0}}, {}, {}) == 1);
+}
+
+// ---- the alert latch --------------------------------------------------------
+
+TEST_CASE("the alert is cleared ONLY by an audit that agreed") {
+    // WatchdogTimer answers update(false) after an alert with Recovered, so
+    // whatever feeds it decides what the operator is told. Feeding it
+    // `state == Diverged` meant BOTH exits from Diverged read as recovery.
+    DivergenceLatch l;
+    const std::vector<Divergence> d{{"RAM", 411, 0, DivergeKind::AppOnly, 2}};
+    l.update(AuditState::Diverged, d, kMin);
+    REQUIRE(l.open());
+    CHECK(l.span_ms() == kMin);
+
+    // (a) the quantities MOVE — a resting exit the app is deaf to, filling in
+    // stages. The streak resets, confirmed() empties, the state drops to
+    // Suspect. The books have not agreed; this alternated PAGE / "they agree
+    // again" / PAGE every 60 s.
+    l.update(AuditState::Suspect, {}, 0);
+    CHECK(l.open());
+    CHECK(l.divergences().size() == 1);       // still names the symbol to page about
+    CHECK(l.divergences()[0].symbol == "RAM");
+
+    // (b) answers stop entirely. Blind is the least recovered a detector can be,
+    // and on this route the compensating BOOK AUDIT BLIND page is suppressed
+    // when the order socket is down — so a false all-clear here was the last
+    // word the operator got about a live phantom.
+    l.update(AuditState::Blind, {}, 0);
+    CHECK(l.open());
+
+    // ...and the one thing that does clear it.
+    l.update(AuditState::Ok, {}, 0);
+    CHECK_FALSE(l.open());
+    CHECK(l.span_ms() == 0);
+}
+
+TEST_CASE("the latch belongs to a session, and starts empty") {
+    DivergenceLatch l;
+    CHECK_FALSE(l.open());
+    l.update(AuditState::Starting, {}, 0);   // no evidence either way
+    CHECK_FALSE(l.open());
+    l.update(AuditState::Diverged, {{"SNXX", 0, 300, DivergeKind::BrokerOnly, 2}},
+             2 * kMin);
+    REQUIRE(l.open());
+    // stand-down is not a recovery: it clears silently, so the next session
+    // starts from nothing rather than inheriting a page.
+    l.clear();
+    CHECK_FALSE(l.open());
 }
 
 TEST_CASE("metric: an auditor nobody answers goes BLIND on its own") {

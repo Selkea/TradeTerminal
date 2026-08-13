@@ -2769,10 +2769,18 @@ std::string App::build_diag_json() {
     {
         const int64_t steady_now_ms = steady_ms();
         j["book_divergence"] = book_audit_.field(steady_now_ms);
-        // ms since an audit last came back AND agreed; -1 = never in this
-        // session. The one number that means the same thing in every state.
+        // ms since an audit last came back AND agreed, counting from the moment
+        // the auditor armed if none ever has; -1 = no live session. The one
+        // number that means the same thing in every state — and, since the
+        // review of this change, one that actually CLIMBS in the state it was
+        // chosen for (armed and never answered used to read -1 forever).
         j["book_audit_agreed_age_ms"] = book_audit_.last_agreed_age_ms(steady_now_ms);
         j["book_audit_rounds"] = book_audit_.rounds();
+        // What the operator was paged about and has not been told is over. It
+        // outlives `book_divergence` slipping to suspect/unknown, which are
+        // exits from DIVERGED that are not recoveries — see net::DivergenceLatch.
+        j["book_divergence_open"] =
+            static_cast<int>(book_div_.divergences().size());
     }
     // Connect-timeout watchdog force-aborts (broker + feed). Nonzero = a gateway
     // handshake wedged and self-healed instead of freezing the I/O thread.
@@ -3052,12 +3060,21 @@ std::string App::build_metrics() {
     // both: "do the books disagree?" and "is anyone still checking?". An alert
     // on the count alone would go quiet the moment the auditor died, which is
     // exactly how this codebase has been blinded before — so the AGE is the one
-    // to page on, and it climbs in every failure mode.
+    // to page on, and it climbs in every failure mode. It really does now: an
+    // armed auditor that has never been answered ages from ARMING rather than
+    // reporting -1, which used to read below every threshold a rule could write
+    // (see BookAudit::last_agreed_age_ms). -1 now means only "no live session".
+    //
+    // The count is the LATCHED set, matching the page: BookAudit::confirmed()
+    // empties as soon as the state leaves Diverged, so a divergence still being
+    // paged about every 15 minutes would have exported 0 here.
     g("tt_book_divergences",
-      "live positions the broker and the app disagree about (confirmed)",
-      static_cast<double>(book_audit_.confirmed().size()));
+      "live positions the broker and the app disagree about (confirmed, and not "
+      "since contradicted by an audit that agreed)",
+      static_cast<double>(book_div_.divergences().size()));
     g("tt_book_audit_agreed_age_ms",
-      "ms since a broker position audit last came back AND agreed (-1 = never)",
+      "ms since a broker position audit last came back AND agreed, or since the "
+      "auditor armed if none ever has (-1 = no live session)",
       static_cast<double>(book_audit_.last_agreed_age_ms(steady_ms())));
 
     // Bar staleness: ms since each symbol's last SUCCESSFUL history delivery.
@@ -3332,11 +3349,16 @@ int App::tick() {
     // opens and decryptions a session, all of it discarded — and on the rendered
     // path it duplicated the read draw() already does below. Now it costs
     // nothing until the day's one 09:25 crossing actually fires.
-    trade_.pump_schedule([this] {
-        start_live_session(trade_.build_start_opts(
-            trade_account_info(), param_specs_fn(), !polygon_key().empty(),
-            !finnhub_key().empty(), data_.connected()));
-    });
+    trade_.pump_schedule(
+        [this] {
+            start_live_session(trade_.build_start_opts(
+                trade_account_info(), param_specs_fn(), !polygon_key().empty(),
+                !finnhub_key().empty(), data_.connected()));
+        },
+        // The scheduled stop goes through the App, not the engine, so the TWS
+        // adapter is actually torn down at 15:55 instead of holding the fixed
+        // orders client id until the next morning's start collided with it.
+        [this] { safe_stop_live(); });
 
     // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
     // so start the live session through the exact path the Start button uses.
@@ -3861,6 +3883,16 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         // down — after the new broker was already dialling.
         reap_async(std::move(tws_), broker_reaps_);
         reap_async(std::move(ibkr_), broker_reaps_);
+        // ...and WAIT for it. Moving the reap up was not enough on its own:
+        // reap_async DETACHES a thread and returns immediately, so the very next
+        // statement dialled client 20 while the old adapter still held it —
+        // ~TwsBroker deliberately does not poke the reader signal (see
+        // tws_broker.cpp), so its I/O thread only notices stop_ when
+        // waitForSignal times out, up to a second later. Only the lineup swap
+        // waited; the direct-start path did not, and the scheduled 15:55 stop
+        // goes through Engine::stop_live rather than App::safe_stop_live, so
+        // tws_ survives the night and 09:25's auto-start hit exactly this.
+        wait_for_broker_reap("live");
         tws_broker = std::make_unique<TwsBroker>(std::move(tc));
         cfg.broker = tws_broker.get();
         route("live: routing orders via TWS socket (port " + std::to_string(port) +
@@ -4123,6 +4155,32 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
 void App::request_quit() {
     if (engine_.live_running()) pending_quit_ = true;   // draw_trading_guards() confirms
     else should_quit_ = true;
+}
+
+// Block until every broker adapter handed to reap_async has actually been
+// destroyed, or kSwapReapWaitS elapses.
+//
+// The only bounded wait that is honest here: it waits on a fact this process
+// OWNS and can observe — the destructor returned — not on a guess about how long
+// the gateway holds a released client id. The lineup swap does the same thing
+// across frames (pump_lineup_swap) because it can; start_live_session cannot,
+// so it blocks. That is deliberate: the cost is a stall of at most one gateway
+// teardown (~1 s, and only when there was a leftover adapter), against dialling
+// kTwsOrdersClientId while this process still holds it, which costs a
+// self-inflicted "error 326: client id already in use" and an order path that is
+// unavailable for the first fast-retry cycle of the session.
+void App::wait_for_broker_reap(const char* who) {
+    if (broker_reaps_->load(std::memory_order_acquire) == 0) return;
+    const double deadline = mono_s() + kSwapReapWaitS;
+    while (broker_reaps_->load(std::memory_order_acquire) > 0 && mono_s() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Past the deadline it proceeds anyway rather than refusing to start: the
+    // 326 tier (fast retries, page only after a minute) is the backstop, and a
+    // session that never comes up is worse than one that retries for a moment.
+    if (broker_reaps_->load(std::memory_order_acquire) > 0)
+        route(std::string(who) + ": previous broker still shutting down after " +
+              std::to_string(static_cast<int>(kSwapReapWaitS)) +
+              "s - starting anyway (expect a brief client-id retry)");
 }
 
 void App::safe_stop_live(bool keep_positions) {
@@ -4623,20 +4681,37 @@ void App::pump_orphan_watchdog() {
 // pump_history_watchdog settled on for the same reason.
 void App::pump_book_audit() {
     static constexpr double kDivergenceReAlertSec = 900.0;   // re-page every 15 min
-    const LiveSnapshot snap = engine_.live_snapshot();
-    // Armed only when there is a session, a broker that can answer, and a book
-    // worth comparing. On the IBKR web route there is no position-audit path, so
-    // the auditor stands down rather than reporting a blindness that is a
-    // property of the route. `reconciled` matters just as much: before it, the
-    // engine's book is empty by construction and every adopted position would
-    // read as a broker-only divergence. It is not an open-ended wait — the
-    // engine flips it on ReconcileEnd or a 10 s failsafe, whichever comes first.
-    const bool armed = engine_.live_running() && tws_ != nullptr && snap.reconciled;
-    if (!armed) {
+    const auto stand_down = [this] {
         book_audit_.stand_down();
         book_div_wd_.reset();
         book_blind_wd_.reset();
         book_audit_sent_.clear();
+        book_div_.clear();
+    };
+    // Armed only when there is a session, a broker that can answer, and a book
+    // worth comparing. On the IBKR web route there is no position-audit path, so
+    // the auditor stands down rather than reporting a blindness that is a
+    // property of the route.
+    //
+    // The two cheap tests come FIRST, ahead of live_snapshot(). The snapshot
+    // deep-copies the session's whole order vector (up to 200 OrderRecords) and
+    // every symbol's state under snap_mu_ — the same mutex the busy-spinning
+    // live engine thread takes to publish — and this runs on the ~100 Hz tick,
+    // so taking it before the guard meant ~100 full copies a second to read one
+    // bool, plus copies on every tick with no session at all.
+    // pump_orphan_watchdog orders it this way for the same reason, and
+    // trade.cpp:195 records the regression that taught it.
+    if (!engine_.live_running() || tws_ == nullptr) {
+        stand_down();
+        return;
+    }
+    const LiveSnapshot snap = engine_.live_snapshot();
+    // `reconciled` matters just as much: before it, the engine's book is empty
+    // by construction and every adopted position would read as a broker-only
+    // divergence. It is not an open-ended wait — the engine flips it on
+    // ReconcileEnd or a 10 s failsafe, whichever comes first.
+    if (!snap.reconciled) {
+        stand_down();
         return;
     }
     const int64_t now_ms = steady_ms();
@@ -4677,6 +4752,16 @@ void App::pump_book_audit() {
                 if (s.symbol == nowp.symbol) { sent_it = true; break; }
             if (!sent_it) settling.push_back(nowp.symbol);
         }
+        // ...and the mirror: a symbol that was in the book when the request went
+        // out and is gone now. It can no longer be compared from the app side at
+        // all, and leaving it in would let the broker's row for it read as a
+        // broker-only divergence purely because the lineup moved underneath.
+        for (const net::BookPos& s : book_audit_sent_) {
+            bool still_here = false;
+            for (const net::BookPos& nowp : app_book)
+                if (nowp.symbol == s.symbol) { still_here = true; break; }
+            if (!still_here) settling.push_back(s.symbol);
+        }
         book_audit_.observe(app_book, broker_book, settling, now_ms);
         book_audit_sent_.clear();
     }
@@ -4693,19 +4778,25 @@ void App::pump_book_audit() {
     }
 
     // ---- alerts -------------------------------------------------------------
-    // The confirmation streak IS the grace period (two audits, ~60 s apart), so
-    // the timer's alert_after is 0: a divergence that reaches Diverged has
-    // already outlasted everything a transient can.
-    switch (book_div_wd_.update(state == net::AuditState::Diverged, now_s, 0.0,
+    // LATCHED, not level-triggered on Diverged: Suspect and Blind are both exits
+    // from Diverged that are not recoveries, and driving the timer straight off
+    // the state announced "the app's book and the broker's agree again" on
+    // divergences that had never once agreed. See net::DivergenceLatch for both
+    // routes. The confirmation streak IS the grace period (two audits, ~60 s
+    // apart), so the timer's alert_after stays 0: a divergence that reaches
+    // Diverged has already outlasted everything a transient can.
+    book_div_.update(state, book_audit_.confirmed(), book_audit_.confirmed_span_ms());
+    switch (book_div_wd_.update(book_div_.open(), now_s, 0.0,
                                 kDivergenceReAlertSec)) {
     case WatchdogTimer::Action::Page: {
-        const std::string msg = net::book_divergence_alert(
-            book_audit_.confirmed(), book_audit_.confirmed_span_ms());
+        const std::string msg =
+            net::book_divergence_alert(book_div_.divergences(), book_div_.span_ms());
         alerts_.notify(AlertNotifier::Critical, msg);
         route("alert: " + msg);
         break;
     }
     case WatchdogTimer::Action::Recovered:
+        // Reachable only from Ok now — an audit that came back and agreed.
         alerts_.notify(AlertNotifier::Warning,
                        "positions: the app's book and the broker's agree again");
         break;
@@ -4728,8 +4819,18 @@ void App::pump_book_audit() {
         break;
     }
     case WatchdogTimer::Action::Recovered:
-        alerts_.notify(AlertNotifier::Warning,
-                       "positions: the broker is answering position requests again");
+        // Only an ANSWER clears this one. The bad condition is
+        // `socket_up && Blind`, so it also goes false when the order SOCKET
+        // DROPS — which is the exact inverse of recovery — and the timer would
+        // then announce "the broker is answering position requests again" at the
+        // moment the broker stopped being reachable at all, with /diag still
+        // reading "unknown: no broker answer for Ns". Still Blind means still
+        // blind: the socket outage has its own page (pump_broker_watchdog), and
+        // when it comes back still-blind this timer pages again on the next tick
+        // because its alert_after is 0.
+        if (state != net::AuditState::Blind)
+            alerts_.notify(AlertNotifier::Warning,
+                           "positions: the broker is answering position requests again");
         break;
     case WatchdogTimer::Action::None:
         break;
