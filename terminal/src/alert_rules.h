@@ -3,6 +3,7 @@
 // from AlertNotifier's beep/webhook side effects so the rules are unit-testable
 // and there's ONE place that decides what pages the phone.
 
+#include "engine/reject.h"          // kOrderRefusedTag and friends
 #include "engine/tws_client_id.h"   // kTwsClientIdConflictTag
 #include "net/book_divergence.h"    // kBookDivergenceTag
 
@@ -44,6 +45,15 @@ inline AlertClass classify_alert(const std::string& l) {
     // can say and it deliberately does nothing else. See net/book_divergence.h.
     if (has(net::kBookDivergenceTag)) return AlertClass::Critical;
     if (has(net::kBookAuditBlindTag)) return AlertClass::Critical;
+    // An order that would have REDUCED or CLOSED a position was refused. Critical
+    // on the first occurrence and with no repeat threshold, because there is no
+    // benign version: the position it would have closed is still open and one
+    // fewer thing is now watching it. This is the same class the tier already
+    // holds "PROTECTIVE STOP REJECTED" for, widened to cover a plain signal exit
+    // — the protective tag only covers stop legs the ADAPTER knew to mark, and a
+    // strategy's own market exit refused by a risk gate is just as naked.
+    // Checked before the two below: all three tags contain "ORDER REFUSED".
+    if (has(kExitOrderRefusedTag)) return AlertClass::Critical;
     // NB: match "half-open ORDER" (a broker order submitted but never acked),
     // NOT bare "half-open". The routine data-feed reconnect logs "...data
     // session (half-open)" — it self-heals on every nightly gateway restart and
@@ -56,9 +66,25 @@ inline AlertClass classify_alert(const std::string& l) {
     // ordinary prose must not page anyone.
     if (has("lineup: ABORTED")) return AlertClass::Critical;
     if (has("lineup: EXCLUDED")) return AlertClass::Warning;
+    // The SAME symbol refused for the SAME reason, kRefusalRepeatAlertAt times.
+    // One refusal is a decision the engine made on purpose; a repeat is a
+    // strategy stuck in a loop it cannot leave, which means that symbol is
+    // silently not trading and will not start on its own. Beep-worthy, not
+    // page-the-whole-tier worthy. Must precede the plain tag below, which it
+    // contains as a substring.
+    if (has(kOrderRefusedRepeatTag)) return AlertClass::Warning;
     if (has("rejected") || has("stream lost") || has("auth failed") ||
         has("(drops!)") || has("half-open order"))
         return AlertClass::Warning;
+    // A single refused ENTRY. Info — webhook, no beep. Most refusals are the
+    // system working as designed (the notional clamp finding a position already
+    // at its cap; the entry gate declining to buy into a shut exchange), and a
+    // beep for each would train the operator to ignore beeps. That is not a
+    // hypothetical: the "half-open" data-feed line above was de-escalated for
+    // exactly that reason. It is still on the channel, because a refusal the
+    // operator never hears about is what let a strategy signal into a closed
+    // exchange three times on 2026-08-13 with nothing said.
+    if (has(kOrderRefusedTag)) return AlertClass::Info;
     if (has("live: fill"))
         return AlertClass::Info;
     return AlertClass::None;

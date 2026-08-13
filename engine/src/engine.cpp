@@ -88,7 +88,12 @@ void finish_stats(BacktestResult& res, Portfolio& pf, LatencyHistogram& lat,
 class EngineCtx final : public IStrategyContext {
 public:
     using NowFn = std::function<int64_t()>;
-    using OrderHook = std::function<void(const OrderRequest&, uint64_t id)>;
+    // id != 0: the order was placed. id == 0: it was REFUSED, and `why` names
+    // the cause (never RejectCause::None, never an empty message - see
+    // engine/reject.h). `record` is false only for the refusals that repeat by
+    // design and would flood a 200-entry blotter; they are still counted.
+    using OrderHook = std::function<void(const OrderRequest&, uint64_t id,
+                                         const RejectReason& why, bool record)>;
 
     EngineCtx(Engine& eng, const std::map<std::string, double>& params,
               const std::vector<std::string>& symbols, NowFn now, ExecSim& exec,
@@ -103,61 +108,95 @@ public:
         symbols_ = symbols;
     }
 
+    // EVERY `return 0` below names a cause. That is the whole point of this
+    // function's shape since 0.23.0: on 2026-08-13 the operator opened /diag,
+    // saw two rejected orders with reject_code 0 and reject_msg "", and could
+    // not distinguish a local risk gate from a buying-power refusal from
+    // something IBKR said. Four of the seven refusal points here recorded a bare
+    // code-0 rejection and three recorded nothing at all - not even a log line.
     uint64_t submit_order(const OrderRequest& in) noexcept override {
         // Replaying seed history to warm indicators: the strategy is seeing old
         // bars, so any signal it raises is historical. Warm it, place nothing.
-        if (warming_) return 0;
-        if (in.qty <= 0.0 || in.symbol_id == 0 || in.symbol_id > symbols_.size())
-            return 0;
-        if ((risk_ || symbol_risk_) && !risk_ok(in)) {
-            if (on_order_) on_order_(in, 0);   // recorded as Rejected
-            return 0;
-        }
+        // Counted but not recorded: a warmup replays hundreds of bars and a
+        // blotter row each would evict every real order in the session.
+        if (warming_) return refuse(in, RejectCause::WarmupReplay, /*record=*/false);
+        if (in.qty <= 0.0) return refuse(in, RejectCause::InvalidQty);
+        if (in.symbol_id == 0 || in.symbol_id > symbols_.size())
+            return refuse(in, RejectCause::SymbolNotInSession);
+        // Pre-screen what ExecSim would otherwise refuse with a bare 0 - a
+        // priceless limit/stop is a malformed request, and naming it here is the
+        // difference between "sim_refused" and a cause an operator can fix.
+        if (in.type == OrdType::Limit && in.limit_price <= 0.0)
+            return refuse(in, RejectCause::MissingLimitPrice);
+        if (in.type == OrdType::Stop && in.stop_price <= 0.0)
+            return refuse(in, RejectCause::MissingStopPrice);
+        // A quarantined symbol places nothing. run_live gates on_tick/on_bar
+        // dispatch already, but on_fill is still delivered and could re-enter
+        // through here - submit_order used to have no strat_halted knowledge at
+        // all, which the dispatch-gate comment in run_live called out as the
+        // remaining hole. Manual orders and the halt machinery's own flatten
+        // bypass this function entirely, so closing is never blocked.
+        if (!manual_ && symbol_halted(in.symbol_id))
+            return refuse(in, RejectCause::StrategyHalted);
+        // THE ENTRY GATE (see LiveConfig::entry_gate). Asked FIRST among the
+        // sizing gates and asked of the wall clock, not of the bar: the bar a
+        // strategy is reacting to opened one bar-length ago, which is exactly
+        // how a 15:55 bar produced a 16:00:17 order into a shut exchange.
+        // Position-increasing strategy orders only.
+        if (entry_gate_ && !manual_ && in.outside_rth == 0 && increases_position(in) &&
+            !entry_gate_(now_()))
+            return refuse(in, RejectCause::SessionClosed);
+        if (const RejectCause c = risk_ok(in); c != RejectCause::None)
+            return refuse(in, c);
         // Down-size a position-increasing order to the notional cap (see
         // clamp_to_notional). Reduce/close orders come back unchanged; an order
-        // that can't add a single share (already at the cap) comes back qty 0.
+        // that can't add a single share (already at the cap), or one with no
+        // price to size against at all, comes back as a cause.
         OrderRequest r = in;
-        clamp_to_notional(r);
-        if (r.qty <= 0.0) {
-            eng_.push_log("risk: position at notional cap, order rejected");
-            if (on_order_) on_order_(in, 0);
-            return 0;
-        }
+        if (const RejectCause c = clamp_to_notional(r); c != RejectCause::None)
+            return refuse(in, c);   // `in`: report the qty the strategy ASKED for
         // Hold-until-profitable: in "hold — don't halt" mode a strategy may not
-        // close a position at a loss. Refused silently (no reject record — a
-        // strategy retries its exit every bar) so the position is held until it
-        // can exit in profit. Manual orders + the kill switch use other paths.
-        if (hold_blocks_loss(r)) return 0;
+        // close a position at a loss, so the position is held until it can exit
+        // in profit. Counted but not recorded (a strategy retries its exit every
+        // bar, and one row per retry would flood the blotter); the refusals
+        // table carries the full count. Manual orders + the kill switch use
+        // other paths.
+        if (hold_blocks_loss(r))
+            return refuse(r, RejectCause::HoldBlocksLoss, /*record=*/false);
         // Buying power (simulator only — a real broker enforces its own
         // margin): a risk-INCREASING order must be coverable at ~1x. Buys need
         // cash for the full cost; a new/larger short's notional must fit within
         // equity. Reducing or closing always passes, so exits are never blocked.
-        if (!broker_) {
+        if (!broker_ && increases_position(r)) {
             const double pos = pf_.position(r.symbol_id).qty;
             const double dir = r.side == Side::Buy ? 1.0 : -1.0;
             const double after = pos + dir * r.qty;
-            if (std::abs(after) > std::abs(pos)) {
-                double px = r.type == OrdType::Limit   ? r.limit_price
-                            : r.type == OrdType::Stop ? r.stop_price
-                                                      : 0.0;
-                if (px <= 0.0 && r.symbol_id <= last_price_.size())
-                    px = last_price_[r.symbol_id - 1];
-                bool ok = true;
-                if (px > 0.0) {
-                    if (r.side == Side::Buy) ok = r.qty * px <= pf_.cash();
-                    else if (after < 0.0) ok = -after * px <= pf_.equity();
-                }
-                if (!ok) {
-                    eng_.push_log("risk: buying power exceeded, rejected");
-                    if (on_order_) on_order_(r, 0);
-                    return 0;
-                }
+            const double px = price_for(r);
+            bool ok = true;
+            if (px > 0.0) {
+                if (r.side == Side::Buy) ok = r.qty * px <= pf_.cash();
+                else if (after < 0.0) ok = -after * px <= pf_.equity();
             }
+            if (!ok) return refuse(r, RejectCause::BuyingPower);
         }
         const uint64_t id = broker_ ? broker_->submit(r, now_()) : exec_.submit(r, now_());
-        if (id && cur_event_tsc_)
+        if (!id) {
+            // The venue refused it synchronously. Ask WHY rather than recording
+            // the bare 0 that used to land in the blotter: TwsBroker alone has
+            // four distinct reasons for this (unknown symbol, read-only account,
+            // order path not connected, command ring full) and they call for
+            // four different responses.
+            RejectReason why = broker_ ? broker_->last_submit_reject()
+                                       : RejectReason{RejectCause::SimRefused, 0,
+                                                      reject_cause_text(RejectCause::SimRefused)};
+            if (why.empty()) why = unexplained_broker_reject();
+            if (why.message.empty()) why.message = reject_cause_text(why.cause);
+            if (on_order_) on_order_(r, 0, why, true);
+            return 0;
+        }
+        if (cur_event_tsc_)
             lat_.record(tsc::to_ns(rdtsc() - cur_event_tsc_));  // tick -> order
-        if (on_order_) on_order_(r, id);
+        if (on_order_) on_order_(r, id, RejectReason{}, true);
         return id;
     }
     bool cancel_order(uint64_t order_id) noexcept override {
@@ -219,6 +258,19 @@ public:
     void set_current_symbol(uint32_t symbol_id) { cur_symbol_ = symbol_id; }
     // While true, submit_order() is a no-op (see LiveConfig::symbol_warmup).
     void set_warming(bool w) { warming_ = w; }
+    // The operator pressed a button. Manual orders bypass the entry gate and the
+    // halt quarantine — a human who has decided to trade is not the failure mode
+    // either exists to prevent, and silently refusing them would be worse than
+    // the 16:05 order that started all this.
+    void set_manual(bool m) { manual_ = m; }
+    // Wall-clock entry gate (LiveConfig::entry_gate); empty = disarmed.
+    void set_entry_gate(std::function<bool(int64_t)> g) { entry_gate_ = std::move(g); }
+    bool entry_gate_armed() const { return static_cast<bool>(entry_gate_); }
+    bool entry_gate_open() const { return !entry_gate_ || entry_gate_(now_()); }
+    // Views onto run_live's halt state (both declared after this object).
+    void set_halt_view(const std::vector<char>* per_symbol) {
+        strat_halted_ = per_symbol;
+    }
     void set_last_price(uint32_t symbol_id, double p) {
         if (symbol_id == 0) return;
         if (last_price_.size() < symbol_id) last_price_.resize(symbol_id, 0.0);
@@ -226,6 +278,32 @@ public:
     }
 
 private:
+    // The ONE refusal exit. Builds the {cause, code, sentence} triple, hands it
+    // to the recorder and returns 0. No path in submit_order may return 0
+    // without going through here — that is what makes "a rejection with no
+    // reason" unrepresentable rather than merely discouraged.
+    uint64_t refuse(const OrderRequest& r, RejectCause cause,
+                    bool record = true) noexcept {
+        if (on_order_)
+            on_order_(r, 0, RejectReason{cause, 0, reject_cause_text(cause)}, record);
+        return 0;
+    }
+
+    // Does this order OPEN or ADD to a position (as opposed to reducing or
+    // closing one)? The single test behind three different policies: the
+    // notional clamp, the buying-power check and the entry gate all apply to
+    // increases only, because refusing an exit is how positions go naked.
+    bool increases_position(const OrderRequest& r) const noexcept {
+        const double pos = pf_.position(r.symbol_id).qty;
+        const double dir = r.side == Side::Buy ? 1.0 : -1.0;
+        return std::abs(pos + dir * r.qty) > std::abs(pos);
+    }
+
+    bool symbol_halted(uint32_t symbol_id) const noexcept {
+        return strat_halted_ && symbol_id >= 1 && symbol_id <= strat_halted_->size() &&
+               (*strat_halted_)[symbol_id - 1];
+    }
+
     // Per-symbol limits when provided, else the session-level fallback.
     const RiskLimits* resolve_risk(uint32_t symbol_id) const noexcept {
         if (symbol_risk_ && symbol_id >= 1 && symbol_id <= symbol_risk_->size())
@@ -246,21 +324,35 @@ private:
     // Enforce max_position_notional by shrinking (never rejecting) a position-
     // INCREASING order so the resulting position's dollar size fits the cap.
     // Strategies size their protective bracket off the actual fill qty and their
-    // exits off the live position, so a smaller fill stays fully protected. Sets
-    // r.qty to 0 when the position is already at the cap (caller rejects).
-    void clamp_to_notional(OrderRequest& r) noexcept {
-        const RiskLimits* rl = resolve_risk(r.symbol_id);
-        if (!rl || rl->max_position_notional <= 0.0) return;
+    // exits off the live position, so a smaller fill stays fully protected.
+    //
+    // Returns None when the order may proceed (r.qty possibly reduced), else the
+    // cause it must be refused with. Reduce/close orders always return None:
+    // this function must never be the reason a position cannot be closed.
+    RejectCause clamp_to_notional(OrderRequest& r) noexcept {
         const double pos = pf_.position(r.symbol_id).qty;
         const double dir = r.side == Side::Buy ? 1.0 : -1.0;
         const double after = pos + dir * r.qty;
-        if (std::abs(after) <= std::abs(pos)) return;   // reducing/closing: leave it
+        if (std::abs(after) <= std::abs(pos))
+            return RejectCause::None;   // reducing/closing: leave it
+        // AN UNPRICEABLE ORDER IS NOT SIZEABLE, so it is not sendable. This
+        // used to `return` and let the order through at full size with the
+        // dollar cap silently unapplied — an order sized against a price nobody
+        // has, which is the failure the 2026-08-13 review went looking for
+        // (correctly, as it turned out: it was not what happened that day, but
+        // the hole was real). Refusing it up front means such an order is never
+        // built rather than being caught downstream by an equity halt after it
+        // has already traded. Increases only: an exit with no quote still goes.
         const double px = price_for(r);
-        if (px <= 0.0) return;   // no price to size against; equity halts still catch it
+        if (px <= 0.0) return RejectCause::PriceUnavailable;
+        const RiskLimits* rl = resolve_risk(r.symbol_id);
+        if (!rl || rl->max_position_notional <= 0.0) return RejectCause::None;
         const double max_abs = rl->max_position_notional / px;   // shares the cap allows
-        if (std::abs(after) <= max_abs) return;                  // already within budget
+        if (std::abs(after) <= max_abs) return RejectCause::None;   // within budget
         const double allowed_add = std::floor(max_abs - std::abs(pos));
-        r.qty = allowed_add > 0.0 ? allowed_add : 0.0;
+        if (allowed_add <= 0.0) return RejectCause::NotionalCap;   // not one share fits
+        r.qty = allowed_add;
+        return RejectCause::None;
     }
 
     // "hold — don't halt" mode (RiskLimits::disable_auto_halt): a strategy order
@@ -283,27 +375,24 @@ private:
         return pnl < 0.0;   // would realize a loss → hold
     }
 
-    bool risk_ok(const OrderRequest& r) noexcept {
+    // None = passes. Returns the specific gate that stopped it: the three used
+    // to share one bare code-0 rejection, so /diag could not tell an oversized
+    // order from a fat-fingered limit price.
+    RejectCause risk_ok(const OrderRequest& r) noexcept {
+        if (!risk_ && !symbol_risk_) return RejectCause::None;
         const RiskLimits* rl = resolve_risk(r.symbol_id);
-        if (!rl) return true;
-        if (r.qty > rl->max_order_qty) {
-            eng_.push_log("risk: order qty exceeds limit, rejected");
-            return false;
-        }
+        if (!rl) return RejectCause::None;
+        if (r.qty > rl->max_order_qty) return RejectCause::MaxOrderQty;
         const double pos = pf_.position(r.symbol_id).qty;
         const double dir = r.side == Side::Buy ? 1.0 : -1.0;
-        if (std::abs(pos + dir * r.qty) > rl->max_position_qty) {
-            eng_.push_log("risk: resulting position exceeds limit, rejected");
-            return false;
-        }
+        if (std::abs(pos + dir * r.qty) > rl->max_position_qty)
+            return RejectCause::MaxPositionQty;
         const double last =
             r.symbol_id > 0 && r.symbol_id <= last_price_.size() ? last_price_[r.symbol_id - 1] : 0.0;
         if (r.type == OrdType::Limit && last > 0.0 &&
-            std::abs(r.limit_price - last) / last > rl->price_band_pct) {
-            eng_.push_log("risk: limit price outside band, rejected (fat finger?)");
-            return false;
-        }
-        return true;
+            std::abs(r.limit_price - last) / last > rl->price_band_pct)
+            return RejectCause::PriceBand;
+        return RejectCause::None;
     }
 
     Engine& eng_;
@@ -318,6 +407,9 @@ private:
     uint32_t cur_symbol_ = 0;
     OrderHook on_order_;
     bool warming_ = false;
+    bool manual_ = false;
+    std::function<bool(int64_t)> entry_gate_;
+    const std::vector<char>* strat_halted_ = nullptr;
     IBrokerAdapter* broker_;
     std::vector<std::string> symbols_;
     int64_t cur_event_tsc_ = 0;
@@ -586,6 +678,12 @@ void Engine::run_replay(ReplayConfig cfg, IStrategy* strategy) {
             clock.set(ev.ts_event_ns);
             const Bar b{ev.ts_event_ns, ev.u.bar.open, ev.u.bar.high,
                         ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
+            // run_backtest sets the last price before every dispatch; this
+            // branch did not, so a strategy ordering off a captured backfill bar
+            // was priced at 0 — the price band and the buying-power check were
+            // both blind, and since 0.23.0 an unpriceable increase is refused
+            // outright (RejectCause::PriceUnavailable) rather than sent unsized.
+            ctx.set_last_price(ev.symbol_id, b.close);
             strategy->on_bar(ctx, ev.symbol_id, b);
             continue;
         }
@@ -804,7 +902,8 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         return symbol_id > 0 && symbol_id <= cfg.symbols.size()
                    ? cfg.symbols[symbol_id - 1] : std::string();
     };
-    auto record_order = [&](const OrderRequest& r, uint64_t id) {
+    auto record_order = [&](const OrderRequest& r, uint64_t id,
+                            const RejectReason& why = {}) {
         OrderRecord rec;
         rec.id = id;
         rec.ts_ns = rt.now_ns();
@@ -816,9 +915,139 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         rec.qty = r.qty;
         rec.limit_price = r.limit_price;
         rec.manual = next_is_manual;
+        if (rec.status == OrderStatus::Rejected) {
+            // THE INVARIANT (engine/reject.h): a rejected record always says
+            // why. Callers that hand a submit straight to the broker/exec pass
+            // no reason at all, so the generic one stands in rather than the
+            // blank that reached /diag on 2026-08-13.
+            rec.reject_cause =
+                why.cause != RejectCause::None ? why.cause : RejectCause::BrokerRefused;
+            rec.reject_code = why.code;
+            rec.reject_msg =
+                why.message.empty() ? reject_cause_text(rec.reject_cause) : why.message;
+        }
         orders.push_back(rec);
         if (orders.size() > 200) orders.erase(orders.begin());
         orders_dirty = true;
+    };
+
+    // ---- refusal bookkeeping (engine/reject.h) ------------------------------
+    // One row per (symbol, cause) for the whole session, plus the alerting
+    // policy. Bounded by symbols x causes, so it cannot flood the way a blotter
+    // row per refusal would.
+    std::vector<RefusalStat> refusals;
+    bool refusals_dirty = true;
+    uint64_t entry_gate_blocked = 0;
+
+    // ALERTING POLICY, argued here because it is the difference between a page
+    // that gets read and a channel that gets muted:
+    //
+    //  * A single refusal of an ENTRY is Info (webhook, no beep). Most refusals
+    //    are the system working — the notional clamp finding a position already
+    //    at its cap, the entry gate declining to buy into a shut exchange. A
+    //    beep for each would train the operator to ignore the beep, which is
+    //    precisely what the "half-open" data-feed spam did before it was
+    //    de-escalated (see alert_rules.h).
+    //  * The SAME (symbol, cause) three times is a Warning (beep). One refusal
+    //    is a decision; a repeat is a strategy stuck in a loop it cannot leave,
+    //    and it means that symbol is silently not trading. Three rather than two
+    //    because one bar can legitimately produce an entry and its bracket leg
+    //    and have both hit the same gate (kRefusalRepeatAlertAt).
+    //  * ANY refusal of an EXIT — an order that would reduce or close a live
+    //    position — is Critical on the FIRST occurrence, regardless of cause. An
+    //    exit that cannot be placed is how a position ends up with nothing that
+    //    will ever close it, which is this system's worst failure class and
+    //    already owns the Critical tier ("PROTECTIVE STOP REJECTED"). There is
+    //    no benign version of it, so there is no repeat threshold.
+    //
+    // hold_blocks_loss is the one deliberate exception: it refuses exits by
+    // design (that is what hold-until-profitable IS), so it is counted and
+    // logged once per symbol, never paged. Its row in `refusals` is how an
+    // operator sees a position being ridden.
+    // Is this order an EXIT — would it strictly SHRINK a position that is open
+    // right now? Deliberately not "the opposite of an increase": a zero-qty or
+    // malformed order increases nothing, and calling that an exit would page
+    // Critical for a strategy bug that risks no position at all. Evaluated
+    // against the same portfolio the refusal was decided on, before any fill can
+    // move it. This one bool decides Critical vs Info (see note_refusal).
+    auto order_reduces_position = [&](const OrderRequest& r) {
+        const double pos = pf.position(r.symbol_id).qty;
+        if (pos == 0.0) return false;   // nothing open to close
+        const double dir = r.side == Side::Buy ? 1.0 : -1.0;
+        return std::abs(pos + dir * r.qty) < std::abs(pos);
+    };
+    auto note_refusal = [&](const OrderRequest& r, const RejectReason& why,
+                            bool record) {
+        const bool is_exit = order_reduces_position(r);
+        RefusalStat* row = nullptr;
+        for (RefusalStat& s : refusals)
+            if (s.symbol_id == r.symbol_id && s.cause == why.cause) { row = &s; break; }
+        const bool first = row == nullptr;
+        if (first) {
+            refusals.push_back(RefusalStat{r.symbol_id, symbol_name(r.symbol_id),
+                                           why.cause, why.code, why.message, 0, 0, 0,
+                                           is_exit});
+            row = &refusals.back();
+            row->first_ts_ns = rt.now_ns();
+        }
+        ++row->count;
+        row->last_ts_ns = rt.now_ns();
+        row->exit_order = row->exit_order || is_exit;
+        refusals_dirty = true;
+        if (why.cause == RejectCause::SessionClosed) ++entry_gate_blocked;
+        // A blotter row for the first of each pair only (see RefusalStat).
+        if (record && first) record_order(r, 0, why);
+
+        // A warmup replay is not a refused order — the strategy is being shown
+        // history and nothing was ever meant to reach the market. Counted so a
+        // set_warming(true) that never got cleared is visible, but never logged
+        // and never paged.
+        if (why.cause == RejectCause::WarmupReplay) return;
+        const std::string sym = symbol_name(r.symbol_id);
+        const std::string what =
+            std::string(" [") + reject_cause_slug(why.cause) + "] " + sym + " " +
+            (r.side == Side::Buy ? "buy " : "sell ") +
+            std::to_string(static_cast<long long>(r.qty)) + ": " + why.message;
+        // Hold-until-profitable is the one refusal that is SUPPOSED to repeat:
+        // the strategy re-offers its exit every bar and hold mode declines it
+        // every bar until the position is green. It says so once (Info) and then
+        // stays quiet — escalating it to Warning at the third bar would page for
+        // every held position, all day, which is how a channel gets muted. Its
+        // row in `refusals` is where an operator sees it is still happening.
+        if (why.cause == RejectCause::HoldBlocksLoss) {
+            if (first) push_log(std::string("live: ") + kOrderRefusedTag + what);
+            return;
+        }
+        if (is_exit) {
+            if (first) push_log(std::string("live: ") + kExitOrderRefusedTag + what);
+            return;
+        }
+        if (first) push_log(std::string("live: ") + kOrderRefusedTag + what);
+        else if (row->count == kRefusalRepeatAlertAt)
+            push_log(std::string("live: ") + kOrderRefusedRepeatTag + what + " (x" +
+                     std::to_string(row->count) + ")");
+    };
+    auto on_order = [&](const OrderRequest& r, uint64_t id, const RejectReason& why,
+                        bool record) {
+        if (id) { record_order(r, id); return; }
+        note_refusal(r, why, record);
+    };
+    // The three paths that bypass submit_order entirely and hand a flatten
+    // straight to the broker/simulator: the kill switch, the EOD backstop and
+    // the watchdog/protective halt. All three close positions, so a 0 from them
+    // is the worst refusal this app can produce — and it used to land in the
+    // blotter as a bare Rejected row with no cause and no page at all. Routed
+    // through the same bookkeeping so it rates Critical like any other refused
+    // exit.
+    auto record_submit = [&](const OrderRequest& r, uint64_t id) {
+        if (id) { record_order(r, id); return; }
+        RejectReason why = cfg.broker
+                               ? cfg.broker->last_submit_reject()
+                               : RejectReason{RejectCause::SimRefused, 0,
+                                              reject_cause_text(RejectCause::SimRefused)};
+        if (why.empty()) why = unexplained_broker_reject();
+        if (why.message.empty()) why.message = reject_cause_text(why.cause);
+        note_refusal(r, why, /*record=*/true);
     };
 
     IBrokerAdapter* const broker = cfg.broker;
@@ -835,8 +1064,19 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         has_swaps_.store(false, std::memory_order_relaxed);
     }
     EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
-                  exec, pf, lat, &cfg.risk, record_order, broker, &cfg.symbol_risk,
+                  exec, pf, lat, &cfg.risk, on_order, broker, &cfg.symbol_risk,
                   &cfg.symbol_params);
+    ctx.set_entry_gate(cfg.entry_gate);
+    // The gate cannot fail silently. An app that forgot to install one gets one
+    // line at session start saying so, and /diag carries entry_gate.armed for
+    // the rest of the session — an unarmed live session is the 2026-08-13
+    // configuration, where a strategy with enter_until_h 24 was free to buy at
+    // 04:05 and have IBKR fill it at the open five hours later.
+    push_log(cfg.entry_gate
+                 ? "live: entry gate ARMED - strategies may only OPEN or ADD to a "
+                   "position while the exchange is open (exits are never gated)"
+                 : "live: entry gate OFF - strategies may enter at ANY hour, "
+                   "including pre-market and after the close");
     // Route an event's symbol to the strategy instance that owns it.
     auto strat_for = [&](uint32_t sid) -> IStrategy* {
         return sid >= 1 && sid <= strategies.size() ? strategies[sid - 1] : nullptr;
@@ -903,6 +1143,16 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         std::lock_guard lock(snap_mu_);
         snap_.running = true;
         snap_.halted = halted;
+        if (refusals_dirty) {
+            snap_.refusals = refusals;
+            refusals_dirty = false;
+        }
+        // Recomputed every publish, not cached: "is the market open" is a
+        // question about NOW, and a cached answer is how a gate reads open all
+        // evening. Cheap - the app's predicate is a localtime + a calendar test.
+        snap_.entry_gate_armed = ctx.entry_gate_armed();
+        snap_.entry_gate_open = ctx.entry_gate_open();
+        snap_.entry_gate_blocked = entry_gate_blocked;
         snap_.reconciled = !reconciling;
         snap_.cash = pf.cash();
         snap_.equity = pf.equity();
@@ -954,6 +1204,10 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // safety net below). Declared here so the fill path can refuse to dispatch
     // on_fill to a halted symbol, same as on_tick/on_bar do.
     std::vector<char> strat_halted(n_sym, 0);
+    // ...and so submit_order can refuse an order from a quarantined symbol with
+    // a named cause instead of relying on dispatch gating alone (on_fill is
+    // still delivered to a halted symbol's strategy).
+    ctx.set_halt_view(&strat_halted);
     // Shared by the sim fill path and the broker event drain.
     auto apply_fill = [&](const Fill& f) {
         pf.apply(f);
@@ -1058,7 +1312,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy,
                            OrdType::Market, {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
             next_is_manual = true;
-            record_order(r, exec.submit(r, rt.now_ns()));
+            record_submit(r, exec.submit(r, rt.now_ns()));
             next_is_manual = false;
         }
         push_log("live: " + why + " — all orders cancelled, flattening, strategy halted");
@@ -1081,7 +1335,11 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     //
     // Hold mode (disable_auto_halt) opts out: that setting exists to ride a
     // position through rather than realise it, and this must not fight it.
-    constexpr double kEodBackstopH = 15.95;   // 15:57 local
+    // 15:57 local. tt::kEodBackstopH in terminal/src/market_calendar.h mirrors
+    // this: the entry gate stops OPENING positions at the same instant this
+    // starts closing them, because this is edge-triggered and marks the day done
+    // when it fires — anything opened after it has nothing left to close it.
+    constexpr double kEodBackstopH = 15.95;
     int64_t eod_day = -1;
     double eod_prev_h = -1.0;   // last hour-of-day seen; -1 = first observation
     auto eod_backstop = [&] {
@@ -1126,7 +1384,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy,
                            OrdType::Market, {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
             next_is_manual = true;   // closing must always work
-            record_order(r, exec.submit(r, rt.now_ns()));
+            record_submit(r, exec.submit(r, rt.now_ns()));
             next_is_manual = false;
         }
         push_log("live: EOD BACKSTOP — open position(s) past 15:57 with no "
@@ -1221,7 +1479,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             OrderRequest r{sid, pos > 0 ? Side::Sell : Side::Buy, OrdType::Market,
                            {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
             next_is_manual = true;   // bypass risk: closing must always work
-            record_order(r, broker ? broker->submit(r, rt.now_ns())
+            record_submit(r, broker ? broker->submit(r, rt.now_ns())
                                     : exec.submit(r, rt.now_ns()));
             next_is_manual = false;
         }
@@ -1392,7 +1650,9 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                                c.outside_rth, c.qty, lmt ? c.limit_price : 0.0,
                                0.0, c.take_profit, c.stop_loss};
                 next_is_manual = true;
+                ctx.set_manual(true);   // bypass the entry gate + halt quarantine
                 const uint64_t id = ctx.submit_order(r);
+                ctx.set_manual(false);
                 next_is_manual = false;
                 push_log(id ? "live: manual " + std::string(c.buy ? "BUY " : "SELL ") +
                                   std::to_string(static_cast<long long>(c.qty)) +
@@ -1441,24 +1701,54 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     // /diag can show why, not just that, an order was rejected.
                     RejectReason rr;
                     if (rejected) rr = broker->take_reject(bev.u.order.order_id);
-                    const bool have_reason = rr.code || !rr.message.empty();
+                    // A rejection with no cause is unactionable, so there is no
+                    // longer such a thing: an adapter that says nothing gets the
+                    // generic sentence, which at least names the layer. On
+                    // 2026-08-13 this branch stored a blank and /diag printed it.
+                    if (rejected) {
+                        if (rr.cause == RejectCause::None)
+                            rr.cause = rr.code ? RejectCause::BrokerRejected
+                                               : RejectCause::BrokerRefused;
+                        if (rr.message.empty()) rr.message = reject_cause_text(rr.cause);
+                    }
+                    // A specific reason may overwrite a generic one, but never
+                    // the other way round: a late reason-less event must not
+                    // wipe a captured "201 Exchange is closed".
+                    const bool specific = rr.cause != RejectCause::BrokerRefused;
+                    OrderRequest refused{};   // rebuilt for the refusal table
+                    bool refused_known = false;
                     for (auto& o : orders)
                         if (o.id == bev.u.order.order_id) {
                             o.status =
                                 rejected ? OrderStatus::Rejected : OrderStatus::Cancelled;
-                            // Only overwrite when this event carried a reason, so
-                            // a later reason-less reject can't wipe a captured one.
-                            if (rejected && have_reason) {
+                            if (rejected &&
+                                (specific || o.reject_cause == RejectCause::None)) {
+                                o.reject_cause = rr.cause;
                                 o.reject_code = rr.code;
                                 o.reject_msg = rr.message;
                             }
+                            refused.symbol_id = o.symbol_id;
+                            refused.side = static_cast<Side>(o.side);
+                            refused.qty = o.qty;
+                            refused_known = true;
                             orders_dirty = true;
                         }
+                    // Count it alongside the local refusals, so "how many
+                    // orders did this session fail to place, and why" is ONE
+                    // table rather than a blotter scan. This is also what gives
+                    // a broker-rejected EXIT its Critical page even when the
+                    // adapter did not tag it protective — the naked-position
+                    // net below only fires on kEvFlagProtective, and a plain
+                    // signal exit refused by IBKR is just as naked.
+                    if (rejected && refused_known)
+                        note_refusal(refused, rr, /*record=*/false);
                     std::string line = "live: order #" +
                                        std::to_string(bev.u.order.order_id) +
                                        (rejected ? " rejected by broker" : " cancelled");
-                    if (rejected && have_reason) {
+                    if (rejected) {
                         line += " [";
+                        line += reject_cause_slug(rr.cause);
+                        line += " ";
                         if (rr.code) line += std::to_string(rr.code) + " ";
                         line += rr.message + "]";
                     }

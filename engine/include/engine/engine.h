@@ -11,12 +11,14 @@
 #include "engine/exec_sim.h"
 #include "engine/latency.h"
 #include "engine/portfolio.h"
+#include "engine/reject.h"
 #include "engine/spsc_ring.h"
 #include "engine/tick_log.h"
 #include "tt/strategy_api.h"
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -96,6 +98,34 @@ struct LiveConfig {
     // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
     // session-wide (per-symbol halting needs per-symbol portfolios).
     std::vector<RiskLimits> symbol_risk;
+    // THE ENTRY GATE (0.23.0). Answers, for a wall-clock instant: may a strategy
+    // OPEN or ADD to a position right now? Empty = disarmed, which is what
+    // backtests and replays want (their clock is the data's, not the world's).
+    //
+    // Why it exists, and why WALL CLOCK. On 2026-08-13 two strategies signalled
+    // entries at 16:00:12 and 16:00:17 ET and IBKR refused both with error 201
+    // "Exchange is closed"; a third at 16:05 was ACCEPTED and rested overnight as
+    // a market order for the next open. Two independent holes produced that:
+    //
+    //   1. rsi2_pullback gates on hour_of_day_local(bar.ts_ns), and ts_ns is the
+    //      bar's OPEN time while the order is placed one bar-length later. Its
+    //      enter_until_h of 16 therefore really means 16:05 on 5m bars, so the
+    //      last bar of every trading day escapes the window.
+    //   2. bollinger_reversion, donchian_trend and scalper_burst ship
+    //      enter_from_h 0 / enter_until_h 24 - no window at all. KORU entered at
+    //      04:05 on 2026-08-13 under that; IBKR held the order and filled it at
+    //      the 09:30 open, 5.4 hours after the signal that justified it.
+    //
+    // Fixing the strategies one at a time fixes neither the next strategy nor
+    // the optimizer, which is free to fit the window to anything. So the gate
+    // lives here, below every strategy, and is asked about NOW rather than about
+    // the bar - a clock the bar-open bug cannot reach.
+    //
+    // It gates position-INCREASING strategy orders only. Exits, reduces, manual
+    // orders, flattens and the kill switch are never gated: refusing to close is
+    // how a position ends up naked, which is a far worse failure than a late
+    // entry. See EngineCtx::submit_order.
+    std::function<bool(int64_t now_ns)> entry_gate;
     // Optional per-symbol seed bars (parallel to symbols), replayed through the
     // strategy right after on_init so indicators are warm when the session
     // starts. Live bars only ever come from tick aggregation, so a strategy
@@ -151,10 +181,47 @@ struct OrderRecord {
     OrderStatus status = OrderStatus::Working;
     double qty = 0, limit_price = 0, fill_price = 0, fee = 0;
     bool manual = false;
-    // Populated when status == Rejected and the broker reported a reason
-    // (e.g. IBKR code 110 + text). code 0 / empty msg = no reason captured.
+    // WHY, when status == Rejected. The invariant, enforced at every write site
+    // and asserted by engine/tests/test_reject.cpp:
+    //
+    //     status == Rejected  =>  reject_cause != None && !reject_msg.empty()
+    //
+    // reject_code is the BROKER's number when it gave one (IBKR 201 "Exchange is
+    // closed"); it stays 0 for every locally-refused order, and 0 no longer means
+    // "no reason" - reject_cause always does say. Before 0.23.0 a rejected record
+    // could carry cause-less 0/"" and did, twice, on 2026-08-13.
+    RejectCause reject_cause = RejectCause::None;
     int reject_code = 0;
     std::string reject_msg;
+};
+
+// One row per (symbol, cause) refusal pair for the whole session: the complete
+// count, even for the causes that are too chatty to give a blotter row each.
+//
+// The blotter (`orders`) records only the FIRST refusal of a pair, because it is
+// a 200-entry ring: a strategy retrying an entry into a closed session every
+// minute would evict every real order in the session and the truth would be gone
+// - the same "instrumentation drowns itself" shape as the history watchdog's
+// repeat pages. This table never floods: it is bounded by symbols x causes, and
+// `count` + `last_ts_ns` say how bad and how recent.
+//
+// HEALTHY vs BROKEN, explicitly: an ordinary live session has ONE row per
+// symbol, cause warmup_replay, count = the number of seed bars that produced a
+// signal, last_ts_ns pinned to the warmup that ended at session start. Anything
+// else - any row whose cause is not warmup_replay, or a warmup_replay row whose
+// last_ts_ns keeps advancing after the session is warm - is a defect.
+struct RefusalStat {
+    uint32_t symbol_id = 0;
+    std::string symbol;
+    RejectCause cause = RejectCause::None;
+    int code = 0;              // broker's number, 0 for local refusals
+    std::string message;
+    uint64_t count = 0;
+    int64_t first_ts_ns = 0, last_ts_ns = 0;
+    // The refused order was REDUCING or CLOSING a position. This is the field
+    // that decides whether a refusal pages Critical: an exit that cannot be
+    // placed is how a position ends up with nothing that will ever close it.
+    bool exit_order = false;
 };
 
 // One entry per symbol in a live session, in symbol_id order (index 0 = id 1).
@@ -197,6 +264,30 @@ struct LiveSnapshot {
     double cash = 0, equity = 0;
     std::vector<SymbolState> symbols;
     std::vector<OrderRecord> orders;   // newest last, capped
+    // Complete per-(symbol, cause) refusal counts for the session. See
+    // RefusalStat for what healthy and broken look like.
+    std::vector<RefusalStat> refusals;
+    // ---- entry-gate state (LiveConfig::entry_gate) --------------------------
+    // Published every frame so the gate cannot fail silently, which is this
+    // project's recurring defect (oldest_history_age_ms pinned at 0 through a
+    // five-hour outage; data.connected true against a login modal).
+    //
+    //   entry_gate_armed  false = NO gate is installed and strategies may enter
+    //                     at any hour, i.e. the 2026-08-13 behaviour. True in
+    //                     any session the app started. Reading false on a live
+    //                     session IS the alarm.
+    //   entry_gate_open   true only while entries are permitted. On a normal
+    //                     weekday it is true 09:30-16:00 local and false either
+    //                     side; a value of true at 18:00, on a Sunday, or on
+    //                     Thanksgiving means the calendar behind it is wrong.
+    //   entry_gate_blocked  how many entries the gate refused this session. 0 on
+    //                     a healthy day. Nonzero is the number that was
+    //                     unobtainable before 0.23.0: strategies signalling into
+    //                     a shut exchange, which used to show up only as an IB
+    //                     reject with no reason - or, at 16:05, not at all.
+    bool entry_gate_armed = false;
+    bool entry_gate_open = false;
+    uint64_t entry_gate_blocked = 0;
     RiskState risk;
     uint64_t ticks = 0, dropped_ticks = 0;
     int64_t last_tick_ts_ms = 0;       // most recent tick across any symbol

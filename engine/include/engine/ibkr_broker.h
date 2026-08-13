@@ -109,6 +109,9 @@ public:
     void flatten() override;
     bool poll_event(EngineEvent& out) override { return ev_ring_->try_pop(out); }
     RejectReason take_reject(uint64_t order_id) override;
+    // Engine-thread-only, asked immediately after a 0 from submit(). See
+    // TwsBroker::last_submit_reject.
+    RejectReason last_submit_reject() const override { return last_submit_reject_; }
     bool ready() const override { return ready_.load(std::memory_order_acquire); }
 
     // Status/log lines (I/O thread produces, UI drains each frame).
@@ -127,12 +130,13 @@ private:
 
     void io_loop();
     void push_ev(const EngineEvent& ev);
-    // Record a reject reason (I/O thread) then push the Rejected event. code 0
-    // and empty msg = no reason available (leaves the reason table untouched).
+    // Record a reject reason (I/O thread) then push the Rejected event. Always
+    // stores a reason — see the matching note on TwsBroker::push_reject.
     // symbol_id + protective mark a rejected protective stop leg so the engine
     // can flatten the position it was guarding (see kEvFlagProtective).
-    void push_reject(uint64_t local_id, int code = 0, std::string msg = {},
-                     uint32_t symbol_id = 0, bool protective = false);
+    void push_reject(uint64_t local_id, RejectCause cause, int code = 0,
+                     std::string msg = {}, uint32_t symbol_id = 0,
+                     bool protective = false);
     void log(std::string line);
     bool push_cmd(const Cmd& c);
 
@@ -156,6 +160,8 @@ private:
     // matching Rejected event is drained.
     std::mutex reject_mu_;
     std::unordered_map<uint64_t, RejectReason> reject_reasons_;
+    // Engine thread only: why the last submit() returned 0.
+    RejectReason last_submit_reject_{};
 
     AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
 

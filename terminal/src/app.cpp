@@ -2902,7 +2902,11 @@ std::string App::build_diag_json() {
     j["symbols"] = std::move(syms);
     j["unprotected_positions"] = unprotected;
 
-    // ---- rejects feed (count + recent, with the broker's reject reason) ----
+    // ---- rejects feed (count + recent, with the reason) --------------------
+    // Every row carries reject_cause, and reject_cause is never "none" on a
+    // rejected order (engine/reject.h). Before 0.23.0 this block could and did
+    // emit reject_code 0 with reject_msg "", which is what the operator found on
+    // 2026-08-13 and could do nothing with.
     int reject_count = 0;
     for (const auto& o : s.orders)
         if (o.status == OrderStatus::Rejected) ++reject_count;
@@ -2916,12 +2920,60 @@ std::string App::build_diag_json() {
             r["type"] = order_type_name(it->type);
             r["qty"] = it->qty;
             r["limit_price"] = it->limit_price;
-            r["reject_code"] = it->reject_code;   // 0 = no numeric code captured
-            r["reject_msg"] = it->reject_msg;      // "" = no reason captured
+            r["reject_cause"] = reject_cause_slug(it->reject_cause);   // greppable
+            r["reject_broker"] = reject_cause_is_broker(it->reject_cause);
+            r["reject_code"] = it->reject_code;   // the BROKER's number; 0 = local
+            r["reject_msg"] = it->reject_msg;     // never empty on a reject
             rejects.push_back(std::move(r));
         }
     j["reject_count"] = reject_count;
     j["rejects_recent"] = std::move(rejects);
+
+    // ---- refusal table (every refusal, counted, per symbol and cause) ------
+    // The complete picture the blotter cannot give: it only records the FIRST
+    // refusal of each (symbol, cause) pair so a retrying strategy cannot evict
+    // the session's real orders from a 200-entry ring.
+    //
+    // HEALTHY: exactly one row per symbol, cause "warmup_replay", last_ts_ms
+    // pinned to session start. BROKEN: any other cause present, or a
+    // warmup_replay row whose last_ts_ms keeps advancing (set_warming never
+    // cleared - a whole session silently placing nothing).
+    json refusals = json::array();
+    uint64_t refusals_total = 0, refusals_exit = 0;
+    for (const auto& rf : s.refusals) {
+        refusals_total += rf.count;
+        if (rf.exit_order) refusals_exit += rf.count;
+        json r;
+        r["symbol"] = rf.symbol;
+        r["cause"] = reject_cause_slug(rf.cause);
+        r["count"] = rf.count;
+        r["exit_order"] = rf.exit_order;   // true = an exit was refused
+        r["code"] = rf.code;
+        r["message"] = rf.message;
+        r["first_ts_ms"] = rf.first_ts_ns / 1'000'000;
+        r["last_ts_ms"] = rf.last_ts_ns / 1'000'000;
+        refusals.push_back(std::move(r));
+    }
+    j["refusals"] = std::move(refusals);
+    j["refusal_count"] = refusals_total;
+    // Nonzero = at least one order that would have REDUCED or CLOSED a position
+    // was refused. There is no benign value but 0.
+    j["refused_exits"] = refusals_exit;
+
+    // ---- entry gate --------------------------------------------------------
+    // armed false on a live session = the app did not install a gate and
+    // strategies may enter at any hour (the 2026-08-13 configuration).
+    // open reads true only inside 09:30-15:57 on a real trading day; true at
+    // 18:00 or on a Sunday means the calendar behind it is wrong.
+    // blocked counts entries the gate refused: 0 on a healthy day, and the
+    // number that did not exist at all before 0.23.0.
+    {
+        json g;
+        g["armed"] = s.entry_gate_armed;
+        g["open"] = s.entry_gate_open;
+        g["blocked"] = s.entry_gate_blocked;
+        j["entry_gate"] = std::move(g);
+    }
 
     // ---- risk-halt headroom (how close the session is to an automated halt) ----
     // nearest_halt_frac is 0 (safe) .. 1 (at the halt), the max proximity across
@@ -3025,6 +3077,26 @@ std::string App::build_metrics() {
     g("tt_dropped_ticks_total", "ticks dropped (ring full)",
       static_cast<double>(s.dropped_ticks));
     g("tt_reject_count", "orders rejected this session", reject_count);
+    // Refusals include the ones that never became a blotter row (a strategy
+    // retrying into the same gate), so this can exceed tt_reject_count. The
+    // exit gauge is the one worth an alerting rule: any nonzero value means an
+    // order that would have closed a position did not get placed.
+    {
+        double total = 0, exits = 0;
+        for (const auto& rf : s.refusals) {
+            total += static_cast<double>(rf.count);
+            if (rf.exit_order) exits += static_cast<double>(rf.count);
+        }
+        g("tt_refusal_count", "orders refused this session, all causes", total);
+        g("tt_refused_exits",
+          "refused orders that would have reduced/closed a position", exits);
+    }
+    g("tt_entry_gate_armed", "1 if a session-hours entry gate is installed",
+      s.entry_gate_armed ? 1 : 0);
+    g("tt_entry_gate_open", "1 while strategies may open/add to positions",
+      s.entry_gate_open ? 1 : 0);
+    g("tt_entry_gate_blocked", "entries refused because the session was closed",
+      static_cast<double>(s.entry_gate_blocked));
     g("tt_feed_stale_ms", "ms since the last tick (-1 = none yet)",
       s.last_tick_ts_ms > 0 ? static_cast<double>(now_ms - s.last_tick_ts_ms) : -1);
     g("tt_stuck_orders", "orders unacked past the half-open threshold (TWS)",
@@ -3803,6 +3875,13 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     cfg.symbol_bar_seconds = sym_bars;
     cfg.risk = session_risk;
     cfg.symbol_risk = sym_risk;
+    // THE ENTRY GATE. Installed for every live session the app starts, so no
+    // strategy can open a position outside the hours in which one can be closed
+    // again — see LiveConfig::entry_gate and tt::rth_entry_allowed. The engine
+    // defaults it OFF because backtests and replays must keep judging the data's
+    // clock, not the world's; a live session that reads entry_gate.armed false
+    // in /diag is therefore a bug HERE, not there.
+    cfg.entry_gate = [](int64_t now_ns) { return rth_entry_allowed_at(now_ns); };
     // Every data source is real-time now => spin the engine
     // thread; ticks are handled in ns, not after Sleep(5).
     cfg.busy_spin = true;

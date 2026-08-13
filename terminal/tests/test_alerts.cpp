@@ -82,6 +82,39 @@ TEST_CASE("classify_alert: a refused trading day reaches the operator") {
     CHECK(classify_alert("lineup: tournament 3/6 - KORU") == AlertClass::None);
 }
 
+TEST_CASE("classify_alert: the refusal tiers, and why they differ") {
+    // THE POLICY, pinned (see run_live's note_refusal and engine/reject.h).
+    //
+    // A single refused ENTRY is Info: webhook, no beep. Most refusals are the
+    // system working - the notional clamp finding a position already at its cap,
+    // the entry gate declining to buy into a shut exchange. Beeping on each
+    // would train the operator to ignore beeps, which is exactly what happened
+    // to the "half-open" data-feed line above.
+    CHECK(classify_alert("live: ORDER REFUSED [session_closed] KORU buy 234: the "
+                         "exchange is not open for new entries right now") ==
+          AlertClass::Info);
+    // The SAME symbol and cause, three times: no longer a decision, a strategy
+    // stuck in a loop it cannot leave. That symbol is silently not trading.
+    CHECK(classify_alert("live: ORDER REFUSED REPEATEDLY [notional_cap] KORU buy "
+                         "234: the position is already at its dollar cap (x3)") ==
+          AlertClass::Warning);
+    // An EXIT refused - the position it would have closed is still open and one
+    // fewer thing is watching it. Critical on the FIRST occurrence, no repeat
+    // threshold, because there is no benign version of it.
+    CHECK(classify_alert("live: EXIT ORDER REFUSED [max_order_qty] MUU sell 161: "
+                         "the order quantity exceeds the per-order share limit") ==
+          AlertClass::Critical);
+    // Ordering guard: all three tags nest as substrings, so a classifier that
+    // tested the generic one first would downgrade the other two.
+    CHECK(std::string(tt::kExitOrderRefusedTag).find(tt::kOrderRefusedTag) !=
+          std::string::npos);
+    CHECK(std::string(tt::kOrderRefusedRepeatTag).find(tt::kOrderRefusedTag) !=
+          std::string::npos);
+    // Lowercase "refused" in ordinary prose must stay silent - the lineup and
+    // the data feed both use the word.
+    CHECK(classify_alert("lineup: refused SOXS, no fit") == AlertClass::None);
+}
+
 TEST_CASE("classify_alert: fills are Info, plain lines are None") {
     CHECK(classify_alert("live: fill #7 BUY 100 @ 12.34") == AlertClass::Info);
     CHECK(classify_alert("candles: SOXL 5m x9750") == AlertClass::None);

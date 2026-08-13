@@ -205,3 +205,55 @@ TEST_CASE("hours: an ordinary day is never an early close") {
     CHECK(is_us_early_close(2025, 11, 28));
     CHECK(is_us_early_close(2025, 12, 24));
 }
+
+// ---- the entry gate ---------------------------------------------------------
+// The 2026-08-13 incident in one predicate. Two strategies signalled entries at
+// 16:00:12 and 16:00:17 ET and IBKR refused both ("Exchange is closed"); a third
+// at 16:05:16 was ACCEPTED and rested overnight as a market order for the next
+// open. Earlier the same week the same strategy entered KORU at 04:05 and IBKR
+// filled it at 09:30, 5.4 hours after the signal that justified it. Every one of
+// those instants must read false here.
+
+TEST_CASE("entry gate: the three 2026-08-13 orders are all outside the window") {
+    // 2026-08-13 was a Thursday, a normal full session.
+    CHECK(is_us_trading_day(mk(2026, 8, 13)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 16, 0)));    // the two rejects
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 16, 5)));    // the resting order
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 4, 5)));     // the 5.4h-stale fill
+    // ...while the fills that session made legitimately are inside it.
+    CHECK(rth_entry_allowed(at(2026, 8, 13, 15, 25)));
+    CHECK(rth_entry_allowed(at(2026, 8, 13, 15, 35)));
+}
+
+TEST_CASE("entry gate: the window is 09:30 up to the 15:57 EOD backstop") {
+    // Closes EARLY, with the backstop, not with the exchange: the backstop is
+    // edge-triggered and marks the day done when it fires, so a position opened
+    // at 15:58 has nothing left that will close it today.
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 9, 29)));
+    CHECK(rth_entry_allowed(at(2026, 8, 13, 9, 30)));
+    CHECK(rth_entry_allowed(at(2026, 8, 13, 15, 56)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 15, 57)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 13, 15, 58)));
+    CHECK(entry_cutoff_h(mk(2026, 8, 13)) == doctest::Approx(kEodBackstopH));
+}
+
+TEST_CASE("entry gate: nothing may be entered on a weekend or a holiday") {
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 15, 12, 0)));   // Saturday
+    CHECK_FALSE(rth_entry_allowed(at(2026, 8, 16, 12, 0)));   // Sunday
+    CHECK_FALSE(rth_entry_allowed(at(2026, 11, 26, 12, 0)));  // Thanksgiving
+    CHECK_FALSE(is_us_trading_day(mk(2026, 7, 3)));           // holiday-swallowed
+    CHECK_FALSE(rth_entry_allowed(at(2026, 7, 3, 12, 0)));
+    CHECK(entry_cutoff_h(mk(2026, 8, 16)) == 0.0);
+}
+
+TEST_CASE("entry gate: a half-day cuts entries three minutes before its 13:00 close") {
+    // The whole point of subtracting the lead from the DAY's close rather than
+    // hardcoding 15:57: on an early close, 15:57 is three hours after the shop
+    // shut. 2026-11-27 is the day after Thanksgiving.
+    REQUIRE(is_us_early_close(2026, 11, 27));
+    CHECK(entry_cutoff_h(mk(2026, 11, 27)) == doctest::Approx(kRthEarlyCloseH - 0.05));
+    CHECK(rth_entry_allowed(at(2026, 11, 27, 12, 56)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 12, 57)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 13, 30)));
+    CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 15, 30)));
+}

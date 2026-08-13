@@ -373,10 +373,9 @@ struct IbkrBroker::Io {
                     r.rc != CURLE_OK ? curl_easy_strerror(r.rc) : r.body.substr(0, 200);
                 b.log("order #" + std::to_string(c.local_id) + " rejected: " + reason);
                 const auto ps = protective_sym_.find(c.local_id);
-                if (ps != protective_sym_.end())
-                    b.push_reject(c.local_id, 0, reason, ps->second, true);
-                else
-                    b.push_reject(c.local_id, 0, reason);
+                b.push_reject(c.local_id, RejectCause::BrokerRejected, 0, reason,
+                              ps != protective_sym_.end() ? ps->second : 0,
+                              ps != protective_sym_.end());
                 return;
             }
             if (!resp.order_id.empty()) {
@@ -404,11 +403,11 @@ struct IbkrBroker::Io {
         b.log("order #" + std::to_string(c.local_id) + " stuck in confirmation loop");
         {
             const auto ps = protective_sym_.find(c.local_id);
-            if (ps != protective_sym_.end())
-                b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop",
-                             ps->second, true);
-            else
-                b.push_reject(c.local_id, 0, "stuck in gateway confirmation loop");
+            b.push_reject(c.local_id, RejectCause::BrokerRefused, 0,
+                          "the gateway kept asking confirmation questions and the "
+                          "order never got an id after 3 rounds",
+                          ps != protective_sym_.end() ? ps->second : 0,
+                          ps != protective_sym_.end());
         }
     }
 
@@ -496,17 +495,26 @@ struct IbkrBroker::Io {
                 std::string& prev = last_status[it->second];
                 if (prev == o.status) continue;
                 prev = o.status;
-                if (o.status == "Cancelled" || o.status == "Inactive") {
+                if (o.status == "Inactive") {
+                    // THE SECOND REASONLESS PRODUCER, and the worse of the two:
+                    // unlike the TWS route there is no error() callback here
+                    // that could ever supply IB's text — this poll sees a status
+                    // string and nothing else. It used to push a bare
+                    // kEvFlagRejected event, so an order refused on this route
+                    // was PERMANENTLY unexplained. It still cannot say why IB
+                    // refused it, but it now says that, and says which route
+                    // could not find out.
+                    const auto ps = protective_sym_.find(it->second);
+                    const bool prot = ps != protective_sym_.end();
+                    b.push_reject(it->second, RejectCause::BrokerRefused, 0,
+                                  "the Client-Portal order poll saw status "
+                                  "Inactive; this route carries no reject reason "
+                                  "at all - check the IBKR portal for the order's "
+                                  "own message",
+                                  prot ? ps->second : 0, prot);
+                } else if (o.status == "Cancelled") {
                     EngineEvent ev{};
                     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
-                    ev.flags = o.status == "Inactive" ? kEvFlagRejected : 0;
-                    if (o.status == "Inactive") {
-                        const auto ps = protective_sym_.find(it->second);
-                        if (ps != protective_sym_.end()) {   // naked-position guard rejected
-                            ev.flags |= kEvFlagProtective;
-                            ev.symbol_id = ps->second;
-                        }
-                    }
                     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
                     ev.u.order.order_id = it->second;
                     b.push_ev(ev);
@@ -568,22 +576,37 @@ IbkrBroker::~IbkrBroker() {
     if (wake_rx_ != static_cast<uintptr_t>(-1)) ::closesocket(static_cast<SOCKET>(wake_rx_));
 }
 
+// See TwsBroker::submit: every 0 names itself, because the engine asks.
 uint64_t IbkrBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
-    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size()) return 0;
+    auto refuse = [&](RejectCause cause, std::string msg) -> uint64_t {
+        last_submit_reject_ = RejectReason{cause, 0, std::move(msg)};
+        return 0;
+    };
+    last_submit_reject_ = RejectReason{};
+    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size())
+        return refuse(RejectCause::BrokerUnknownSymbol,
+                      "symbol id " + std::to_string(r.symbol_id) +
+                          " is not in this broker adapter's symbol list");
     if (cfg_.read_only) {
         log("order blocked: account is READ-ONLY (trading disabled)");
-        return 0;
+        return refuse(RejectCause::BrokerReadOnly,
+                      reject_cause_text(RejectCause::BrokerReadOnly));
     }
     if (!ready()) {
         log("order rejected: gateway session not ready");
-        return 0;
+        return refuse(RejectCause::BrokerNotConnected,
+                      "the Client-Portal gateway session is not ready, so the "
+                      "order was never sent");
     }
     const uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
     Cmd c;
     c.type = Cmd::Submit;
     c.local_id = id;
     c.req = r;
-    return push_cmd(c) ? id : 0;
+    if (push_cmd(c)) return id;
+    return refuse(RejectCause::BrokerQueueFull,
+                  "the broker command ring is full, so the order was dropped "
+                  "before it reached the I/O thread");
 }
 
 bool IbkrBroker::cancel(uint64_t order_id) {
@@ -619,15 +642,17 @@ void IbkrBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void IbkrBroker::push_reject(uint64_t local_id, int code, std::string msg,
-                             uint32_t symbol_id, bool protective) {
-    if (code || !msg.empty()) {
+void IbkrBroker::push_reject(uint64_t local_id, RejectCause cause, int code,
+                             std::string msg, uint32_t symbol_id, bool protective) {
+    {
         std::lock_guard lock(reject_mu_);
         // Record BEFORE pushing the event so the reason is visible by the time
         // the engine thread drains it. Bounded: rejects are rare, and every
-        // entry is normally consumed by take_reject().
+        // entry is normally consumed by take_reject(). Unconditional: see the
+        // matching note in TwsBroker::push_reject.
         if (reject_reasons_.size() > 512) reject_reasons_.clear();
-        reject_reasons_[local_id] = RejectReason{code, std::move(msg)};
+        if (msg.empty()) msg = reject_cause_text(cause);
+        reject_reasons_[local_id] = RejectReason{cause, code, std::move(msg)};
     }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
@@ -683,7 +708,10 @@ void IbkrBroker::io_loop() {
                 // standalone Stop (not an engine bracket parent) protects a fill.
                 const bool is_bracket = c.req.take_profit > 0.0 || c.req.stop_loss > 0.0;
                 const bool prot = c.req.type == OrdType::Stop && !is_bracket;
-                push_reject(c.local_id, 0, "gateway not ready", c.req.symbol_id, prot);
+                push_reject(c.local_id, RejectCause::BrokerNotConnected, 0,
+                            "the Client-Portal gateway was not ready when this "
+                            "order reached the I/O thread, so nothing was sent",
+                            c.req.symbol_id, prot);
             }
         }
         if (now_ready) {

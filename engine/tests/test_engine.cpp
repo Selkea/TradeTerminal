@@ -160,9 +160,9 @@ TEST_CASE("backtest: SMA trades on synthetic data and reruns are bit-identical")
 }
 
 // run_live calls broker->take_reject() for every Rejected event and stores
-// whatever comes back. An adapter that captures no reason must yield an empty
-// one (code 0, empty msg) so the order simply reads "rejected", never garbage.
-// This pins the base-class default that the reference/sim adapters inherit.
+// whatever comes back. The base-class default and the whole no-blank-reason
+// invariant now live in engine/tests/test_reject.cpp; this stub stays because
+// several cases below need a broker that does nothing.
 namespace {
 struct StubBroker : IBrokerAdapter {
     uint64_t submit(const OrderRequest&, int64_t) override { return 0; }
@@ -291,11 +291,16 @@ TEST_CASE("exec sim: an explicit cancel reports itself and its OCO partner") {
     CHECK(sim.open_orders() == 0);
 }
 
-TEST_CASE("broker: default take_reject reports no reason") {
+TEST_CASE("broker: default take_reject reports no BROKER CODE, but does explain") {
+    // Was "reports no reason", and asserted r.message.empty() - the base class
+    // was pinning the 2026-08-13 defect in place. The numeric code is still 0
+    // (there is no broker number to report), but the sentence is not blank.
+    // engine/tests/test_reject.cpp owns the rest of this contract.
     StubBroker b;
     const RejectReason r = b.take_reject(42);
     CHECK(r.code == 0);
-    CHECK(r.message.empty());
+    CHECK(r.cause == RejectCause::BrokerRefused);
+    CHECK_FALSE(r.message.empty());
 }
 
 // ---- hot-restart reconciliation: gate dispatch, hold adopted positions until

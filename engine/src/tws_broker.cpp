@@ -90,6 +90,10 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unordered_map<uint64_t, uint32_t> sid_by_local;
     std::unordered_set<uint64_t> protective;          // stop-loss leg locals
     std::unordered_set<uint64_t> stuck_warned;        // logged-once half-open orders
+    // Orders IB has marked "Inactive" (= rejected) whose REASON has not arrived
+    // yet. orderStatus and error() race for these; see orderStatus /
+    // flush_pending_inactive. Empty in steady state — an entry lives 0-300 ms.
+    std::unordered_map<uint64_t, Clock::time_point> pending_inactive;
     Clock::time_point last_stuck_check{};
 
     // Connect-time reconciliation: replay positions/orders/cash exactly once
@@ -343,10 +347,18 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (it != local_by_tws.end() && fatal_order_error(errorCode) &&
             !done.count(it->second)) {
             const uint64_t local = it->second;
+            // THE REASON ARRIVED — flush the deferred Inactive with it. Before
+            // 0.23.0 orderStatus("Inactive") had already inserted `local` into
+            // `done`, so this whole block was skipped and push_reject — the only
+            // thing that ever populates reject_reasons_ — was never called. IB's
+            // text reached terminal.log and nothing else; /diag showed an order
+            // rejected for no stated reason (2026-08-13, twice; 2026-08-11 once).
+            pending_inactive.erase(local);
             done.insert(local);
             const bool prot = protective.count(local) != 0;
             const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
-            b.push_reject(local, errorCode, errorString, sid, prot);
+            b.push_reject(local, RejectCause::BrokerRejected, errorCode, errorString,
+                          sid, prot);
             if (errorCode == kTwsDuplicateOrderId) {
                 local_by_tws.erase(id);
                 tws_by_local.erase(local);
@@ -375,22 +387,56 @@ struct TwsBroker::Io final : DefaultEWrapper {
                       std::to_string(ms) + " ms (" + status + ")");
             }
         }
-        if ((status == "Cancelled" || status == "ApiCancelled" ||
-             status == "Inactive") &&
-            !done.count(local)) {
+        // "Inactive" IS a rejection, but it carries no reason: IB delivers the
+        // text through error() instead. Which of the two callbacks arrives first
+        // is not something IB guarantees — on 2026-08-13 orderStatus won and its
+        // done.insert() suppressed the error() that was 0-1 ms behind it,
+        // destroying "Order rejected - reason:Exchange is closed." So the reject
+        // is DEFERRED here rather than pushed: error() flushes it the instant the
+        // reason lands (the normal path), and flush_pending_inactive() flushes it
+        // reason-less after a short grace if no error ever comes. `done` is set
+        // by whichever of the two actually flushes, so the order is still
+        // reported exactly once.
+        if (status == "Inactive" && !done.count(local)) {
+            if (!pending_inactive.count(local))
+                pending_inactive[local] = Clock::now();
+            return;
+        }
+        if ((status == "Cancelled" || status == "ApiCancelled") && !done.count(local)) {
             done.insert(local);
+            pending_inactive.erase(local);
             EngineEvent ev{};
             ev.type = static_cast<uint16_t>(EvType::OrderCancel);
-            if (status == "Inactive") {
-                ev.flags = kEvFlagRejected;
-                if (protective.count(local)) {   // naked-position: guard rejected
-                    ev.flags |= kEvFlagProtective;
-                    ev.symbol_id = sid_by_local.count(local) ? sid_by_local[local] : 0;
-                }
-            }
             ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
             ev.u.order.order_id = local;
             b.push_ev(ev);
+        }
+    }
+
+    // Deferred rejects whose reason never came. The grace is deliberately short:
+    // it delays only the no-error case, and the naked-position safety net (a
+    // rejected protective stop -> flatten + halt that symbol) rides on this
+    // event. The io_loop calls this every iteration and wakes at least once a
+    // second, so worst case a reason-less reject is reported ~1.3 s late — three
+    // orders of magnitude inside the flatten's own latency, and the alternative
+    // is what shipped before: instant, and permanently unexplained.
+    void flush_pending_inactive() {
+        constexpr auto kReasonGrace = std::chrono::milliseconds(300);
+        const auto now = Clock::now();
+        for (auto it = pending_inactive.begin(); it != pending_inactive.end();) {
+            if (now - it->second < kReasonGrace) { ++it; continue; }
+            const uint64_t local = it->first;
+            it = pending_inactive.erase(it);
+            if (!done.insert(local).second) continue;   // error() already flushed it
+            const bool prot = protective.count(local) != 0;
+            const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
+            // Still non-empty: it names the layer and the fact that IB said
+            // nothing, which is itself the finding.
+            b.push_reject(local, RejectCause::BrokerRefused, 0,
+                          "IB marked the order Inactive and sent no error code "
+                          "within 300 ms - check the adapter log around this "
+                          "order for an IB error line",
+                          sid, prot);
         }
     }
 
@@ -822,7 +868,10 @@ struct TwsBroker::Io final : DefaultEWrapper {
             // bracket parent) protects a fill.
             const bool is_bracket = cmd.req.take_profit > 0.0 || cmd.req.stop_loss > 0.0;
             const bool prot = cmd.req.type == OrdType::Stop && !is_bracket;
-            b.push_reject(cmd.local_id, 0, "not connected to gateway",
+            b.push_reject(cmd.local_id, RejectCause::BrokerNotConnected, 0,
+                          "the order path was not connected when this order "
+                          "reached the I/O thread, so nothing was written to the "
+                          "gateway",
                           cmd.req.symbol_id, prot);
             return;
         }
@@ -1017,22 +1066,40 @@ void TwsBroker::watchdog_loop() {
     }
 }
 
+// Every `return 0` records WHY first (last_submit_reject_), because the engine
+// asks. These four refusals used to be one indistinguishable 0 in the blotter,
+// and they call for four different responses: fix the lineup, turn trading on,
+// wait for the gateway, or investigate a wedged I/O thread.
 uint64_t TwsBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
-    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size()) return 0;
+    auto refuse = [&](RejectCause cause, std::string msg) -> uint64_t {
+        last_submit_reject_ = RejectReason{cause, 0, std::move(msg)};
+        return 0;
+    };
+    last_submit_reject_ = RejectReason{};
+    if (r.symbol_id == 0 || r.symbol_id > cfg_.symbols.size())
+        return refuse(RejectCause::BrokerUnknownSymbol,
+                      "symbol id " + std::to_string(r.symbol_id) +
+                          " is not in this broker adapter's symbol list");
     if (cfg_.read_only) {
         log("order blocked: account is READ-ONLY (trading disabled)");
-        return 0;
+        return refuse(RejectCause::BrokerReadOnly,
+                      reject_cause_text(RejectCause::BrokerReadOnly));
     }
     if (!ready()) {
         log("order rejected: socket API not connected");
-        return 0;
+        return refuse(RejectCause::BrokerNotConnected,
+                      "the TWS socket API is not connected (no nextValidId), so "
+                      "the order was never written to the gateway");
     }
     const uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
     Cmd c;
     c.type = Cmd::Submit;
     c.local_id = id;
     c.req = r;
-    return push_cmd(c) ? id : 0;
+    if (push_cmd(c)) return id;
+    return refuse(RejectCause::BrokerQueueFull,
+                  "the broker command ring is full, so the order was dropped "
+                  "before it reached the I/O thread");
 }
 
 bool TwsBroker::cancel(uint64_t order_id) {
@@ -1093,15 +1160,19 @@ void TwsBroker::push_ev(const EngineEvent& ev) {
     if (!ev_ring_->try_push(ev)) log("event dropped: ring full");
 }
 
-void TwsBroker::push_reject(uint64_t local_id, int code, std::string msg,
-                            uint32_t symbol_id, bool protective) {
-    if (code || !msg.empty()) {
+void TwsBroker::push_reject(uint64_t local_id, RejectCause cause, int code,
+                            std::string msg, uint32_t symbol_id, bool protective) {
+    {
         std::lock_guard lock(reject_mu_);
         // Record BEFORE pushing the event so the reason is visible by the time
         // the engine thread drains it. Bounded: rejects are rare, and every
-        // entry is normally consumed by take_reject().
+        // entry is normally consumed by take_reject(). Written UNCONDITIONALLY
+        // now — the old `if (code || !msg.empty())` guard meant a caller with
+        // nothing to say left no entry at all, and the engine could not tell
+        // that from "the reason has not landed yet".
         if (reject_reasons_.size() > 512) reject_reasons_.clear();
-        reject_reasons_[local_id] = RejectReason{code, std::move(msg)};
+        if (msg.empty()) msg = reject_cause_text(cause);
+        reject_reasons_[local_id] = RejectReason{cause, code, std::move(msg)};
     }
     EngineEvent ev{};
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
@@ -1219,6 +1290,10 @@ void TwsBroker::io_loop() {
         // its last stream-end never comes, so no callback will ever notice.
         io.check_reconcile_timeout();
         io.flush_stale_execs();
+        // Same reason as check_reconcile_timeout above: the deferred reject it
+        // flushes is waiting for a callback that may never arrive, so no
+        // callback can be relied on to notice.
+        io.flush_pending_inactive();
         io.check_stuck();
     }
 
