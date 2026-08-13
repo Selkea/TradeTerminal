@@ -197,8 +197,15 @@ TEST_CASE("every TWS client that latches a 326 can also clear it and retry") {
         // Nothing may pin it true by another route.
         CHECK(count(src, "client_id_conflict_.store(true") == 0);
         // And the I/O loop must still get to a connect attempt while it is set —
-        // slowed to kTwsClientIdRetrySec, not parked. A client that only ever
-        // slept here would satisfy the two counts above and still never recover.
-        CHECK(count(src, "kTwsClientIdRetrySec") >= 1);
+        // slowed to the 326 cadence, not parked. A client that only ever slept
+        // here would satisfy the two counts above and still never recover.
+        //
+        // Either spelling counts. The ORDERS client moved to the tiered helper
+        // in 0.22.0 (fast retries first, then the slow cadence) because its
+        // client id is now fixed at kTwsOrdersClientId: with no other id to move
+        // to, the retry cadence IS the recovery, and 15 s on every lineup swap
+        // would be a 15 s order-path outage with positions live at the broker.
+        // The feed and data clients still rotate and still use the constant.
+        CHECK(count(src, "kTwsClientIdRetrySec") + count(src, "tws_client_id_retry_sec") >= 1);
     }
 }

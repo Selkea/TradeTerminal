@@ -96,6 +96,32 @@ public:
     // (adoption is first-connect only), so an open session keeps its state.
     void request_reconnect();
 
+    // ---- periodic position audit (compare-only) -----------------------------
+    //
+    // Re-reads the ACCOUNT's positions mid-session so the app can check its own
+    // book against the only authority there is. It exists because on 2026-08-13
+    // the app carried a phantom 411-share position for 4 h 03 m with every other
+    // signal reading healthy: the exit had filled at the broker and the fill
+    // callback went to a client id that no longer existed, and there is no
+    // callback for a callback that never arrives. See net/book_divergence.h.
+    //
+    // Strictly separate from connect-time reconciliation. This path pushes NO
+    // engine event and seeds NOTHING — it publishes a snapshot for the UI thread
+    // to compare. Re-seeding on divergence would fix the number and hide the
+    // deafness underneath it.
+    struct BrokerPosition {
+        std::string symbol;   // the SESSION table's spelling (see Io::position)
+        double qty = 0.0;     // signed; negative = short
+    };
+    // UI thread: ask for a fresh snapshot. Cheap and account-level (reqPositions
+    // is not under the historical-data pacing rules), and a no-op while
+    // reconciliation or a previous audit is still in flight.
+    void request_position_audit();
+    // UI thread: take the newest COMPLETED snapshot. False until a new one has
+    // landed since the last take — so a caller that gets false learns "no answer
+    // yet", which is exactly the state the auditor must be able to see.
+    bool take_position_audit(std::vector<BrokerPosition>& out);
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -143,6 +169,16 @@ private:
     std::atomic<bool> client_id_conflict_{false};
     std::atomic<bool> stop_{false};
     std::atomic<bool> reconnect_req_{false};   // scheduled daily refresh: drop + reconnect
+    // Position audit. The UI thread sets audit_req_; the I/O thread issues the
+    // reqPositions and, on positionEnd, publishes under audit_mu_ and bumps
+    // audit_seq_. take_position_audit compares audit_seq_ against what it last
+    // handed out, so "nothing new since last time" is distinguishable from "the
+    // books agree" — the distinction the whole detector rests on.
+    std::atomic<bool> audit_req_{false};
+    std::mutex audit_mu_;
+    std::vector<BrokerPosition> audit_positions_;
+    uint64_t audit_seq_ = 0;      // guarded by audit_mu_
+    uint64_t audit_taken_ = 0;    // guarded by audit_mu_ (UI thread only reader)
     // The I/O thread's reader signal while it exists (EReaderOSSignal*);
     // push_cmd pokes it so a submitted order is picked up immediately instead
     // of on the next wait timeout.

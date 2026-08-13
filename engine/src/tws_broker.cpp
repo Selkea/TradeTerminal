@@ -39,6 +39,7 @@ int64_t now_ms() {
 // else order-scoped is logged but the order's fate comes via orderStatus.
 bool fatal_order_error(int code) {
     switch (code) {
+    case 103:   // duplicate order id — the placement never reached the market
     case 110:   // price out of range
     case 200:   // no security definition
     case 201:   // order rejected
@@ -59,7 +60,24 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::unique_ptr<EClientSocket> client;
     std::unique_ptr<EReader> reader;
 
-    long next_tws_id = -1;   // seeded by nextValidId on connect
+    // Next TWS order id to spend. Seeded by nextValidId, then only ever moved
+    // FORWARD (tws_advance_order_id) — by adoption, by a 103 self-heal, and by a
+    // later nextValidId. Mechanism B of 2026-08-13: this was assigned
+    // unconditionally from nextValidId and never advanced past the ids of the
+    // orders reconciliation had just adopted, so a session could start below the
+    // account's high-water mark and every placement collided with "error 103:
+    // Duplicate order id" — which pushed no reject, so the engine left those
+    // orders Working forever. See engine/tws_client_id.h.
+    long next_tws_id = -1;
+    // The handshake for the CURRENT connection has completed. Separates
+    // "nextValidId arrived" (which can happen again, for a reqIds answer or a
+    // reconnect) from "this connection just came up", so the id seed can be
+    // refreshed without re-logging "connected" or re-clearing the 326 latch.
+    bool handshaked = false;
+    // 326 episode bookkeeping, for the tiered retry + delayed page. Steady ms.
+    int64_t conflict_since_ms = 0;
+    int conflict_attempts = 0;
+    bool conflict_paged = false;
     // Handshake rejected (e.g. paper disclaimer not accepted yet): tear down
     // and retry from io_loop — destroying the reader inside a callback is unsafe.
     bool reset_conn = false;
@@ -137,13 +155,33 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (client) client->eDisconnect();
         reader.reset();
         client.reset();
-        next_tws_id = -1;
+        // next_tws_id is deliberately NOT reset. It is this broker's high-water
+        // mark for the account's order ids, and the ids it already spent are
+        // still live at the gateway across a reconnect; throwing it away and
+        // taking the reconnect's nextValidId is how a session walks backwards
+        // into "error 103: Duplicate order id". The `!client` guards below are
+        // what stop a submit while disconnected, not this sentinel.
+        handshaked = false;
+        // An audit that was mid-flight when the socket went has no answer coming.
+        // Leaving it "active" would make the auditor wait forever on a request
+        // nobody is going to serve — and reporting "no divergence" while blind is
+        // the precise failure mode net/book_divergence.h exists to prevent.
+        audit_active = false;
+        audit_buf_.clear();
     }
 
     // ---- EWrapper callbacks (I/O thread, inside processMsgs) ----------------
     void nextValidId(OrderId orderId) override {
-        next_tws_id = orderId;
+        // FORWARD ONLY. Two callers reach here and both can carry a value below
+        // ids this session has already spent: a mid-session reconnect (the
+        // server's seed is per-connection and 2026-08-13 showed it arriving at
+        // 59 while the account had reached ~76), and our own reqIds(1) after
+        // reconciliation. Assigning it outright — which is what the code did —
+        // guarantees the next placement collides. See kTwsDuplicateOrderId.
+        next_tws_id = tws_advance_order_id(next_tws_id, static_cast<long>(orderId));
         b.ready_.store(true, std::memory_order_release);
+        if (handshaked) return;   // a reqIds answer, not a fresh connection
+        handshaked = true;
         // Assume the fresh session has upstream until a 1100 says otherwise (a
         // gateway that came up disconnected sends one within seconds).
         b.upstream_ok_.store(true, std::memory_order_release);
@@ -153,8 +191,20 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // Watch-IbGateway.ps1 keys its cold relaunch off broker_connected, so a
         // latch that outlived the condition is what turns one gateway restart
         // into one every four minutes for the rest of the day.
-        if (b.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
-            b.log(tws_client_id_cleared_line("the ORDER path", b.cfg_.client_id));
+        if (b.client_id_conflict_.exchange(false, std::memory_order_acq_rel)) {
+            // Only announce the recovery to whoever was told about the outage —
+            // the WatchdogTimer rule. The all-clear tag pages Warning, and a
+            // Warning for a three-second collision nobody heard about is how a
+            // channel gets ignored.
+            if (conflict_paged)
+                b.log(tws_client_id_cleared_line("the ORDER path", b.cfg_.client_id));
+            else
+                b.log("API client id " + std::to_string(b.cfg_.client_id) +
+                      " was released; the ORDER path is connected.");
+        }
+        conflict_since_ms = 0;
+        conflict_attempts = 0;
+        conflict_paged = false;
         b.log("connected (socket API), orders ready");
         // Adopt existing account state on the FIRST connect of the session only;
         // a later reconnect must not re-seed a position the engine now tracks
@@ -192,24 +242,51 @@ struct TwsBroker::Io final : DefaultEWrapper {
         }
         if (errorCode == kTwsClientIdInUse) {
             // Something else already holds this session's orders client id. See
-            // engine/tws_client_id.h: the latch makes the explanation appear
-            // ONCE and slows io_loop's retry to kTwsClientIdRetrySec; it does
-            // NOT end the client. App::start_live_session hands out 20-39 in
-            // rotation precisely because the id we collide with is often our
-            // own previous session's, still being released by the gateway.
+            // engine/tws_client_id.h: the client keeps retrying the SAME id, and
+            // since 0.22.0 that id is kTwsOrdersClientId and never moves.
             //
-            // We do NOT quietly reconnect on some other id. TWS scopes an API
-            // client's view of OPEN ORDERS to the id that placed them, so
-            // drifting off the id would hand the connect-time reconciliation a
-            // different set of resting orders to adopt than the one this app
-            // has always adopted — on the order path, on a restart, which is
-            // the single place this codebase can least afford a surprise.
-            if (!b.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
-                b.log(tws_client_id_conflict_line(
-                    "the ORDER path",
-                    "nothing this session submits can reach the market",
-                    b.cfg_.host, b.cfg_.port, b.cfg_.client_id));
+            // Rotating away from a collision is exactly what caused the
+            // 2026-08-13 phantom position: IB scopes an order's callbacks to the
+            // client that placed it, so a session on a different id adopts
+            // resting orders it can neither hear nor cancel. There is no id this
+            // app can move to that is safe, so the only options are "keep asking"
+            // and "tell a human" — and it does both, on a tier.
+            //
+            // The episode starts QUIET. Under a fixed id the overwhelmingly
+            // common 326 is our own just-reaped session, released within
+            // seconds; paging Critical on every lineup swap would teach the
+            // operator to swipe away the one that means a foreign program has
+            // the order path for the day. The explanation still appears in the
+            // log immediately (2026-08-11's defect was silence); only the
+            // paging TAG waits for kTwsClientIdPageAfterSec, emitted from
+            // io_loop, which is the thing that knows how long it has been.
+            if (!b.client_id_conflict_.exchange(true, std::memory_order_acq_rel)) {
+                conflict_since_ms = now_ms();
+                conflict_attempts = 0;
+                conflict_paged = false;
+                b.log(tws_client_id_waiting_line("the ORDER path", b.cfg_.client_id,
+                                                 kTwsClientIdFastRetrySec));
+            }
             return;
+        }
+        if (errorCode == kTwsDuplicateOrderId) {
+            // Mechanism B of 2026-08-13. The placement did NOT reach the market;
+            // before 0.22.0 nothing said so — 103 was not in fatal_order_error,
+            // so no reject was pushed and the engine left the order Working
+            // forever while check_stuck muttered once after 15 s. The operator's
+            // manual sell was refused this way for four hours.
+            //
+            // Self-heal first: advance past the colliding id so the NEXT
+            // placement has a chance. `id` is the TWS order id IB refused.
+            next_tws_id = tws_advance_order_id(next_tws_id, static_cast<long>(id) + 1);
+            b.log(tws_duplicate_order_id_line(static_cast<long>(id), next_tws_id,
+                                              b.cfg_.client_id));
+            // Then drop the mapping this collision would otherwise corrupt.
+            // place() writes local_by_tws[tws_id] = local unconditionally, so a
+            // reused id has already overwritten whatever the ADOPTED order at
+            // that id was mapped to — leaving it in place would attribute that
+            // order's fills to the refused one. Falls through to the reject
+            // below, which is what unsticks the engine.
         }
         b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
               "): " + errorString);
@@ -221,6 +298,10 @@ struct TwsBroker::Io final : DefaultEWrapper {
             const bool prot = protective.count(local) != 0;
             const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
             b.push_reject(local, errorCode, errorString, sid, prot);
+            if (errorCode == kTwsDuplicateOrderId) {
+                local_by_tws.erase(id);
+                tws_by_local.erase(local);
+            }
         }
     }
 
@@ -325,15 +406,67 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (!recon_active || !recon_pos_done || !recon_ord_done || !recon_acct_done)
             return;
         recon_active = false;
+        // Ask the server for its next valid id now that adoption has raised our
+        // own high-water mark. It cannot hurt — tws_advance_order_id only ever
+        // moves forward, so a server answer below the adopted mark is discarded
+        // — and it covers the ids this app never saw: orders that were placed
+        // and have already filled or been cancelled leave no open order to adopt,
+        // but they DID spend ids. Adoption alone cannot know about those.
+        //
+        // reqIds is answered by nextValidId, which is why `handshaked` exists:
+        // without it this answer would re-log "connected" and re-run the
+        // reconcile it is being sent from.
+        if (client) client->reqIds(1);
         EngineEvent ev{};
         ev.type = static_cast<uint16_t>(EvType::ReconcileEnd);
         ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
         b.push_ev(ev);
-        b.log("reconcile: complete");
+        b.log("reconcile: complete (next order id " + std::to_string(next_tws_id) + ")");
+    }
+
+    // ---- periodic position audit (net/book_divergence.h) --------------------
+    //
+    // A COMPARE-ONLY re-read of the account's positions, on a timer, during a
+    // live session. Deliberately not part of reconciliation and deliberately
+    // incapable of seeding anything: it publishes a snapshot the UI thread reads
+    // and pushes NO engine event. A drift detector that silently re-seeded the
+    // portfolio would repair the number and erase the evidence that the order
+    // path had gone deaf — which is the whole failure it exists to catch.
+    bool audit_active = false;
+    std::vector<TwsBroker::BrokerPosition> audit_buf_;
+
+    void start_audit() {
+        if (!client || recon_active || audit_active) return;
+        audit_active = true;
+        audit_buf_.clear();
+        client->reqPositions();
     }
 
     void position(const std::string& /*account*/, const Contract& contract,
                   Decimal pos, double avgCost) override {
+        if (audit_active) {
+            const uint32_t sid = sid_for(contract.symbol);
+            if (sid == 0) return;   // not a session symbol: not in the app's book
+            // Report the SESSION table's spelling, not the contract's, so the
+            // two sides of the comparison are string-identical by construction.
+            // A case or whitespace difference between the engine's symbol and
+            // IB's would otherwise read as "the app holds a position the broker
+            // has never heard of" — a Critical page, from a typo.
+            const std::string& sym = b.cfg_.symbols[sid - 1];
+            const double qty = DecimalFunctions::decimalToDouble(pos);
+            // SUM across accounts. reqPositions reports one row per account, and
+            // this route does per-symbol sub-account routing (TwsConfig::
+            // symbol_accounts), while the engine keeps ONE portfolio spanning
+            // them. Keeping the last row instead of the total would report a
+            // divergence for every symbol split across two accounts.
+            for (auto& e : audit_buf_)
+                if (e.symbol == sym) {
+                    e.qty += qty;
+                    return;
+                }
+            audit_buf_.push_back({sym, qty});
+            return;
+        }
         if (!recon_active) return;
         const uint32_t sid = sid_for(contract.symbol);
         if (sid == 0) return;   // not a session symbol
@@ -351,6 +484,17 @@ struct TwsBroker::Io final : DefaultEWrapper {
               std::to_string(qty) + " @ " + std::to_string(avgCost));
     }
     void positionEnd() override {
+        if (audit_active) {
+            if (client) client->cancelPositions();   // one-shot: stop the stream
+            audit_active = false;
+            {
+                std::lock_guard lk(b.audit_mu_);
+                b.audit_positions_ = audit_buf_;
+                ++b.audit_seq_;
+            }
+            audit_buf_.clear();
+            return;
+        }
         if (!recon_active) return;
         if (client) client->cancelPositions();   // one-shot: stop the stream
         recon_pos_done = true;
@@ -363,6 +507,35 @@ struct TwsBroker::Io final : DefaultEWrapper {
         if (local_by_tws.count(orderId)) return;   // already ours this session
         const uint32_t sid = sid_for(contract.symbol);
         if (sid == 0) return;
+        // MECHANISM B, fixed at the source. reqAllOpenOrders is the ONLY place
+        // this process learns about order ids it did not issue, and every one of
+        // them is already spent at the gateway. Not advancing past them is what
+        // let a session seeded at 59 collide with everything from 59 to ~76 on
+        // 2026-08-13. Do it before anything below can fail out.
+        next_tws_id = tws_advance_order_id(next_tws_id, static_cast<long>(orderId) + 1);
+        // PART 1's escape hatch. The orders client id is fixed
+        // (kTwsOrdersClientId), so an order this app placed always reports that
+        // id here — IB puts the placing client on the wire for every open order
+        // (EOrderDecoder::decodeClientId). A different id therefore means this
+        // order was placed by something else: a build predating 0.22.0 whose
+        // orders are still resting, an order typed into the Gateway GUI, another
+        // program on the account. We can SEE it and we cannot HEAR it: its
+        // fills go to the placing client and cancelOrder answers 10147.
+        //
+        // It is adopted anyway. Refusing would leave a real position with
+        // nothing in the book at all — strictly worse than a book entry that
+        // might go stale — so the page IS the mitigation, and book_divergence
+        // is the net under it.
+        //
+        // clientId 0 is NOT exempted. That is the id IB reports for an order
+        // typed into the Gateway/TWS window, and such an order is deaf to us in
+        // exactly the same way; "a human placed it" is a reason to say so, not a
+        // reason to stay quiet. (reqAutoOpenOrders would bind those to us, but
+        // only for client id 0, which the order path must not be.)
+        if (order.clientId != b.cfg_.client_id)
+            b.log(tws_foreign_order_line(contract.symbol, order.orderType,
+                                         static_cast<long>(orderId),
+                                         order.clientId, b.cfg_.client_id));
         const uint64_t local = b.next_id_.fetch_add(1, std::memory_order_relaxed);
         local_by_tws[orderId] = local;
         tws_by_local[local] = orderId;
@@ -700,6 +873,23 @@ bool TwsBroker::push_cmd(const Cmd& c) {
     return true;
 }
 
+void TwsBroker::request_position_audit() {
+    audit_req_.store(true, std::memory_order_release);
+    // Wake the I/O thread: it is normally parked in waitForSignal for up to 1s,
+    // and an auditor whose cadence quietly drifted a second per round would make
+    // its own age figures lie.
+    if (auto* s = static_cast<EReaderOSSignal*>(wake_.load(std::memory_order_acquire)))
+        s->issueSignal();
+}
+
+bool TwsBroker::take_position_audit(std::vector<BrokerPosition>& out) {
+    std::lock_guard lk(audit_mu_);
+    if (audit_seq_ == audit_taken_) return false;   // no new answer
+    audit_taken_ = audit_seq_;
+    out = audit_positions_;
+    return true;
+}
+
 void TwsBroker::request_reconnect() {
     reconnect_req_.store(true, std::memory_order_release);
     // Wake the I/O thread so it acts on the flag now rather than at the next wait.
@@ -772,11 +962,34 @@ void TwsBroker::io_loop() {
             // while positions are open, until a human noticed. Io::error logged
             // the one sentence that explains this; connect_gateway and
             // connectionClosed stay silent meanwhile, so the retry costs no log.
-            const auto gap = client_id_conflict_.load(std::memory_order_acquire)
-                                 ? std::chrono::seconds(kTwsClientIdRetrySec)
-                                 : std::chrono::seconds(3);
+            //
+            // TIERED since 0.22.0, because the id no longer rotates. The first
+            // few retries are fast (kTwsClientIdFastRetrySec): with a fixed id
+            // the common 326 is this app's own just-reaped session, and paying
+            // 15 s for it on every lineup swap would mean a 15 s order-path
+            // outage with positions live at the broker and nothing adopted yet.
+            // After that it falls back to the slow cadence, which is what the
+            // original 15 s was reasoned about — a conflict lasting all
+            // afternoon costing four attempts a minute of nothing.
+            const bool conflict = client_id_conflict_.load(std::memory_order_acquire);
+            const auto gap =
+                conflict ? std::chrono::seconds(tws_client_id_retry_sec(io.conflict_attempts))
+                         : std::chrono::seconds(3);
+            // The delayed page. The explanation was logged the moment the
+            // refusal arrived; the uppercase tag — the one that pages Critical —
+            // waits until the conflict has proved it is not our own socket
+            // clearing. Emitted here rather than in the callback because this is
+            // the loop that knows how long it has been going on.
+            if (conflict && !io.conflict_paged && io.conflict_since_ms &&
+                now_ms() - io.conflict_since_ms >= kTwsClientIdPageAfterSec * 1000) {
+                io.conflict_paged = true;
+                log(tws_client_id_conflict_line(
+                    "the ORDER path", "nothing this session submits can reach the market",
+                    cfg_.host, cfg_.port, cfg_.client_id));
+            }
             if (now - last_connect >= gap) {
                 last_connect = now;
+                if (conflict) ++io.conflict_attempts;
                 if (!io.connect_gateway())
                     log("cannot reach IB Gateway at " + cfg_.host + ":" +
                         std::to_string(cfg_.port) + " (is it running + API enabled?)");
@@ -804,6 +1017,11 @@ void TwsBroker::io_loop() {
 
         Cmd c;
         while (cmd_ring_->try_pop(c)) io.handle_cmd(c);
+        // Position audit. Consumed unconditionally so a request that arrives
+        // while the socket is down is dropped rather than queued — the auditor
+        // measures "how long since an ANSWER", and a stale request replayed on
+        // reconnect would answer a question about a book minutes in the past.
+        if (audit_req_.exchange(false, std::memory_order_acq_rel)) io.start_audit();
         io.flush_stale_execs();
         io.check_stuck();
     }
