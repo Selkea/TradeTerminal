@@ -136,6 +136,8 @@ add_executable(tt_terminal_tests
     tests/test_hist_requests.cpp
     tests/test_bar_cache.cpp
     tests/test_hist_freshness.cpp
+    tests/test_book_divergence.cpp
+    tests/test_tws_order_identity.cpp
     tests/test_gateway_auth.cpp
     tests/test_market_calendar.cpp
     tests/test_strategies.cpp

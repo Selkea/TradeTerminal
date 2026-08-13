@@ -16,6 +16,7 @@
 #include "journal.h"
 #include "lineup_dryrun.h"
 #include "market_data.h"
+#include "net/book_divergence.h"
 #include "net/diag_server.h"
 #include "net/gateway_data.h"
 #include "net/hist_freshness.h"
@@ -110,6 +111,10 @@ private:
     // route, skip the flatten so open positions + resting orders stay at the
     // broker to be re-adopted on restart; ignored (flattens) on other routes.
     void safe_stop_live(bool keep_positions = false);
+    // Wait (bounded) for reap_async'd broker adapters to finish being destroyed,
+    // so a new session never dials the fixed orders client id while this process
+    // still holds it. See the definition.
+    void wait_for_broker_reap(const char* who);
     void do_ibkr_signout();          // run Stop-IbkrLogin, log
     void save_config();              // panel state -> cfg_ -> config.json
     // Read-only diagnostics endpoint (net/diag_server.h). start_diag_server()
@@ -443,6 +448,33 @@ private:
     void pump_orphan_watchdog();
     WatchdogTimer orphan_wd_;                // ditto, for adopted-but-naked positions
 
+    // Book-divergence auditor: re-reads the ACCOUNT's positions every minute
+    // during a live session and compares them against the engine's book. It is
+    // the layer that has to work whether or not the client-id fix is perfect —
+    // on 2026-08-13 a phantom 411-share position was published as real, with a
+    // fictional +$528 unrealized, for 4 h 03 m, and no invariant anywhere
+    // noticed. Detect-only: it pages and populates /diag, and never seeds,
+    // halts, cancels or flattens. See net/book_divergence.h.
+    void pump_book_audit();
+    net::BookAudit book_audit_;
+    WatchdogTimer book_div_wd_;              // page/re-page cadence for a confirmed divergence
+    WatchdogTimer book_blind_wd_;            // ditto for "the auditor is not being answered"
+    double book_audit_next_s_ = 0.0;         // mono_s() of the next request
+    // The app-side quantities as they were when the in-flight audit was
+    // REQUESTED. Half of the race handling: any symbol whose quantity differs by
+    // the time the answer lands moved mid-audit (an ordinary fill), and
+    // comparing two books taken at different instants is not evidence of
+    // anything — those symbols are dropped from the round. The other half is
+    // net::kBookAuditConfirmRounds, which covers a fill the broker has already
+    // executed but the engine has not yet drained.
+    std::vector<net::BookPos> book_audit_sent_;
+    // What the operator is still owed an answer about. The page, the all-clear
+    // and tt_book_divergences all read this rather than BookAudit::confirmed(),
+    // because confirmed() empties the moment the state leaves Diverged —
+    // including into Suspect (the quantities merely moved) and Blind (nothing is
+    // answering any more), neither of which is a recovery. See DivergenceLatch.
+    net::DivergenceLatch book_div_;
+
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07
     // outage was invisible to every existing signal (see net/hist_freshness.h);
@@ -502,6 +534,14 @@ private:
     double swap_deadline_s_ = 0.0;           // mono_s() give-up for the flatten
     std::vector<uint32_t> swap_flatten_ids_; // dropped symbol_ids being closed
     TradePanel::StartOpts swap_opts_;        // the new lineup to restart on
+    // How long the Restart stage will wait for the OLD broker's destructor to
+    // return before starting the new session on the same (fixed) client id.
+    // Five seconds is several times the ~1 s the old I/O thread can spend parked
+    // in waitForSignal before it notices stop_ and disconnects, and it is a
+    // deadline rather than a sleep: the ordinary case clears in milliseconds and
+    // the swap proceeds on that frame. See pump_lineup_swap.
+    static constexpr double kSwapReapWaitS = 5.0;
+    double swap_reap_deadline_s_ = 0.0;      // mono_s() give-up for that wait
 
     // Coordinate-descent state for the auto-optimizer (UI thread only).
     struct AutoOpt {
@@ -546,10 +586,26 @@ private:
     // engine (members destruct in reverse declaration order).
     std::unique_ptr<IbkrBroker> ibkr_;
     std::unique_ptr<TwsBroker> tws_;   // same ordering contract as ibkr_
-    // Rotates the TWS broker/feed API client ids across session starts so a quick
-    // stop->start never reuses an id the just-reaped connection is still releasing
-    // at the gateway (error 326: "client id already in use").
-    int tws_client_seq_ = 0;
+    // Rotates the TWS FEED API client id across session starts so a quick
+    // stop->start never reuses an id the just-reaped connection is still
+    // releasing at the gateway (error 326: "client id already in use").
+    //
+    // The BROKER used to share this counter and no longer does: its id is fixed
+    // at kTwsOrdersClientId. IB scopes an order's fills and cancels to the
+    // client that placed it, so a session that rotates onto a new id adopts
+    // resting orders it cannot hear — the 2026-08-13 phantom position. The feed
+    // has no such tie: it places nothing, so nothing is scoped to it.
+    int tws_feed_seq_ = 0;
+    // Broker teardowns handed to detached threads and not yet finished. The
+    // lineup swap waits on this before starting a new session, because with a
+    // FIXED orders client id a restart 16 ms after the reap would collide with
+    // our own socket — reap_async detaches, and the old I/O thread can sit in
+    // waitForSignal for up to a second before it notices stop_ and calls
+    // eDisconnect. This is the only bounded wait that is safe here: it waits on
+    // a fact this process owns and can observe, not on a guess about how long
+    // the gateway holds a released id.
+    std::shared_ptr<std::atomic<int>> broker_reaps_ =
+        std::make_shared<std::atomic<int>>(0);
     // Same reasoning: the host destroys any leftover per-run strategy
     // instances and unloads their DLLs, which must happen only after the
     // engine's threads are joined.

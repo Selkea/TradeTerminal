@@ -4,6 +4,7 @@
 // and there's ONE place that decides what pages the phone.
 
 #include "engine/tws_client_id.h"   // kTwsClientIdConflictTag
+#include "net/book_divergence.h"    // kBookDivergenceTag
 
 #include <string>
 
@@ -29,6 +30,20 @@ inline AlertClass classify_alert(const std::string& l) {
     // deliberately a different tag, so recovering cannot page Critical.
     if (has(kTwsClientIdConflictTag)) return AlertClass::Critical;
     if (has(kTwsClientIdClearedTag)) return AlertClass::Warning;
+    // A resting order placed by some OTHER API client, adopted anyway. IB routes
+    // fills and cancels to the PLACING client, so the book's copy of this order
+    // is deaf: it can fill without the app ever hearing, which is exactly the
+    // 4-hour phantom position of 2026-08-13. Critical because nothing about the
+    // state announces itself afterwards — the order simply looks resting forever.
+    if (has(kTwsForeignOrderTag)) return AlertClass::Critical;
+    // Every placement refused because its id is already in use on the account:
+    // the order path is paralysed and, before 0.22.0, silently so.
+    if (has(kTwsDuplicateOrderIdTag)) return AlertClass::Critical;
+    // A live position that the broker and the app disagree about. One of the two
+    // is lying and code cannot tell which, so this is the loudest thing the app
+    // can say and it deliberately does nothing else. See net/book_divergence.h.
+    if (has(net::kBookDivergenceTag)) return AlertClass::Critical;
+    if (has(net::kBookAuditBlindTag)) return AlertClass::Critical;
     // NB: match "half-open ORDER" (a broker order submitted but never acked),
     // NOT bare "half-open". The routine data-feed reconnect logs "...data
     // session (half-open)" — it self-heals on every nightly gateway restart and
