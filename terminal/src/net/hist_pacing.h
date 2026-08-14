@@ -11,8 +11,8 @@
 // it recovers nothing and only delays recovery.
 //
 // One rule predicted 177 of those 178 outcomes:
-//   a reqHistoricalData issued within ~5s of a historicalDataEnd that delivered
-//   >= ~3000 bars is never answered.
+//   a reqHistoricalData issued too soon after a historicalDataEnd that
+//   delivered >= ~3000 bars is never answered.
 // Grouped by the gap since the previous delivery:
 //   gap > 20s                 -> alive 85, dead  0
 //   gap <= 5s, prev < 3000    -> alive 16, dead  0
@@ -23,6 +23,43 @@
 // gap after a 2,163-bar batch survived, while one at a 9s gap after a 7,700-bar
 // batch died. No IBKR pacing-violation error (162/165/366/420) is ever emitted —
 // IB answers a breach with silence, which is exactly what we observe.
+//
+// ---- 2026-08-13: THE HOLE IN THE TABLE ABOVE, AND WHAT FELL INTO IT --------
+//
+// READ THE BUCKETS AGAIN BEFORE TRUSTING THEM. 85+16+12+64 = 177 observations,
+// and every one is either <= 5s or > 20s. THE 5-20s BAND CONTAINS NO DATA AT
+// ALL. The original release nonetheless set the quiet window to 10s, reasoning
+// "the danger zone measured out at ~5s; 10s is comfortably clear of it" — i.e.
+// the constant was INTERPOLATED INTO A GAP IN THE MEASUREMENT. The only gap the
+// data ever showed safe is > 20s; 10s was never observed to be anything.
+//
+// Production filled the hole, and 10s is inside the danger zone:
+//   [13:57:52] candles: SNXX 5m x9570      <- 9,570-bar delivery
+//   [13:58:03] MUU 5m 6mo req 139 sent     <- 11s later, PAST the 10s window
+//   [13:58:23] MUU 5m: history unanswered for 20s - cancelled req 139
+// Reproduced ~20 times on 2026-08-13 alone, on a fixed 30-minute rebuild cycle.
+// SOXS and RAM survived every cycle only because they are issued FIRST after a
+// reconnect, onto a clean session; MUU and KORU always landed in the shadow of
+// the big delivery and received ZERO bars for the whole session, leaving two
+// live strategies trading on candles up to 120 minutes stale. Nothing is wrong
+// with those contracts — KORU has itself delivered 5m x9725 on other days.
+//
+// The band is therefore now:
+//   gap 11-12s, prev ~9,500-10,100 -> alive  0, dead ~20   (2026-08-13)
+// Known-dead now reaches 12s and known-safe still starts at 20s. The window
+// below is set ABOVE the measured-safe boundary, not between the two: picking
+// anything in 12-20s would repeat the exact mistake this note exists to record.
+//
+// SECOND DEFECT, same incident: a SMALL delivery used to mask a BIG one. The
+// gate looked only at the most recent historicalDataEnd, and tws_data.cpp
+// stamped it on every delivery regardless of size:
+//   [15:23:21] candles: SOXS 5m x10055   <- the poison
+//   [15:23:32] candles: RAM  5m x2799    <- 2,799 < kBigBatchBars: "not big"
+//   [15:23:33] MUU 5m 6mo req 32 sent    <- gate saw last=2,799 at 1s -> DEAD
+// RAM's harmless batch cleared SOXS's poison 12 seconds early. The gate now
+// remembers the last BIG delivery specifically, so nothing can reset it early.
+// Fixing either defect alone leaves the wedge intact: a longer window still
+// lets RAM mask SOXS, and tracking the big delivery still permits a send at 11s.
 
 #include <cstddef>
 #include <cstdint>
@@ -129,22 +166,52 @@ inline std::string hist_key(const std::string& symbol, const HistWire& w) {
 
 // A delivery at or above this many bars poisons the next request for a while.
 inline constexpr size_t kBigBatchBars = 3'000;
-// Quiet window after such a delivery. The danger zone measured out at ~5s; 10s
-// is comfortably clear of it and still well under the 20s timeout, so a blocked
-// request costs at most one extra io_loop pass rather than a failed fetch.
-inline constexpr int64_t kBigBatchQuietMs = 10'000;
 // Unanswered for this long = dead. See the note above: this is a classifier,
 // not a patience setting.
 inline constexpr int64_t kHistTimeoutMs = 20'000;
+// Quiet window after a BIG delivery. 22s, not the 10s that shipped first:
+// known-dead now reaches 12s and the only measured-safe gap is > 20s, so this
+// sits ABOVE the safe boundary rather than inside the unmeasured 12-20s band.
+//
+// It deliberately EXCEEDS kHistTimeoutMs, which the original invariant forbade
+// ("a blocked send must cost an extra loop pass, never a failed fetch"). That
+// invariant conflated two holds that age differently:
+//   - A FIRST send held here sits on io_loop's `deferred` queue and has not been
+//     handed to HistRequests at all, so it has no age, cannot be classified
+//     dead however long it waits, and is bounded instead by kHistQueueMaxWaitMs.
+//   - A RETRY held here is for a request already on the wire and already dead,
+//     so waiting DOES push it toward escalation — which is why kHistEscalateMs
+//     below is now expressed in terms of this window instead of assuming it is
+//     shorter than one timeout.
+inline constexpr int64_t kBigBatchQuietMs = 22'000;
 
-// Should we hold a new history request back right now?
-inline bool history_send_blocked(size_t last_batch_bars, int64_t ms_since_last_end) {
-    return last_batch_bars >= kBigBatchBars && ms_since_last_end < kBigBatchQuietMs;
+// Should we hold a history request back right now? `ms_since_big_end` is the age
+// of the last BIG delivery specifically (>= kBigBatchBars), NOT of the last
+// delivery of any size — that distinction is the whole of defect 2 above, where
+// a 2,799-bar batch cleared a 10,055-bar batch's poison twelve seconds early.
+// A session that has delivered no big batch at all passes a large sentinel.
+inline bool history_send_blocked(int64_t ms_since_big_end) {
+    return ms_since_big_end < kBigBatchQuietMs;
 }
 
+// Does this delivery re-arm the quiet window? Split out of tws_data.cpp so the
+// masking rule is testable: the defect was not the threshold but the fact that
+// EVERY delivery re-stamped the clock, which nothing outside that one line
+// could observe. A delivery too small to poison must leave the clock alone.
+inline bool history_delivery_poisons(size_t bars) { return bars >= kBigBatchBars; }
+
 // A request unanswered for THIS long is escalated whether or not a retry was
-// ever issued. Two timeouts: exactly the age a request reaches when it dies,
-// gets retried immediately, and dies again — the natural escalation timeline.
+// ever issued. Two timeouts PLUS one quiet window: exactly the age a request
+// reaches when it dies, waits out the longest legitimate hold before its retry
+// may go out, and then dies again — the natural escalation timeline.
+//
+// The quiet-window term is not padding. Once kBigBatchQuietMs exceeded one
+// timeout, a bare 2 * kHistTimeoutMs would have escalated every request whose
+// retry was still legitimately waiting for the window to pass, tearing down a
+// healthy data session on a schedule. The reverse error is the one this project
+// has already shipped: hist_pacing's rule is that the gate may delay a retry but
+// must NEVER delay the recovery, so this must exceed the longest legal hold and
+// nothing more.
 //
 // WHY IT IS AGE-BASED AND NOT PURELY RETRY-BASED. `already_retried` is set by
 // HistRequests::begin_retry, and Io::retry_dead_history has to ask the send gate
@@ -159,8 +226,10 @@ inline bool history_send_blocked(size_t last_batch_bars, int64_t ms_since_last_e
 //
 // This cannot fire spuriously: a request only has an age here if it was
 // genuinely put on the wire (pump_requests adds to HistRequests only on the send
-// path), so 40 s of silence is 40 s of real silence.
-inline constexpr int64_t kHistEscalateMs = 2 * kHistTimeoutMs;
+// path), so 62 s of silence is 62 s of real silence. That same property is what
+// makes the quiet window safe to lengthen past a timeout — a request still
+// sitting on the deferred queue has no age here at all.
+inline constexpr int64_t kHistEscalateMs = 2 * kHistTimeoutMs + kBigBatchQuietMs;
 
 // What to do with an in-flight request of this age.
 enum class HistAction {

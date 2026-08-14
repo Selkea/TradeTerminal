@@ -35,8 +35,28 @@ public:
     // One observation. `bad` is the watched condition right now; `now_s` is
     // steady seconds (see the header note — NOT ImGui::GetTime()); `alert_after_s`
     // is how long a bad state must persist before the first page; `re_alert_s` is
-    // the gap between repeat pages while it persists.
-    Action update(bool bad, double now_s, double alert_after_s, double re_alert_s) {
+    // the gap before the FIRST repeat page while it persists.
+    //
+    // `backoff_mult` widens that gap on each repeat, capped at `re_alert_cap_s`
+    // (0 = uncapped). The default of 1.0 is a flat repeat, which is what every
+    // caller had before and what a short, self-clearing outage still wants.
+    //
+    // WHY A BACKOFF EXISTS AT ALL. On 2026-08-14 a single unchanged book
+    // divergence — NVDA app=0 broker=20, stable for over eight hours — paged
+    // Critical every 15 minutes for the whole session, ~32 times, alongside a
+    // half-hourly history-stale page. The condition was real and worth exactly
+    // one page; what it produced was a channel the operator stops reading, which
+    // is strictly worse than not paging at all because the NEXT alert is the one
+    // that matters. A repeat page carries no information the first did not: the
+    // alert text already quotes how long the condition has run.
+    //
+    // The shape (immediately, then the gap, then x3, capped at an hour) is the
+    // one engine/reject.h already argued for refused exits, kept identical so
+    // there is one repeat policy in this codebase rather than two. Bounded on
+    // both sides on purpose: never silent, because a divergence nobody is
+    // looking at is how a real position ends up unmanaged, and never a flood.
+    Action update(bool bad, double now_s, double alert_after_s, double re_alert_s,
+                  double backoff_mult = 1.0, double re_alert_cap_s = 0.0) {
         if (!bad) {
             // Only announce a recovery to whoever was told about the outage. A
             // blip that cleared inside the grace period was never worth a page,
@@ -50,7 +70,17 @@ public:
             since_s_ = now_s;
         }
         if (now_s - since_s_ < alert_after_s) return Action::None;
-        if (alerted_ && now_s - last_alert_s_ < re_alert_s) return Action::None;
+        if (alerted_ && now_s - last_alert_s_ < re_alert_cur_s_) return Action::None;
+        // Widen only on a REPEAT. The first page of an episode always uses the
+        // caller's base gap, so an episode that clears and returns starts loud
+        // again rather than inheriting the backoff of the one before it.
+        if (alerted_ && backoff_mult > 1.0) {
+            re_alert_cur_s_ *= backoff_mult;
+            if (re_alert_cap_s > 0.0 && re_alert_cur_s_ > re_alert_cap_s)
+                re_alert_cur_s_ = re_alert_cap_s;
+        } else {
+            re_alert_cur_s_ = re_alert_s;
+        }
         alerted_ = true;
         last_alert_s_ = now_s;
         return Action::Page;
@@ -66,6 +96,7 @@ public:
         alerted_ = false;
         since_s_ = 0.0;
         last_alert_s_ = 0.0;
+        re_alert_cur_s_ = 0.0;   // the next episode pages on its own base gap
     }
 
     // How long the current bad episode has run (0 if there isn't one). The page
@@ -84,6 +115,8 @@ private:
     bool alerted_ = false;
     double since_s_ = 0.0;
     double last_alert_s_ = 0.0;
+    // The gap currently in force, which is the base gap until a repeat widens it.
+    double re_alert_cur_s_ = 0.0;
 };
 
 } // namespace tt::ui
