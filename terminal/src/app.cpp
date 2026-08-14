@@ -4770,7 +4770,15 @@ void App::pump_orphan_watchdog() {
 // named, and leaves the decision to the human — the same rule
 // pump_history_watchdog settled on for the same reason.
 void App::pump_book_audit() {
-    static constexpr double kDivergenceReAlertSec = 900.0;   // re-page every 15 min
+    // First repeat after 15 min, then x3 up to hourly. A divergence is real and
+    // must never go silent, but it is also STABLE by construction — the detector
+    // only opens one after two consecutive audits agree it is there — so a
+    // repeat carries nothing the first page did not, and the text already quotes
+    // how long it has run. On 2026-08-14 the flat 15-minute cadence paged ~32
+    // times about one unchanged NVDA divergence and drowned the channel.
+    static constexpr double kDivergenceReAlertSec = 900.0;      // first repeat: 15 min
+    static constexpr double kDivergenceBackoffMult = 3.0;
+    static constexpr double kDivergenceReAlertCapSec = 3600.0;  // never quieter than hourly
     const auto stand_down = [this] {
         book_audit_.stand_down();
         book_div_wd_.reset();
@@ -4876,8 +4884,8 @@ void App::pump_book_audit() {
     // apart), so the timer's alert_after stays 0: a divergence that reaches
     // Diverged has already outlasted everything a transient can.
     book_div_.update(state, book_audit_.confirmed(), book_audit_.confirmed_span_ms());
-    switch (book_div_wd_.update(book_div_.open(), now_s, 0.0,
-                                kDivergenceReAlertSec)) {
+    switch (book_div_wd_.update(book_div_.open(), now_s, 0.0, kDivergenceReAlertSec,
+                                kDivergenceBackoffMult, kDivergenceReAlertCapSec)) {
     case WatchdogTimer::Action::Page: {
         const std::string msg =
             net::book_divergence_alert(book_div_.divergences(), book_div_.span_ms());
@@ -4900,7 +4908,8 @@ void App::pump_book_audit() {
     // not itself broken.
     const bool socket_up = tws_->ready();
     switch (book_blind_wd_.update(socket_up && state == net::AuditState::Blind,
-                                  now_s, 0.0, kDivergenceReAlertSec)) {
+                                  now_s, 0.0, kDivergenceReAlertSec,
+                                  kDivergenceBackoffMult, kDivergenceReAlertCapSec)) {
     case WatchdogTimer::Action::Page: {
         const std::string msg =
             net::book_audit_blind_alert(book_audit_.unanswered_ms(now_ms));

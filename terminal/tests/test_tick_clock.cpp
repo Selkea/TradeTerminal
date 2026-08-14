@@ -313,3 +313,60 @@ TEST_CASE("a frozen clock cannot expire a deadline, and then expires it all at o
     const double armed = mono.now_s();
     CHECK(mono.now_s() < armed + 30.0);
 }
+
+// ---- repeat-page backoff ---------------------------------------------------
+//
+// 2026-08-14: one unchanged book divergence (NVDA app=0 broker=20, stable over
+// eight hours) paged Critical every 15 minutes for a whole session. The
+// condition was real and worth exactly one page; the cadence was what made the
+// channel unreadable.
+
+TEST_CASE("a flat repeat is still the default") {
+    // Every pre-existing caller passes no backoff and must be unaffected.
+    WatchdogTimer wd;
+    CHECK(wd.update(true, 0.0, 0.0, 900.0) == Action::Page);
+    CHECK(wd.update(true, 899.0, 0.0, 900.0) == Action::None);
+    CHECK(wd.update(true, 900.0, 0.0, 900.0) == Action::Page);
+    CHECK(wd.update(true, 1800.0, 0.0, 900.0) == Action::Page);
+    CHECK(wd.update(true, 2700.0, 0.0, 900.0) == Action::Page);
+}
+
+TEST_CASE("repeat pages back off geometrically and cap") {
+    WatchdogTimer wd;
+    const double gap = 900.0, mult = 3.0, cap = 3600.0;
+    auto up = [&](double t) { return wd.update(true, t, 0.0, gap, mult, cap); };
+    CHECK(up(0.0) == Action::Page);        // first page, immediately
+    CHECK(up(899.0) == Action::None);
+    CHECK(up(900.0) == Action::Page);      // +15 min
+    CHECK(up(3599.0) == Action::None);     // next gap widened to 45 min
+    CHECK(up(3600.0) == Action::Page);     // 900 + 2700
+    CHECK(up(7199.0) == Action::None);     // capped at 1 h, not 135 min
+    CHECK(up(7200.0) == Action::Page);
+    CHECK(up(10800.0) == Action::Page);    // stays hourly forever
+}
+
+TEST_CASE("the backoff is bounded on both sides") {
+    // It must never go silent: a divergence nobody looks at is how a real
+    // position ends up unmanaged. Over twelve hours of an unchanged condition
+    // the old cadence paged 48 times; this must be far fewer, and NOT zero.
+    WatchdogTimer wd;
+    int pages = 0;
+    for (double t = 0.0; t <= 12 * 3600.0; t += 30.0)
+        if (wd.update(true, t, 0.0, 900.0, 3.0, 3600.0) == Action::Page) ++pages;
+    CHECK(pages > 5);
+    CHECK(pages < 15);
+}
+
+TEST_CASE("a new episode pages on the base gap, not the old backoff") {
+    // Otherwise a long first episode would leave the NEXT one - a different
+    // incident - starting out at the hourly cadence it had backed off to.
+    WatchdogTimer wd;
+    for (double t = 0.0; t <= 6 * 3600.0; t += 30.0)
+        wd.update(true, t, 0.0, 900.0, 3.0, 3600.0);
+    CHECK(wd.update(false, 6 * 3600.0 + 30.0, 0.0, 900.0, 3.0, 3600.0) ==
+          Action::Recovered);
+    const double t0 = 7 * 3600.0;
+    CHECK(wd.update(true, t0, 0.0, 900.0, 3.0, 3600.0) == Action::Page);
+    CHECK(wd.update(true, t0 + 899.0, 0.0, 900.0, 3.0, 3600.0) == Action::None);
+    CHECK(wd.update(true, t0 + 900.0, 0.0, 900.0, 3.0, 3600.0) == Action::Page);
+}
