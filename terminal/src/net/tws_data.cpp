@@ -136,11 +136,21 @@ struct TwsData::Io final : DefaultEWrapper {
     std::unordered_set<std::string> held_logged_;
     // Distinct farm-status codes already reported (the stream repeats them).
     std::unordered_set<int> farm_codes_seen;
-    // When the last historicalDataEnd landed, and how big it was. IB stops
-    // answering a request issued too soon after a large delivery — see
-    // kBigBatchBars.
-    std::chrono::steady_clock::time_point last_hist_end{};
-    size_t last_hist_bars = 0;
+    // When the last BIG historicalDataEnd landed. IB stops answering a request
+    // issued too soon after a large delivery — see kBigBatchQuietMs.
+    //
+    // Deliveries below kBigBatchBars deliberately do NOT stamp this. Tracking
+    // the last delivery of ANY size was defect 2 of 2026-08-13: a 2,799-bar
+    // batch landing between a 10,055-bar batch and the next request cleared the
+    // poison twelve seconds early, and MUU and KORU received no bars for the
+    // rest of the session.
+    //
+    // The sentinel is explicit rather than a default-constructed time_point:
+    // steady_clock's epoch is boot time on Windows, so on a freshly restarted
+    // host "no big delivery yet" would otherwise read as "one landed seconds
+    // ago" and block the first fetch of the session.
+    static constexpr int64_t kNeverBig = INT64_MIN / 4;
+    int64_t last_big_hist_end_ms = kNeverBig;
 
     // Issue (or re-issue) one history request. Kept in one place so the retry
     // path below is byte-identical to the original send.
@@ -174,10 +184,7 @@ struct TwsData::Io final : DefaultEWrapper {
         // subject to the same pacing rule pump_requests enforces below — see
         // HistRequests::dead_ids for why sending into the quiet window would now
         // cost a whole data session rather than one silently dropped request.
-        const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now() - last_hist_end)
-                                   .count();
-        const bool blocked = history_send_blocked(last_hist_bars, since_end);
+        const bool blocked = history_send_blocked(steady_ms() - last_big_hist_end_ms);
         for (const int id : hist.dead_ids(now_ms, blocked)) {
             const HistPending* dead = hist.find(id);
             if (!dead) continue;
@@ -405,10 +412,7 @@ struct TwsData::Io final : DefaultEWrapper {
             // and come round again — the io_loop re-enters within ~1s. This one
             // IS all-or-nothing: the window is a property of the socket, not of
             // the request, so nothing queued behind it can go either.
-            const auto since_end = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::steady_clock::now() - last_hist_end)
-                                       .count();
-            if (history_send_blocked(last_hist_bars, since_end)) {
+            if (history_send_blocked(steady_ms() - last_big_hist_end_ms)) {
                 deferred.insert(deferred.end(),
                                 reqs.begin() + static_cast<ptrdiff_t>(ri), reqs.end());
                 break;   // NOT return: the stream/scan work below was already drained
@@ -733,10 +737,10 @@ struct TwsData::Io final : DefaultEWrapper {
         // put() ignores a delivery too thin to be usable; see net/bar_cache.h.
         bars.put(p->symbol, p->bar, p->dur, b.candles, steady_ms());
         hist.erase(reqId);
-        // Remember how much just landed: the next request must not follow a big
-        // batch too closely (see kBigBatchBars).
-        last_hist_end = std::chrono::steady_clock::now();
-        last_hist_bars = b.candles.size();
+        // Remember when a BIG batch landed: the next request must not follow one
+        // too closely (see kBigBatchQuietMs). A smaller delivery is harmless and
+        // must not overwrite this — see last_big_hist_end_ms.
+        if (history_delivery_poisons(b.candles.size())) last_big_hist_end_ms = steady_ms();
         // Bars only come back over an authenticated session, so a NON-EMPTY
         // delivery is independent proof the gateway is logged in — and it is the
         // proof that stays fresh during the day, after this session's farm

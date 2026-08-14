@@ -53,26 +53,56 @@ TEST_CASE("feed order: sorting is stable and puts close-only last") {
 using namespace tt::net;
 
 TEST_CASE("a small preceding delivery does not block the next request") {
-    // 16/16 alive in the sample, even at a sub-second gap.
-    CHECK_FALSE(history_send_blocked(2'163, 0));
-    CHECK_FALSE(history_send_blocked(2'163, 4'000));
-    CHECK_FALSE(history_send_blocked(0, 0));
+    // 16/16 alive in the sample, even at a sub-second gap. A delivery below the
+    // threshold never stamps the clock at all, so what the gate sees is the age
+    // of the last BIG batch — for a session that has had none, the sentinel.
+    CHECK_FALSE(history_delivery_poisons(2'163));
+    CHECK_FALSE(history_delivery_poisons(0));
+    CHECK_FALSE(history_send_blocked(INT64_MAX / 4));
 }
 
 TEST_CASE("a large preceding delivery blocks until the quiet window passes") {
     // 76/93 dead in the sample at a <=5s gap after a >=3000-bar batch.
-    CHECK(history_send_blocked(7'700, 0));
-    CHECK(history_send_blocked(7'700, 4'000));
-    CHECK(history_send_blocked(3'000, 9'999));      // exactly at the bar threshold
-    CHECK_FALSE(history_send_blocked(7'700, 10'000));   // window elapsed
-    CHECK_FALSE(history_send_blocked(7'700, 60'000));
+    CHECK(history_delivery_poisons(7'700));
+    CHECK(history_delivery_poisons(kBigBatchBars));   // exactly at the threshold
+    CHECK(history_send_blocked(0));
+    CHECK(history_send_blocked(4'000));
+    CHECK(history_send_blocked(kBigBatchQuietMs - 1));
+    CHECK_FALSE(history_send_blocked(kBigBatchQuietMs));   // window elapsed
+    CHECK_FALSE(history_send_blocked(60'000));
 }
 
 TEST_CASE("it is the preceding delivery that matters, not the gap alone") {
     // The pair that rules out send-spacing as the explanation: KORU survived a
     // 4s gap after a 2,163-bar batch; SNXX died at a 9s gap after 7,700 bars.
-    CHECK_FALSE(history_send_blocked(2'163, 4'000));
-    CHECK(history_send_blocked(7'700, 9'000));
+    CHECK_FALSE(history_delivery_poisons(2'163));
+    CHECK(history_send_blocked(9'000));
+}
+
+TEST_CASE("2026-08-13: eleven seconds after a big delivery is NOT safe") {
+    // The production sequence that filled the unmeasured 5-20s band:
+    //   [13:57:52] candles: SNXX 5m x9570
+    //   [13:58:03] MUU 5m 6mo sent, 11s later — PAST the old 10s window
+    //   [13:58:23] unanswered for 20s, cancelled
+    // Reproduced ~20 times that day; MUU and KORU got zero bars all session.
+    // Against the old constant these passed the gate. They must not now.
+    CHECK(history_send_blocked(11'000));
+    CHECK(history_send_blocked(12'000));
+    // The window must sit ABOVE the only gap the data ever showed safe (>20s),
+    // never inside 12-20s where there is still no evidence either way. Choosing
+    // a number in that band would repeat the original mistake exactly.
+    CHECK(kBigBatchQuietMs > 20'000);
+}
+
+TEST_CASE("2026-08-13: a small delivery cannot mask a big one") {
+    //   [15:23:21] candles: SOXS 5m x10055   <- the poison
+    //   [15:23:32] candles: RAM  5m x2799    <- must NOT re-arm the window
+    //   [15:23:33] MUU sent, 12s after SOXS but 1s after RAM -> allowed -> died
+    // RAM's batch is genuinely below the threshold, so it is invisible to the
+    // clock and MUU is still measured against SOXS.
+    CHECK_FALSE(history_delivery_poisons(2'799));
+    CHECK(history_delivery_poisons(10'055));
+    CHECK(history_send_blocked(12'000));   // 12s since SOXS, not 1s since RAM
 }
 
 TEST_CASE("a request inside its normal turnaround is left alone") {
@@ -109,17 +139,32 @@ TEST_CASE("silence long enough to have died twice escalates even with no retry")
     // The escalation age is the natural timeline it replaces: one timeout to die,
     // one more to die again after an immediate retry. Anything shorter would
     // escalate a request whose retry is simply still in flight.
-    CHECK(kHistEscalateMs == 2 * kHistTimeoutMs);
+    CHECK(kHistEscalateMs == 2 * kHistTimeoutMs + kBigBatchQuietMs);
     // ...and it must be comfortably past the longest legitimate deferral, or
     // waiting out the big-batch quiet window would itself tear the session down.
     CHECK(kHistEscalateMs > kHistTimeoutMs + kBigBatchQuietMs);
 }
 
-TEST_CASE("the quiet window stays clear of the death timeout") {
-    // A blocked send must cost an extra loop pass, never a failed fetch: if the
-    // quiet window ever reached the timeout, holding a request back would itself
-    // mark it dead.
-    CHECK(kBigBatchQuietMs < kHistTimeoutMs);
+TEST_CASE("the quiet window is bounded by the queue wait, not by the timeout") {
+    // This replaces `kBigBatchQuietMs < kHistTimeoutMs`, whose stated reason was
+    // that a blocked send must cost a loop pass and never a failed fetch. That
+    // conflated two holds which age differently:
+    //
+    //   - A FIRST send held by the gate goes on io_loop's deferred queue and is
+    //     never handed to HistRequests, so it has NO age, cannot be classified
+    //     dead however long the window is, and is bounded by the queue wait.
+    //   - Only a RETRY ages while held, because its request is already on the
+    //     wire and already dead — and kHistEscalateMs now absorbs exactly one
+    //     full window for that case.
+    //
+    // The old form was not merely redundant, it was harmful: it pinned the quiet
+    // window below 20s, and 2026-08-13 proved everything up to at least 12s is
+    // unsafe while nothing below 20s is known safe. Keeping it would have
+    // forbidden the only correct value.
+    CHECK(kBigBatchQuietMs < kHistQueueMaxWaitMs);
+    // Waiting out a full window must never itself trigger the data-session
+    // reconnect: the gate may delay a retry, it must never delay the recovery.
+    CHECK(kHistEscalateMs > kHistTimeoutMs + kBigBatchQuietMs);
 }
 
 // ---- aggregate send rate ---------------------------------------------------
