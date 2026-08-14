@@ -26,6 +26,7 @@
 // AlpacaBroker is the reference implementation.
 
 #include "engine/events.h"
+#include "engine/reject.h"
 #include "tt/events.h"
 
 #include <cstdint>
@@ -34,13 +35,29 @@
 namespace tt {
 
 // Why an order was rejected, captured by the adapter alongside a Rejected
-// OrderCancel event. The numeric code is the broker's (e.g. IBKR 110 "price
-// doesn't conform to min tick"); message is its human text. Both empty/0 when
-// the reject path carried no reason (e.g. an order that just went Inactive).
+// OrderCancel event. `cause` is the machine-readable taxonomy (engine/reject.h);
+// `code` is the broker's own number when it gave one (e.g. IBKR 201 "Exchange is
+// closed", 110 "price doesn't conform to min tick"); `message` is the human text.
+//
+// A default-constructed RejectReason means "the adapter recorded nothing", which
+// is a state the engine REPLACES rather than stores: on 2026-08-13 two orders
+// reached /diag as code 0 with an empty message and the operator had no way to
+// tell what had refused them. See EngineCtx / run_live's OrderCancel handling.
 struct RejectReason {
+    RejectCause cause = RejectCause::None;
     int code = 0;
     std::string message;
+
+    bool empty() const { return cause == RejectCause::None && message.empty(); }
 };
+
+// The generic non-empty reason. Used wherever an adapter refused an order
+// without saying why: it is still a poor answer, but it is an answer, and it
+// names the layer that produced it so the next reader knows where to look.
+inline RejectReason unexplained_broker_reject() {
+    return {RejectCause::BrokerRefused, 0,
+            reject_cause_text(RejectCause::BrokerRefused)};
+}
 
 class IBrokerAdapter {
 public:
@@ -58,8 +75,27 @@ public:
     // Consume the reason for a rejected order id, if the adapter recorded one
     // when it pushed the Rejected event. Called on the engine thread as that
     // event is drained; erases the entry so it is returned at most once.
-    // Default: adapters that don't track reasons return an empty reason.
-    virtual RejectReason take_reject(uint64_t /*order_id*/) { return {}; }
+    //
+    // Default: a GENERIC BUT NON-EMPTY reason, not a blank one. An adapter that
+    // does not track reasons still owes the operator a sentence - the blank that
+    // used to come back here is what made the 2026-08-13 rejects unreadable.
+    virtual RejectReason take_reject(uint64_t /*order_id*/) {
+        return unexplained_broker_reject();
+    }
+
+    // Why the most recent submit() returned 0. Called on the engine thread
+    // immediately after that 0 and before any other submit on this adapter, so
+    // an implementation may keep it in a plain member (submit() is documented
+    // above as engine-thread-only).
+    //
+    // Default: the same generic non-empty reason. A submit that returns 0 with
+    // nothing to say is the same defect class as a reject with no message -
+    // /diag shows "an order was refused" and the operator is left guessing
+    // between "not connected", "read-only account" and "queue full", which have
+    // completely different responses.
+    virtual RejectReason last_submit_reject() const {
+        return unexplained_broker_reject();
+    }
 
     // True once the adapter is connected and accepting orders.
     virtual bool ready() const = 0;

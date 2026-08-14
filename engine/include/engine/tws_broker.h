@@ -52,6 +52,10 @@ public:
     void flatten() override;
     bool poll_event(EngineEvent& out) override { return ev_ring_->try_pop(out); }
     RejectReason take_reject(uint64_t order_id) override;
+    // submit() is engine-thread-only (see IBrokerAdapter), and the engine asks
+    // this immediately after a 0 return, so a plain member is sufficient and no
+    // lock is needed. Four distinct refusals used to share one bare 0.
+    RejectReason last_submit_reject() const override { return last_submit_reject_; }
     bool ready() const override { return ready_.load(std::memory_order_acquire); }
     // The LOCAL app<->gateway API socket being up (ready()) does NOT mean the
     // gateway itself is connected to IBKR: during an IBKR maintenance window /
@@ -141,12 +145,15 @@ private:
     // connect that started after its unlocked timeout check; 0 = unconditional.
     void abort_inflight_connect(const char* why, int64_t only_if_started_ms = 0);
     void push_ev(const EngineEvent& ev);
-    // Record a reject reason (I/O thread) then push the Rejected event. code 0
-    // and empty msg = no reason available (leaves the reason table untouched).
-    // symbol_id + protective mark a rejected protective stop leg so the engine
-    // can flatten the position it was guarding (see kEvFlagProtective).
-    void push_reject(uint64_t local_id, int code = 0, std::string msg = {},
-                     uint32_t symbol_id = 0, bool protective = false);
+    // Record a reject reason (I/O thread) then push the Rejected event. The
+    // reason is ALWAYS stored now, even when IB gave no numeric code: a blank
+    // entry and a missing entry were indistinguishable to the engine, and the
+    // missing one is what /diag rendered as reject_code 0 / reject_msg "" on
+    // 2026-08-13. symbol_id + protective mark a rejected protective stop leg so
+    // the engine can flatten the position it was guarding (kEvFlagProtective).
+    void push_reject(uint64_t local_id, RejectCause cause, int code = 0,
+                     std::string msg = {}, uint32_t symbol_id = 0,
+                     bool protective = false);
     void log(std::string line);
     bool push_cmd(const Cmd& c);
 
@@ -192,6 +199,8 @@ private:
     // lives only until the matching Rejected event is drained.
     std::mutex reject_mu_;
     std::unordered_map<uint64_t, RejectReason> reject_reasons_;
+    // Engine thread only: why the last submit() returned 0.
+    RejectReason last_submit_reject_{};
 
     AckLatency ack_lat_;   // recorded on the I/O thread, read from the UI thread
     std::atomic<int> stuck_count_{0};   // I/O thread writes, UI thread reads

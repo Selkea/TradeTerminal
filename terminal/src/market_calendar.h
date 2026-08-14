@@ -184,6 +184,64 @@ inline double us_market_close_h(const std::tm& tm) {
 // 15:59 and turns an exact minute count into 23339999. Nothing here depends on
 // that millisecond, but a boundary function whose value is one short of the
 // round number is a trap for the next person to write a test against it.
+// ---- the entry gate (LiveConfig::entry_gate) --------------------------------
+//
+// MAY A STRATEGY OPEN OR ADD TO A POSITION AT THIS LOCAL TIME? Exits are never
+// asked; see the LiveConfig::entry_gate comment for why the engine asks the
+// wall clock rather than the bar.
+//
+// It closes EARLIER than the market does, at the same 15:57 the engine's EOD
+// backstop flattens on (kEodBackstopH in engine/src/engine.cpp — keep the two
+// together). Not an arbitrary margin: the backstop is edge-triggered and marks
+// the day done the moment it fires, so a position opened at 15:58 has nothing
+// left that will close it today, and a 5-minute strategy's next bar lands after
+// the close. Opening a position that nothing will close is the failure class
+// that costs the most here, so the last minute one may be OPENED is the last
+// minute something will still CLOSE it.
+//
+// The lead is subtracted from the day's real close so the three 13:00 early
+// closes get the same treatment (12:57) rather than a cutoff three hours after
+// they shut — which is the bug the half-day arithmetic exists to avoid.
+inline constexpr double kEodBackstopH = 15.95;      // 15:57, mirrors the engine
+inline constexpr double kEntryCloseLeadH = 0.05;    // 3 minutes
+
+// Last local hour at which an entry may be placed, or 0 when the market does
+// not open at all today (weekend/holiday: nothing may be entered).
+inline double entry_cutoff_h(const std::tm& tm) {
+    const double close_h = us_market_close_h(tm);
+    if (close_h <= 0.0) return 0.0;
+    return close_h - kEntryCloseLeadH < kEodBackstopH ? close_h - kEntryCloseLeadH
+                                                      : kEodBackstopH;
+}
+
+// HEALTHY vs BROKEN, since this is a gate and a gate that is always open is
+// indistinguishable from no gate at all: true only on a weekday that is not a
+// holiday, between 09:30:00 and the cutoff above. False at 09:29:59, false at
+// 15:57:00, false all weekend, false on Thanksgiving, false at 04:05 (the hour
+// KORU entered on 2026-08-13 and IBKR filled 5.4 hours later at the open), and
+// false at 16:00:12 and 16:05:16 (the three orders that started this).
+inline bool rth_entry_allowed(const std::tm& tm) {
+    const double cutoff = entry_cutoff_h(tm);
+    if (cutoff <= 0.0) return false;   // not a trading day
+    const int sod = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    const int open_sod = static_cast<int>(kRthOpenH * 3600.0 + 0.5);
+    const int cutoff_sod = static_cast<int>(cutoff * 3600.0 + 0.5);
+    return sod >= open_sod && sod < cutoff_sod;
+}
+
+// The engine hands nanoseconds; the calendar thinks in local civil time, which
+// on the VPS is Eastern by deployment (see the note at the top of this file).
+inline bool rth_entry_allowed_at(int64_t now_ns) {
+    const std::time_t t = static_cast<std::time_t>(now_ns / 1'000'000'000);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    return rth_entry_allowed(tm);
+}
+
 inline int64_t rth_open_elapsed_ms(const std::tm& tm) {
     const double close_h = us_market_close_h(tm);
     if (close_h <= 0.0) return 0;

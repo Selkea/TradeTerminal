@@ -32,6 +32,7 @@ target_link_libraries(tt_net
 add_executable(tt_engine_tests
     tests/test_spsc_ring.cpp
     tests/test_engine.cpp
+    tests/test_reject.cpp
     tests/test_strategy_host.cpp
     tests/test_strategy_registry.cpp
     tests/test_tick_log.cpp
