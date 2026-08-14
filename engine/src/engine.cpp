@@ -927,7 +927,20 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 why.message.empty() ? reject_cause_text(rec.reject_cause) : why.message;
         }
         orders.push_back(rec);
-        if (orders.size() > 200) orders.erase(orders.begin());
+        if (orders.size() > 200) {
+            // Evict the oldest FINISHED row, not simply the oldest. A WORKING
+            // row is the only thing that can name the symbol, side and size of
+            // an event that arrives for that id later, and a bracket's resting
+            // legs live for days on a session that spans days (this one has).
+            // Dropping one turned a broker rejection into an unattributable
+            // "order #N rejected" with no refusal row and no page. Still hard
+            // bounded: if all 200 are working the oldest goes anyway.
+            auto victim = std::find_if(orders.begin(), orders.end(),
+                                       [](const OrderRecord& o) {
+                                           return o.status != OrderStatus::Working;
+                                       });
+            orders.erase(victim == orders.end() ? orders.begin() : victim);
+        }
         orders_dirty = true;
     };
 
@@ -976,27 +989,49 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         const double dir = r.side == Side::Buy ? 1.0 : -1.0;
         return std::abs(pos + dir * r.qty) < std::abs(pos);
     };
-    auto note_refusal = [&](const OrderRequest& r, const RejectReason& why,
-                            bool record) {
-        const bool is_exit = order_reduces_position(r);
+    // known_exit: the CALLER knows this order would have reduced a position and
+    // the request cannot say so itself. A broker rejection for an id the blotter
+    // no longer holds (a bracket's take-profit leg, whose id is minted inside
+    // the adapter and never returned from submit(); a resting leg whose row aged
+    // out) arrives with no side and no qty, so order_reduces_position would call
+    // the most dangerous refusal in the system an entry.
+    auto note_refusal = [&](const OrderRequest& r, const RejectReason& why, bool record,
+                            bool known_exit = false) {
+        const bool is_exit = known_exit || order_reduces_position(r);
         RefusalStat* row = nullptr;
         for (RefusalStat& s : refusals)
             if (s.symbol_id == r.symbol_id && s.cause == why.cause) { row = &s; break; }
         const bool first = row == nullptr;
         if (first) {
-            refusals.push_back(RefusalStat{r.symbol_id, symbol_name(r.symbol_id),
-                                           why.cause, why.code, why.message, 0, 0, 0,
-                                           is_exit});
+            RefusalStat fresh;
+            fresh.symbol_id = r.symbol_id;
+            fresh.symbol = symbol_name(r.symbol_id);
+            fresh.cause = why.cause;
+            fresh.code = why.code;
+            fresh.message = why.message;
+            fresh.first_ts_ns = rt.now_ns();
+            refusals.push_back(std::move(fresh));
             row = &refusals.back();
-            row->first_ts_ns = rt.now_ns();
         }
+        // "The first time this pair was refused" and "the first time an EXIT of
+        // this pair was refused" are DIFFERENT questions, and conflating them is
+        // what made a refused exit silent. The (symbol, cause) key is shared
+        // with entry refusals, so an earlier harmless entry refusal — the entry
+        // gate declining a buy at 16:05, say — created the row and every later
+        // refused exit on that symbol for that cause then said nothing at all.
+        const bool first_exit = is_exit && !row->exit_order;
         ++row->count;
         row->last_ts_ns = rt.now_ns();
         row->exit_order = row->exit_order || is_exit;
+        if (is_exit) ++row->exit_count;
         refusals_dirty = true;
         if (why.cause == RejectCause::SessionClosed) ++entry_gate_blocked;
-        // A blotter row for the first of each pair only (see RefusalStat).
-        if (record && first) record_order(r, 0, why);
+        // A blotter row for the first of each pair, and for the first EXIT of
+        // each pair (see RefusalStat): reject_count is the field the operator
+        // watches, and a refused exit that never moved it is how this whole
+        // investigation started. Still at most two rows per pair, so a strategy
+        // retrying into the same gate cannot evict the session's real orders.
+        if (record && (first || first_exit)) record_order(r, 0, why);
 
         // A warmup replay is not a refused order — the strategy is being shown
         // history and nothing was ever meant to reach the market. Counted so a
@@ -1004,28 +1039,52 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         // and never paged.
         if (why.cause == RejectCause::WarmupReplay) return;
         const std::string sym = symbol_name(r.symbol_id);
+        // qty 0 = rebuilt from an event, not from the blotter: the side and size
+        // are genuinely unknown and saying "buy 0" would invent them.
         const std::string what =
             std::string(" [") + reject_cause_slug(why.cause) + "] " + sym + " " +
-            (r.side == Side::Buy ? "buy " : "sell ") +
-            std::to_string(static_cast<long long>(r.qty)) + ": " + why.message;
+            (r.qty > 0.0 ? std::string(r.side == Side::Buy ? "buy " : "sell ") +
+                               std::to_string(static_cast<long long>(r.qty))
+                         : std::string("order (size unknown - see the broker line "
+                                       "below for the id)")) +
+            ": " + why.message;
         // Hold-until-profitable is the one refusal that is SUPPOSED to repeat:
         // the strategy re-offers its exit every bar and hold mode declines it
         // every bar until the position is green. It says so once (Info) and then
         // stays quiet — escalating it to Warning at the third bar would page for
         // every held position, all day, which is how a channel gets muted. Its
         // row in `refusals` is where an operator sees it is still happening.
+        // Checked before the exit branch: it refuses exits BY DESIGN.
         if (why.cause == RejectCause::HoldBlocksLoss) {
             if (first) push_log(std::string("live: ") + kOrderRefusedTag + what);
             return;
         }
         if (is_exit) {
-            if (first) push_log(std::string("live: ") + kExitOrderRefusedTag + what);
+            // First one always pages; after that, on the backoff schedule in
+            // reject.h. Never "once, then silence" — the position it would have
+            // closed is still open for as long as this keeps happening.
+            const int64_t now = rt.now_ns();
+            if (row->exit_pages == 0 || now - row->exit_paged_ns >= row->exit_repage_ns) {
+                push_log(std::string("live: ") + kExitOrderRefusedTag + what +
+                         (row->exit_count > 1
+                              ? " (x" + std::to_string(row->exit_count) + ")"
+                              : ""));
+                ++row->exit_pages;
+                row->exit_paged_ns = now;
+                row->exit_repage_ns = std::min(
+                    row->exit_repage_ns * kExitRefusalRepageGrowth, kExitRefusalRepageMaxNs);
+            }
             return;
         }
         if (first) push_log(std::string("live: ") + kOrderRefusedTag + what);
-        else if (row->count == kRefusalRepeatAlertAt)
+        else if (row->count >= row->warn_at) {
+            // >=, not ==: see kRefusalRepeatAlertAt. The counter advances in the
+            // branches above too, so an == test can have its one value consumed
+            // by a refusal that never reaches this line.
             push_log(std::string("live: ") + kOrderRefusedRepeatTag + what + " (x" +
                      std::to_string(row->count) + ")");
+            row->warn_at = row->count * 10;   // says so again at 30, 300, ...
+        }
     };
     auto on_order = [&](const OrderRequest& r, uint64_t id, const RejectReason& why,
                         bool record) {
@@ -1740,11 +1799,45 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     // adapter did not tag it protective — the naked-position
                     // net below only fires on kEvFlagProtective, and a plain
                     // signal exit refused by IBKR is just as naked.
-                    if (rejected && refused_known)
-                        note_refusal(refused, rr, /*record=*/false);
+                    //
+                    // UNCONDITIONAL since 0.23.1. It used to require a blotter
+                    // row, and two whole classes of rejection do not have one:
+                    // a bracket's take-profit/stop legs get their ids inside
+                    // the adapter (tws_broker.cpp handle_submit) and are never
+                    // returned from submit(), and a resting leg's row can age
+                    // out of the 200-entry ring on a multi-day session. Those
+                    // rejections produced NOTHING — no refusals row, no
+                    // reject_count, no refused_exits, no page above Warning —
+                    // and a rejected take-profit leg is precisely the exit this
+                    // path was added to cover.
+                    if (rejected) {
+                        // The blotter knew the symbol; without a row, the event
+                        // does (push_reject carries it for every reject now).
+                        if (!refused_known) refused.symbol_id = bev.symbol_id;
+                        const uint32_t rsid = refused.symbol_id;
+                        // With no row there is no side and no qty to infer from,
+                        // so the POSITION decides: an unidentifiable rejection on
+                        // a symbol that holds a position is treated as an exit.
+                        // Deliberately asymmetric — over-calling it costs one
+                        // page, under-calling it costs the naked position that
+                        // this project's two worst incidents both were.
+                        const bool unknown_on_open =
+                            !refused_known && rsid >= 1 && rsid <= n_sym &&
+                            pf.position(rsid).qty != 0.0;
+                        note_refusal(refused, rr, /*record=*/!refused_known,
+                                     /*known_exit=*/(bev.flags & kEvFlagProtective) != 0 ||
+                                         unknown_on_open);
+                    }
+                    // "refused", not "rejected": the tagged line note_refusal
+                    // just emitted is what decides the alert tier, and this one
+                    // carries the id and the broker's code for the log. While it
+                    // said "rejected" it matched classify_alert's generic rule
+                    // and beeped Warning for every refusal — including the
+                    // benign refused ENTRY the policy above deliberately rates
+                    // Info, which drew TWO pages per order.
                     std::string line = "live: order #" +
                                        std::to_string(bev.u.order.order_id) +
-                                       (rejected ? " rejected by broker" : " cancelled");
+                                       (rejected ? " refused by broker" : " cancelled");
                     if (rejected) {
                         line += " [";
                         line += reject_cause_slug(rr.cause);
@@ -1859,6 +1952,19 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 // Backfilled bar (feed outage recovery): keep the strategy's
                 // indicators continuous, but never fill or mark positions
                 // against stale prices.
+                //
+                // The bar's close IS a usable price for sizing, and setting it
+                // is not marking: ctx's last price feeds the price band, the
+                // buying-power check and the notional clamp only. Without it a
+                // strategy ordering off a backfill bar on a symbol that has not
+                // ticked this session was priced at 0 — both gates blind, and
+                // since 0.23.0 an unpriceable increase is refused outright with
+                // price_unavailable. run_replay does the same at the matching
+                // branch; when only one of them did, a capture no longer
+                // reproduced the live session it was taken from, which is the
+                // whole point of the capture.
+                if (ev.symbol_id >= 1 && ev.symbol_id <= n_sym)
+                    ctx.set_last_price(ev.symbol_id, ev.u.bar.close);
                 if (!halted && ev.symbol_id >= 1 && ev.symbol_id <= n_sym &&
                     !strat_halted[ev.symbol_id - 1] && !reconciling &&
                     !adopt_hold[ev.symbol_id - 1]) {

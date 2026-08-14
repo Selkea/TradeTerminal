@@ -80,6 +80,24 @@ TEST_CASE("reject taxonomy: broker causes are exactly the venue's own") {
     CHECK_FALSE(reject_cause_is_broker(RejectCause::None));
 }
 
+TEST_CASE("reject taxonomy: exactly two causes refuse an exit by design") {
+    // What /diag's refused_exits and tt_refused_exits subtract before they claim
+    // "there is no benign value but 0". Adding a third by-design refusal without
+    // thinking about that claim should break here first.
+    CHECK(reject_cause_exit_is_by_design(RejectCause::HoldBlocksLoss));
+    CHECK(reject_cause_exit_is_by_design(RejectCause::WarmupReplay));
+    int by_design = 0;
+    for (RejectCause c : kAllRejectCauses)
+        if (reject_cause_exit_is_by_design(c)) ++by_design;
+    CHECK(by_design == 2);
+    // The ones that must never be excused: each is a position left with one
+    // fewer thing that will close it.
+    CHECK_FALSE(reject_cause_exit_is_by_design(RejectCause::BrokerRejected));
+    CHECK_FALSE(reject_cause_exit_is_by_design(RejectCause::BrokerNotConnected));
+    CHECK_FALSE(reject_cause_exit_is_by_design(RejectCause::PriceBand));
+    CHECK_FALSE(reject_cause_exit_is_by_design(RejectCause::MaxOrderQty));
+}
+
 TEST_CASE("reject taxonomy: the alert tags nest, so classify_alert order matters") {
     // Both specific tags contain the generic one as a substring, which is why
     // tt::ui::classify_alert must test Critical and Repeat BEFORE the plain tag.
@@ -649,5 +667,402 @@ TEST_CASE("alerting: a refused EXIT emits the Critical tag, an entry does not") 
     const size_t at = all.find(kOrderRefusedTag);
     REQUIRE(at != std::string::npos);
     CHECK(all.compare(at - 5, 5, "EXIT ") == 0);
+    check_no_blank_reasons(s);
+}
+
+// ---- 4. the refusal that says nothing ---------------------------------------
+// Everything below is 0.23.1, and every case here PASSED SILENTLY in 0.23.0 for
+// the same reason: the alerting policy was keyed on "is this the first row for
+// this (symbol, cause) pair", which is not the question any of it was asking.
+
+namespace {
+// Refused entry, then a real fill, then a refused EXIT - all on ONE (symbol,
+// cause) pair. The shape that goes silent: any cause reachable by both an entry
+// and an exit (broker_not_connected during a gateway outage, broker_rejected on
+// an IB 201 in the morning and again in the afternoon, max_order_qty after a
+// limit change) hits it.
+struct EntryRefusedThenExitRefused : IStrategy {
+    std::atomic<int> stage{0};       // 0 bad entry, 1 real buy, 3 bad exit
+    std::atomic<int> bad_exits{0};
+    std::atomic<int> bad_entries{0};
+    bool keep_trying = false;        // stay on the entry path after the exit
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        OrderRequest r{};
+        r.symbol_id = sid;
+        r.qty = 10;
+        const int st = stage.load();
+        if (st == 0) {
+            stage = 1;
+            r.side = Side::Buy;              // flat, so this is an ENTRY
+            r.type = OrdType::Limit;
+            r.limit_price = 5000.0;          // last trade is 50: outside the band
+            ctx.submit_order(r);
+            ++bad_entries;
+        } else if (st == 1) {
+            stage = 2;                       // wait for the fill (on_fill -> 3)
+            r.side = Side::Buy;
+            r.type = OrdType::Market;
+            ctx.submit_order(r);
+        } else if (st == 3) {
+            stage = keep_trying ? 4 : 5;
+            r.side = Side::Sell;             // long 10, so this SHRINKS it: EXIT
+            r.type = OrdType::Limit;
+            r.limit_price = 5000.0;
+            ctx.submit_order(r);
+            ++bad_exits;
+        } else if (st == 4) {
+            stage = 5;
+            r.side = Side::Sell;             // a second refused exit
+            r.type = OrdType::Limit;
+            r.limit_price = 5000.0;
+            ctx.submit_order(r);
+            ++bad_exits;
+        } else if (st == 5 && keep_trying) {
+            r.side = Side::Buy;              // long 10, so buying ADDS: entry
+            r.type = OrdType::Limit;
+            r.limit_price = 5000.0;
+            ctx.submit_order(r);
+            ++bad_entries;
+        }
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {
+        int expect = 2;
+        stage.compare_exchange_strong(expect, 3);
+    }
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("alerting: a refused EXIT pages even when an ENTRY was refused first") {
+    // THE BLOCKER of the 0.23.0 review. The Critical tag was emitted only when
+    // the refusal created the (symbol, cause) row, and that row is SHARED with
+    // entry refusals - so one harmless entry refusal earlier in the session
+    // (the entry gate declining a buy at 16:05) bought permanent silence for
+    // every refused exit on that symbol for that cause. No Critical, no
+    // Warning, not even the Info line: the exit branch returned first.
+    //
+    // Alerting is entirely log-line driven (App::alert_scan -> classify_alert),
+    // so no line means no page of ANY tier, while the position that exit would
+    // have closed stays open.
+    EntryRefusedThenExitRefused strat;
+    Engine eng;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 100'000.0;
+    cfg.risk.price_band_pct = 0.20;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump(eng, [&] { return strat.bad_exits.load() >= 1; });
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+
+    const RefusalStat* r = row(s, RejectCause::PriceBand);
+    REQUIRE(r != nullptr);
+    CHECK(r->count >= 2);        // the entry and the exit share the row...
+    CHECK(r->exit_count == 1);   // ...but only ONE of them was an exit
+    CHECK(r->exit_order);
+    std::string all;
+    for (std::string line; eng.pop_log(line);) all += line + "\n";
+    INFO("engine log:\n", all);
+    CHECK(all.find(kExitOrderRefusedTag) != std::string::npos);
+    // The blotter is what /diag's reject_count and rejects_recent are built
+    // from, and it recorded only the first row per pair - so the refused EXIT,
+    // the one the operator needs, was missing from there too.
+    int rejected_rows = 0;
+    for (const OrderRecord& o : s.orders)
+        if (o.status == OrderStatus::Rejected) ++rejected_rows;
+    CHECK(rejected_rows >= 2);
+    check_no_blank_reasons(s);
+}
+
+TEST_CASE("alerting: the repeat Warning cannot be swallowed by a silent branch") {
+    // The counter advances for EVERY refusal, including the branches that return
+    // before the repeat check (an exit, a hold_blocks_loss, a warmup replay).
+    // Tested with ==, the threshold value gets consumed inside one of those and
+    // the Warning then NEVER fires for that pair again, however many times the
+    // strategy jams. Here refusals 2 and 3 are exits, so 0.23.0's `count ==
+    // kRefusalRepeatAlertAt` never matched on the entry path and a strategy
+    // refused a dozen times running said nothing.
+    EntryRefusedThenExitRefused strat;
+    strat.keep_trying = true;
+    Engine eng;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 100'000.0;
+    cfg.risk.price_band_pct = 0.20;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump(eng, [&] { return strat.bad_entries.load() >= 4; });
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+
+    const RefusalStat* r = row(s, RejectCause::PriceBand);
+    REQUIRE(r != nullptr);
+    CHECK(r->count > kRefusalRepeatAlertAt);
+    CHECK(r->exit_count == 2);
+    std::string all;
+    for (std::string line; eng.pop_log(line);) all += line + "\n";
+    INFO("engine log:\n", all);
+    CHECK(all.find(kOrderRefusedRepeatTag) != std::string::npos);
+}
+
+TEST_CASE("alerting: hold-until-profitable refuses exits all day and never pages") {
+    // THE ONE DELIBERATE EXCEPTION, and the one this fix could most easily have
+    // broken. hold mode refuses exits BY DESIGN - that is what
+    // hold-until-profitable IS - and the strategy re-offers the same exit every
+    // tick. Now that a refused exit repeats its Critical page on a backoff, a
+    // hold_blocks_loss refusal falling through to the exit branch would page
+    // every five minutes for every held position, all day. It says so once
+    // (Info) and is then visible only in the refusal table.
+    //
+    // /diag's refused_exits and tt_refused_exits skip this cause for the same
+    // reason: both are documented "there is no benign value but 0", and one
+    // held position produced 189 before 0.23.1.
+    struct BuyThenHeldExit : IStrategy {
+        std::atomic<int> stage{0};
+        std::atomic<int> refused{0};
+        void on_init(IStrategyContext&) noexcept override {}
+        void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+        void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+            OrderRequest r{};
+            r.symbol_id = sid;
+            r.qty = 10;
+            r.type = OrdType::Market;
+            if (stage.load() == 0) {
+                stage = 1;
+                r.side = Side::Buy;
+                ctx.submit_order(r);
+            } else if (stage.load() == 2) {
+                r.side = Side::Sell;          // underwater: hold mode declines it
+                if (ctx.submit_order(r) == 0) ++refused;
+            }
+        }
+        void on_fill(IStrategyContext&, const Fill&) noexcept override {
+            int expect = 1;
+            stage.compare_exchange_strong(expect, 2);
+        }
+        void on_stop(IStrategyContext&) noexcept override {}
+        void destroy() noexcept override {}
+    } strat;
+    Engine eng;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 100'000.0;
+    cfg.risk.disable_auto_halt = true;   // hold-until-profitable
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump(eng, [&] { return strat.stage.load() >= 2; });   // buys at 50
+    // Waits on the PUBLISHED row, not the strategy's own counter: the snapshot
+    // lags the engine thread by a publish.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        eng.push_live_tick("AAA", 2, 40.0, 0.0);   // now underwater
+        const LiveSnapshot cur = eng.live_snapshot();
+        const RefusalStat* held = row(cur, RejectCause::HoldBlocksLoss);
+        if (held && held->count >= 5) break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+
+    const RefusalStat* r = row(s, RejectCause::HoldBlocksLoss);
+    REQUIRE(r != nullptr);
+    CHECK(r->count >= 5);
+    CHECK(r->exit_count == r->count);   // every one of them WAS an exit
+    CHECK(r->exit_order);
+    std::string all;
+    for (std::string line; eng.pop_log(line);) all += line + "\n";
+    INFO("engine log:\n", all);
+    CHECK(all.find(kExitOrderRefusedTag) == std::string::npos);    // never Critical
+    CHECK(all.find(kOrderRefusedRepeatTag) == std::string::npos);  // never Warning
+    // ...and exactly one Info line, however many times it happens.
+    size_t said = 0;
+    for (size_t at = all.find(kOrderRefusedTag); at != std::string::npos;
+         at = all.find(kOrderRefusedTag, at + 1))
+        ++said;
+    CHECK(said == 1);
+    check_no_blank_reasons(s);
+}
+
+namespace {
+// A bracket: the parent's id comes back from submit(), the take-profit and
+// stop legs get theirs INSIDE the adapter (tws_broker.cpp handle_submit) and are
+// never returned, so the engine's blotter has never heard of them.
+struct BracketLegBroker : IBrokerAdapter {
+    static constexpr uint64_t kLegId = 4242;   // minted inside the adapter
+    std::mutex mu;
+    std::deque<EngineEvent> q;
+    uint64_t next = 1;
+
+    uint64_t submit(const OrderRequest& r, int64_t) override {
+        std::lock_guard l(mu);
+        const uint64_t id = next++;
+        EngineEvent f{};   // fills instantly, so a position exists to protect
+        f.type = static_cast<uint16_t>(EvType::Fill);
+        f.symbol_id = r.symbol_id;
+        f.u.fill.order_id = id;
+        f.u.fill.price = 50.0;
+        f.u.fill.qty = r.qty;
+        f.u.fill.side = static_cast<uint8_t>(r.side);
+        q.push_back(f);
+        return id;
+    }
+    // IBKR refuses the take-profit leg. NOT kEvFlagProtective: only the stop leg
+    // is tagged (tws_broker.cpp), which is precisely why the engine's other
+    // safety net does not cover this one.
+    void reject_take_profit(uint32_t sid) {
+        std::lock_guard l(mu);
+        EngineEvent e{};
+        e.type = static_cast<uint16_t>(EvType::OrderCancel);
+        e.flags = kEvFlagRejected;
+        e.symbol_id = sid;
+        e.u.order.order_id = kLegId;
+        q.push_back(e);
+    }
+    bool cancel(uint64_t) override { return true; }
+    void cancel_all() override {}
+    void flatten() override {}
+    bool poll_event(EngineEvent& out) override {
+        std::lock_guard l(mu);
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool ready() const override { return true; }
+    RejectReason take_reject(uint64_t id) override {
+        if (id != kLegId) return {};
+        return {RejectCause::BrokerRejected, 201,
+                "Order rejected - reason:Exchange is closed."};
+    }
+};
+} // namespace
+
+TEST_CASE("refusal: a rejected order the blotter never held is still counted and paged") {
+    // The broker-reject path used to require a blotter row before it would touch
+    // the refusal table, and two whole classes of rejection do not have one:
+    //   * a bracket's take-profit/stop legs, whose ids are minted inside the
+    //     adapter and never returned from submit();
+    //   * any resting leg whose row aged out of the 200-entry ring on a session
+    //     that spans days (this one has).
+    // Such a rejection produced NOTHING an operator could see: refusals empty,
+    // refusal_count 0, refused_exits 0, reject_count 0 - the tripwire that
+    // started this whole investigation - and the only trace was one line rated
+    // Warning, indistinguishable from routine order noise.
+    BracketLegBroker broker;
+    Engine eng;
+    OneShotStrat strat;
+    strat.req = mkt(Side::Buy, 10.0);
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 100'000.0;
+    cfg.broker = &broker;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    // Wait for the parent to fill: the position is what makes the refused leg an
+    // exit rather than an entry.
+    REQUIRE(pump(eng, [&] {
+        const LiveSnapshot s = eng.live_snapshot();
+        return !s.symbols.empty() && s.symbols[0].position.qty != 0.0;
+    }));
+    broker.reject_take_profit(1);
+    pump(eng, [&] { return has_cause(eng.live_snapshot(), RejectCause::BrokerRejected); });
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+
+    const RefusalStat* r = row(s, RejectCause::BrokerRejected);
+    REQUIRE(r != nullptr);                 // it is IN the table at all
+    CHECK(r->symbol == "AAA");             // and it says which symbol
+    CHECK(r->code == 201);
+    CHECK(r->message.find("Exchange is closed") != std::string::npos);
+    // An unidentifiable rejection on a symbol that HOLDS a position is treated
+    // as an exit. Deliberately asymmetric: over-calling it costs one page,
+    // under-calling it costs the naked position.
+    CHECK(r->exit_order);
+    CHECK(r->exit_count == 1);
+    int rejected_rows = 0;
+    for (const OrderRecord& o : s.orders)
+        if (o.status == OrderStatus::Rejected) ++rejected_rows;
+    CHECK(rejected_rows >= 1);             // /diag reject_count moves off 0
+    std::string all;
+    for (std::string line; eng.pop_log(line);) all += line + "\n";
+    INFO("engine log:\n", all);
+    CHECK(all.find(kExitOrderRefusedTag) != std::string::npos);
+    check_no_blank_reasons(s);
+}
+
+namespace {
+// Orders off a BAR and nothing else - the shape of a symbol that gets backfill
+// on a feed reconnect but has not ticked this session.
+struct BarBuyer : IStrategy {
+    std::atomic<bool> sent{false};
+    std::atomic<uint64_t> id{0};
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        if (sent.exchange(true)) return;
+        OrderRequest r{};
+        r.symbol_id = sid;
+        r.side = Side::Buy;
+        r.type = OrdType::Market;
+        r.qty = 10;
+        id = ctx.submit_order(r);
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("live: an order off a BACKFILL bar is priced, exactly as replay prices it") {
+    // 0.23.0 added the missing set_last_price to run_replay's captured-bar
+    // branch and not to run_live's, so the two disagreed about the same event:
+    // live priced the symbol at 0 and refused the order price_unavailable, while
+    // replaying the capture priced it off the bar close and placed it. A capture
+    // that does not reproduce the session it was taken from cannot be used to
+    // explain the /diag row it was taken to explain.
+    //
+    // Not an exotic path: ibkr_feed.cpp and polygon_feed.cpp backfill EVERY
+    // configured symbol on each stream reconnect, so a symbol that has never
+    // ticked still receives bars.
+    BarBuyer strat;
+    Engine eng;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 100'000.0;
+    cfg.risk.max_position_notional = 5'000.0;   // arms the clamp that needs a price
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    EngineEvent bar{};
+    bar.type = static_cast<uint16_t>(EvType::Bar);
+    bar.symbol_id = 1;
+    bar.ts_event_ns = 1;
+    bar.u.bar.open = bar.u.bar.high = bar.u.bar.low = bar.u.bar.close = 50.0;
+    bar.u.bar.volume = 1000.0;
+    // NO tick is ever pushed: the bar close is the only price this symbol has.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!strat.sent.load() && std::chrono::steady_clock::now() < deadline) {
+        eng.push_feed_event(bar);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    // The submit itself happens on the engine thread inside on_bar; give the
+    // refusal (if any) a moment to reach the snapshot.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+    CHECK(strat.sent.load());
+    CHECK(strat.id.load() != 0);   // it was PLACED, sized against the bar close
+    // Asserted against the LOG, not the snapshot: with no ticks at all the live
+    // loop is idle and may not have published a refusal row yet, so an empty
+    // snapshot would pass this for the wrong reason.
+    std::string all;
+    for (std::string line; eng.pop_log(line);) all += line + "\n";
+    INFO("engine log:\n", all);
+    CHECK(all.find(reject_cause_slug(RejectCause::PriceUnavailable)) == std::string::npos);
+    CHECK(all.find(kOrderRefusedTag) == std::string::npos);
     check_no_blank_reasons(s);
 }

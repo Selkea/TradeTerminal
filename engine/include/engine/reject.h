@@ -202,6 +202,26 @@ constexpr bool reject_cause_is_broker(RejectCause c) noexcept {
     }
 }
 
+// True for the two causes that refuse an EXIT by DESIGN. Everything that counts
+// refused exits - /diag's refused_exits, the tt_refused_exits metric, any
+// alerting rule built on either - must skip these, because both fields are
+// documented "there is no benign value but 0" and these two are benign every
+// single time:
+//
+//   hold_blocks_loss  IS hold-until-profitable. The strategy re-offers its exit
+//                     every bar and the mode declines it until the position is
+//                     green; one held position produced 189 of them in a
+//                     three-second test.
+//   warmup_replay     the strategy is being shown seed history and nothing was
+//                     ever meant to reach the market. A HEALTHY session has one
+//                     such row per symbol (see RefusalStat).
+//
+// Neither is paged by run_live either - note_refusal returns before the exit
+// branch for both - so this keeps the gauge and the pager saying the same thing.
+constexpr bool reject_cause_exit_is_by_design(RejectCause c) noexcept {
+    return c == RejectCause::HoldBlocksLoss || c == RejectCause::WarmupReplay;
+}
+
 // ---- alert tags -------------------------------------------------------------
 // Matched verbatim by tt::ui::classify_alert (terminal/src/alert_rules.h). They
 // live here, next to the enum, so the log line and the classifier cannot drift:
@@ -218,6 +238,33 @@ inline constexpr const char* kExitOrderRefusedTag = "EXIT ORDER REFUSED";
 // decision and starts being a strategy stuck in a loop. 3, not 2, because a
 // single bar can legitimately produce an entry plus its bracket leg and have
 // both hit the same gate.
+//
+// Compared with >=, never ==. The counter is incremented for EVERY refusal of
+// the pair, including the ones that return before this check is reached (an
+// exit, a hold_blocks_loss); an == test lets those consume the value 3 and the
+// Warning then never fires for that pair again, no matter how many times the
+// strategy jams. A pair that has already warned re-arms at count * 10, so a
+// session that keeps failing says so again at 30, 300, ... rather than once.
 inline constexpr uint64_t kRefusalRepeatAlertAt = 3;
+
+// A refused EXIT pages Critical on the FIRST occurrence and keeps saying so
+// while it keeps happening. Both halves are load-bearing:
+//
+//  * One page is not enough. Until 0.23.1 the Critical tag was emitted only on
+//    the first refusal of a (symbol, cause) pair, which meant a refused exit was
+//    SILENT whenever an entry had already been refused for the same cause on
+//    that symbol earlier in the session — and after that, permanently silent.
+//    The position it would have closed is still open the whole time.
+//  * A page per refusal is too much. A strategy re-offers its exit every tick,
+//    so a 12-hour gateway outage (2026-07-30) with an open position would have
+//    produced a Critical every few milliseconds and muted the channel — the
+//    exact failure the "half-open" data-feed spam taught this project.
+//
+// So it repeats with a geometric backoff: immediately, then 5 min later, then
+// x3 each time up to an hour. Loud while an operator can still act, never
+// silent, bounded at ~8 pages over a 12-hour outage per (symbol, cause).
+inline constexpr int64_t kExitRefusalRepageNs = 300LL * 1'000'000'000;      // 5 min
+inline constexpr int64_t kExitRefusalRepageMaxNs = 3600LL * 1'000'000'000;  // 1 h
+inline constexpr int64_t kExitRefusalRepageGrowth = 3;
 
 } // namespace tt

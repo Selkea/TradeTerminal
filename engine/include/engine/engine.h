@@ -221,7 +221,23 @@ struct RefusalStat {
     // The refused order was REDUCING or CLOSING a position. This is the field
     // that decides whether a refusal pages Critical: an exit that cannot be
     // placed is how a position ends up with nothing that will ever close it.
+    // STICKY: true if ANY refusal of this pair was an exit, which is why it may
+    // not be multiplied by `count` — see exit_count.
     bool exit_order = false;
+    // How many of `count` were exits. /diag's refused_exits and the
+    // tt_refused_exits metric sum THIS, not count: both are documented as
+    // "there is no benign value but 0", and summing count made them report
+    // every entry refusal that happened to share a (symbol, cause) row with one
+    // exit — 189 for a single held position in the 0.23.0 review.
+    uint64_t exit_count = 0;
+
+    // ---- alerting bookkeeping (run_live only; not published) ----------------
+    // Kept on the row because the row IS the per-(symbol, cause) state, and an
+    // alert decision that lives anywhere else drifts from the counter it reads.
+    uint64_t exit_pages = 0;        // Critical pages emitted for this pair
+    int64_t exit_paged_ns = 0;      // when the last one went out
+    int64_t exit_repage_ns = kExitRefusalRepageNs;   // wait before the next
+    uint64_t warn_at = kRefusalRepeatAlertAt;        // count that re-arms the Warning
 };
 
 // One entry per symbol in a live session, in symbol_id order (index 0 = id 1).

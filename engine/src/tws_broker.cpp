@@ -1178,7 +1178,13 @@ void TwsBroker::push_reject(uint64_t local_id, RejectCause cause, int code,
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
     ev.flags = static_cast<uint16_t>(kEvFlagRejected |
                                      (protective ? kEvFlagProtective : 0));
-    ev.symbol_id = protective ? symbol_id : 0;
+    // The symbol rides on EVERY reject, not just a protective one. The engine
+    // needs it for the rejects it cannot find in its blotter — a bracket's
+    // take-profit leg, whose local id is minted here and never returned from
+    // submit() — and a refusal row that cannot say which symbol is barely a
+    // refusal row. The flatten-and-halt net stays gated on kEvFlagProtective,
+    // so this widens what is REPORTED, never what is acted on.
+    ev.symbol_id = symbol_id;
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);

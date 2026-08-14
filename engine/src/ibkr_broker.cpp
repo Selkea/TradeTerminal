@@ -658,7 +658,7 @@ void IbkrBroker::push_reject(uint64_t local_id, RejectCause cause, int code,
     ev.type = static_cast<uint16_t>(EvType::OrderCancel);
     ev.flags = static_cast<uint16_t>(kEvFlagRejected |
                                      (protective ? kEvFlagProtective : 0));
-    ev.symbol_id = protective ? symbol_id : 0;
+    ev.symbol_id = symbol_id;   // on every reject: see TwsBroker::push_reject
     ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
     ev.u.order.order_id = local_id;
     push_ev(ev);

@@ -2942,12 +2942,19 @@ std::string App::build_diag_json() {
     uint64_t refusals_total = 0, refusals_exit = 0;
     for (const auto& rf : s.refusals) {
         refusals_total += rf.count;
-        if (rf.exit_order) refusals_exit += rf.count;
+        // exit_count, NOT count: a row is keyed on (symbol, cause) and its
+        // exit_order flag is sticky, so summing count reported every ENTRY
+        // refusal that shared a row with one exit. And the two causes that
+        // refuse exits BY DESIGN are excluded outright (engine/reject.h):
+        // counting them made a field documented as "there is no benign value
+        // but 0" read 189 for one held position.
+        if (!reject_cause_exit_is_by_design(rf.cause)) refusals_exit += rf.exit_count;
         json r;
         r["symbol"] = rf.symbol;
         r["cause"] = reject_cause_slug(rf.cause);
         r["count"] = rf.count;
         r["exit_order"] = rf.exit_order;   // true = an exit was refused
+        r["exit_count"] = rf.exit_count;   // how many of `count` were exits
         r["code"] = rf.code;
         r["message"] = rf.message;
         r["first_ts_ms"] = rf.first_ts_ns / 1'000'000;
@@ -3085,7 +3092,11 @@ std::string App::build_metrics() {
         double total = 0, exits = 0;
         for (const auto& rf : s.refusals) {
             total += static_cast<double>(rf.count);
-            if (rf.exit_order) exits += static_cast<double>(rf.count);
+            // See the matching sum in /diag: exit_count, not count, and never a
+            // by-design exit refusal — an alerting rule on this gauge fired
+            // permanently in hold-until-profitable mode.
+            if (!reject_cause_exit_is_by_design(rf.cause))
+                exits += static_cast<double>(rf.exit_count);
         }
         g("tt_refusal_count", "orders refused this session, all causes", total);
         g("tt_refused_exits",

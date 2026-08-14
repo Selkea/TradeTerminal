@@ -63,7 +63,9 @@ TEST_CASE("classify_alert: a routine data-feed reconnect does NOT page") {
 TEST_CASE("classify_alert: a genuine half-open ORDER still pages as Warning") {
     CHECK(classify_alert("order #123 unacked for 27s — possible half-open order") ==
           AlertClass::Warning);
-    CHECK(classify_alert("live: order #5 rejected by broker") == AlertClass::Warning);
+    // The generic "rejected" rule still catches anything that is NOT one of the
+    // engine's own tagged refusal lines (an adapter complaint, a gateway line).
+    CHECK(classify_alert("tws: order 41 rejected by the gateway") == AlertClass::Warning);
     CHECK(classify_alert("tws-feed: stream lost, reconnecting") == AlertClass::Warning);
 }
 
@@ -113,6 +115,29 @@ TEST_CASE("classify_alert: the refusal tiers, and why they differ") {
     // Lowercase "refused" in ordinary prose must stay silent - the lineup and
     // the data feed both use the word.
     CHECK(classify_alert("lineup: refused SOXS, no fit") == AlertClass::None);
+}
+
+TEST_CASE("classify_alert: a refusal the BROKER caused is tiered by its tag") {
+    // THE TIER BUG THE 0.23.0 SUITE MISSED, because every case above uses a
+    // local slug. reject_cause_slug(BrokerRejected) is the literal string
+    // "broker_rejected", and IB's own text is "Order rejected - reason:...", so
+    // a broker-caused refusal line contains "rejected" twice. Tested BELOW the
+    // generic "rejected" rule, every entry IBKR refused on 2026-08-13 beeped
+    // Warning while the policy it was written under rates it Info.
+    CHECK(classify_alert("live: ORDER REFUSED [broker_rejected] KORU buy 234: Order "
+                         "rejected - reason:Exchange is closed.") == AlertClass::Info);
+    // ...and the exit stays Critical, for the same reason in reverse.
+    CHECK(classify_alert("live: EXIT ORDER REFUSED [broker_rejected] MUU sell 161: "
+                         "Order rejected - reason:Exchange is closed.") ==
+          AlertClass::Critical);
+    CHECK(classify_alert("live: ORDER REFUSED REPEATEDLY [broker_rejected] MUU buy "
+                         "161: Order rejected - reason:Exchange is closed. (x3)") ==
+          AlertClass::Warning);
+    // The engine's trace line for the SAME event, which repeats the broker's
+    // text next to the order id. It must not page a second time: one refusal,
+    // one tier, decided by the tagged line above.
+    CHECK(classify_alert("live: order #7 refused by broker [broker_rejected 201 Order "
+                         "rejected - reason:Exchange is closed.]") == AlertClass::None);
 }
 
 TEST_CASE("classify_alert: fills are Info, plain lines are None") {

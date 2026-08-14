@@ -73,9 +73,6 @@ inline AlertClass classify_alert(const std::string& l) {
     // page-the-whole-tier worthy. Must precede the plain tag below, which it
     // contains as a substring.
     if (has(kOrderRefusedRepeatTag)) return AlertClass::Warning;
-    if (has("rejected") || has("stream lost") || has("auth failed") ||
-        has("(drops!)") || has("half-open order"))
-        return AlertClass::Warning;
     // A single refused ENTRY. Info — webhook, no beep. Most refusals are the
     // system working as designed (the notional clamp finding a position already
     // at its cap; the entry gate declining to buy into a shut exchange), and a
@@ -84,7 +81,25 @@ inline AlertClass classify_alert(const std::string& l) {
     // exactly that reason. It is still on the channel, because a refusal the
     // operator never hears about is what let a strategy signal into a closed
     // exchange three times on 2026-08-13 with nothing said.
+    //
+    // MUST precede the generic "rejected" rule below, not follow it. The line
+    // embeds reject_cause_slug(), and the slug for a broker-caused refusal is
+    // "broker_rejected" — which contains "rejected". Below the generic rule,
+    // every refusal IB caused (the 201 "Exchange is closed" of 2026-08-13, all
+    // six lineup symbols) beeped Warning while the policy above called it Info,
+    // and the suite missed it because its cases all used local slugs.
     if (has(kOrderRefusedTag)) return AlertClass::Info;
+    // The engine's own trace line for a broker rejection it has ALREADY logged,
+    // one line earlier, with one of the tags above (engine.cpp's broker-event
+    // drain). It repeats the broker's own text — "Order rejected -
+    // reason:Exchange is closed." — so without this it matched the generic rule
+    // below and paged a SECOND time, at Warning, for exactly the refused
+    // entries the tagged line rates Info. The tag decides the tier; this line
+    // exists to carry the order id and the broker's numeric code into the log.
+    if (has("refused by broker")) return AlertClass::None;
+    if (has("rejected") || has("stream lost") || has("auth failed") ||
+        has("(drops!)") || has("half-open order"))
+        return AlertClass::Warning;
     if (has("live: fill"))
         return AlertClass::Info;
     return AlertClass::None;
