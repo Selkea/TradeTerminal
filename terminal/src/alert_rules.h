@@ -6,6 +6,7 @@
 #include "engine/reject.h"          // kOrderRefusedTag and friends
 #include "engine/tws_client_id.h"   // kTwsClientIdConflictTag
 #include "net/book_divergence.h"    // kBookDivergenceTag
+#include "symbol_params.h"          // kUnreachableStopTag
 
 #include <string>
 
@@ -45,6 +46,23 @@ inline AlertClass classify_alert(const std::string& l) {
     // can say and it deliberately does nothing else. See net/book_divergence.h.
     if (has(net::kBookDivergenceTag)) return AlertClass::Critical;
     if (has(net::kBookAuditBlindTag)) return AlertClass::Critical;
+    // A symbol whose only exit cannot fire inside a trading day. Critical, and
+    // in the same tier as a rejected protective stop, because it describes the
+    // same state: a position with nothing that will close it at a loss.
+    // bollinger_reversion and rsi2_pullback place NO price stop by design, so
+    // their time stop is the whole risk control — and on 2026-08-14 STKH's was
+    // fitted to 233 bars of 300 s against a 77-bar day. The position lost $506
+    // in 2 h 16 m and only the 15:57 engine backstop ever closed it. Nothing
+    // paged; the app's naked-position alert deliberately exempts these two
+    // strategies precisely because they are SUPPOSED to hold without a stop.
+    // That exemption is only sound while the time stop is reachable, which is
+    // what this line now says out loud.
+    if (has(kUnreachableStopTag)) return AlertClass::Critical;
+    // An off-lineup broker position found at reconciliation: real stock this
+    // session does not trade, cannot audit, and cannot flatten. 20 NVDA shares
+    // sat in the account from 2026-07-21 to 2026-08-13 because reconciliation
+    // discarded the row without even logging it (engine/reconcile_policy.h).
+    if (has("OFF-LINEUP BROKER POSITION")) return AlertClass::Critical;
     // An order that would have REDUCED or CLOSED a position was refused. Critical
     // on the first occurrence and with no repeat threshold, because there is no
     // benign version: the position it would have closed is still open and one

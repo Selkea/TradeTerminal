@@ -33,6 +33,14 @@ struct alignas(64) EngineEvent {
                  uint8_t _p[7]; } fill;
         struct { double qty, avg_price; } pos;    // PosSnap
         struct { double cash; } acct;             // AcctSnap
+        // ReconcileEnd: non-zero STOCK positions the broker reported for symbols
+        // this session does not trade. They are NOT adopted — PosSnap is keyed
+        // on a session symbol id and has no bucket for an unrecognised symbol —
+        // so this count is the only thing that crosses into the engine, and it
+        // exists so "broker reconciliation complete — 0 symbol(s) held" can stop
+        // being said while the account holds 20 shares of something.
+        // See engine/reconcile_policy.h.
+        struct { int32_t offlineup; } recon;   // -1 = the position stream never answered
     } u{};
 };
 static_assert(sizeof(EngineEvent) == 64, "one cache line per event");

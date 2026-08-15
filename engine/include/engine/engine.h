@@ -35,6 +35,31 @@ struct BacktestConfig {
     ExecParams exec{};
     std::map<std::string, double> params;   // strategy parameters
     bool synth_ticks = true;                // O/H/L/C intrabar ticks for limit fills
+    // THE DAY BOUNDARY THE LIVE ENGINE HAS AND THE REPLAY DID NOT. Local hour at
+    // which a bar crossing it cancels every resting order and market-closes the
+    // position, mirroring run_live's 15:57 EOD backstop (kEodBackstopH). 0 = off.
+    //
+    // Why it is a config knob and defaults OFF: a manual backtest and a replay
+    // must keep judging the data's own clock — a daily-bar series has no
+    // intraday boundary to honour, and a captured replay is meant to reproduce
+    // what happened, not to improve on it. It is turned ON for the OPTIMIZER
+    // path only (App::pump_sweep's sweep_base_), where the whole purpose is to
+    // score a fit that will be TRADED.
+    //
+    // 2026-08-14 is why it exists. Engine::run replayed six months straight
+    // through with no session concept, so the tournament scored an STKH
+    // bollinger_reversion fit with time_stop = 233 bars at +8.60% — a 19.4-hour
+    // hold on a 300 s series. Live, everything is force-flattened at 15:57, so
+    // 77 bars is the ceiling and that time stop could never fire. It was the
+    // strategy's ONLY exit for a losing position (no price stop by design), and
+    // the position lost $506 in the 2 h 16 m before the backstop liquidated it.
+    // The optimizer was fitting under physics production does not have.
+    //
+    // Clamping the parameter afterwards (tt::ui::time_stop_reachable) is a guard
+    // rail; this is the source fix. Without it the optimizer keeps proposing
+    // unreachable holds for every time-based parameter of every strategy, and
+    // each one has to be caught by hand.
+    double eod_flatten_h = 0.0;
 };
 
 struct TradeRow {
@@ -98,6 +123,21 @@ struct LiveConfig {
     // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
     // session-wide (per-symbol halting needs per-symbol portfolios).
     std::vector<RiskLimits> symbol_risk;
+    // HOLD-ONLY symbols (parallel to symbols; empty = none, nonzero = hold-only).
+    //
+    // A symbol carried in the session ONLY so an existing broker position can be
+    // adopted, audited and closed - never to open a new one. A lineup swap uses
+    // this for a symbol it is dropping while the broker still shows a position
+    // there: a symbol outside cfg.symbols can be neither adopted, audited nor
+    // flattened (2026-08-06 orphan $846; 2026-07-21 NVDA, undetected 24 days),
+    // so it has to stay - but it must not trade.
+    //
+    // It is a FIRST-CLASS FLAG rather than "leave the strategy key empty",
+    // because an empty key is not the absence of a strategy: App::acquire_strategy
+    // maps "" to kBuiltinStrategyKey ("sma_crossover.cpp"), a real promoted
+    // strategy, which then runs on its declared defaults and opens a position the
+    // moment adopt_hold releases the symbol.
+    std::vector<uint8_t> symbol_hold_only;
     // THE ENTRY GATE (0.23.0). Answers, for a wall-clock instant: may a strategy
     // OPEN or ADD to a position right now? Empty = disarmed, which is what
     // backtests and replays want (their clock is the data's, not the world's).
@@ -245,6 +285,12 @@ struct SymbolState {
     std::string symbol;
     double last_price = 0.0;
     Position position{};
+    // Commissions paid on this symbol so far. Position::realized_pnl is GROSS of
+    // them (Portfolio::apply charges the fee to cash only), so realized minus
+    // this is what the account actually kept. On 2026-08-14 the difference was
+    // $15.08 on a reported -$597.01, and the reported figure is the one used to
+    // judge whether a strategy has an edge. See Portfolio::fees().
+    double fees = 0.0;
     // The parameters this symbol's strategy is ACTUALLY running, as the engine
     // holds them. The terminal keeps its own copy in the Trade tab, which the
     // optimizer overwrites with each champion whether or not the live engine

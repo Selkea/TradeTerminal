@@ -2,6 +2,7 @@
 
 #include "engine/clock.h"
 #include "engine/price_tick.h"
+#include "engine/reconcile_policy.h"   // off-lineup positions: the 24-day NVDA blind spot
 #include "engine/tws_client_id.h"   // error 326: what it means, in words
 
 // TWS API (fetched at configure time; see third_party/CMakeLists.txt).
@@ -127,6 +128,12 @@ struct TwsBroker::Io final : DefaultEWrapper {
     std::vector<double> recon_pos_qty;    // signed total per symbol id-1
     std::vector<double> recon_pos_cost;   // sum of |qty| * avgCost
     std::vector<double> recon_pos_abs;    // sum of |qty|, the weight
+    // Non-zero stock positions IB reported for symbols this session does not
+    // trade. Counted, not adopted (engine/reconcile_policy.h): the count rides
+    // the ReconcileEnd event so the engine's "reconciliation complete" line can
+    // stop claiming 0 while the account holds something, and it is published on
+    // the broker so /diag can show it without reading logs.
+    int32_t recon_offlineup = -1;   // -1 = not measured; see reconcile_offlineup()
 
     // Executions wait (briefly) for their commissionReport so the fee rides
     // the fill event; flushed with fee 0 if the report never shows.
@@ -492,6 +499,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
         recon_active = true;
         recon_pos_done = recon_ord_done = recon_acct_done = false;
         recon_started_ms = now_ms();
+        recon_offlineup = 0;   // a reconcile is starting: 0 now MEANS zero
         recon_pos_qty.assign(b.cfg_.symbols.size(), 0.0);
         recon_pos_cost.assign(b.cfg_.symbols.size(), 0.0);
         recon_pos_abs.assign(b.cfg_.symbols.size(), 0.0);
@@ -538,9 +546,20 @@ struct TwsBroker::Io final : DefaultEWrapper {
         // without it this answer would re-log "connected" and re-run the
         // reconcile it is being sent from.
         if (client) client->reqIds(1);
+        // ONLY a reconcile that actually received the position stream may
+        // publish a count. check_reconcile_timeout() also lands here, via
+        // finish_reconcile("gave up"), with recon_pos_done false and not one
+        // position row seen — and storing 0 there would report "the broker holds
+        // nothing outside the lineup" when the truth is "the broker never
+        // answered". That is this project's signature defect (a detector that
+        // reads healthy while blind), and it is the exact failure mode the
+        // book auditor's Blind state exists to avoid.
+        const int32_t published = recon_pos_done ? recon_offlineup : -1;
+        b.recon_offlineup_.store(published, std::memory_order_release);
         EngineEvent ev{};
         ev.type = static_cast<uint16_t>(EvType::ReconcileEnd);
         ev.ts_ingest_tsc = static_cast<int64_t>(rdtsc());
+        ev.u.recon.offlineup = published;   // -1 = unmeasured, carried into the engine
         b.push_ev(ev);
         b.log(std::string("reconcile: ") + why + " (next order id " +
               std::to_string(next_tws_id) + ")");
@@ -641,7 +660,24 @@ struct TwsBroker::Io final : DefaultEWrapper {
             return;
         }
         if (!recon_active) return;
-        if (sid == 0) return;   // not a session symbol: nothing to adopt it into
+        // OFF-LINEUP ROWS ARE REPORTED BEFORE THEY ARE DISCARDED. This used to
+        // be a bare early return on an unrecognised symbol id, sitting ABOVE the
+        // log line below, so a real position in a symbol this session does not
+        // trade was dropped without a trace — see engine/reconcile_policy.h for
+        // the 24 days of NVDA that cost. Adoption is still lineup-only (PosSnap
+        // has nowhere to put an unrecognised symbol); only the silence is gone.
+        // test_reconcile_policy greps this arm for that early return, so do not
+        // write one here, in code or in a comment.
+        switch (classify_reconcile_row(sid, qty, contract.secType)) {
+        case ReconRow::Adopt:
+            break;
+        case ReconRow::OffLineupIgnore:
+            return;
+        case ReconRow::OffLineupReport:
+            ++recon_offlineup;
+            b.log(offlineup_position_line(contract.symbol, qty, avgCost));
+            return;
+        }
         // ACCUMULATE, don't emit: one row per account, summed at positionEnd.
         // See recon_pos_qty.
         if (sid <= recon_pos_qty.size()) {

@@ -24,6 +24,11 @@ void Portfolio::apply(const Fill& f) {
 
     cash_ -= d * f.price;   // buy consumes cash, sell frees it
     cash_ -= f.fee;
+    // Booked per symbol as well as against cash, so realized_net() exists at
+    // all. Charged on EVERY fill, opening or closing: the commission on the
+    // entry is as much a cost of the round trip as the one on the exit, and
+    // attributing only the exit's would understate a completed trade by half.
+    s.fees += f.fee;
 
     const bool same_direction = s.qty == 0.0 || (s.qty > 0) == (d > 0);
     if (same_direction) {
@@ -64,6 +69,22 @@ double Portfolio::equity() const {
     double eq = cash_;
     for (const Slot& s : slots_) eq += s.qty * s.last_price;
     return eq;
+}
+
+double Portfolio::fees(uint32_t symbol_id) const {
+    const Slot* s = find(symbol_id);
+    return s ? s->fees : 0.0;
+}
+
+double Portfolio::fees() const {
+    double f = 0.0;
+    for (const Slot& s : slots_) f += s.fees;
+    return f;
+}
+
+double Portfolio::realized_net(uint32_t symbol_id) const {
+    const Slot* s = find(symbol_id);
+    return s ? s->realized - s->fees : 0.0;
 }
 
 Position Portfolio::position(uint32_t symbol_id) const {

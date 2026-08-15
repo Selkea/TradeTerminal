@@ -36,6 +36,11 @@ public:
         RiskLimits risk{};
         // Autopilot: re-optimize while trading. mode 0 off, 1 params-only,
         // 2 full (strategy can be swapped). trigger 0 timer, 1 drawdown, 2 both.
+        // Carried ONLY to hold/adopt/close an existing broker position, never
+        // to open one (LiveConfig::symbol_hold_only). Set by a lineup swap on a
+        // symbol it is dropping while the broker still shows a position there.
+        // A flag, not an empty strat_key: "" resolves to sma_crossover.cpp.
+        bool hold_only = false;
         int ap_mode = 0;
         int ap_trigger = 0;
         double ap_interval_min = 30;
@@ -152,6 +157,24 @@ public:
     bool has_own_params(const std::string& symbol,
                         const ParamSpecsFn& strat_params) const;
     int remove_symbols(const std::vector<std::string>& symbols);
+
+    // Everything tt::ui::time_stop_reachable needs about one tab, resolved the
+    // same way build_start_opts resolves it — the tab's OWN value for every
+    // declared name, the strategy default for the rest. Reading r.params
+    // directly would miss a time_stop the tab inherits, which is the case that
+    // matters most: an inherited one was never fitted to this symbol at all.
+    //
+    // Its own accessor rather than a build_start_opts() call, because that one
+    // needs the account file, both vendor keys (two DPAPI decrypts each) and the
+    // data-session state, none of which this question depends on.
+    struct TabParams {
+        bool found = false;
+        int bar_seconds = 0;
+        bool hold_dont_halt = false;   // RiskLimits::disable_auto_halt
+        std::map<std::string, double> params;
+    };
+    TabParams tab_params(const std::string& symbol,
+                         const ParamSpecsFn& strat_params) const;
 
     // Suppress the scheduled auto-start for the rest of today. The daily lineup
     // calls this when it refuses to start a session: the auto-start below is

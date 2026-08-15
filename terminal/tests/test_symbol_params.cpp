@@ -360,3 +360,119 @@ TEST_CASE("config: a trade_symbols entry with no params key at all loads") {
     CHECK(back.trade_symbols[0].symbol == "KORU");
     CHECK(back.trade_symbols[0].params.empty());
 }
+
+// ---------------------------------------------------------------------------
+// A TIME STOP THAT CANNOT FIRE INSIDE A TRADING DAY.
+//
+// 2026-08-14, -$506.26 on STKH: 85% of the day's loss from one trade whose only
+// risk control was arithmetically incapable of running. bollinger_reversion
+// places NO price stop by design and its z-recovery exit is gated on the price
+// being back above the entry, so on a LOSING trade the time stop is the only
+// exit that exists. That morning's tournament fitted it to 233 bars of 300 s —
+// 19.4 hours, about three trading days — against a session the engine force-
+// flattens at 15:57. The position filled at 13:41, held 27 bars, fell 10.1%,
+// and was liquidated by the backstop.
+//
+// Two symbols of five carried an unreachable stop that day (STKH 233, SNDQ
+// 375). It is a property of the fit, not of STKH.
+
+TEST_CASE("session_bars: the day, in bars, at the size actually traded") {
+    // 09:30 -> 15:57 is 6 h 27 m = 23220 s. The 15:57 flatten, NOT the 16:00
+    // close: a position that cannot be closed is not held, and 15:57 is the last
+    // moment anything closes one.
+    CHECK(session_bars(300) == 77);      // 5-minute bars, the production size
+    CHECK(session_bars(60) == 387);
+    CHECK(session_bars(3600) == 6);
+    // Never "bars left from now". A 09:35 lineup build and a 14:00 rebuild must
+    // reach the same verdict about the same numbers, or the gate would depend on
+    // when someone happened to press the button.
+    CHECK(session_bars(300) == session_bars(300));
+    CHECK(session_bars(0) == 0);         // unknown bar size: nothing to say
+    CHECK(session_bars(-5) == 0);
+}
+
+TEST_CASE("time_stop_reachable: the exact 2026-08-14 numbers") {
+    CHECK_FALSE(time_stop_reachable({{"time_stop", 233}}, 300));   // STKH, live
+    CHECK_FALSE(time_stop_reachable({{"time_stop", 375}}, 300));   // SNDQ, never entered
+    CHECK(time_stop_reachable({{"time_stop", 46}}, 300));          // SNDU, fine
+    // The boundary, both sides. 77 bars is exactly one session and IS reachable;
+    // 78 is not.
+    CHECK(time_stop_reachable({{"time_stop", 77}}, 300));
+    CHECK_FALSE(time_stop_reachable({{"time_stop", 78}}, 300));
+    // 233 bars is a perfectly ordinary swing hold on DAILY bars. The bound is a
+    // fact about the intraday session, so it must not follow the number around.
+    CHECK(time_stop_reachable({{"time_stop", 233}}, 86400));
+    // Strategies with a real price stop declare no time_stop at all; a 0 is
+    // repaired by the strategy itself (bollinger_reversion restores 12).
+    CHECK(time_stop_reachable({{"length", 31}, {"entry_z", 1.16}}, 300));
+    CHECK(time_stop_reachable({{"time_stop", 0}}, 300));
+    // "hold - don't halt" rides positions past the day on purpose. Asking the
+    // question there would refuse a configuration that is working as intended.
+    CHECK(time_stop_reachable({{"time_stop", 233}}, 300, /*hold_dont_halt=*/true));
+    // Unknown bar size: not ours to judge rather than refuse-by-default.
+    CHECK(time_stop_reachable({{"time_stop", 233}}, 0));
+}
+
+TEST_CASE("admission: an unreachable time stop keeps a symbol out of the lineup") {
+    SymbolOutcome stkh;                     // exactly the 2026-08-14 state:
+    stkh.tournament_ran = true;             // a tournament ran,
+    stkh.fitted_this_build = true;          // it crowned a champion,
+    stkh.has_own_params = true;             // the tab carries that champion,
+    stkh.time_stop_reachable = false;       // and the champion cannot exit a loser.
+    CHECK(admit_lineup_symbol(stkh) == LineupAdmit::ExcludeUnreachableStop);
+
+    // A SEPARATE verdict from Exclude, and that distinction is the point: these
+    // two say opposite things about the fit ("nothing was fitted to it" versus
+    // "something was, and it is unrealizable") and need different operator
+    // lines. Folding them together would send someone hunting a tournament
+    // failure that did not happen.
+    SymbolOutcome nofit;
+    nofit.tournament_ran = true;
+    CHECK(admit_lineup_symbol(nofit) == LineupAdmit::Exclude);
+
+    // It outranks the hand-added bypass. "Not ours to judge" is the right answer
+    // to "did a tournament validate this symbol"; it is not the right answer to
+    // "can anything here close the position it is about to open".
+    SymbolOutcome manual;
+    manual.tournament_ran = false;
+    CHECK(admit_lineup_symbol(manual) == LineupAdmit::Admit);
+    manual.time_stop_reachable = false;
+    CHECK(admit_lineup_symbol(manual) == LineupAdmit::ExcludeUnreachableStop);
+
+    // ...but NOT over an open position. Dropping an exposed symbol either
+    // market-closes it or orphans it outside cfg.symbols, where reconciliation
+    // cannot adopt it and the 15:57 backstop cannot flatten it. Refusing to
+    // trade a symbol must never create the orphan.
+    SymbolOutcome held = stkh;
+    held.holds_position = true;
+    CHECK(admit_lineup_symbol(held) == LineupAdmit::Admit);
+
+    // Default true, so a caller that has not been taught this question yet
+    // cannot silently exclude the entire lineup.
+    CHECK(SymbolOutcome{}.time_stop_reachable);
+}
+
+TEST_CASE("plan_lineup: unreachable stops are excluded AND named separately") {
+    SymbolOutcome ok;
+    ok.tournament_ran = ok.fitted_this_build = ok.has_own_params = true;
+    SymbolOutcome bad = ok;
+    bad.time_stop_reachable = false;
+    SymbolOutcome nofit;
+    nofit.tournament_ran = true;
+
+    const LineupPlan p = plan_lineup({{"MUU", ok}, {"STKH", bad}, {"SNXX", nofit}});
+    CHECK(p.admitted == std::vector<std::string>{"MUU"});
+    // In `excluded` as well, because that is the list the tabs are removed by —
+    // a symbol reported only in the new bucket would be excluded in the log and
+    // still trading in the panel.
+    CHECK(p.excluded == std::vector<std::string>{"STKH", "SNXX"});
+    CHECK(p.unreachable_stop == std::vector<std::string>{"STKH"});
+    CHECK(p.start);
+
+    // Every pick unreachable = start nothing, through the SAME path a lineup of
+    // borrowed parameters takes. A session where no symbol can close a losing
+    // position is worse than no session.
+    const LineupPlan none = plan_lineup({{"STKH", bad}, {"SNDQ", bad}});
+    CHECK_FALSE(none.start);
+    CHECK(none.unreachable_stop.size() == 2);
+}

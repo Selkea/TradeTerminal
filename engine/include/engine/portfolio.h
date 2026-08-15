@@ -37,6 +37,25 @@ public:
     double equity() const;
     Position position(uint32_t symbol_id) const;
 
+    // COMMISSIONS PAID on this symbol (or across the book). Position::realized
+    // is gross of them — apply() books (price - avg) * qty and charges the fee
+    // only to cash_ — so every realized-P&L surface in the product understates
+    // a loss by exactly this much.
+    //
+    // 2026-08-14 closed -$597.01 realized against -$612.09 of actual cash: 13
+    // fills, $15.08 of commission, 2.5% of the number used to judge whether the
+    // strategies have an edge. It scales with trade count, and a scalper's
+    // does not stay at 2.5%.
+    //
+    // `realized` is deliberately LEFT gross rather than quietly redefined:
+    // journal rows, saved sessions and every historical comparison were computed
+    // that way, and silently shifting the meaning of a number under them is how
+    // a P&L series stops being comparable to itself. Both are published; net is
+    // the one to judge on.
+    double fees(uint32_t symbol_id) const;
+    double fees() const;
+    double realized_net(uint32_t symbol_id) const;
+
     int wins() const { return wins_; }
     int losses() const { return losses_; }
 
@@ -45,7 +64,8 @@ private:
         uint32_t symbol_id = 0;
         double qty = 0.0;        // signed
         double avg_price = 0.0;
-        double realized = 0.0;
+        double realized = 0.0;   // GROSS of commissions (see fees())
+        double fees = 0.0;       // commissions charged to this symbol
         double last_price = 0.0;
     };
     Slot& slot(uint32_t symbol_id);

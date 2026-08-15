@@ -95,7 +95,7 @@ static std::vector<WatchedSymbol> every30(const std::vector<std::string>& syms) 
 static std::vector<StaleBars> stale_at(const HistoryFreshness& f,
                                        const std::vector<WatchedSymbol>& syms,
                                        int64_t now, int64_t window) {
-    return f.stale(syms, "5m", now, window, window);
+    return f.stale(syms, "5m", now, now, window, window);
 }
 
 TEST_CASE("stale: nothing is reported while every symbol refreshes") {
@@ -153,11 +153,11 @@ TEST_CASE("stale: a slow symbol does not raise the bar for a fast one") {
     const int64_t days_live = 4 * 1440 * kMin;
     const int64_t full_day = 389 * kMin;    // 09:30 -> 15:59
     const int64_t half_day = 209 * kMin;    // 09:30 -> 12:59, the three 1pm closes
-    const auto both = f.stale(syms, "5m", 800 * kMin, days_live, full_day);
+    const auto both = f.stale(syms, "5m", 800 * kMin, 800 * kMin, days_live, full_day);
     REQUIRE(both.size() == 2);
     CHECK(both[0].symbol == "SOXS");
     CHECK(both[1].symbol == "SNDQ");
-    CHECK(f.stale(syms, "5m", 800 * kMin, days_live, half_day).size() == 2);
+    CHECK(f.stale(syms, "5m", 800 * kMin, 800 * kMin, days_live, half_day).size() == 2);
 }
 
 TEST_CASE("stale: a symbol that has NEVER been answered is aged from the session") {
@@ -175,7 +175,7 @@ TEST_CASE("stale: a symbol that has NEVER been answered is aged from the session
     // overnight is entitled to page for a symbol it has never once been served,
     // however short today's open has been so far. 0.21.0 aged it from the armed
     // window instead, which is why a slow-cadence symbol could never get here.
-    const auto never = f.stale(syms, "5m", 500 * kMin, 3 * 1440 * kMin, 46 * kMin);
+    const auto never = f.stale(syms, "5m", 500 * kMin, 500 * kMin, 3 * 1440 * kMin, 46 * kMin);
     REQUIRE(never.size() == 1);
     CHECK(never[0].age_ms == 3 * 1440 * kMin);
 }
@@ -187,7 +187,7 @@ TEST_CASE("stale: a symbol outside the watched set is never reported") {
     // every session. pump_history_watchdog keeps both out of this list.
     HistoryFreshness f;
     f.record("SOXS", "5m", 0);
-    CHECK(f.stale({}, "5m", 500 * kMin, 500 * kMin, 500 * kMin).empty());
+    CHECK(f.stale({}, "5m", 500 * kMin, 500 * kMin, 500 * kMin, 500 * kMin).empty());
 }
 
 TEST_CASE("stale: a fresh delivery clears the whole condition") {
@@ -246,12 +246,12 @@ TEST_CASE("armed: outside market hours nothing is overdue, however old") {
     const int64_t now = 120 * kMin;
     const int64_t session = 400 * kMin;
     // Armed (mid-session), this is exactly what the operator was paged about.
-    CHECK(f.stale(syms, "5m", now, session, 400 * kMin).size() == 4);
+    CHECK(f.stale(syms, "5m", now, now, session, 400 * kMin).size() == 4);
     // Closed: the same evidence, judged against a shut market.
-    CHECK(f.stale(syms, "5m", now, session, 0).empty());
+    CHECK(f.stale(syms, "5m", now, now, session, 0).empty());
     // ...and it stays empty as the night wears on, which is the whole point:
     // the 30-minute re-alert cannot find anything to re-page.
-    CHECK(f.stale(syms, "5m", 900 * kMin, 900 * kMin, 0).empty());
+    CHECK(f.stale(syms, "5m", 900 * kMin, 900 * kMin, 900 * kMin, 0).empty());
 }
 
 TEST_CASE("armed: the open boundary DEFERS an overnight-stale symbol, then says it") {
@@ -284,8 +284,7 @@ TEST_CASE("armed: the open boundary DEFERS an overnight-stale symbol, then says 
         return hist_armed_ms(session_at(hh, mm), tt::rth_open_elapsed_ms(tm));
     };
     auto at = [&](int hh, int mm) {
-        return f.stale(syms, "5m", today(hh, mm), session_at(hh, mm),
-                       armed_at(hh, mm));
+        return f.stale(syms, "5m", today(hh, mm), today(hh, mm), session_at(hh, mm), armed_at(hh, mm));
     };
     CHECK(at(9, 30).empty());    // the instant the gate opens: 16.5 h "stale"
     CHECK(at(10, 14).empty());   // 44 minutes of open market: still settling in
@@ -319,14 +318,14 @@ TEST_CASE("armed: the gate costs a fixed 45 minutes, once, at the open") {
     // market had been open 78 minutes, so the settle-in was long since done.
     CHECK(stale_at(f, syms, 107 * kMin, 107 * kMin).empty());
     CHECK(stale_at(f, syms, 108 * kMin, 108 * kMin).size() == 1);
-    CHECK(f.stale(syms, "5m", 107 * kMin, 82 * kMin, win(107 * kMin)).empty());
-    CHECK(f.stale(syms, "5m", 108 * kMin, 83 * kMin, win(108 * kMin)).size() == 1);
+    CHECK(f.stale(syms, "5m", 107 * kMin, 107 * kMin, 82 * kMin, win(107 * kMin)).empty());
+    CHECK(f.stale(syms, "5m", 108 * kMin, 108 * kMin, 83 * kMin, win(108 * kMin)).size() == 1);
     // A stall that starts after the open pays nothing at all: last delivery
     // 11:30 (t = 150), grace 90, so it pages at 13:00 (t = 240) either way.
     HistoryFreshness g;
     g.record("SOXS", "5m", 150 * kMin);
-    CHECK(g.stale(syms, "5m", 239 * kMin, 214 * kMin, win(239 * kMin)).empty());
-    CHECK(g.stale(syms, "5m", 241 * kMin, 216 * kMin, win(241 * kMin)).size() == 1);
+    CHECK(g.stale(syms, "5m", 239 * kMin, 239 * kMin, 214 * kMin, win(239 * kMin)).empty());
+    CHECK(g.stale(syms, "5m", 241 * kMin, 241 * kMin, 216 * kMin, win(241 * kMin)).size() == 1);
     CHECK(stale_at(g, syms, 241 * kMin, 241 * kMin).size() == 1);   // ungated: same
 
     // Where it DOES bite: a session live since 07:00 that has never been served
@@ -339,7 +338,7 @@ TEST_CASE("armed: the gate costs a fixed 45 minutes, once, at the open") {
         const int64_t t = hh * 60 + mm;                        // local minutes
         const int64_t session = (t - 7 * 60) * kMin;           // live since 07:00
         const int64_t open = t > 570 ? (t - 570) * kMin : 0;   // 09:30
-        return h.stale(syms, "5m", 0, session, hist_armed_ms(session, open));
+        return h.stale(syms, "5m", 0, 0, session, hist_armed_ms(session, open));
     };
     CHECK(stale_at(h, syms, 0, 91 * kMin).size() == 1);   // ungated: 08:31
     CHECK(at(8, 31).empty());
@@ -364,10 +363,10 @@ TEST_CASE("armed: a half-day shuts the gate at 13:00") {
     const int64_t now = 200 * kMin;   // MUU is 200 minutes stale either way
     const int64_t session = 600 * kMin;
     // 2026-11-27, the Friday after Thanksgiving: still open at 12:30...
-    CHECK(f.stale(syms, "5m", now, session, armed(2026, 11, 27, 12, 30)).size() == 1);
-    CHECK(f.stale(syms, "5m", now, session, armed(2026, 11, 27, 14, 30)).empty());
+    CHECK(f.stale(syms, "5m", now, now, session, armed(2026, 11, 27, 12, 30)).size() == 1);
+    CHECK(f.stale(syms, "5m", now, now, session, armed(2026, 11, 27, 14, 30)).empty());
     // ...while the ordinary Friday a week later runs to 16:00.
-    CHECK(f.stale(syms, "5m", now, session, armed(2026, 12, 4, 14, 30)).size() == 1);
+    CHECK(f.stale(syms, "5m", now, now, session, armed(2026, 12, 4, 14, 30)).size() == 1);
 }
 
 // ---- the page text ---------------------------------------------------------
@@ -469,4 +468,151 @@ TEST_CASE("alert: a dropped socket says the reconnect path already owns it") {
     CHECK(has(msg, "data socket disconnected"));
     CHECK(has(msg, "reconnect path is already on it"));
     CHECK_FALSE(has(msg, "gateway"));   // nothing for the operator to restart
+}
+
+// ---------------------------------------------------------------------------
+// A SERIES THAT STOPS ADVANCING WHILE ITS DELIVERIES ARRIVE ON TIME.
+//
+// 2026-08-14. STKH's 5-minute series was pinned at exactly x10010 bars from
+// 10:44:49 through 15:44:49 — five hours — while MUU's grew the expected six
+// bars per half hour (x9681 -> x9747). After the close STKH's count began to
+// SHRINK (x10007, x10001, x9997) as the 6-month window slid off the back with
+// nothing being appended at the front. Every fetch succeeded, on schedule, and
+// returned the same newest bar; the watchdog reported "still refreshing MUU,
+// SNDQ, STKH, SNDU" throughout, and /diag published the DELIVERY age under the
+// field name last_bar_age_ms, which is a claim about a bar.
+//
+// This class measured freshness as "time since a batch ARRIVED", so a source
+// that keeps answering with frozen data reads perfectly fresh. The 2026-08-07
+// outage the file was written for is the opposite failure — requests that stop
+// being answered — and the delivery age catches that one. Both are real, so both
+// are measured, and the watchdog judges on the one that is about the DATA.
+
+TEST_CASE("hist: a frozen series is stale even though every fetch succeeds") {
+    HistoryFreshness f;
+    const std::vector<WatchedSymbol> syms{{"STKH", 30}, {"MUU", 30}};
+    // 45 minutes of open market, so the arming settle-in is cleared and the
+    // watchdog is entitled to judge.
+    const int64_t armed = 200 * kMin;
+    const int64_t session = 200 * kMin;
+
+    // Both symbols delivered punctually every 5 minutes for two hours. MUU's
+    // newest bar advances with the clock; STKH's does not move at all — the
+    // exact shape of x10010 sitting still while the fetches keep succeeding.
+    const int64_t wall0 = 1'700'000'000'000LL;
+    const int64_t stkh_frozen_bar = wall0;
+    for (int i = 0; i <= 24; ++i) {
+        const int64_t delivered = i * 5 * kMin;
+        f.record("STKH", "5m", delivered, stkh_frozen_bar);
+        f.record("MUU", "5m", delivered, wall0 + delivered);
+    }
+    const int64_t now_steady = 24 * 5 * kMin;      // last delivery was just now
+    const int64_t now_wall = wall0 + now_steady;
+
+    // The delivery age says both are perfect. That is the measurement that ran
+    // for five hours and said nothing.
+    CHECK(f.age_ms("STKH", "5m", now_steady) == 0);
+    CHECK(f.age_ms("MUU", "5m", now_steady) == 0);
+    CHECK(f.refreshing(syms, "5m", now_steady).size() == 2);
+
+    // The BAR age separates them.
+    CHECK(f.bar_age_ms("MUU", "5m", now_wall) == 0);
+    CHECK(f.bar_age_ms("STKH", "5m", now_wall) == 120 * kMin);
+
+    const auto stale = f.stale(syms, "5m", now_steady, now_wall, session, armed);
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].symbol == "STKH");
+    // It reports the BAR's age, not the delivery's, and says which it is —
+    // "300m" and "300m frozen" are different faults with different fixes, and
+    // the operator cannot tell them apart from a bare number.
+    CHECK(stale[0].age_ms == 120 * kMin);
+    CHECK(stale[0].frozen);
+    CHECK(stale[0].ever);
+}
+
+TEST_CASE("hist: a healthy series is never called frozen") {
+    HistoryFreshness f;
+    const std::vector<WatchedSymbol> syms{{"MUU", 30}};
+    const int64_t wall0 = 1'700'000'000'000LL;
+    for (int i = 0; i <= 24; ++i)
+        f.record("MUU", "5m", i * 5 * kMin, wall0 + i * 5 * kMin);
+    const int64_t now_steady = 24 * 5 * kMin;
+    CHECK(f.stale(syms, "5m", now_steady, wall0 + now_steady, 200 * kMin, 200 * kMin)
+              .empty());
+    // One missed 5-minute bar is not a stall. The threshold is three bar
+    // intervals or the symbol's cadence grace, whichever is LARGER, so a normal
+    // gap cannot page.
+    CHECK(f.stale(syms, "5m", now_steady, wall0 + now_steady + 10 * kMin, 200 * kMin,
+                  200 * kMin)
+              .empty());
+}
+
+TEST_CASE("hist: the bar-age threshold scales with the interval") {
+    // On a "1d" series the newest bar is legitimately hours or a whole weekend
+    // old. Judging it against the 45-minute floor that is right for 5-minute
+    // bars would page every single morning — the "wrong every day" failure this
+    // file already documents for the gateway-restart advice.
+    HistoryFreshness f;
+    const std::vector<WatchedSymbol> syms{{"MUU", 30}};
+    const int64_t wall0 = 1'700'000'000'000LL;
+    const int64_t day = 24 * 60 * kMin;
+    f.record("MUU", "1d", 0, wall0);
+    // A day-old daily bar is normal.
+    CHECK(f.stale(syms, "1d", 0, wall0 + day, 200 * kMin, 200 * kMin).empty());
+    // Four days is not.
+    const auto stale = f.stale(syms, "1d", 0, wall0 + 4 * day, 200 * kMin, 200 * kMin);
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].frozen);
+    CHECK(hist_interval_ms("5m") == 5 * kMin);
+    CHECK(hist_interval_ms("1h") == 60 * kMin);
+    CHECK(hist_interval_ms("1d") == day);
+    // An interval nobody recognises is not judged on data age at all. Inventing
+    // a bound would be worse than the blind spot.
+    CHECK(hist_interval_ms("15m") == 0);
+    f.record("MUU", "15m", 0, wall0);
+    const std::vector<WatchedSymbol> odd{{"MUU", 30}};
+    CHECK(f.stale(odd, "15m", 0, wall0 + 100 * day, 200 * kMin, 200 * kMin).empty());
+}
+
+TEST_CASE("hist: a caller with no bar timestamp cannot certify the data as fresh") {
+    // record()'s newest_bar_ms defaults to 0 for an empty batch and for any call
+    // site that has not been taught the question. That must leave the bar age
+    // UNKNOWN rather than reset it — a delivery carrying no bar is not evidence
+    // that the series advanced.
+    HistoryFreshness f;
+    const int64_t wall0 = 1'700'000'000'000LL;
+    f.record("STKH", "5m", 0);
+    CHECK(f.bar_age_ms("STKH", "5m", wall0) == -1);   // never answered
+    CHECK(f.age_ms("STKH", "5m", 0) == 0);            // ...but the delivery landed
+    // ...and once a real bar has arrived, a later bar-less delivery does not
+    // silently overwrite it with "now".
+    f.record("STKH", "5m", 0, wall0);
+    f.record("STKH", "5m", 60 * kMin);
+    CHECK(f.bar_age_ms("STKH", "5m", wall0 + 60 * kMin) == 60 * kMin);
+    // Never negative: a source that hands over the in-progress bar of the
+    // current interval legitimately stamps it ahead of now, and a negative age
+    // slips under every `>` threshold a rule can write.
+    CHECK(f.bar_age_ms("STKH", "5m", wall0 - 5 * kMin) == 0);
+    // Freshness belongs to a SESSION, so clear() must drop both maps or a dead
+    // session's bar would stand as evidence about the next one.
+    f.clear();
+    CHECK(f.bar_age_ms("STKH", "5m", wall0) == -1);
+}
+
+TEST_CASE("hist: the page names a frozen series as such") {
+    // The old wording sends the operator to look for failing requests ("check
+    // the tws-data 'retrying as req' lines"). When the fetches are SUCCEEDING on
+    // time and the series is not advancing there are no such lines to find, and
+    // a reader who goes looking concludes the page was spurious.
+    const std::vector<StaleBars> frozen{{"STKH", 300 * kMin, true, true}};
+    const std::string msg =
+        hist_stall_alert("STKH 300m frozen", frozen, {"MUU", "STKH"}, true);
+    CHECK(msg.find("STOPPED ADVANCING") != std::string::npos);
+    CHECK(msg.find("frozen SERIES") != std::string::npos);
+    CHECK(msg.find("do NOT restart the gateway") != std::string::npos);
+    // The ordinary "nothing is arriving" stall keeps its own, different text.
+    const std::vector<StaleBars> dead{{"SOXS", 300 * kMin, true, false}};
+    const std::string old = hist_stall_alert("SOXS 300m", dead, {"MUU"}, true);
+    CHECK(old.find("STOPPED ADVANCING") == std::string::npos);
+    CHECK(old.find("have stopped refreshing") != std::string::npos);
 }

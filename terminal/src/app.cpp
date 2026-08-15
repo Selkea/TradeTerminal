@@ -522,8 +522,16 @@ App::App(std::string gateway_url)
         // reaches here carries no candles at all. Counting that as a refresh
         // would reset the metric on the very failure it exists to catch, while
         // the tournament scores nothing and seed_bars re-seeds nothing.
+        // ...and the NEWEST BAR's own timestamp alongside the delivery time. A
+        // delivery age answers "is the request path alive"; only the bar's stamp
+        // answers "is the data advancing", and on 2026-08-14 STKH's 5m series
+        // sat frozen at exactly x10010 bars for five hours while its deliveries
+        // arrived punctually — the watchdog reported it healthy the whole time
+        // and /diag published the delivery age under the name last_bar_age_ms.
+        // Candle::ts is epoch SECONDS; the bar map is wall-clock ms.
         if (!b.cached && !b.candles.empty())
-            hist_fresh_.record(b.symbol, b.interval, steady_ms());
+            hist_fresh_.record(b.symbol, b.interval, steady_ms(),
+                               b.candles.back().ts * 1000);
         start_pending_backtest(b);
         stash_pending_sweep(b);
         collect_lineup_bars(b);   // before the move: needs b.candles
@@ -1065,10 +1073,34 @@ void App::pump_sweep() {
                 opt_.key = sweep_setup_.key;
                 // Sizing and session-shape knobs keep their manual values; only
                 // signal params are swept (see sweep_param_is_fixed).
+                //
+                // ...and time_stop is additionally CAPPED to what this bar size
+                // can reach inside a trading day (sweep_param_max). A ParamDesc
+                // is bar-size agnostic — bollinger_reversion declares max 500,
+                // which is a legitimate swing hold on daily bars — so the bound
+                // can only be applied here, where the interval is known. On
+                // 2026-08-14 the uncapped range let the tournament crown a
+                // 233-bar time stop on a 300 s series and score it +8.60%, on a
+                // hold production flattens out of existence every afternoon.
+                const int sweep_bar_sec = bar_seconds_of_interval(rq.interval);
                 for (const auto& s : strat_mgr_.param_specs(opt_.key))
-                    if (s.max > s.min && !sweep_param_is_fixed(s.name))
-                        opt_.params.push_back({s.name, s.min, s.max});
+                    if (s.max > s.min && !sweep_param_is_fixed(s.name)) {
+                        const double hi =
+                            sweep_param_max(s.name, s.max, sweep_bar_sec);
+                        if (hi <= s.min) continue;   // nothing left to sweep
+                        opt_.params.push_back({s.name, s.min, hi});
+                    }
                 opt_.best = sweep_base_.params;
+                // THE SOURCE FIX behind that cap: give the replay the day
+                // boundary the live engine has. Engine::run otherwise walks six
+                // months of bars with no session concept at all, so it scores
+                // holds no live position can ever achieve — and it will keep
+                // doing that for every time-based parameter of every strategy,
+                // not just time_stop. Optimizer path only: a manual backtest and
+                // a replay must keep judging the data's own clock.
+                // See BacktestConfig::eod_flatten_h.
+                if (sweep_bar_sec > 0 && sweep_bar_sec < 24 * 3600)
+                    sweep_base_.eod_flatten_h = kEodBackstopH;
 
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;
@@ -1689,6 +1721,74 @@ void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
         return std::find(keep.begin(), keep.end(), s) != keep.end();
     };
     const LiveSnapshot snap = engine_.live_snapshot();
+    // REFUSE TO DROP A SYMBOL THE BROKER SAYS WE ARE STILL IN.
+    //
+    // The drop test below used to be `snap.symbols[i].position.qty != 0.0`
+    // alone — the APP's own book, which is exactly the number this whole class
+    // of bug corrupts. On 2026-08-13 that number was a phantom for four hours.
+    // On 2026-08-06 a dropped symbol's market-close never filled and the $846
+    // position it left behind was invisible to every later session.
+    //
+    // The moment a symbol leaves cfg_.symbols it stops being adoptable at
+    // reconciliation, stops being reachable by flatten(), cancel_all(), the kill
+    // switch and the 15:57 EOD backstop, and stops being auditable at all — see
+    // engine/reconcile_policy.h, where 20 NVDA shares lived undetected for 24
+    // days for precisely this reason. So a symbol the broker's last audit shows
+    // non-flat is KEPT in the next lineup instead of being dropped and closed:
+    // on the restart, reconciliation adopts the position and adopt_hold pauses
+    // its strategy until it goes flat, so nothing trades it while it is held.
+    //
+    // Keeping, not force-closing on the broker's number: submitting a sell for
+    // shares the engine's portfolio does not know about would take the app's
+    // book to -20 while the broker went to 0 — inventing a second, opposite
+    // divergence out of the first. This detector is compare-only for that
+    // reason (net/book_divergence.h); the app must not trade on a number it
+    // cannot reconcile.
+    std::vector<std::string> forced_keep;
+    std::vector<TradePanel::SymbolOpt> forced_keep_opts;
+    for (const SymbolState& ss : snap.symbols) {
+        if (stays(upper(ss.symbol))) continue;
+        bool unknown = false;
+        if (!book_audit_.broker_holds(ss.symbol, unknown)) continue;
+        forced_keep.push_back(ss.symbol);
+        keep.push_back(upper(ss.symbol));
+    }
+    if (!forced_keep.empty()) {
+        // Carried into the RESTART as well, or "keeping it" would last exactly
+        // until the new session's cfg.symbols was built without it. Bar size,
+        // account and risk are copied off the new lineup's first symbol; the
+        // strategy is left empty because this tab exists to hold a position to
+        // flat, not to trade.
+        std::string list;
+        for (const std::string& s : forced_keep) {
+            TradePanel::SymbolOpt so;
+            if (!next.symbols.empty()) {
+                so = next.symbols.front();
+                so.params.clear();
+                so.inherited_params.clear();
+                so.param_source = ParamSource::None;
+                so.strat_key.clear();
+                // The flag is what actually stops it trading. Clearing the key
+                // does NOT leave the tab strategy-less: acquire_strategy maps ""
+                // to kBuiltinStrategyKey ("sma_crossover.cpp"), a real promoted
+                // strategy, which would then run on its declared defaults and
+                // open a position the instant adopt_hold released the symbol -
+                // on a symbol the lineup had just decided not to trade.
+                so.hold_only = true;
+                so.ap_mode = 0;
+            }
+            so.symbol = s;
+            forced_keep_opts.push_back(std::move(so));
+            list += (list.empty() ? "" : ", ") + s;
+        }
+        route_operator(
+            "lineup swap: KEEPING " + list +
+            " in the session - the broker's book still shows a position there, and a "
+            "symbol outside cfg.symbols can be neither adopted, audited, nor "
+            "flattened (2026-08-06 orphan, $846; 2026-07-21 NVDA, 24 days). It is "
+            "carried HOLD-ONLY: reconciliation adopts it and its exits still "
+            "work, but it may not open or add.");
+    }
     std::vector<uint32_t> dropped_ids;   // symbols leaving the lineup (any state)
     swap_flatten_ids_.clear();
     for (size_t i = 0; i < snap.symbols.size(); ++i) {
@@ -1716,6 +1816,9 @@ void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
         engine_.submit_manual(id, q < 0.0, std::fabs(q));
     }
     swap_opts_ = next;
+    // ...plus anything the broker says we may not walk away from (above).
+    for (TradePanel::SymbolOpt& so : forced_keep_opts)
+        swap_opts_.symbols.push_back(std::move(so));
     swap_stage_ = SwapStage::Flatten;
     swap_deadline_s_ = mono_s() + 30.0;   // give the closes 30s to fill
     route("lineup swap: closing " + std::to_string(swap_flatten_ids_.size()) +
@@ -2102,6 +2205,16 @@ void App::pump_daily_lineup() {
             o.fitted_this_build = lineup_.fitted.count(sym) != 0;
             o.has_own_params = trade_.has_own_params(sym, param_specs_fn());
             o.holds_position = symbol_has_exposure(lsnap, sym);
+            // Can the set this tab would trade close a losing position before
+            // the 15:57 flatten? 2026-08-14: STKH went live on a bollinger_
+            // reversion fit with time_stop = 233 bars of 300 s — three trading
+            // days — and BollRev places no price stop, so for 2 h 16 m nothing
+            // in the system could exit that position at a loss. -$506, 85% of
+            // the day. See tt::ui::time_stop_reachable.
+            const TradePanel::TabParams tp = trade_.tab_params(sym, param_specs_fn());
+            o.time_stop_reachable =
+                !tp.found ||
+                time_stop_reachable(tp.params, tp.bar_seconds, tp.hold_dont_halt);
             outcomes.emplace_back(sym, o);
         }
         const LineupPlan plan = plan_lineup(outcomes);
@@ -2139,15 +2252,44 @@ void App::pump_daily_lineup() {
             lineup_.phase = Phase::Idle;
             return;
         }
-        if (!plan.excluded.empty()) {
+        if (!plan.unreachable_stop.empty()) {
+            // Its OWN line, and it is not the no-fit line. These symbols DO have
+            // a parameter set fitted to them; the set is unrealizable. Folding
+            // that into "no fit from this morning's tournament" would send the
+            // operator looking for a tournament failure that did not happen and
+            // hide the one thing worth acting on — the optimizer is still
+            // proposing holds the trading day cannot contain.
             std::string list;
-            for (const std::string& s : plan.excluded)
+            for (const std::string& s : plan.unreachable_stop)
                 list += (list.empty() ? "" : ", ") + s;
-            route_operator("lineup: EXCLUDED " + list +
+            route_operator(
+                "lineup: EXCLUDED " + list +
+                " - their time stop cannot fire inside a trading day (" +
+                std::to_string(session_bars(cfg_.trade_bar_sec)) +
+                " bars from the open to the 15:57 flatten at this bar size). These "
+                "strategies place NO price stop, so the time stop is the only thing "
+                "that ever closes a losing position - 2026-08-14 STKH held 233 bars' "
+                "worth of nothing and lost $506. Refit them; do not hand-edit the "
+                "number, a value no backtest scored is not a fit.");
+        }
+        {
+            // The no-fit line names only the no-fit symbols. plan.excluded is
+            // the whole set that will not trade (both faults), because that is
+            // what the tabs have to be removed by.
+            std::string list;
+            for (const std::string& s : plan.excluded) {
+                if (std::find(plan.unreachable_stop.begin(),
+                              plan.unreachable_stop.end(),
+                              s) != plan.unreachable_stop.end())
+                    continue;   // already reported above, with its own reason
+                list += (list.empty() ? "" : ", ") + s;
+            }
+            if (!list.empty())
+                route_operator("lineup: EXCLUDED " + list +
                      " - no fit from this morning's tournament and no parameters of "
                      "their own; trading them would mean running another symbol's "
                      "fit. Nothing is held in them, so dropping the tab is safe.");
-            trade_.remove_symbols(plan.excluded);
+            if (!plan.excluded.empty()) trade_.remove_symbols(plan.excluded);
         }
         route("lineup: ready - " + std::to_string(plan.admitted.size()) +
                  " symbols loaded into the Trade tabs");
@@ -2435,6 +2577,31 @@ void App::autopilot_evaluate() {
             champ = &e;
     if (!champ) {
         route("autopilot: " + S.symbol + " cycle produced no result");
+        return;
+    }
+    // A better SCORE is not the whole test, and this gate sits above BOTH
+    // install paths (params refresh and strategy swap) because both hand
+    // champ->params to a LIVE strategy. The autopilot re-optimizes every 30
+    // minutes on the same tournament machinery that crowned STKH's 233-bar time
+    // stop on 2026-08-14 — a 19.4-hour hold on a 300 s series, against a day the
+    // engine force-flattens at 15:57 — so it is a third route by which an
+    // unrealizable fit reaches a running strategy, alongside the daily lineup
+    // and the Start button. bollinger_reversion and rsi2_pullback place no price
+    // stop, so that time stop is the ONLY thing that would ever close a losing
+    // position. Keep the incumbent: it is at least a set the session was allowed
+    // to start on. See tt::ui::time_stop_reachable.
+    if (!time_stop_reachable(champ->params, cfg_.trade_bar_sec)) {
+        const auto it = champ->params.find("time_stop");
+        route_operator("autopilot: " + S.symbol + " champion REJECTED - " +
+                       kUnreachableStopTag + " (" +
+                       std::to_string(static_cast<int>(it != champ->params.end()
+                                                           ? it->second : 0.0)) +
+                       " bars, only " +
+                       std::to_string(session_bars(cfg_.trade_bar_sec)) +
+                       " fit in a trading day at this bar size). Keeping the "
+                       "incumbent; the fit is unrealizable, not merely worse.");
+        S.challenger.clear();
+        S.streak = 0;
         return;
     }
 
@@ -2782,6 +2949,16 @@ std::string App::build_diag_json() {
         j["book_divergence_open"] =
             static_cast<int>(book_div_.divergences().size());
     }
+    // Non-zero STOCK positions the LAST reconcile found in symbols this session
+    // does not trade. A first-class field for the same reason book_divergence is
+    // one: for 24 days this number was structurally unobservable — reconciliation
+    // discarded those rows above its own log line, so the log could not even
+    // distinguish "IB never sent it" from "we threw it away" — and 20 NVDA shares
+    // sat in the account with no strategy, no stop, and nothing able to flatten
+    // them. -1 = no TWS route (the IBKR web route has no position stream at all,
+    // which is a different answer from "none found"). See
+    // engine/reconcile_policy.h.
+    j["reconcile_offlineup"] = tws_ ? tws_->reconcile_offlineup() : -1;
     // Connect-timeout watchdog force-aborts (broker + feed). Nonzero = a gateway
     // handshake wedged and self-healed instead of freezing the I/O thread.
     j["connect_aborts"] = (tws_ ? tws_->connect_aborts() : 0) +
@@ -2865,13 +3042,28 @@ std::string App::build_diag_json() {
         e["avg_price"] = ss.position.avg_price;
         e["unrealized_pnl"] = ss.position.unrealized_pnl;
         e["realized_pnl"] = ss.position.realized_pnl;
+        // realized_pnl is GROSS of commissions — Portfolio::apply books
+        // (price - avg) * qty and charges the fee to cash only. 2026-08-14
+        // reported -$597.01 against -$612.09 of actual cash on 13 fills. Both
+        // are published (the gross figure is what every historical journal row
+        // and saved session was computed with, so redefining it silently would
+        // break comparability); net is the one to judge edge on.
+        e["fees"] = ss.fees;
+        e["realized_pnl_net"] = ss.position.realized_pnl - ss.fees;
         const bool naked = ss.position.qty != 0.0 && !has_working_stop(ss.symbol);
         e["unprotected"] = naked;
         if (naked) ++unprotected;
-        // ms since this symbol's last SUCCESSFUL bar delivery at data.bar_interval
-        // (-1 = never in this process). SOXS read 09:17 all afternoon on
-        // 2026-08-07 while every other field here looked healthy.
-        e["last_bar_age_ms"] = hist_fresh_.age_ms(ss.symbol, bar_ivl, steady_now);
+        // TWO ages, because they answer different questions and one of them used
+        // to masquerade as the other. last_delivery_age_ms is ms since this
+        // symbol's last SUCCESSFUL bar delivery (SOXS read 09:17 all afternoon on
+        // 2026-08-07 while every other field looked healthy). last_bar_age_ms is
+        // the age of the newest BAR in that delivery — which is what this field
+        // has always been NAMED and never held. On 2026-08-14 STKH's 5m series
+        // was frozen at x10010 bars for five hours while its deliveries arrived
+        // on schedule: perfect on the delivery age, five hours stale on the data.
+        // -1 in either = never answered in this process.
+        e["last_delivery_age_ms"] = hist_fresh_.age_ms(ss.symbol, bar_ivl, steady_now);
+        e["last_bar_age_ms"] = hist_fresh_.bar_age_ms(ss.symbol, bar_ivl, now_ms);
         // Params come from the ENGINE, not from cfg_.trade_symbols. The Trade
         // tab's copy is overwritten by every crowned champion, while the live
         // engine only takes one when autopilot's improvement test passes — so
@@ -3108,6 +3300,14 @@ std::string App::build_metrics() {
       s.entry_gate_open ? 1 : 0);
     g("tt_entry_gate_blocked", "entries refused because the session was closed",
       static_cast<double>(s.entry_gate_blocked));
+    // Any nonzero value is worth an alerting rule: the account holds stock this
+    // session does not trade, cannot audit and cannot flatten, and until 0.25.0
+    // reconciliation discarded those rows without so much as a log line — 20
+    // NVDA shares for 24 days. -1 = no TWS route (nothing to measure), which is
+    // a different answer from 0 (measured, none found).
+    g("tt_reconcile_offlineup",
+      "broker positions found outside this session's symbols (-1 = no TWS route)",
+      tws_ ? static_cast<double>(tws_->reconcile_offlineup()) : -1.0);
     g("tt_feed_stale_ms", "ms since the last tick (-1 = none yet)",
       s.last_tick_ts_ms > 0 ? static_cast<double>(now_ms - s.last_tick_ts_ms) : -1);
     g("tt_stuck_orders", "orders unacked past the half-open threshold (TWS)",
@@ -3405,6 +3605,7 @@ int App::tick() {
     pump_book_audit();        // alert if the app's book and the broker's disagree
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
     pump_preopen_gateway_check();   // 08:45 window: is the gateway actually LOGGED IN?
+    pump_session_guard();     // a live session must not outlive its trading day
 
     // Deferred strategy loads, strategy-switch backtests, and finished-run
     // instance cleanup advance every tick, independent of open panels.
@@ -3459,6 +3660,19 @@ int App::tick() {
                 begin_lineup_swap(opts);
             } else {
                 route("lineup: auto-starting the live session");
+                // Say what will end it, at the moment it begins. On 2026-08-14
+                // this branch started an unattended five-symbol session with
+                // trade_sched_on false, i.e. with NOTHING on any clock able to
+                // stop it, and said nothing about that — the session ran 1 h 47 m
+                // past the close. pump_session_guard is the backstop now, so this
+                // is no longer a refusal; it is the operator being told which of
+                // the two is holding the rope.
+                if (!trade_.sched_on())
+                    route_operator(
+                        "lineup: starting UNATTENDED with no scheduled stop armed "
+                        "(trade_sched_on is off) - the session guard will stop it "
+                        "shortly after the close. Arm the Trade panel schedule if you "
+                        "want it stopped earlier.");
                 start_live_session(opts);
             }
         }
@@ -3798,6 +4012,72 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         return;
     }
     TradePanel::StartOpts opts = opts_in;
+    // THE UNREACHABLE-TIME-STOP GATE, at the one choke point every start path
+    // goes through (Start button, scheduled auto-start, daily lineup, swap
+    // restart). The lineup's own admission gate catches the scheduled path, but
+    // a hand-added tab never goes through it and the operator's Start button
+    // never has — and the parameter set that lost $506 on 2026-08-14 would be
+    // just as unreachable arriving by either of those routes.
+    //
+    // REFUSE the symbol, START THE REST. A session of four healthy symbols is
+    // strictly better than no session, and it is also better than five with one
+    // that cannot close what it opens.
+    //
+    // The broker carve-out: a symbol the broker's last audit says we are holding
+    // is kept, because dropping it here is not neutral — outside cfg.symbols it
+    // is never adopted, never audited, and neither flatten() nor the 15:57
+    // backstop can reach it (engine/reconcile_policy.h). Refusing to trade it
+    // must not turn it into the orphan this branch exists to avoid.
+    {
+        std::vector<TradePanel::SymbolOpt> keep;
+        std::vector<std::string> refused, kept_exposed;
+        for (auto& so : opts.symbols) {
+            if (time_stop_reachable(so.params, so.bar_seconds,
+                                    so.risk.disable_auto_halt)) {
+                keep.push_back(std::move(so));
+                continue;
+            }
+            // broker_held_last_session, NOT broker_holds: this runs while no
+            // session is live, so stand_down() has already cleared the live
+            // book and broker_holds() would answer `unknown` every single time —
+            // making the `|| unknown` carve-out below unconditional and this
+            // whole gate incapable of refusing anything.
+            bool unknown = false;
+            if (book_audit_.broker_held_last_session(so.symbol, unknown) || unknown) {
+                kept_exposed.push_back(so.symbol);
+                keep.push_back(std::move(so));
+                continue;
+            }
+            refused.push_back(so.symbol);
+        }
+        if (!kept_exposed.empty()) {
+            std::string list;
+            for (const std::string& s : kept_exposed)
+                list += (list.empty() ? "" : ", ") + s;
+            route_operator(std::string("live: ") + kUnreachableStopTag + " on " + list +
+                           " - KEPT in the session because the broker book is not "
+                           "confirmed flat there, so dropping them would orphan a real "
+                           "position outside anything that can close it. They can "
+                           "re-enter on that set once flat. Refit them.");
+        }
+        if (!refused.empty()) {
+            std::string list;
+            for (const std::string& s : refused)
+                list += (list.empty() ? "" : ", ") + s;
+            route_operator(std::string("live: REFUSED ") + list + " - " +
+                           kUnreachableStopTag +
+                           ": longer than a trading day, and these strategies place no "
+                           "price stop, so nothing would ever close a losing position "
+                           "(2026-08-14 STKH: -$506 in 2h16m). Starting the session "
+                           "without them.");
+        }
+        opts.symbols = std::move(keep);
+        if (opts.symbols.empty()) {
+            route_operator(std::string("live: not starting - every symbol has an ") +
+                           kUnreachableStopTag + ". Refit them and start again.");
+            return;
+        }
+    }
     order_by_feed_fidelity(opts.symbols,
                            [](const TradePanel::SymbolOpt& s) { return s.strat_key; });
 
@@ -3805,6 +4085,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     std::vector<int> sym_bars;
     std::vector<std::string> sym_accts;
     std::vector<RiskLimits> sym_risk;
+    std::vector<uint8_t> sym_hold_only;   // see LiveConfig::symbol_hold_only
     bool any_record = false;
     // Session-level equity/stale halts run on one portfolio, so
     // drive them from the tightest (min non-zero) per-symbol value.
@@ -3820,6 +4101,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         sym_bars.push_back(so.bar_seconds);
         sym_accts.push_back(so.account);
         sym_risk.push_back(so.risk);
+        sym_hold_only.push_back(so.hold_only ? 1 : 0);
         any_record = any_record || so.record;
         // A "hold — don't halt" symbol is left out of the equity-halt
         // aggregation, so its loss can't arm the session's auto-flatten; its
@@ -3886,6 +4168,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     cfg.symbol_bar_seconds = sym_bars;
     cfg.risk = session_risk;
     cfg.symbol_risk = sym_risk;
+    cfg.symbol_hold_only = sym_hold_only;
     // THE ENTRY GATE. Installed for every live session the app starts, so no
     // strategy can open a position outside the hours in which one can be closed
     // again — see LiveConfig::entry_gate and tt::rth_entry_allowed. The engine
@@ -4992,6 +5275,64 @@ std::string App::traded_bar_interval() const {
 // See tt::rth_open_elapsed_ms (market_calendar.h) for the arithmetic, including
 // the 1pm early closes, and net::kHistArmSettleMs for why the settle-in is a
 // fixed window rather than each symbol's own grace.
+// A live session must not outlive its trading day. See App::pump_session_guard
+// in app.h for the 2026-08-14 incident and tt::session_should_stop for the
+// clock arithmetic (including the three 1pm early closes, which a hardcoded
+// 16:15 would get wrong by three hours).
+//
+// It is deliberately NOT conditional on trade_sched_on, on the lineup, or on how
+// the session was started. The whole defect was that the only clock-driven
+// terminator in the app could be — and was — switched off, while the thing that
+// STARTS unattended sessions could not.
+void App::pump_session_guard() {
+    if (!engine_.live_running()) return;
+    if (swap_stage_ != SwapStage::None) return;   // a swap is mid-stop already
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    const int sod_now = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    const bool stop_now = session_should_stop(tm, session_guard_day_,
+                                              session_guard_prev_sod_);
+    session_guard_prev_sod_ = sod_now;   // observed, whether or not we act
+    if (!stop_now) return;
+    session_guard_day_ = tm.tm_yday;   // once per day, whatever happens below
+    const double end_h = session_end_h(tm);
+    const int late_min =
+        end_h > 0.0
+            ? (tm.tm_hour * 60 + tm.tm_min) - static_cast<int>(end_h * 60.0 + 0.5)
+            : 0;
+    // WARNING, not Critical. Reaching this line means the backstop worked; the
+    // Critical case is the one nobody hears about. It still has to be said,
+    // because it means the scheduled stop did not fire — the operator has a
+    // configuration to fix, and on 2026-08-14 nothing anywhere announced that.
+    alerts_.notify(AlertNotifier::Warning,
+                   "WATCHDOG session guard: a live session was still running " +
+                       std::to_string(late_min) +
+                       " min after the close - stopping it. The Trade panel's "
+                       "scheduled stop did not fire (check trade_sched_on / "
+                       "trade_sched_stop); nothing else on any clock ends a session.");
+    route_operator("session guard: stopping a live session " +
+                   std::to_string(late_min) + " min past the close");
+    // Through safe_stop_live, exactly like the scheduled stop, and for the same
+    // reason: Engine::stop_live leaves the TWS adapter connected and holding
+    // kTwsOrdersClientId until the next morning's start dials the same id.
+    //
+    // KEEP POSITIONS. The default safe_stop_live() runs the kill switch, which
+    // is cancel_all() + flatten() — and this fires at 16:15, with the exchange
+    // already shut. That sequence CANCELS the resting protective stop and then
+    // sends a market flatten that will not fill until the next open, so a
+    // position that survived 15:57 (the 2026-08-06 orphan is the documented
+    // case: the backstop's flatten did not fill, $846) would be left with
+    // nothing protecting it overnight. Strictly worse than the state the guard
+    // exists to correct.
+    //
+    // Keeping them leaves the position AND its resting broker orders alive for
+    // the next session's reconcile-and-adopt, which is the same mechanism the
+    // lineup swap already depends on. The point of this guard is to end an
+    // unattended SESSION, not to liquidate into a closed market.
+    safe_stop_live(true);
+}
+
 void App::pump_history_watchdog() {
     static constexpr double kHistStaleReAlertSec = 1800.0;   // re-page every 30 min
     if (!engine_.live_running()) {
@@ -5050,8 +5391,15 @@ void App::pump_history_watchdog() {
     const int64_t armed_ms = net::hist_armed_ms(session_ms, open_ms);
 
     const int64_t now_steady = steady_ms();
-    const auto stale = hist_fresh_.stale(watched, traded_bar_interval(),
-                                         now_steady, session_ms, armed_ms);
+    // BOTH clocks. The delivery age must be steady (an NTP step around a gateway
+    // restart would otherwise read as hours of fake staleness), and the bar age
+    // must be wall — a bar's timestamp comes from the exchange and can only be
+    // compared against wall time. See net/hist_freshness.h.
+    const int64_t now_wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const auto stale = hist_fresh_.stale(watched, traded_bar_interval(), now_steady,
+                                         now_wall, session_ms, armed_ms);
 
     if (stale.empty()) {
         if (hist_stale_last_alert_s_ != 0.0) {
@@ -5077,8 +5425,13 @@ void App::pump_history_watchdog() {
     std::string detail;
     for (const net::StaleBars& sb : stale) {
         if (!detail.empty()) detail += ", ";
+        // "frozen" names WHICH age this is. A symbol whose deliveries are on
+        // time and whose newest bar is 300 minutes old is a different fault
+        // from one nothing has answered for 300 minutes, and the operator
+        // cannot tell them apart from a bare number.
         detail += sb.symbol + " " +
-                  (sb.ever ? std::to_string(sb.age_ms / 60'000) + "m"
+                  (sb.ever ? std::to_string(sb.age_ms / 60'000) + "m" +
+                                 (sb.frozen ? " frozen" : "")
                            : std::string("never"));
     }
     // The wording is net::hist_stall_alert's, not this function's: the old text

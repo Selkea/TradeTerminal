@@ -18,6 +18,11 @@ static std::tm mk(int y, int m, int d) {
     tm.tm_mon = m - 1;
     tm.tm_mday = d;
     tm.tm_wday = weekday_of(y, m, d);
+    // localtime_s fills this in too, and the session guard's once-per-day stamp
+    // is keyed on it — a helper that left it 0 would make every date in a year
+    // compare equal and quietly pass a test that should fail.
+    tm.tm_yday =
+        static_cast<int>(days_from_civil(y, m, d) - days_from_civil(y, 1, 1));
     return tm;
 }
 
@@ -256,4 +261,114 @@ TEST_CASE("entry gate: a half-day cuts entries three minutes before its 13:00 cl
     CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 12, 57)));
     CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 13, 30)));
     CHECK_FALSE(rth_entry_allowed(at(2026, 11, 27, 15, 30)));
+}
+
+// ---- the session guard ------------------------------------------------------
+//
+// 2026-08-14: /diag at 17:45:50 ET — 1 h 46 m past the close — read
+// live_running true, halted false. The 09:41 session had been started by the
+// daily auto-lineup, and NOTHING on any clock could end it: pump_schedule
+// returns on its first line when trade_sched_on is false (it was), the lineup
+// auto-start never consults that flag, and the engine's 15:57 EOD backstop
+// flattens without clearing live_running_. A human clicking "Update & restart"
+// at 17:46:47 is what stopped it.
+//
+// Until this existed, NOTHING anywhere asserted that a live session ever ends.
+// That absence is the finding; these cases are the assertion.
+
+static std::tm at_s(int y, int m, int d, int hh, int mm, int ss) {
+    std::tm tm = at(y, m, d, hh, mm);
+    tm.tm_sec = ss;
+    return tm;
+}
+
+TEST_CASE("session guard: a normal day ends the session at 16:15") {
+    // 15 minutes after the close, not at it: the 15:57 backstop, a strategy's
+    // own EOD flatten and the day's last fills all land around 16:00, and
+    // stopping on top of them reaps the broker adapter mid-flight - the
+    // 2026-08-13 lost-execution-report failure class.
+    CHECK(session_end_h(mk(2026, 8, 14)) == doctest::Approx(16.25));
+    const int cutoff = 16 * 3600 + 15 * 60;
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 16, 14, 59), -1, cutoff - 30));
+    CHECK(session_should_stop(at_s(2026, 8, 14, 16, 15, 0), -1, cutoff - 1));
+    // ...and it does NOT fire during the session it is guarding.
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 9, 41, 37), -1, 9 * 3600));
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 15, 57, 0), -1, 15 * 3600));
+}
+
+TEST_CASE("session guard: a session started AFTER the close is left alone") {
+    // THE REGRESSION THIS PINS. The first version of this guard was LEVEL
+    // triggered, so it fired on the first tick of any session begun after the
+    // cutoff - which is every VPS deploy, because the evening is the only
+    // window where deploying is safe (flat book, market closed). Paired with a
+    // position-liquidating stop, an 18:30 deploy would have cancelled the
+    // resting protective orders and fired a market flatten into a shut
+    // exchange, seconds after coming up.
+    //
+    // Edge-triggered, the guard may only stop a session it WATCHED cross the
+    // cutoff. prev_sod < 0 is the first observation of a fresh process.
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 18, 30, 0), -1, -1));
+    const int deployed_at = 18 * 3600 + 30 * 60;
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 18, 30, 30), -1, deployed_at));
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 23, 59, 0), -1, deployed_at));
+    // The operator's real 2026-08-14 restart at 17:47:38, for the same reason.
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 14, 17, 48, 0), -1,
+                                    17 * 3600 + 47 * 60 + 38));
+}
+
+TEST_CASE("session guard: an early close is 13:15, not 16:15") {
+    // A hardcoded 16:15 would be three hours late on the three NYSE half-days -
+    // the same arithmetic entry_cutoff_h exists to get right. 2026-11-27 is the
+    // day after Thanksgiving; 2026-12-24 is Christmas Eve.
+    REQUIRE(is_us_early_close(2026, 11, 27));
+    CHECK(session_end_h(mk(2026, 11, 27)) == doctest::Approx(13.25));
+    const int early = 13 * 3600 + 15 * 60;
+    CHECK_FALSE(session_should_stop(at_s(2026, 11, 27, 13, 14, 59), -1, early - 30));
+    CHECK(session_should_stop(at_s(2026, 11, 27, 13, 15, 0), -1, early - 1));
+    REQUIRE(is_us_early_close(2026, 12, 24));
+    CHECK(session_end_h(mk(2026, 12, 24)) == doctest::Approx(13.25));
+    CHECK(session_should_stop(at_s(2026, 12, 24, 14, 0, 0), -1, early - 1));
+}
+
+TEST_CASE("session guard: a non-trading day is not a cutoff of its own") {
+    // The first version returned true from the first tick of any weekend or
+    // holiday, which is the same level-trigger defect wearing a second face: it
+    // fights a session a human deliberately started on a Saturday, and such a
+    // session cannot trade anyway (the entry gate refuses every entry outside
+    // RTH). An UNATTENDED session running into Saturday was already stopped by
+    // Friday's crossing, so the arm caught nothing the edge does not.
+    CHECK(session_end_h(mk(2026, 8, 15)) == 0.0);                  // Saturday
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 15, 3, 0, 0), -1, 2 * 3600));
+    CHECK_FALSE(session_should_stop(at_s(2026, 8, 16, 12, 0, 0), -1, 11 * 3600));
+    CHECK_FALSE(session_should_stop(at_s(2026, 11, 26, 10, 0, 0), -1, 9 * 3600));
+    // Friday's crossing is what actually catches the unattended case.
+    CHECK(session_should_stop(at_s(2026, 8, 14, 16, 15, 0), -1,
+                              16 * 3600 + 14 * 60 + 59));
+}
+
+TEST_CASE("session guard: it fires once a day, so a deliberate restart survives") {
+    // The guard is a backstop against a session nobody is watching, not a lock
+    // on the Start button. On 2026-08-14 a human DID start a fresh session at
+    // 17:47:38, after the close, on purpose; fighting that every tick would make
+    // the app unusable to the person who owns it.
+    const int cutoff = 16 * 3600 + 15 * 60;
+    const std::tm crossing = at_s(2026, 8, 14, 16, 15, 0);
+    CHECK(session_should_stop(crossing, -1, cutoff - 1));
+    CHECK_FALSE(session_should_stop(crossing, crossing.tm_yday, cutoff - 1));
+    // ...and the stamp does not leak into the next day.
+    const std::tm tomorrow = at_s(2026, 8, 17, 16, 15, 0);
+    CHECK(session_should_stop(tomorrow, crossing.tm_yday, cutoff - 1));
+}
+
+TEST_CASE("session guard: it does not depend on the panel schedule at all") {
+    // The entire defect was that the only clock-driven terminator in the app
+    // could be switched off, while the thing that STARTS unattended sessions
+    // could not. This is a pure function of the clock and the calendar: there is
+    // no configuration input to switch off. Stated as a test because "it has no
+    // arguments to disable it" is exactly the property that was missing.
+    // The VPS's actual 2026-08-14 setting was trade_sched_stop "20:00" - even an
+    // ARMED schedule would not have stopped that session until then, whereas the
+    // guard ends it at the crossing regardless.
+    CHECK(session_should_stop(at_s(2026, 8, 14, 16, 15, 0), -1,
+                              16 * 3600 + 15 * 60 - 1));
 }

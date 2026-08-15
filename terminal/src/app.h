@@ -475,6 +475,32 @@ private:
     // answering any more), neither of which is a recovery. See DivergenceLatch.
     net::DivergenceLatch book_div_;
 
+    // THE SESSION GUARD: a live session must not outlive its trading day.
+    //
+    // 2026-08-14, /diag at 17:45:50 ET — 1 h 46 m after the close — read
+    // live_running true, halted false. The session had been started at 09:41:37
+    // by the daily auto-lineup and nothing on any clock could end it:
+    // TradePanel::pump_schedule returns on its first line when trade_sched_on is
+    // false (it was), the lineup auto-start never consults that flag at all, and
+    // the engine's 15:57 EOD backstop flattens without clearing live_running_.
+    // Every other terminator in the app is a BUTTON. A human clicking "Update &
+    // restart" at 17:46:47 is what finally stopped it.
+    //
+    // So this is deliberately INDEPENDENT of trade_sched_on and of the Trade
+    // panel entirely: the panel's schedule is an operator preference for
+    // stopping EARLIER, and this is the floor underneath it that makes "a
+    // session cannot outlive its trading day" true by construction. It goes
+    // through safe_stop_live (not the engine) so the TWS adapter is reaped and
+    // kTwsOrdersClientId is released — holding it all night is what collides
+    // with error 326 at the next morning's start.
+    // Fires at most once per calendar day; see tt::session_should_stop.
+    void pump_session_guard();
+    int session_guard_day_ = -1;   // tm_yday the guard last stopped a session (-1 = never)
+    // Seconds-of-day this guard last observed (-1 = never). The guard is
+    // edge-triggered on the close crossing, so a session started AFTER the
+    // cutoff — every evening deploy — is left alone. See session_should_stop.
+    int session_guard_prev_sod_ = -1;
+
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07
     // outage was invisible to every existing signal (see net/hist_freshness.h);

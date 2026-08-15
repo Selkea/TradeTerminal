@@ -82,6 +82,23 @@ bool TradePanel::has_own_params(const std::string& symbol,
     return false;
 }
 
+TradePanel::TabParams TradePanel::tab_params(const std::string& symbol,
+                                             const ParamSpecsFn& strat_params) const {
+    TabParams out;
+    for (const SymRow& r : pending_) {
+        if (r.symbol != symbol) continue;
+        out.found = true;
+        out.bar_seconds = r.bar_sec;
+        out.hold_dont_halt = r.risk.disable_auto_halt;
+        std::vector<ParamDefault> declared;
+        for (const StratParam& sp : strat_params(r.strat_key))
+            declared.push_back({sp.name, sp.value});
+        out.params = select_symbol_params(r.params, declared).params;
+        return out;
+    }
+    return out;
+}
+
 void TradePanel::block_scheduled_start() {
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};

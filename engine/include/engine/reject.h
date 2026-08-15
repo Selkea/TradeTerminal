@@ -50,6 +50,7 @@ enum class RejectCause : uint16_t {
     HoldBlocksLoss,       // hold-until-profitable refused a losing exit
     SessionClosed,        // outside the window in which an entry may be placed
     StrategyHalted,       // this symbol (or the session) is quarantined
+    HoldOnlySymbol,       // carried only to hold/close a position, never to open one
     // ---- the execution venue said no ----
     SimRefused,           // ExecSim returned 0 (should be unreachable: pre-screened)
     BrokerNotConnected,
@@ -80,6 +81,7 @@ inline constexpr RejectCause kAllRejectCauses[] = {
     RejectCause::HoldBlocksLoss,
     RejectCause::SessionClosed,
     RejectCause::StrategyHalted,
+    RejectCause::HoldOnlySymbol,
     RejectCause::SimRefused,
     RejectCause::BrokerNotConnected,
     RejectCause::BrokerReadOnly,
@@ -109,6 +111,7 @@ constexpr const char* reject_cause_slug(RejectCause c) noexcept {
     case RejectCause::HoldBlocksLoss:      return "hold_blocks_loss";
     case RejectCause::SessionClosed:       return "session_closed";
     case RejectCause::StrategyHalted:      return "strategy_halted";
+    case RejectCause::HoldOnlySymbol:      return "hold_only_symbol";
     case RejectCause::SimRefused:          return "sim_refused";
     case RejectCause::BrokerNotConnected:  return "broker_not_connected";
     case RejectCause::BrokerReadOnly:      return "broker_read_only";
@@ -164,6 +167,9 @@ constexpr const char* reject_cause_text(RejectCause c) noexcept {
                "order would be refused or rest until the next open";
     case RejectCause::StrategyHalted:
         return "this symbol is halted, so its strategy may not place orders";
+    case RejectCause::HoldOnlySymbol:
+        return "this symbol is carried only so its existing position can be "
+               "adopted, audited and closed - it may reduce or exit, never open";
     case RejectCause::SimRefused:
         return "the fill simulator refused the order";
     case RejectCause::BrokerNotConnected:

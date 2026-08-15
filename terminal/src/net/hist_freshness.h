@@ -41,7 +41,23 @@ struct StaleBars {
     // carries the session's own age instead.
     int64_t age_ms = 0;
     bool ever = false;    // false = no bar set has EVER arrived for this symbol
+    // The deliveries are ON TIME and the SERIES is not advancing: `age_ms` is
+    // then the age of the newest BAR, not of the last delivery. A different
+    // fault with a different fix — nothing is wrong with the request path, so
+    // "check the tws-data retry lines" is the wrong advice for it — and the one
+    // that ran five hours undetected on 2026-08-14 (STKH pinned at x10010).
+    bool frozen = false;
 };
+
+// Bar length in ms for an interval string ("5m" / "1h" / "1d" — the optimizer's
+// table, sweep_interval_str). 0 for anything unrecognised, which every caller
+// reads as "do not judge the data's age".
+inline int64_t hist_interval_ms(const std::string& interval) {
+    if (interval == "5m") return 5 * 60 * 1000;
+    if (interval == "1h") return 60 * 60 * 1000;
+    if (interval == "1d") return 24 * 60 * 60 * 1000;
+    return 0;
+}
 
 // A symbol the watchdog is entitled to expect refreshes for, together with the
 // cadence that is supposed to deliver them.
@@ -173,6 +189,29 @@ inline std::string hist_stall_alert(const std::string& detail,
         if (!healthy.empty()) healthy += ", ";
         healthy += s;
     }
+    // A FROZEN series needs different words, and the difference is the whole
+    // point of measuring bar age separately. "check the tws-data 'retrying as
+    // req' lines" sends the operator to look for failing requests; when the
+    // requests are succeeding on time and the SERIES is not advancing there are
+    // no such lines to find, and the reader concludes the page is spurious.
+    // Naming the fault is what makes it actionable.
+    bool any_frozen = false;
+    for (const StaleBars& s : stale) any_frozen = any_frozen || s.frozen;
+    if (any_frozen) {
+        std::string frozen;
+        for (const StaleBars& s : stale) {
+            if (!s.frozen) continue;
+            if (!frozen.empty()) frozen += ", ";
+            frozen += s.symbol;
+        }
+        return "WATCHDOG historical bars have STOPPED ADVANCING for " +
+               std::to_string(stale.size()) +
+               " traded symbol(s) - strategies are trading on stale candles: " +
+               detail + " (the fetches are SUCCEEDING on time for " + frozen +
+               " and returning the same newest bar - this is a frozen SERIES, "
+               "not a dead request path, so there are no 'retrying as req' lines "
+               "to find; do NOT restart the gateway)";
+    }
     // Disconnected is the ordinary outage the reconnect path is already working
     // on. Connected with NOTHING refreshing is the one case where the upstream
     // is still a live suspect, so it does not get the "not the gateway" verdict
@@ -194,13 +233,70 @@ inline std::string hist_stall_alert(const std::string& detail,
            detail + state;
 }
 
+// TWO AGES, AND ONLY ONE OF THEM IS ABOUT THE DATA.
+//
+// This class recorded steady_ms() at delivery and called it freshness, so
+// `age_ms` has always meant "time since a batch ARRIVED". A source that keeps
+// answering, on time, with a series that has stopped advancing therefore reads
+// perfectly fresh — and that is not a hypothetical:
+//
+//   2026-08-14. STKH's 5-minute series was pinned at exactly x10010 bars from
+//   10:44:49 through 15:44:49 — five hours — while MUU's grew the expected six
+//   bars per half hour (x9681 -> x9747). After the close STKH's count began to
+//   SHRINK (x10007, x10001, x9997) as the 6-month window slid off the back with
+//   nothing being appended at the front. The watchdog reported "still refreshing
+//   MUU, SNDQ, STKH, SNDU" the whole time, and /diag published the delivery age
+//   under the field name `last_bar_age_ms`, which is a claim about a bar.
+//
+// The 2026-08-07 outage this file was written for was the OTHER failure —
+// requests that stopped being answered at all — and the delivery age catches
+// that one perfectly. Both are real, so both are measured, separately:
+//
+//   - DELIVERY age (age_ms): is the request path alive? Diagnostic; also what
+//     `refreshing()` spends as evidence for "do NOT restart the gateway".
+//   - BAR age (bar_age_ms): is the DATA advancing? This is what the watchdog
+//     judges on, because "strategies are trading on stale candles" is a
+//     statement about candles.
+//
+// A symbol whose newest bar stops moving is stale even while its deliveries are
+// punctual, which is the case that ran for five hours in silence.
 class HistoryFreshness {
 public:
     // Data worker thread, once per successfully delivered bar set.
+    //
+    // `newest_bar_ms` is the epoch-ms timestamp of the last bar in the batch, or
+    // 0 when the caller has none to give (an empty batch, or a call site that
+    // has not been taught yet) — in which case only the delivery age is
+    // recorded and the bar age stays at whatever the last real batch left, so a
+    // caller who cannot answer cannot accidentally certify the data as fresh.
+    //
+    // WALL-CLOCK ms for the bar, STEADY ms for the delivery, deliberately: a bar
+    // timestamp comes from the exchange and can only be compared against wall
+    // time, while the delivery age must survive an NTP step around a gateway
+    // restart (see the note at the top of this file).
     void record(const std::string& symbol, const std::string& interval,
-                int64_t now_ms) {
+                int64_t now_ms, int64_t newest_bar_ms = 0) {
         std::lock_guard<std::mutex> g(mu_);
-        last_[key(symbol, interval)] = now_ms;
+        const std::string k = key(symbol, interval);
+        last_[k] = now_ms;
+        if (newest_bar_ms > 0) newest_bar_[k] = newest_bar_ms;
+    }
+
+    // ms between `wall_now_ms` and the newest bar this symbol has ever
+    // delivered, or -1 if no batch with a usable timestamp has arrived.
+    //
+    // Never negative: a bar's timestamp is its OPEN, and a source that hands
+    // over the in-progress bar of the current interval legitimately produces a
+    // stamp in the future relative to nothing in particular. Clamping at 0 keeps
+    // "the data is current" as the answer rather than a negative age that every
+    // `>` threshold silently passes.
+    int64_t bar_age_ms(const std::string& symbol, const std::string& interval,
+                       int64_t wall_now_ms) const {
+        std::lock_guard<std::mutex> g(mu_);
+        const auto it = newest_bar_.find(key(symbol, interval));
+        if (it == newest_bar_.end()) return -1;
+        const int64_t age = wall_now_ms - it->second;
+        return age > 0 ? age : 0;
     }
 
     // ms since the last successful delivery, or -1 if none has ever arrived in
@@ -258,19 +354,45 @@ public:
     //
     // /diag's worst_age_ms and age_ms are untouched by any of this: the alert is
     // gated, the measurement is not.
+    // THE THIRD question, added 2026-08-14 and the reason this signature grew a
+    // wall clock: is the DATA advancing? A symbol whose deliveries are punctual
+    // and whose newest bar has not moved in five hours is exactly as blind as
+    // one nobody is answering, and the pre-existing measurement — time since a
+    // batch arrived — cannot express it. See the class comment.
+    //
+    // The bar-age threshold is the LARGER of the symbol's cadence grace and
+    // three bar intervals, never the cadence grace alone: on a "1d" series the
+    // newest bar is legitimately hours or a weekend old, so the 45-minute floor
+    // that is right for 5-minute bars would page every single morning. An
+    // interval hist_interval_ms does not recognise is not judged on data age at
+    // all — inventing a bound would be worse than the blind spot.
     std::vector<StaleBars> stale(const std::vector<WatchedSymbol>& watched,
                                  const std::string& interval, int64_t now_ms,
-                                 int64_t session_ms, int64_t armed_ms) const {
+                                 int64_t wall_now_ms, int64_t session_ms,
+                                 int64_t armed_ms) const {
         std::vector<StaleBars> out;
         if (armed_ms <= kHistArmSettleMs) return out;   // shut, or too early to judge
+        const int64_t ivl_ms = hist_interval_ms(interval);
         {
             std::lock_guard<std::mutex> g(mu_);
             for (const WatchedSymbol& w : watched) {
-                const auto it = last_.find(key(w.symbol, interval));
+                const std::string k = key(w.symbol, interval);
+                const auto it = last_.find(k);
                 const bool ever = it != last_.end();
                 const int64_t age = ever ? now_ms - it->second : session_ms;
-                if (age > bar_stale_grace_ms(w.refresh_interval_min))
-                    out.push_back({w.symbol, age, ever});
+                const int64_t grace = bar_stale_grace_ms(w.refresh_interval_min);
+                if (age > grace) {
+                    out.push_back({w.symbol, age, ever, false});
+                    continue;   // nothing is arriving: the older fault wins the page
+                }
+                if (ivl_ms <= 0) continue;              // interval we can't judge
+                const auto bt = newest_bar_.find(k);
+                if (bt == newest_bar_.end()) continue;  // no bar stamp: nothing to judge
+                const int64_t raw = wall_now_ms - bt->second;
+                const int64_t bar_age = raw > 0 ? raw : 0;
+                const int64_t bar_grace = grace > 3 * ivl_ms ? grace : 3 * ivl_ms;
+                if (bar_age > bar_grace)
+                    out.push_back({w.symbol, bar_age, true, true});
             }
         }
         for (size_t i = 1; i < out.size(); ++i)   // tiny n (a lineup is <10)
@@ -313,6 +435,7 @@ public:
     void clear() {
         std::lock_guard<std::mutex> g(mu_);
         last_.clear();
+        newest_bar_.clear();
     }
 
 private:
@@ -321,7 +444,8 @@ private:
     }
 
     mutable std::mutex mu_;
-    std::unordered_map<std::string, int64_t> last_;
+    std::unordered_map<std::string, int64_t> last_;        // steady ms, at DELIVERY
+    std::unordered_map<std::string, int64_t> newest_bar_;  // wall ms, the BAR's own stamp
 };
 
 } // namespace tt::net

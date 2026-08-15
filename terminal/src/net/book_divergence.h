@@ -338,6 +338,20 @@ public:
         state_ = AuditState::Off;
         streaks_.clear();
         confirmed_.clear();
+        // The live book belongs to a SESSION — a dead session's book proves
+        // nothing about the current one, so the auditor's own state is cleared.
+        // But it is KEPT here first, because the one caller that runs BETWEEN
+        // sessions has nothing else to ask.
+        //
+        // start_live_session refuses a symbol whose time stop cannot fire, and
+        // carves out "unless the broker might be holding it" so the refusal
+        // cannot orphan a real position. That gate runs while no session is
+        // live, i.e. after stand_down() — so reading the cleared live book made
+        // `unknown` unconditionally true and the gate could NEVER refuse
+        // anything. A guard whose default is "unproven, so allow" is no guard;
+        // it is exactly the shape of the 2026-08-10 defect.
+        if (!last_broker_.empty()) last_stopped_broker_ = last_broker_;
+        last_broker_.clear();
         last_agreed_ms_ = 0;
         last_answer_ms_ = 0;
         armed_at_ms_ = 0;
@@ -368,6 +382,15 @@ public:
         if (!armed_) arm(now_ms);
         ++rounds_;
         last_answer_ms_ = now_ms;   // an answer DID arrive: this is not blindness
+        // Kept whole, before any of the comparison logic can discard rows as
+        // settling or uncomparable. This is the ONLY place in the app that holds
+        // the broker's actual book — reconciliation cannot, by construction (see
+        // engine/reconcile_policy.h: it drops every symbol outside the lineup) —
+        // and App::begin_lineup_swap needs it to answer "is this symbol I am
+        // about to drop really flat AT THE BROKER". Answering that from the
+        // app's own snapshot is what let the 2026-08-06 orphan out: the app's
+        // number is the number this whole class of bug corrupts.
+        last_broker_ = broker;
         // A round that compared nothing is not agreement. Everything below —
         // the streaks, the confirmed set, and above all last_agreed_ms_, which
         // is the number the remote alert rule watches — is a claim about
@@ -429,6 +452,48 @@ public:
 
     AuditState state() const { return state_; }
     bool blind() const { return state_ == AuditState::Blind; }
+
+    // The broker's book as of the most recent completed audit — every row it
+    // sent, including symbols this session does not trade. Empty before the
+    // first answer and after stand_down().
+    const std::vector<BookPos>& last_broker() const { return last_broker_; }
+
+    // Is the BROKER carrying a position in `symbol` right now, as far as the
+    // last audit could tell?
+    //
+    // `unknown` is the answer when no audit has ever come back, and it is NOT
+    // folded into false. The caller (a lineup swap deciding whether it may drop
+    // a symbol) has to distinguish "the broker says flat" from "nobody has
+    // asked" — treating silence as flat is precisely the assumption that
+    // orphaned a live position on 2026-08-06.
+    bool broker_holds(const std::string& symbol, bool& unknown) const {
+        unknown = last_broker_.empty();
+        for (const BookPos& p : last_broker_)
+            if (p.symbol == symbol) return std::fabs(p.qty) > kQtyEpsilon;
+        return false;
+    }
+
+    // The same question asked BETWEEN sessions, where last_broker_ has been
+    // cleared by stand_down() and broker_holds() can therefore only ever answer
+    // "unknown". Falls back to the last book the previous session saw.
+    //
+    // `unknown` is still not folded into false: if no session has ever had an
+    // answer there is genuinely nothing to go on, and the caller must treat that
+    // as "may be holding" rather than as "flat" (2026-08-06, $846 orphaned by
+    // exactly that conflation). What this fixes is the OTHER direction — a
+    // previous session that did get a clean answer is now allowed to inform the
+    // decision instead of being thrown away and read as silence.
+    //
+    // Deliberately a SEPARATE accessor. broker_holds() must keep meaning "as of
+    // the live audit" for the divergence pages, which must never be raised off a
+    // stale book.
+    bool broker_held_last_session(const std::string& symbol, bool& unknown) const {
+        if (!last_broker_.empty()) return broker_holds(symbol, unknown);
+        unknown = last_stopped_broker_.empty();
+        for (const BookPos& p : last_stopped_broker_)
+            if (p.symbol == symbol) return std::fabs(p.qty) > kQtyEpsilon;
+        return false;
+    }
     const std::vector<Divergence>& confirmed() const { return confirmed_; }
     // How long the confirmed disagreement has held the SAME pair of quantities.
     // The page quotes it, because "unchanged over 61s" is the fact that rules
@@ -519,6 +584,11 @@ private:
     AuditState state_ = AuditState::Off;
     std::unordered_map<std::string, Entry> streaks_;
     std::vector<Divergence> confirmed_;
+    std::vector<BookPos> last_broker_;   // the last answer, whole (see last_broker())
+    // The last non-empty book, preserved across stand_down() for the one caller
+    // that runs between sessions. Never used for paging — see
+    // broker_held_last_session().
+    std::vector<BookPos> last_stopped_broker_;
     int64_t last_agreed_ms_ = 0;    // 0 = never
     int64_t last_answer_ms_ = 0;    // 0 = never
     int64_t armed_at_ms_ = 0;
