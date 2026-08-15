@@ -1098,9 +1098,11 @@ void App::pump_sweep() {
                 // doing that for every time-based parameter of every strategy,
                 // not just time_stop. Optimizer path only: a manual backtest and
                 // a replay must keep judging the data's own clock.
-                // See BacktestConfig::eod_flatten_h.
-                if (sweep_bar_sec > 0 && sweep_bar_sec < 24 * 3600)
-                    sweep_base_.eod_flatten_h = kEodBackstopH;
+                // See BacktestConfig::eod_flatten_h. The predicate lives in
+                // sweep_eod_flatten_h so it is testable — nothing constructs an
+                // App, so an expression here could be deleted with a green suite
+                // and take the whole fix with it.
+                sweep_base_.eod_flatten_h = sweep_eod_flatten_h(sweep_bar_sec);
 
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;

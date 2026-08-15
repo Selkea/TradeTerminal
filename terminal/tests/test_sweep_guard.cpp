@@ -8,8 +8,13 @@
 #include "symbol_params.h"   // session_bars / time_stop_reachable: the LIVE half
 
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 using namespace tt;
+using tt::ui::bar_seconds_of_interval;
+using tt::ui::sweep_eod_flatten_h;
 
 // ---- which parameters the optimizer may touch ------------------------------
 TEST_CASE("sweep: sizing and session-shape parameters are never swept") {
@@ -164,4 +169,48 @@ TEST_CASE("sweep: interval strings map to the bar size the fit is traded on") {
     CHECK(bar_seconds_of_interval("1d") == 23400);
     CHECK(bar_seconds_of_interval("weekly") == 0);   // unknown: do not judge
     CHECK(bar_seconds_of_interval("") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// THE ONE LINE THE WHOLE DAY BOUNDARY HANGS ON.
+//
+// BacktestConfig::eod_flatten_h is what stops the optimizer scoring holds that
+// production force-flattens out of existence (the 2026-08-14 STKH time_stop of
+// 233 bars, +8.60% in backtest, -$506 live). But App::pump_sweep is the ONLY
+// place in the repo that ever sets it non-zero, nothing constructs an App in a
+// test, and every case that exercises the field hand-sets it. A parity audit
+// found that deleting the arming line disarmed the entire fix with a green
+// suite. These pin the decision and the fact that app.cpp still asks for it.
+
+TEST_CASE("sweep: intraday bars are scored with the live day boundary") {
+    CHECK(sweep_eod_flatten_h(300) == doctest::Approx(kEodBackstopH));    // 5m
+    CHECK(sweep_eod_flatten_h(3600) == doctest::Approx(kEodBackstopH));   // 1h
+    CHECK(sweep_eod_flatten_h(60) == doctest::Approx(kEodBackstopH));
+}
+
+TEST_CASE("sweep: a session-length bar has no intraday boundary to honour") {
+    // "1d" is 23400 s — one RTH session, NOT 86400. Scoring a daily series
+    // against a 15:57 cutoff would be the bug: a daily bar's clock is the
+    // data's, not the world's (BacktestConfig::eod_flatten_h).
+    CHECK(sweep_eod_flatten_h(bar_seconds_of_interval("1d")) == doctest::Approx(0.0));
+    CHECK(sweep_eod_flatten_h(86'400) == doctest::Approx(0.0));
+}
+
+TEST_CASE("sweep: an unrecognised interval is left unarmed rather than guessed") {
+    CHECK(sweep_eod_flatten_h(bar_seconds_of_interval("30s")) == doctest::Approx(0.0));
+    CHECK(sweep_eod_flatten_h(0) == doctest::Approx(0.0));
+    CHECK(sweep_eod_flatten_h(-1) == doctest::Approx(0.0));
+}
+
+TEST_CASE("sweep: pump_sweep still arms the boundary through that predicate") {
+    // Source-text pin. The cases above prove the predicate is right; only this
+    // proves the optimizer still calls it. Without it the predicate could be
+    // perfect and orphaned, which is the exact state the audit found.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    CHECK(src.find("sweep_base_.eod_flatten_h = sweep_eod_flatten_h(") !=
+          std::string::npos);
 }

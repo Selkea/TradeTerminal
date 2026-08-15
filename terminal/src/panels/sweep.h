@@ -2,6 +2,8 @@
 
 #include "engine/engine.h"
 
+#include "../market_calendar.h"   // kEodBackstopH: the hour the live engine flattens
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -55,6 +57,26 @@ inline int bar_seconds_of_interval(const std::string& ivl) {
     if (ivl == "1h") return 3600;
     if (ivl == "1d") return 6 * 3600 + 30 * 60;   // one RTH session
     return 0;
+}
+
+// The EOD flatten hour an OPTIMIZER run must be scored at, for a given bar size.
+// 0 means "no day boundary" — see BacktestConfig::eod_flatten_h.
+//
+// This exists as a function rather than an expression at the call site because
+// that call site is the entire reach the day-boundary fix has into production:
+// App::pump_sweep is the ONLY place in the repo that ever sets eod_flatten_h
+// non-zero, no test constructs an App, and every test that exercises the field
+// hand-sets it. So until this was extracted, deleting the arming line disarmed
+// the whole fix — every optimizer score silently reverting to the physics that
+// crowned a 233-bar time stop — with a completely green suite.
+//
+// Armed only for a bar SHORTER than a session. "1d" is 23400 s (one RTH
+// session, not 86400), and a daily series has no intraday boundary to honour:
+// flattening it at 15:57 would be the bug, not the fix. An unrecognised
+// interval is 0 seconds and stays unarmed rather than guessing at one.
+inline double sweep_eod_flatten_h(int bar_seconds) {
+    constexpr int kSessionSeconds = 6 * 3600 + 30 * 60;   // 23400 — "1d"
+    return bar_seconds > 0 && bar_seconds < kSessionSeconds ? kEodBackstopH : 0.0;
 }
 
 // The upper bound the optimizer may actually sweep a parameter to, given the bar
