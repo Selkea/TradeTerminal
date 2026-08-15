@@ -1768,6 +1768,13 @@ void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
                 so.inherited_params.clear();
                 so.param_source = ParamSource::None;
                 so.strat_key.clear();
+                // The flag is what actually stops it trading. Clearing the key
+                // does NOT leave the tab strategy-less: acquire_strategy maps ""
+                // to kBuiltinStrategyKey ("sma_crossover.cpp"), a real promoted
+                // strategy, which would then run on its declared defaults and
+                // open a position the instant adopt_hold released the symbol -
+                // on a symbol the lineup had just decided not to trade.
+                so.hold_only = true;
                 so.ap_mode = 0;
             }
             so.symbol = s;
@@ -1779,7 +1786,8 @@ void App::begin_lineup_swap(const TradePanel::StartOpts& next) {
             " in the session - the broker's book still shows a position there, and a "
             "symbol outside cfg.symbols can be neither adopted, audited, nor "
             "flattened (2026-08-06 orphan, $846; 2026-07-21 NVDA, 24 days). It is "
-            "carried with no strategy, so reconciliation adopts and holds it.");
+            "carried HOLD-ONLY: reconciliation adopts it and its exits still "
+            "work, but it may not open or add.");
     }
     std::vector<uint32_t> dropped_ids;   // symbols leaving the lineup (any state)
     swap_flatten_ids_.clear();
@@ -4077,6 +4085,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     std::vector<int> sym_bars;
     std::vector<std::string> sym_accts;
     std::vector<RiskLimits> sym_risk;
+    std::vector<uint8_t> sym_hold_only;   // see LiveConfig::symbol_hold_only
     bool any_record = false;
     // Session-level equity/stale halts run on one portfolio, so
     // drive them from the tightest (min non-zero) per-symbol value.
@@ -4092,6 +4101,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
         sym_bars.push_back(so.bar_seconds);
         sym_accts.push_back(so.account);
         sym_risk.push_back(so.risk);
+        sym_hold_only.push_back(so.hold_only ? 1 : 0);
         any_record = any_record || so.record;
         // A "hold — don't halt" symbol is left out of the equity-halt
         // aggregation, so its loss can't arm the session's auto-flatten; its
@@ -4158,6 +4168,7 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     cfg.symbol_bar_seconds = sym_bars;
     cfg.risk = session_risk;
     cfg.symbol_risk = sym_risk;
+    cfg.symbol_hold_only = sym_hold_only;
     // THE ENTRY GATE. Installed for every live session the app starts, so no
     // strategy can open a position outside the hours in which one can be closed
     // again — see LiveConfig::entry_gate and tt::rth_entry_allowed. The engine

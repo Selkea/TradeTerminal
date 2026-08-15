@@ -123,6 +123,21 @@ struct LiveConfig {
     // `risk`). Applied per order in EngineCtx; the equity/stale halts above stay
     // session-wide (per-symbol halting needs per-symbol portfolios).
     std::vector<RiskLimits> symbol_risk;
+    // HOLD-ONLY symbols (parallel to symbols; empty = none, nonzero = hold-only).
+    //
+    // A symbol carried in the session ONLY so an existing broker position can be
+    // adopted, audited and closed - never to open a new one. A lineup swap uses
+    // this for a symbol it is dropping while the broker still shows a position
+    // there: a symbol outside cfg.symbols can be neither adopted, audited nor
+    // flattened (2026-08-06 orphan $846; 2026-07-21 NVDA, undetected 24 days),
+    // so it has to stay - but it must not trade.
+    //
+    // It is a FIRST-CLASS FLAG rather than "leave the strategy key empty",
+    // because an empty key is not the absence of a strategy: App::acquire_strategy
+    // maps "" to kBuiltinStrategyKey ("sma_crossover.cpp"), a real promoted
+    // strategy, which then runs on its declared defaults and opens a position the
+    // moment adopt_hold releases the symbol.
+    std::vector<uint8_t> symbol_hold_only;
     // THE ENTRY GATE (0.23.0). Answers, for a wall-clock instant: may a strategy
     // OPEN or ADD to a position right now? Empty = disarmed, which is what
     // backtests and replays want (their clock is the data's, not the world's).

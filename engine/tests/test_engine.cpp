@@ -1234,3 +1234,108 @@ TEST_CASE("portfolio: fees are per symbol and reset with the portfolio") {
     pf.reset(100000.0);
     CHECK(pf.fees() == doctest::Approx(0.0));
 }
+
+// ---- hold-only symbols -----------------------------------------------------
+//
+// A lineup swap that drops a symbol while the broker still shows a position
+// there must KEEP it in cfg.symbols — a symbol outside the session list can be
+// neither adopted, audited nor flattened (2026-08-06 orphan $846; 2026-07-21
+// NVDA, undetected for 24 days). But it must not trade.
+//
+// The first implementation expressed that as strat_key.clear(), which does NOT
+// produce a strategy-less tab: App::acquire_strategy maps "" to
+// kBuiltinStrategyKey ("sma_crossover.cpp"), a real promoted strategy that then
+// runs on its declared defaults and opens a position the moment adopt_hold
+// releases the symbol. Hence a first-class flag the ENGINE honours.
+
+namespace {
+// Submits one buy, then one sell of the same size, recording what came back.
+struct BuyThenSellStrat : IStrategy {
+    uint64_t buy_id = 0, sell_id = 0;
+    std::atomic<bool> done{false};
+    void on_init(IStrategyContext&) noexcept override { buy_id = sell_id = 0; }
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        if (done.load()) return;
+        if (buy_id == 0) {
+            buy_id = ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 10,
+                                       0, 0, 0, 0});
+            if (buy_id == 0) done.store(true);   // refused: stop retrying
+            return;
+        }
+        if (ctx.position(sid).qty > 0.0 && sell_id == 0) {
+            sell_id = ctx.submit_order({sid, Side::Sell, OrdType::Market, {}, 10,
+                                        0, 0, 0, 0});
+            done.store(true);
+        }
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("hold-only: an opening order is refused, and says why") {
+    Engine eng;
+    BuyThenSellStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.symbol_hold_only = {1};
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump_until(eng, [&] { return strat.done.load(); }, 5000);
+    eng.stop_live();
+    // Refused: submit_order returns 0 and the record names the cause. A bare
+    // rejection here would be the 2026-08-13 defect all over again.
+    CHECK(strat.buy_id == 0u);
+    const auto snap = eng.live_snapshot();
+    REQUIRE(snap.orders.size() >= 1);
+    const OrderRecord& r = snap.orders.front();
+    CHECK(r.status == OrderStatus::Rejected);
+    CHECK(r.reject_cause == RejectCause::HoldOnlySymbol);
+    CHECK_FALSE(r.reject_msg.empty());
+    // It never reached a position.
+    CHECK(snap.symbols[0].position.qty == doctest::Approx(0.0));
+}
+
+TEST_CASE("hold-only: the symbol can still REDUCE, or it would trap the position") {
+    // The whole point of carrying the symbol is to let the position OUT. A flag
+    // that blocked exits too would turn the orphan-protection into the orphan.
+    Engine eng;
+    BuyThenSellStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.symbol_hold_only = {};   // opens allowed: build a position first
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    // Wait for the round trip to COMPLETE, not merely for the sell to be
+    // submitted: strat.done is set at submit time, and asserting on the
+    // position before the fill lands is a race, not a result.
+    CHECK(pump_until(eng, [&] {
+        const auto s = eng.live_snapshot();
+        return strat.sell_id != 0 && !s.symbols.empty() &&
+               s.symbols[0].position.qty == 0.0;
+    }, 5000));
+    eng.stop_live();
+    const auto snap = eng.live_snapshot();
+    CHECK(strat.buy_id != 0u);
+    CHECK(strat.sell_id != 0u);
+    // Both accepted; the sell reduced the position back to flat.
+    CHECK(snap.symbols[0].position.qty == doctest::Approx(0.0));
+}
+
+TEST_CASE("hold-only: absent or short vector leaves every symbol tradable") {
+    // Parallel-vector hazard: a config that sets it for one symbol and not
+    // another must not silently gate the unlisted one.
+    Engine eng;
+    BuyThenSellStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA", "BBB"};
+    cfg.bar_seconds = 100'000;
+    cfg.symbol_hold_only = {};   // empty = nothing is hold-only
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    CHECK(pump_until(eng, [&] { return strat.done.load(); }, 5000));
+    eng.stop_live();
+    CHECK(strat.buy_id != 0u);
+}

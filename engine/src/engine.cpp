@@ -100,11 +100,12 @@ public:
               Portfolio& pf, LatencyHistogram& lat, const RiskLimits* risk = nullptr,
               OrderHook on_order = {}, IBrokerAdapter* broker = nullptr,
               const std::vector<RiskLimits>* symbol_risk = nullptr,
-              const std::vector<std::map<std::string, double>>* symbol_params = nullptr)
+              const std::vector<std::map<std::string, double>>* symbol_params = nullptr,
+              const std::vector<uint8_t>* symbol_hold_only = nullptr)
         : eng_(eng), params_(params), now_(std::move(now)), exec_(exec), pf_(pf),
           lat_(lat), risk_(risk), symbol_risk_(symbol_risk),
-          symbol_params_(symbol_params), on_order_(std::move(on_order)),
-          broker_(broker) {
+          symbol_params_(symbol_params), symbol_hold_only_(symbol_hold_only),
+          on_order_(std::move(on_order)), broker_(broker) {
         symbols_ = symbols;
     }
 
@@ -146,6 +147,13 @@ public:
         if (entry_gate_ && !manual_ && in.outside_rth == 0 && increases_position(in) &&
             !entry_gate_(now_()))
             return refuse(in, RejectCause::SessionClosed);
+        // HOLD-ONLY (see LiveConfig::symbol_hold_only). Same test as the entry
+        // gate and for the same reason - reducing and exiting must always be
+        // allowed, or carrying the symbol would trap the position it exists to
+        // let out. Not conditional on `manual_`: an operator order on a
+        // hold-only tab is far more likely to be a mistake than an intention.
+        if (increases_position(in) && hold_only(in.symbol_id))
+            return refuse(in, RejectCause::HoldOnlySymbol);
         if (const RejectCause c = risk_ok(in); c != RejectCause::None)
             return refuse(in, c);
         // Down-size a position-increasing order to the notional cap (see
@@ -404,6 +412,13 @@ private:
     const RiskLimits* risk_;
     const std::vector<RiskLimits>* symbol_risk_ = nullptr;
     const std::vector<std::map<std::string, double>>* symbol_params_ = nullptr;
+    const std::vector<uint8_t>* symbol_hold_only_ = nullptr;
+    // May this symbol open or add? Absent vector = every symbol may.
+    bool hold_only(uint32_t symbol_id) const noexcept {
+        return symbol_hold_only_ && symbol_id >= 1 &&
+               symbol_id <= symbol_hold_only_->size() &&
+               (*symbol_hold_only_)[symbol_id - 1] != 0;
+    }
     uint32_t cur_symbol_ = 0;
     OrderHook on_order_;
     bool warming_ = false;
@@ -1179,7 +1194,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     }
     EngineCtx ctx(*this, cfg.params, cfg.symbols, [&rt] { return rt.now_ns(); },
                   exec, pf, lat, &cfg.risk, on_order, broker, &cfg.symbol_risk,
-                  &cfg.symbol_params);
+                  &cfg.symbol_params, &cfg.symbol_hold_only);
     ctx.set_entry_gate(cfg.entry_gate);
     // The gate cannot fail silently. An app that forgot to install one gets one
     // line at session start saying so, and /diag carries entry_gate.armed for

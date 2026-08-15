@@ -36,6 +36,11 @@ public:
         RiskLimits risk{};
         // Autopilot: re-optimize while trading. mode 0 off, 1 params-only,
         // 2 full (strategy can be swapped). trigger 0 timer, 1 drawdown, 2 both.
+        // Carried ONLY to hold/adopt/close an existing broker position, never
+        // to open one (LiveConfig::symbol_hold_only). Set by a lineup swap on a
+        // symbol it is dropping while the broker still shows a position there.
+        // A flag, not an empty strat_key: "" resolves to sma_crossover.cpp.
+        bool hold_only = false;
         int ap_mode = 0;
         int ap_trigger = 0;
         double ap_interval_min = 30;
