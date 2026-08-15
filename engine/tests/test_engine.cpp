@@ -1102,7 +1102,17 @@ struct BuyAndNeverExit final : IStrategy {
 // in every timezone — hour_of_day_local reads the machine's zone, and a
 // hardcoded epoch would test a different hour of the day on every box.
 // `days` sessions of 5-minute bars, from the 09:30 open through a 16:00 open.
-std::vector<Bar> local_session_bars(int days) {
+//
+// A bar COMPLETES at open + interval (engine.cpp), and the boundary is tested
+// against the completion, so bar i is stamped 09:35 + i*5m: i=76 is 15:55, i=77
+// is 16:00 — the one that crosses 15:57 — and i=78 is 16:05.
+//
+// last_open_i extends the session into after-hours. It matters: with the default
+// 78 there are only two bars past the cutoff and the strategy below re-enters at
+// most once, so an edge trigger and a LEVEL trigger produce identical fills and
+// the crossing test cannot be distinguished from a threshold test. 126 runs to a
+// 20:00 open, which is the shape the live feed actually delivers.
+std::vector<Bar> local_session_bars(int days, int last_open_i = 78) {
     std::vector<Bar> out;
     for (int d = 0; d < days; ++d) {
         std::tm tm{};
@@ -1114,7 +1124,7 @@ std::vector<Bar> local_session_bars(int days) {
         tm.tm_isdst = -1;
         const std::time_t open = std::mktime(&tm);
         REQUIRE(open != static_cast<std::time_t>(-1));
-        for (int i = 0; i <= 78; ++i) {   // 09:30 .. 16:00 opens
+        for (int i = 0; i <= last_open_i; ++i) {   // 09:30 .. 16:00 opens
             Bar b{};
             b.ts_ns = static_cast<int64_t>(open + i * 300) * 1000000000LL;
             b.open = b.close = 10.0;
@@ -1186,6 +1196,114 @@ TEST_CASE("backtest: the boundary is compared against the LOCAL clock") {
     cfg.eod_flatten_h = 23.99;
     const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
     CHECK(r.fills.size() == 1);
+}
+
+namespace {
+
+// Re-enters the moment it finds itself flat, which is what makes the EDGE
+// trigger observable: the three cases above buy once and never again, so the
+// position is already closed for every bar after the crossing and a level test
+// passes them all by falling into `if (pos == 0.0) return`.
+struct RebuysWhenFlat final : IStrategy {
+    int bars = 0;
+    double pos = 0.0;
+    bool in_flight = false;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        if (++bars < 2 || pos != 0.0 || in_flight) return;
+        in_flight = true;
+        ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0});
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill& f) noexcept override {
+        in_flight = false;
+        pos += f.side == Side::Buy ? f.qty : -f.qty;
+    }
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+// Holds a position AND leaves a resting exit sitting in the book across the
+// boundary. The limit is far above every price in the fixture, so nothing but
+// the flatten's own cancel_all can ever retire it.
+struct RestsAnExitOrder final : IStrategy {
+    int bars = 0;
+    int order_ends = 0;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        ++bars;
+        if (bars == 2)
+            ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0});
+        else if (bars == 4)
+            ctx.submit_order({sid, Side::Sell, OrdType::Limit, {}, 100, 999.0, 0, 0, 0});
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {
+        ++order_ends;
+    }
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+} // namespace
+
+TEST_CASE("backtest: the boundary is a CROSSING, not a threshold") {
+    // The distinction the three cases above cannot make, and the one the live
+    // backstop documents at engine.cpp ("a level trigger would flatten the
+    // instant the engine came up at, say, 16:10"). v0.25.1 shipped exactly this
+    // bug in the session guard, so it is worth a case that fails on it.
+    //
+    // Two sessions of bars running to 20:05, and a strategy that re-enters
+    // whenever it is flat:
+    //   EDGE  — flatten at day 1's 16:00 crossing, the re-entry rides the whole
+    //           evening untouched, flatten again at day 2's 16:00, re-enter and
+    //           finish long. Three buys, two sells.
+    //   LEVEL — measured, not guessed: 2 fills, 1 sell, ends flat. Every evening
+    //           bar is past 15:57, so the flatten runs again on the bar after the
+    //           re-entry is submitted and its cancel_all kills that entry before
+    //           it can fill. The strategy is left with its in-flight guard latched
+    //           and never trades again — the symbol is wedged for the rest of the
+    //           run, which scores as "this fit stops trading after day one".
+    Engine eng;
+    RebuysWhenFlat strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(2, 126);   // 09:30 .. 20:00 opens
+    cfg.synth_ticks = false;
+    cfg.eod_flatten_h = 15.95;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+
+    CHECK(r.fills.size() == 5);
+    int sells = 0;
+    for (const TradeRow& f : r.fills)
+        if (f.side == static_cast<uint8_t>(Side::Sell)) ++sells;
+    CHECK(sells == 2);            // one per day, not one per evening bar
+    CHECK(strat.pos == doctest::Approx(100));   // finishes long, never re-closed
+}
+
+TEST_CASE("backtest: the flatten retires resting orders and says so") {
+    // A liquidation that leaves the strategy's exit order alive is worse than no
+    // liquidation: bollinger_reversion (and every other strategy here) latches an
+    // entry_id_/exit_id_ in-flight guard and will not trade again until it hears
+    // the order end. Deleting the cancel_all loop wedges the symbol for the rest
+    // of the run, and the fit scores as "stops trading after day one" rather than
+    // as the flat position it should be.
+    Engine eng;
+    RestsAnExitOrder strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(2);
+    cfg.synth_ticks = false;
+    cfg.eod_flatten_h = 15.95;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+
+    // The entry and the liquidation — NOT the 999.0 exit, which can never fill.
+    REQUIRE(r.fills.size() == 2);
+    CHECK(r.fills[1].side == static_cast<uint8_t>(Side::Sell));
+    // The resting order died at the boundary and the strategy was told once.
+    CHECK(strat.order_ends == 1);
 }
 
 // ---------------------------------------------------------------------------
