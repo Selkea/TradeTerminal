@@ -496,6 +496,10 @@ private:
     // Fires at most once per calendar day; see tt::session_should_stop.
     void pump_session_guard();
     int session_guard_day_ = -1;   // tm_yday the guard last stopped a session (-1 = never)
+    // Seconds-of-day this guard last observed (-1 = never). The guard is
+    // edge-triggered on the close crossing, so a session started AFTER the
+    // cutoff — every evening deploy — is left alone. See session_should_stop.
+    int session_guard_prev_sod_ = -1;
 
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07

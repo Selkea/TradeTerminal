@@ -304,15 +304,34 @@ inline double session_end_h(const std::tm& tm) {
 // every tick — the guard is a backstop against a session nobody is watching, not
 // a lock on the Start button.
 //
-// On a non-trading day (weekend, holiday) session_end_h is 0 and this is true
-// from the first tick: a session that is somehow live on a Saturday has no
-// trading day to outlive at all.
-inline bool session_should_stop(const std::tm& tm, int last_stop_yday) {
+// EDGE-TRIGGERED on the crossing, exactly like Engine's own EOD backstop
+// (engine.cpp: "A level trigger would flatten the instant the engine came up at,
+// say, 16:10"). `prev_sod` is the seconds-of-day this guard last OBSERVED, or -1
+// if it has not observed one yet. The guard may only stop a session it watched
+// cross the cutoff.
+//
+// WHY THIS IS NOT OPTIONAL. A level test fires on the first tick of any session
+// that starts after the cutoff — which is every VPS deploy, because the evening
+// is the only window where deploying is safe (flat book, market closed). The
+// first version of this guard paired a level test with a position-liquidating
+// stop, so an 18:30 deploy would have cancelled the resting protective orders
+// and fired a market flatten into a shut exchange, seconds after coming up.
+//
+// The non-trading-day arm is gone with it. It read `end_h <= 0 -> true`, which
+// stopped any session live on a weekend from the first tick. It is unnecessary:
+// a session running unattended into Saturday was already stopped by FRIDAY's
+// crossing, so all the arm could still catch is a session a human started
+// deliberately on a non-trading day — which is the case the once-per-day rule
+// above exists to leave alone, and which cannot trade anyway (the entry gate
+// refuses every entry outside RTH).
+inline bool session_should_stop(const std::tm& tm, int last_stop_yday, int prev_sod) {
     if (tm.tm_yday == last_stop_yday) return false;   // already stopped today
+    if (prev_sod < 0) return false;                   // no crossing observed yet
     const double end_h = session_end_h(tm);
+    if (end_h <= 0.0) return false;                   // not a trading day at all
     const int sod = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
-    if (end_h <= 0.0) return true;                    // not a trading day at all
-    return sod >= static_cast<int>(end_h * 3600.0 + 0.5);
+    const int end_sod = static_cast<int>(end_h * 3600.0 + 0.5);
+    return prev_sod < end_sod && sod >= end_sod;
 }
 
 inline int64_t rth_open_elapsed_ms(const std::tm& tm) {

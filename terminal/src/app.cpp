@@ -5274,7 +5274,11 @@ void App::pump_session_guard() {
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};
     localtime_s(&tm, &now_tt);
-    if (!session_should_stop(tm, session_guard_day_)) return;
+    const int sod_now = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    const bool stop_now = session_should_stop(tm, session_guard_day_,
+                                              session_guard_prev_sod_);
+    session_guard_prev_sod_ = sod_now;   // observed, whether or not we act
+    if (!stop_now) return;
     session_guard_day_ = tm.tm_yday;   // once per day, whatever happens below
     const double end_h = session_end_h(tm);
     const int late_min =
@@ -5296,7 +5300,21 @@ void App::pump_session_guard() {
     // Through safe_stop_live, exactly like the scheduled stop, and for the same
     // reason: Engine::stop_live leaves the TWS adapter connected and holding
     // kTwsOrdersClientId until the next morning's start dials the same id.
-    safe_stop_live();
+    //
+    // KEEP POSITIONS. The default safe_stop_live() runs the kill switch, which
+    // is cancel_all() + flatten() — and this fires at 16:15, with the exchange
+    // already shut. That sequence CANCELS the resting protective stop and then
+    // sends a market flatten that will not fill until the next open, so a
+    // position that survived 15:57 (the 2026-08-06 orphan is the documented
+    // case: the backstop's flatten did not fill, $846) would be left with
+    // nothing protecting it overnight. Strictly worse than the state the guard
+    // exists to correct.
+    //
+    // Keeping them leaves the position AND its resting broker orders alive for
+    // the next session's reconcile-and-adopt, which is the same mechanism the
+    // lineup swap already depends on. The point of this guard is to end an
+    // unattended SESSION, not to liquidate into a closed market.
+    safe_stop_live(true);
 }
 
 void App::pump_history_watchdog() {
