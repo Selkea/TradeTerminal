@@ -1055,3 +1055,182 @@ TEST_CASE("the legacy single-argument pop_log still drains") {
     CHECK(n > 0);
     eng.stop_live();
 }
+
+// ---------------------------------------------------------------------------
+// THE DAY BOUNDARY THE BACKTEST DID NOT HAVE (BacktestConfig::eod_flatten_h).
+//
+// 2026-08-14, -$506.26 on STKH. The morning tournament fitted its
+// bollinger_reversion time_stop to 233 bars and scored it +8.60% — a 19.4-hour
+// hold on a 300 s series. That score was reachable because Engine::run replayed
+// six months of bars straight through with no session concept at all. Live, the
+// engine force-flattens everything at 15:57, so 77 bars is the ceiling; and
+// BollRev places no price stop by design, which makes that time stop the ONLY
+// exit a losing position has. It could not fire from the instant it was crowned.
+// The position filled at 13:41, held 27 bars, fell 10.1%, and was liquidated by
+// the backstop.
+//
+// The optimizer was fitting under physics production does not have. Clamping the
+// parameter afterwards is a guard rail; this is the source fix, and without it
+// every time-based parameter of every strategy keeps inheriting the same lie.
+namespace {
+
+// Buys once, on its second bar, and then does nothing at all. Deliberately has
+// NO exit: the point is whether the ENGINE closes the day, so a strategy that
+// could close itself would prove nothing. This is bollinger_reversion's shape on
+// a losing trade, reduced to its essentials.
+struct BuyAndNeverExit final : IStrategy {
+    int bars = 0;
+    int fills = 0;
+    int order_ends = 0;
+    bool bought = false;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        if (++bars != 2 || bought) return;
+        bought = true;
+        ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0});
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override { ++fills; }
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {
+        ++order_ends;
+    }
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+// Bars on the LOCAL clock, built through mktime so the case means the same thing
+// in every timezone — hour_of_day_local reads the machine's zone, and a
+// hardcoded epoch would test a different hour of the day on every box.
+// `days` sessions of 5-minute bars, from the 09:30 open through a 16:00 open.
+std::vector<Bar> local_session_bars(int days) {
+    std::vector<Bar> out;
+    for (int d = 0; d < days; ++d) {
+        std::tm tm{};
+        tm.tm_year = 2026 - 1900;
+        tm.tm_mon = 8 - 1;
+        tm.tm_mday = 17 + d;    // Mon 2026-08-17 onward: consecutive weekdays
+        tm.tm_hour = 9;
+        tm.tm_min = 30;
+        tm.tm_isdst = -1;
+        const std::time_t open = std::mktime(&tm);
+        REQUIRE(open != static_cast<std::time_t>(-1));
+        for (int i = 0; i <= 78; ++i) {   // 09:30 .. 16:00 opens
+            Bar b{};
+            b.ts_ns = static_cast<int64_t>(open + i * 300) * 1000000000LL;
+            b.open = b.close = 10.0;
+            b.high = 10.05;
+            b.low = 9.95;
+            b.volume = 1e6;
+            out.push_back(b);
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("backtest: without a day boundary a position rides forever") {
+    // The behaviour that scored STKH's 233-bar hold at +8.60%. Kept as a case in
+    // its own right because it is still the CORRECT behaviour for a manual
+    // backtest and for a replay, whose clock is the data's and not the world's —
+    // eod_flatten_h defaults to 0 for exactly that reason, and a change that
+    // switched it on everywhere would silently rewrite every saved replay.
+    Engine eng;
+    BuyAndNeverExit strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(2);
+    cfg.synth_ticks = false;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    REQUIRE(r.fills.size() == 1);                     // the entry, and nothing else
+    CHECK(r.fills[0].side == static_cast<uint8_t>(Side::Buy));
+}
+
+TEST_CASE("backtest: eod_flatten_h closes the position the live engine would") {
+    Engine eng;
+    BuyAndNeverExit strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(2);
+    cfg.synth_ticks = false;
+    cfg.eod_flatten_h = 15.95;   // 15:57, mirroring run_live's kEodBackstopH
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+
+    // The entry, then the liquidation the live engine performs every afternoon.
+    // Without it this run books ONE fill and carries the position across the day
+    // boundary — which is how a 233-bar time stop came to look realizable.
+    REQUIRE(r.fills.size() == 2);
+    CHECK(r.fills[0].side == static_cast<uint8_t>(Side::Buy));
+    CHECK(r.fills[1].side == static_cast<uint8_t>(Side::Sell));
+    CHECK(r.fills[1].qty == doctest::Approx(100));
+    // The strategy is TOLD, so its own bookkeeping stays honest — every strategy
+    // here latches an entry_id_/exit_id_ in-flight guard, and a liquidation it
+    // never heard about would wedge the symbol for the rest of the run.
+    CHECK(strat.fills == 2);
+    // Through ExecSim, so the close pays the same slippage and the same IBKR
+    // commission as any other fill. A free liquidation would flatter exactly the
+    // fits this exists to penalise.
+    CHECK(r.fills[1].fee > 0.0);
+}
+
+TEST_CASE("backtest: the boundary is compared against the LOCAL clock") {
+    // A cutoff above every hour in the data must close nothing at all — the
+    // sanity check that the crossing test is reading an hour of day rather than
+    // an epoch, which would fire on the first bar and pass the case above for
+    // entirely the wrong reason.
+    Engine eng;
+    BuyAndNeverExit strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.synth_ticks = false;
+    cfg.eod_flatten_h = 23.99;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(r.fills.size() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// REALIZED P&L IS GROSS OF COMMISSIONS, AND THE PRODUCT SAID OTHERWISE.
+//
+// 2026-08-14 closed a reported -$597.01 realized against -$612.09 of actual
+// cash: 13 fills, $15.08 of commission, 2.5% of the very number used to judge
+// whether the strategies have an edge. Portfolio::apply books
+// (price - avg) * qty into realized and charges the fee to cash_ only, so every
+// realized-P&L surface understates a loss by exactly the commissions paid.
+
+TEST_CASE("portfolio: realized_net is realized minus the commissions actually paid") {
+    Portfolio pf(10000.0);
+    const double cash0 = pf.cash();
+    pf.apply(mk_fill(1, Side::Buy, 100, 10.0, 1.00));
+    pf.apply(mk_fill(1, Side::Sell, 100, 11.0, 1.50));
+
+    // Both numbers, both published. `realized` stays GROSS on purpose: every
+    // journal row and every saved session was computed that way, and silently
+    // redefining it would stop a P&L series being comparable to itself.
+    CHECK(pf.position(1).realized_pnl == doctest::Approx(100.0));
+    CHECK(pf.fees(1) == doctest::Approx(2.50));
+    CHECK(pf.realized_net(1) == doctest::Approx(97.50));
+
+    // THE INVARIANT nothing asserted before: on a flat round trip, the money the
+    // account actually kept IS realized_net. If these two ever disagree, one of
+    // them is not describing this account.
+    CHECK(pf.position(1).qty == doctest::Approx(0.0));
+    CHECK(pf.cash() - cash0 == doctest::Approx(pf.realized_net(1)));
+    // The ENTRY's commission counts too. Attributing only the exit's would halve
+    // the cost of every completed round trip.
+    CHECK(pf.fees(1) > 1.50);
+}
+
+TEST_CASE("portfolio: fees are per symbol and reset with the portfolio") {
+    Portfolio pf(100000.0);
+    pf.apply(mk_fill(1, Side::Buy, 100, 10.0, 1.0));
+    pf.apply(mk_fill(2, Side::Buy, 50, 20.0, 2.0));
+    CHECK(pf.fees(1) == doctest::Approx(1.0));
+    CHECK(pf.fees(2) == doctest::Approx(2.0));
+    CHECK(pf.fees() == doctest::Approx(3.0));
+    CHECK(pf.fees(99) == doctest::Approx(0.0));   // a symbol that never traded
+    CHECK(pf.realized_net(99) == doctest::Approx(0.0));
+    // A session's costs belong to that session: reset() clears the slots, so a
+    // new session cannot inherit yesterday's commissions into its net P&L.
+    pf.reset(100000.0);
+    CHECK(pf.fees() == doctest::Approx(0.0));
+}

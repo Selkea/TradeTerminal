@@ -537,6 +537,57 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
         push(end);
     });
 
+    // THE DAY BOUNDARY (BacktestConfig::eod_flatten_h). Off unless the caller
+    // asks — see the field for the full 2026-08-14 post-mortem. When on, it
+    // reproduces run_live's 15:57 EOD backstop inside the replay: cancel every
+    // resting order, market-close the position, and let the strategy hear both.
+    //
+    // Without it the optimizer scores holds that production force-flattens out
+    // of existence, which is how bollinger_reversion's MANDATORY time stop —
+    // the only exit a losing position of its has — got fitted to 233 bars on a
+    // 300 s series, three times longer than a trading day.
+    //
+    // EDGE-triggered on the crossing, exactly like the live backstop: a level
+    // test would re-flatten on every remaining bar of the evening and turn a
+    // series with after-hours bars into a stream of closes.
+    double eod_prev_h = -1.0;
+    auto eod_flatten = [&](double price, int64_t now_ns) {
+        if (!(cfg.eod_flatten_h > 0.0)) return;
+        const double hod = hour_of_day_local(now_ns);
+        const double prev = eod_prev_h;
+        eod_prev_h = hod;
+        if (prev < 0.0 || prev >= cfg.eod_flatten_h || hod < cfg.eod_flatten_h) return;
+        // Resting orders die first, and the strategy is TOLD. Skipping the
+        // callback would leave an in-flight guard latched (every strategy here
+        // keeps one — see bollinger_reversion's entry_id_/exit_id_) and wedge
+        // the symbol for the rest of the backtest, which would score as "this
+        // fit stops trading after day one" rather than as a flat position.
+        for (uint64_t id : exec.cancel_all())
+            strategy->on_order_end(ctx, OrderEnd{id, kSymbolId,
+                                                 OrderEndReason::Cancelled, {},
+                                                 now_ns, 0, {}});
+        const double pos = pf.position(kSymbolId).qty;
+        if (pos == 0.0) return;   // flat already: the normal path
+        // Through ExecSim rather than a synthesized Fill, so the close pays the
+        // same slippage and the same IBKR commission every other fill in the run
+        // pays. A free liquidation would flatter exactly the fits this exists to
+        // penalise. Priced at this bar, so the deadline handed to on_price has
+        // to clear the modeled wire latency the submit just added.
+        const OrderRequest r{kSymbolId, pos > 0 ? Side::Sell : Side::Buy,
+                             OrdType::Market, {}, std::abs(pos), 0.0, 0.0, 0.0, 0.0};
+        exec.submit(r, now_ns);
+        std::vector<Fill> eod_fills;
+        exec.on_price(kSymbolId, price,
+                      now_ns + cfg.exec.latency_ns + cfg.exec.latency_jitter_ns,
+                      eod_fills);
+        for (const Fill& f : eod_fills) {
+            pf.apply(f);
+            res.fills.push_back(TradeRow{f.ts_ns, static_cast<uint8_t>(f.side),
+                                         f.qty, f.price, f.fee});
+            strategy->on_fill(ctx, f);
+        }
+    };
+
     // Engine loop: single consumer, deterministic order.
     std::vector<Fill> fills;
     fills.reserve(16);
@@ -586,6 +637,10 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
             Bar b{ev.ts_event_ns - dt, ev.u.bar.open, ev.u.bar.high,
                   ev.u.bar.low, ev.u.bar.close, ev.u.bar.volume};
             strategy->on_bar(ctx, ev.symbol_id, b);
+            // AFTER the strategy, so a strategy that closes its own position on
+            // this bar is never second-guessed, and the equity point below
+            // already reflects the liquidation when it does not.
+            eod_flatten(price, ev.ts_event_ns);
             res.eq_ts.push_back(static_cast<double>(ev.ts_event_ns) / 1e9);
             res.eq_val.push_back(pf.equity());
         }
@@ -1224,6 +1279,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         for (size_t i = 0; i < n_sym; ++i) {
             snap_.symbols[i].last_price = last_price[i];
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
+            snap_.symbols[i].fees = pf.fees(static_cast<uint32_t>(i + 1));
             snap_.symbols[i].adopted = adopt_hold[i] != 0;
         }
         // Params change only at session start and on a swap, so copy the maps
@@ -1929,8 +1985,21 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                     reconciling = false;
                     int held = 0;
                     for (const char h : adopt_hold) held += h ? 1 : 0;
+                    // The off-lineup count is NOT decoration. This line used to
+                    // read "0 symbol(s) held until flat" on an account holding
+                    // 20 NVDA shares that reconciliation had silently discarded
+                    // — for 24 days — because `held` counts adopted SESSION
+                    // symbols and an unrecognised one is never adopted. It is
+                    // the one line an operator sees at every session start, so
+                    // it must not be able to say "complete" about a book it did
+                    // not fully account for. See engine/reconcile_policy.h.
+                    const uint32_t off = bev.u.recon.offlineup;
                     push_log("live: broker reconciliation complete — " +
-                             std::to_string(held) + " symbol(s) held until flat");
+                             std::to_string(held) + " symbol(s) held until flat" +
+                             (off ? ", " + std::to_string(off) +
+                                        " BROKER POSITION(S) OUTSIDE THIS LINEUP "
+                                        "- not adopted, not closeable here"
+                                  : std::string()));
                 }
             }
             if (any) {

@@ -422,3 +422,79 @@ TEST_CASE("cadence: a divergence is caught in minutes, not hours") {
     CHECK(kBookAuditBlindMs <= 10 * kMin);
     CHECK(kBookAuditBlindMs > kBookAuditIntervalMs);   // one missed round is not an event
 }
+
+// ---------------------------------------------------------------------------
+// THE BROKER'S BOOK, KEPT — because nothing else in the app has it.
+//
+// Connect-time reconciliation cannot answer "what does the broker actually
+// hold": it discards every position outside cfg_.symbols, above its own log line
+// (engine/reconcile_policy.h — 20 NVDA shares invisible for 24 days). The
+// auditor is the only place the whole answer arrives, so App::begin_lineup_swap
+// reads it to decide whether it may drop a symbol.
+//
+// It used to decide that from snap.symbols[i].position.qty — the APP's own book,
+// which is precisely the number this entire class of bug corrupts. On 2026-08-13
+// that number was a phantom for four hours. On 2026-08-06 a dropped symbol's
+// market-close never filled and the $846 position it left behind was invisible
+// to every session afterwards: outside cfg.symbols a position can be neither
+// adopted, nor audited, nor flattened, nor reached by the 15:57 EOD backstop.
+
+TEST_CASE("audit: the broker's whole book survives the comparison") {
+    BookAudit a;
+    a.arm(0);
+    CHECK(a.last_broker().empty());   // nothing has answered yet
+
+    // The 2026-08-14 shape: the app trades MUU and SOXS, and the account also
+    // holds 20 NVDA that no lineup has touched since 2026-07-21.
+    a.observe({{"MUU", 0}, {"SOXS", 100}},
+              {{"MUU", 0}, {"SOXS", 100}, {"NVDA", 20}}, {}, kMin);
+    REQUIRE(a.last_broker().size() == 3);
+
+    bool unknown = true;
+    CHECK(a.broker_holds("SOXS", unknown));
+    CHECK_FALSE(unknown);
+    CHECK_FALSE(a.broker_holds("MUU", unknown));   // present and flat
+    CHECK_FALSE(unknown);
+    // Kept WHOLE, before the comparison can discard it: NVDA is not in the app's
+    // book at all, so any storage keyed off the app side would lose exactly the
+    // row that matters.
+    CHECK(a.broker_holds("NVDA", unknown));
+    CHECK_FALSE(unknown);
+    // A symbol the broker never mentioned is flat, and that answer is KNOWN —
+    // the answer arrived, and it did not name this symbol.
+    CHECK_FALSE(a.broker_holds("KORU", unknown));
+    CHECK_FALSE(unknown);
+}
+
+TEST_CASE("audit: silence is not flatness") {
+    // The distinction the caller must be able to make. Treating "nobody has
+    // asked" as "the broker says flat" is the assumption that produced the
+    // 2026-08-06 orphan, and folding unknown into false would hide it again.
+    BookAudit a;
+    a.arm(0);
+    bool unknown = false;
+    CHECK_FALSE(a.broker_holds("SOXS", unknown));
+    CHECK(unknown);
+
+    // A round that compares NOTHING must not be mistaken for evidence either.
+    a.observe({}, {}, {}, kMin);
+    CHECK(a.last_broker().empty());
+    unknown = false;
+    CHECK_FALSE(a.broker_holds("SOXS", unknown));
+    CHECK(unknown);
+}
+
+TEST_CASE("audit: the broker's book belongs to a session, not to the process") {
+    // stand_down() runs when the session ends. A book carried across it would
+    // let yesterday's positions decide whether today's lineup may drop a symbol.
+    BookAudit a;
+    a.arm(0);
+    a.observe({{"MUU", 0}}, {{"MUU", 0}, {"NVDA", 20}}, {}, kMin);
+    bool unknown = true;
+    REQUIRE(a.broker_holds("NVDA", unknown));
+    a.stand_down();
+    CHECK(a.last_broker().empty());
+    unknown = false;
+    CHECK_FALSE(a.broker_holds("NVDA", unknown));
+    CHECK(unknown);
+}

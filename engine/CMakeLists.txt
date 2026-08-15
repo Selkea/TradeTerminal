@@ -40,6 +40,7 @@ add_executable(tt_engine_tests
     tests/test_price_tick.cpp
     tests/test_ack_latency.cpp
     tests/test_symbol_rank.cpp
+    tests/test_reconcile_policy.cpp
     # Compiled a SECOND time here (see below), statically-linked instead of as
     # a DLL -- test_strategy_registry.cpp's regression guard for the
     # TT_STRATEGY_STATIC_LINK path (terminal/CMakeLists.txt's real usage:
@@ -52,6 +53,11 @@ target_link_libraries(tt_engine_tests PRIVATE tt_engine doctest)
 target_compile_definitions(tt_engine_tests PRIVATE
     TT_TEST_SDK_INCLUDE="${CMAKE_SOURCE_DIR}/sdk/include"
     TT_TEST_STRATEGY_SRC="${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp"
+    # test_reconcile_policy pins the ONE line of tws_broker.cpp that decides
+    # whether an off-lineup broker position is reported or silently discarded.
+    # The call site is inside a TWS callback that needs a gateway to execute, so
+    # it is checked as source text -- which needs to know where the source is.
+    TT_REPO_DIR="${CMAKE_SOURCE_DIR}"
 )
 set_source_files_properties(${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp PROPERTIES
     COMPILE_DEFINITIONS "TT_STRATEGY_STATIC_LINK;TT_STRATEGY_STATIC_KEY=\"sma_crossover.cpp\"")

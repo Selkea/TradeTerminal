@@ -5,6 +5,7 @@
 #include "doctest.h"
 
 #include "panels/sweep.h"
+#include "symbol_params.h"   // session_bars / time_stop_reachable: the LIVE half
 
 #include <cmath>
 
@@ -102,4 +103,65 @@ TEST_CASE("the legacy two-arg form keeps its old, opinion-free behaviour") {
     const BacktestResult r = mk(0, 0.0, 0.0);
     CHECK(sweep_metric_of(r, kSharpe) == doctest::Approx(0.0));
     CHECK(sweep_metric_of(r, kMaxDD) == doctest::Approx(0.0));
+}
+
+// ---- the sweep may not propose a hold the trading day cannot contain -------
+//
+// 2026-08-14. The tournament fitted STKH's bollinger_reversion time_stop to
+// 233 bars on a 300 s series and scored it +8.60%, because Engine::run replayed
+// six months with no day boundary. Live, everything is force-flattened at 15:57,
+// so 77 bars is the ceiling — and BollRev places no price stop, making that time
+// stop the ONLY thing that would ever close a losing position. It could not fire
+// from the moment it was crowned. -$506, 85% of the day's loss.
+
+TEST_CASE("sweep: time_stop is capped to what the bar size can reach in a day") {
+    using tt::ui::sweep_param_max;
+    // bollinger_reversion declares max 500; rsi2_pullback the same. On the
+    // 5-minute series both are traded on, the reachable maximum is 77.
+    CHECK(sweep_param_max("time_stop", 500, 300) == doctest::Approx(77));
+    CHECK(sweep_param_max("time_stop", 500, 60) == doctest::Approx(387));
+    // 233 bars is a legitimate swing hold on DAILY bars, so the declared range
+    // is left alone there. The bound is a fact about the intraday session, which
+    // is exactly why it cannot live in the strategy's bar-size-agnostic
+    // ParamDesc — it has to be applied where the interval is known.
+    CHECK(sweep_param_max("time_stop", 500, 86400) == doctest::Approx(500));
+    // Never RAISES a declared maximum: a strategy that deliberately allows only
+    // 20 bars keeps its 20.
+    CHECK(sweep_param_max("time_stop", 20, 300) == doctest::Approx(20));
+    // Only time_stop, and only when the bar size is known. Capping a lookback
+    // or a z-threshold at "bars in a day" would be nonsense, and inventing a
+    // limit for an interval nobody recognises is worse than the blind spot.
+    CHECK(sweep_param_max("length", 300, 300) == doctest::Approx(300));
+    CHECK(sweep_param_max("trend_len", 1000, 300) == doctest::Approx(1000));
+    CHECK(sweep_param_max("time_stop", 500, 0) == doctest::Approx(500));
+}
+
+TEST_CASE("sweep: the cap agrees with the live admission gate, exactly") {
+    // Two files answer "how many bars fit in a trading day" — sweep.h for the
+    // fit and symbol_params.h for the session that trades it. If they ever
+    // disagree, the optimizer proposes sets the session then refuses, and every
+    // lineup build dies in the EXCLUDED path with nothing left to trade.
+    // Pinned rather than shared, because sweep.h must stay free of the
+    // terminal's calendar (it is included by the engine-facing panel code).
+    for (int bar_sec : {60, 300, 900, 3600}) {
+        CHECK(tt::ui::sweep_param_max("time_stop", 100000, bar_sec) ==
+              doctest::Approx(tt::ui::session_bars(bar_sec)));
+        // ...and the boundary itself round-trips: the largest value the sweep
+        // may propose is the largest value the session will accept.
+        const int cap = tt::ui::session_bars(bar_sec);
+        CHECK(tt::ui::time_stop_reachable({{"time_stop", double(cap)}}, bar_sec));
+        CHECK_FALSE(
+            tt::ui::time_stop_reachable({{"time_stop", double(cap) + 1}}, bar_sec));
+    }
+}
+
+TEST_CASE("sweep: interval strings map to the bar size the fit is traded on") {
+    using tt::ui::bar_seconds_of_interval;
+    CHECK(bar_seconds_of_interval("5m") == 300);
+    CHECK(bar_seconds_of_interval("1h") == 3600);
+    // "1d" is one RTH SESSION, not 86400: a daily bar spans the trading day, and
+    // pricing it at 24 h would understate how many of them fit in one.
+    CHECK(bar_seconds_of_interval("1d") == 23400);
+    CHECK(bar_seconds_of_interval("weekly") == 0);   // unknown: do not judge
+    CHECK(bar_seconds_of_interval("") == 0);
 }

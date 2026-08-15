@@ -3,6 +3,7 @@
 #include "engine/engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <map>
@@ -44,6 +45,56 @@ inline bool sweep_param_is_fixed(const std::string& n) {
            n == "alloc_pct" || n == "risk_pct" || n == "enter_from_h" ||
            n == "enter_until_h" || n == "session_min" || n == "eod_min" ||
            n == "min_gain_cps";
+}
+
+// Bar size in seconds for an optimizer interval string ("5m" / "1h" / "1d" —
+// sweep_interval_str's table). 0 for anything unrecognised, which every caller
+// reads as "do not judge".
+inline int bar_seconds_of_interval(const std::string& ivl) {
+    if (ivl == "5m") return 300;
+    if (ivl == "1h") return 3600;
+    if (ivl == "1d") return 6 * 3600 + 30 * 60;   // one RTH session
+    return 0;
+}
+
+// The upper bound the optimizer may actually sweep a parameter to, given the bar
+// size the fit will be traded on.
+//
+// Only time_stop, and only downwards. 2026-08-14: the tournament fitted STKH's
+// time_stop to 233 bars on a 300 s series and scored it +8.60%, because the
+// backtest replayed six months with no day boundary. Live, the engine flattens
+// everything at 15:57, so 77 bars is the most a position can ever hold — and
+// bollinger_reversion places no price stop, making that time stop the ONLY thing
+// that can close a losing position. The fit was unreachable the moment it was
+// crowned. See tt::ui::time_stop_reachable for the full post-mortem.
+//
+// The cap lives HERE, at the sweep request, and NOT in the strategy's ParamDesc
+// (bollinger_reversion.cpp declares max 500; rsi2_pullback the same). A
+// ParamDesc is bar-size agnostic and 233 bars is a perfectly legitimate swing
+// hold on daily bars — it is only impossible on intraday bars that get force
+// flattened every afternoon. The bound is a fact about the SESSION, so it
+// belongs where the session's bar size is known.
+//
+// bar_seconds 0 (an interval nobody recognises) leaves the declared max alone:
+// refusing to sweep on an unknown bar size would be inventing a limit rather
+// than applying one.
+inline double sweep_param_max(const std::string& name, double desc_max,
+                              int bar_seconds) {
+    if (name != "time_stop" || bar_seconds <= 0) return desc_max;
+    // Mirrors tt::ui::session_bars (terminal/src/symbol_params.h): 09:30 to the
+    // 15:57 EOD flatten. Restated rather than included so this header stays free
+    // of the terminal's calendar; test_sweep_guard pins the two together at
+    // every bar size, because a disagreement means the optimizer proposes sets
+    // the live session then refuses and every lineup build dies EXCLUDED.
+    //
+    // INTEGER seconds, not (15.95 - 9.5) * 3600: 15.95 has no exact double and
+    // that expression is 23219.999999999996, one bar short at every size that
+    // divides the day evenly (386 instead of 387 at 60 s).
+    const int span_s = 15 * 3600 + 57 * 60 - (9 * 3600 + 30 * 60);   // 23220
+    const int reachable = span_s / bar_seconds;
+    if (reachable < 1) return desc_max;   // bar longer than a session: not ours to judge
+    const double cap = static_cast<double>(reachable);
+    return desc_max < cap ? desc_max : cap;
 }
 
 // Automatic optimizer: coordinate descent over a strategy's declared

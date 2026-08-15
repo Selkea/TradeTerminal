@@ -242,6 +242,79 @@ inline bool rth_entry_allowed_at(int64_t now_ns) {
     return rth_entry_allowed(tm);
 }
 
+// ---- the session guard (App::pump_session_guard) ----------------------------
+//
+// A LIVE SESSION MUST NOT OUTLIVE ITS TRADING DAY. Unconditionally, without
+// depending on anything the operator can switch off.
+//
+// 2026-08-14. /diag at 17:45:50 ET — 1 h 46 m after the close — read
+// live_running true, halted false. TradePanel::pump_schedule is supposed to stop
+// the session at 15:55, and it did not, because its very first statement is
+// `if (!sched_on_) return;` and the VPS config carried "trade_sched_on": false
+// (and "trade_sched_stop": "20:00", so even enabled nothing was due). The
+// session had been started at 09:41:37 by the daily auto-lineup, which reaches
+// start_live_session through lineup_autostart_pending_ and never consults
+// sched_on_ at all. It finally ended at 17:46:47 because a human clicked
+// "Update & restart".
+//
+// The app therefore had ONE component that starts unattended sessions
+// unconditionally and a DIFFERENT, disabled component as the only thing that
+// could ever end one. Every other terminator is a button: sign out, quit,
+// update, switch account, kill switch. The engine's own 15:57 EOD backstop
+// (kEodBackstopH) flattens and returns — it never clears live_running_ — so it
+// cannot end a session either; panels/trade.h already names that as the hazard.
+//
+// What a session outliving its day costs: entries into a shut exchange (closed
+// separately by rth_entry_allowed since 0.23.0, but that gate had not been
+// deployed on the 14th), and — still open — holding kTwsOrdersClientId all night
+// so the next morning's start collides with our own socket on error 326, which
+// is the exact failure the scheduled stop was routed through App::safe_stop_live
+// to prevent.
+//
+// So the rule moves here, where it is pure and testable, and the caller runs it
+// from App::tick() independent of the Trade panel's schedule. The panel's
+// schedule keeps its job (a stop EARLIER than this, chosen by the operator);
+// this is the floor underneath it.
+
+// How long after the close a session is allowed to keep running before the
+// guard stops it. Not zero, deliberately: the engine's 15:57 backstop, a
+// strategy's own EOD flatten and the last fills of the day all land in the
+// minutes around 16:00, and stopping the session on top of them would reap the
+// broker adapter mid-flight and lose the fill callbacks — the 2026-08-13 failure
+// class. Fifteen minutes is long enough for every close to settle and short
+// enough that "the session ended today" is still true.
+inline constexpr double kSessionEndLagH = 0.25;   // 15 minutes
+
+// Local hour at which a live session must be stopped today, or 0 when the market
+// does not open at all (weekend/holiday: a session running then should stop as
+// soon as the guard sees it, which the 0 encodes).
+//
+// Derived from the DAY's real close, not hardcoded to 16:15 — on the three NYSE
+// 1pm early closes a fixed 16:15 would be three hours late, which is the same
+// half-day arithmetic bug entry_cutoff_h exists to avoid.
+inline double session_end_h(const std::tm& tm) {
+    const double close_h = us_market_close_h(tm);
+    if (close_h <= 0.0) return 0.0;
+    return close_h + kSessionEndLagH;
+}
+
+// Should a live session be stopped right now? `last_stop_yday` is the tm_yday
+// the guard last fired on (-1 = never), so the stop happens ONCE per day and a
+// human who deliberately restarts a session after the close is not fought with
+// every tick — the guard is a backstop against a session nobody is watching, not
+// a lock on the Start button.
+//
+// On a non-trading day (weekend, holiday) session_end_h is 0 and this is true
+// from the first tick: a session that is somehow live on a Saturday has no
+// trading day to outlive at all.
+inline bool session_should_stop(const std::tm& tm, int last_stop_yday) {
+    if (tm.tm_yday == last_stop_yday) return false;   // already stopped today
+    const double end_h = session_end_h(tm);
+    const int sod = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    if (end_h <= 0.0) return true;                    // not a trading day at all
+    return sod >= static_cast<int>(end_h * 3600.0 + 0.5);
+}
+
 inline int64_t rth_open_elapsed_ms(const std::tm& tm) {
     const double close_h = us_market_close_h(tm);
     if (close_h <= 0.0) return 0;

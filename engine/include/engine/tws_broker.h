@@ -126,6 +126,18 @@ public:
     // yet", which is exactly the state the auditor must be able to see.
     bool take_position_audit(std::vector<BrokerPosition>& out);
 
+    // Non-zero STOCK positions the LAST connect-time reconciliation found in
+    // symbols this session does not trade (engine/reconcile_policy.h). Any
+    // thread; published once, when the reconcile ends.
+    //
+    // A number, not a list, because the list is already in the log with its
+    // symbol and size — this is the /diag field that tells an operator to go
+    // look. Non-zero means the account holds something no strategy watches, no
+    // stop protects, and neither flatten() nor the 15:57 EOD backstop can reach.
+    int reconcile_offlineup() const {
+        return static_cast<int>(recon_offlineup_.load(std::memory_order_acquire));
+    }
+
 private:
     struct Cmd {
         enum : uint8_t { Submit = 1, Cancel, CancelAll, Flatten } type = Submit;
@@ -181,6 +193,9 @@ private:
     // audit_seq_. take_position_audit compares audit_seq_ against what it last
     // handed out, so "nothing new since last time" is distinguishable from "the
     // books agree" — the distinction the whole detector rests on.
+    // Published by the I/O thread at the end of every reconcile; read by the UI
+    // thread for /diag and the operator page. See reconcile_offlineup().
+    std::atomic<uint32_t> recon_offlineup_{0};
     std::atomic<bool> audit_req_{false};
     std::mutex audit_mu_;
     std::vector<BrokerPosition> audit_positions_;

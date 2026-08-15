@@ -35,6 +35,31 @@ struct BacktestConfig {
     ExecParams exec{};
     std::map<std::string, double> params;   // strategy parameters
     bool synth_ticks = true;                // O/H/L/C intrabar ticks for limit fills
+    // THE DAY BOUNDARY THE LIVE ENGINE HAS AND THE REPLAY DID NOT. Local hour at
+    // which a bar crossing it cancels every resting order and market-closes the
+    // position, mirroring run_live's 15:57 EOD backstop (kEodBackstopH). 0 = off.
+    //
+    // Why it is a config knob and defaults OFF: a manual backtest and a replay
+    // must keep judging the data's own clock — a daily-bar series has no
+    // intraday boundary to honour, and a captured replay is meant to reproduce
+    // what happened, not to improve on it. It is turned ON for the OPTIMIZER
+    // path only (App::pump_sweep's sweep_base_), where the whole purpose is to
+    // score a fit that will be TRADED.
+    //
+    // 2026-08-14 is why it exists. Engine::run replayed six months straight
+    // through with no session concept, so the tournament scored an STKH
+    // bollinger_reversion fit with time_stop = 233 bars at +8.60% — a 19.4-hour
+    // hold on a 300 s series. Live, everything is force-flattened at 15:57, so
+    // 77 bars is the ceiling and that time stop could never fire. It was the
+    // strategy's ONLY exit for a losing position (no price stop by design), and
+    // the position lost $506 in the 2 h 16 m before the backstop liquidated it.
+    // The optimizer was fitting under physics production does not have.
+    //
+    // Clamping the parameter afterwards (tt::ui::time_stop_reachable) is a guard
+    // rail; this is the source fix. Without it the optimizer keeps proposing
+    // unreachable holds for every time-based parameter of every strategy, and
+    // each one has to be caught by hand.
+    double eod_flatten_h = 0.0;
 };
 
 struct TradeRow {
@@ -245,6 +270,12 @@ struct SymbolState {
     std::string symbol;
     double last_price = 0.0;
     Position position{};
+    // Commissions paid on this symbol so far. Position::realized_pnl is GROSS of
+    // them (Portfolio::apply charges the fee to cash only), so realized minus
+    // this is what the account actually kept. On 2026-08-14 the difference was
+    // $15.08 on a reported -$597.01, and the reported figure is the one used to
+    // judge whether a strategy has an edge. See Portfolio::fees().
+    double fees = 0.0;
     // The parameters this symbol's strategy is ACTUALLY running, as the engine
     // holds them. The terminal keeps its own copy in the Trade tab, which the
     // optimizer overwrites with each champion whether or not the live engine
