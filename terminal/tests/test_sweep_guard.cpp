@@ -214,3 +214,88 @@ TEST_CASE("sweep: pump_sweep still arms the boundary through that predicate") {
     CHECK(src.find("sweep_base_.eod_flatten_h = sweep_eod_flatten_h(") !=
           std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// THE SIZE THE OPTIMIZER SCORES AT.
+//
+// The boundary cases above are about WHEN the replay trades. These are about
+// HOW MUCH — the parity hole that was silently wrong on every score ever
+// produced. Engine::run built its EngineCtx with no risk pointer, so
+// ctx.budget() returned cash * 0.95: measured at 989 shares / $94,509 of
+// $100,000 against a $5,000 live per-symbol budget, roughly 19x.
+
+TEST_CASE("risk: the notional cap is half the daily-loss budget at a 20% move") {
+    // The live derivation, now shared with the optimizer instead of inlined in
+    // App::start_live where the replay could not reach it.
+    RiskLimits rl{};
+    rl.daily_max_loss = 2'000.0;
+    CHECK(tt::ui::position_notional_cap(rl, 100'000.0) == doctest::Approx(5'000.0));
+}
+
+TEST_CASE("risk: an explicit cap is returned untouched, so applying twice is safe") {
+    // Live now assigns unconditionally (rl.max_position_notional = cap(...))
+    // rather than skipping already-set symbols, so idempotence is load-bearing:
+    // a non-idempotent form would re-derive over an operator's explicit number.
+    RiskLimits rl{};
+    rl.max_position_notional = 250.0;
+    rl.daily_max_loss = 2'000.0;   // would derive 5,000 if it were consulted
+    CHECK(tt::ui::position_notional_cap(rl, 100'000.0) == doctest::Approx(250.0));
+    rl.max_position_notional = tt::ui::position_notional_cap(rl, 100'000.0);
+    CHECK(tt::ui::position_notional_cap(rl, 100'000.0) == doctest::Approx(250.0));
+}
+
+TEST_CASE("risk: with no daily-loss limit a symbol is still never left uncapped") {
+    // Not a guard-rail preference. An absent cap makes ctx.budget() return
+    // cash * 0.95, which hands one position the entire account.
+    RiskLimits rl{};
+    CHECK(tt::ui::position_notional_cap(rl, 100'000.0) == doctest::Approx(20'000.0));
+    CHECK(tt::ui::position_notional_cap(rl, 0.0) == doctest::Approx(0.0));
+}
+
+TEST_CASE("risk: the sweep scores at the live caps, sized off the live budget") {
+    RiskLimits live{};
+    live.daily_max_loss = 2'000.0;
+    live.max_order_qty = 1'000;
+    live.max_position_qty = 5'000;
+    const RiskLimits swept = tt::ui::sweep_risk_limits(live, 100'000.0);
+    CHECK(swept.max_position_notional == doctest::Approx(5'000.0));
+    CHECK(swept.max_order_qty == doctest::Approx(1'000));      // carried through
+    CHECK(swept.max_position_qty == doctest::Approx(5'000));
+    CHECK(swept.price_band_pct == doctest::Approx(live.price_band_pct));
+}
+
+TEST_CASE("risk: the run_live-only halts are dropped rather than carried in dead") {
+    // Engine::run has no equity-halt machinery at all, so a BacktestConfig
+    // carrying daily_max_loss would read as protection the replay applies and
+    // does not. The replay-relevant consequence of the limit survives — it is
+    // what sized the notional cap on the line above.
+    RiskLimits live{};
+    live.daily_max_loss = 2'000.0;
+    live.max_drawdown_pct = 0.10;
+    live.stale_feed_sec = 45;
+    live.disable_auto_halt = true;
+    const RiskLimits swept = tt::ui::sweep_risk_limits(live, 100'000.0);
+    CHECK(swept.daily_max_loss == doctest::Approx(0.0));
+    CHECK(swept.max_drawdown_pct == doctest::Approx(0.0));
+    CHECK(swept.stale_feed_sec == 0);
+    CHECK_FALSE(swept.disable_auto_halt);
+    CHECK(swept.max_position_notional == doctest::Approx(5'000.0));   // still sized
+}
+
+TEST_CASE("sweep: pump_sweep still arms the risk through that predicate") {
+    // The same source-text pin as the day boundary, for the same reason: nothing
+    // constructs an App, so the arming line is unreachable from a test and the
+    // predicate above could be perfect and orphaned.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    CHECK(src.find("sweep_base_.risk = sweep_risk_limits(") != std::string::npos);
+    // ...and that live derives its cap from the SAME function. Two copies of the
+    // formula is the defect this whole fix is about; if this line ever goes back
+    // to an inline expression, the optimizer silently scores at a size live does
+    // not use again.
+    CHECK(src.find("position_notional_cap(rl, opts.session_cash)") !=
+          std::string::npos);
+}

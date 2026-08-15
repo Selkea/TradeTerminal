@@ -1109,6 +1109,15 @@ void App::pump_sweep() {
                 // it. Scoring an entry the live gate refuses is the same class of
                 // lie as scoring a hold the live backstop flattens.
                 sweep_base_.entry_cutoff_h = sweep_base_.eod_flatten_h;
+                // ...AND THE SIZE. The two lines above stopped the replay
+                // scoring trades live refuses on the CLOCK; this one stops it
+                // scoring them at a size live refuses. Engine::run built its
+                // EngineCtx with no risk pointer, so ctx.budget() returned the
+                // whole account: measured at 989 shares / $94,509 of $100,000
+                // against a $5,000 live per-symbol budget, ~19x, on every score
+                // this optimizer has ever produced. Same limits the live session
+                // will use, from the same function that derives them there.
+                sweep_base_.risk = sweep_risk_limits(trade_.risk(), rq.cash);
 
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;
@@ -4129,29 +4138,15 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // Per-trade notional guardrail: cap each position's dollar size so one
     // adverse move can't spend the whole day's loss budget in a single trade.
     // Strategies size off the ~$1M paper equity (risk_pct * cash), which dwarfs
-    // the loss limit; the share caps are notional-blind and miss it. We can't
-    // see a strategy's stop at order time, so bound exposure assuming a
-    // worst-case excursion: a $N position loses ~N*move against us, so keep
-    // N*move within a slice of the budget. Only when a daily-loss halt is armed
-    // and no explicit cap was set; the engine down-sizes orders to fit.
-    // 20% adverse move: these thin low-float names routinely swing that far
-    // intraday (a 10% assumption let SNDU lose the whole day's budget on one
-    // 20% drop, 2026-07-29).
-    constexpr double kAdverseMove = 0.20;     // assume up to a 20% move against us
-    constexpr double kLossBudgetFrac = 0.5;   // one trade risks <= half the budget
-    // With no daily-loss limit there is nothing to derive a cap from, but a live
-    // symbol must never be uncapped: strategies now size off this number
-    // (ctx.budget), so an absent cap would hand one position the whole paper
-    // account. Fall back to a fixed slice of session cash — the allocation
-    // these strategies shipped with before sizing moved onto the budget.
-    constexpr double kNoLimitAllocFrac = 0.20;
-    for (RiskLimits& rl : sym_risk) {
-        if (rl.max_position_notional > 0.0) continue;
-        rl.max_position_notional =
-            rl.daily_max_loss > 0.0
-                ? kLossBudgetFrac * rl.daily_max_loss / kAdverseMove
-                : kNoLimitAllocFrac * opts.session_cash;
-    }
+    // the loss limit; the share caps are notional-blind and miss it. The engine
+    // down-sizes orders to fit, and hands the number to the strategy up front
+    // through ctx.budget().
+    //
+    // The derivation moved to tt::ui::position_notional_cap so the OPTIMIZER can
+    // apply the identical number (see sweep_risk_limits). While it was inline
+    // here, the replay had no cap at all and sized ~19x what this line permits.
+    for (RiskLimits& rl : sym_risk)
+        rl.max_position_notional = position_notional_cap(rl, opts.session_cash);
     // Sizing is invisible otherwise: the strategy asks for a qty, the engine
     // may shrink it, and nothing says what the ceiling was. Name it per symbol
     // so a "why is this position so small" question has an answer in the log.

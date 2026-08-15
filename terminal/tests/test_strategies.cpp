@@ -16,6 +16,10 @@
 // day boundary actually removes the incentive that cost -$506. See the block at
 // the bottom of the file.
 #include "engine/engine.h"
+// sweep_risk_limits: the acceptance runs at the size the OPTIMIZER will score
+// at, which is the whole point — a hand-written RiskLimits here would prove the
+// engine honours a cap without proving the optimizer ever sets one.
+#include "panels/sweep.h"
 
 #include <chrono>
 #include <cmath>
@@ -770,12 +774,14 @@ std::vector<Bar> stkh_shaped_bars(int days) {
     return out;
 }
 
-BacktestResult boll_replay(double time_stop, double eod_flatten_h) {
+BacktestResult boll_replay(double time_stop, double eod_flatten_h,
+                           std::optional<RiskLimits> risk = std::nullopt) {
     BacktestConfig cfg;
     cfg.symbol = "STKH";
     cfg.bars = stkh_shaped_bars(4);   // 316 bars: long enough for 233 to fire
     cfg.initial_cash = 100'000.0;
     cfg.eod_flatten_h = eod_flatten_h;
+    cfg.risk = std::move(risk);
     cfg.params = {{"length", 5},     {"entry_z", 1.5}, {"exit_z", 0.58},
                   {"time_stop", time_stop}, {"trend_len", 0}, {"qty", 100}};
     IStrategy* s = make("bollinger_reversion.cpp");
@@ -819,4 +825,51 @@ TEST_CASE("acceptance: with the day boundary it is worth exactly nothing") {
     // hard ceiling, which is what makes every value above it identical.
     CHECK(a.fills.back().side == static_cast<uint8_t>(Side::Sell));
     CHECK(a.fills.back().ts_ns < local_ts(2026, 8, 18, 9, 30));
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPTANCE: the size the optimizer scores at.
+//
+// The two cases above are the day-boundary acceptance — the replay must not
+// score a HOLD production flattens. This is the third parity hole and the one
+// that was wrong on every score ever recorded: the replay must not score a SIZE
+// production refuses. Same strategy, same fixture, same harness, so the two
+// results are directly comparable.
+
+TEST_CASE("acceptance: with no risk the replay buys the whole account") {
+    // THE MEASURED DEFECT, on the real bollinger_reversion rather than a probe.
+    // $100,000 of cash and no cap: budget() returns 95,000 and the strategy
+    // spends essentially all of it in one position. Live, the same symbol is
+    // capped at $5,000. Recorded as a case so the number that justified the fix
+    // stays visible and is not just an anecdote in a commit message.
+    const BacktestResult r = boll_replay(233, 15.95);
+    REQUIRE(r.fills.size() >= 1);
+    const double notional = r.fills[0].qty * r.fills[0].price;
+    CHECK(r.fills[0].qty == doctest::Approx(989));
+    CHECK(notional == doctest::Approx(94'509).epsilon(0.001));
+    CHECK(notional > 0.9 * 100'000.0);      // the whole account, in one trade
+}
+
+TEST_CASE("acceptance: the live caps size it the way production would") {
+    // The same run under production's sizing. The live per-symbol budget comes
+    // out of a $2,000 daily-loss limit at a 20% assumed adverse move — $5,000 —
+    // and 989 shares becomes 52. That factor of 19 is what every backtest score
+    // this repo has ever produced was inflated by.
+    RiskLimits live{};
+    live.daily_max_loss = 2'000.0;
+    const RiskLimits swept = tt::ui::sweep_risk_limits(live, 100'000.0);
+    REQUIRE(swept.max_position_notional == doctest::Approx(5'000.0));
+
+    const BacktestResult r = boll_replay(233, 15.95, swept);
+    REQUIRE(r.fills.size() >= 1);
+    const double notional = r.fills[0].qty * r.fills[0].price;
+    CHECK(r.fills[0].qty == doctest::Approx(52));
+    CHECK(notional <= 5'000.0);             // inside the budget, not merely near it
+    CHECK(notional > 4'900.0);              // and not silenced down to nothing
+
+    // Still TRADING, not just trading smaller. A cap that shrank the strategy
+    // into inactivity would "fix" the score the same way a cutoff that refused
+    // every entry would — by removing the evidence rather than the error.
+    const BacktestResult uncapped = boll_replay(233, 15.95);
+    CHECK(r.fills.size() == uncapped.fills.size());
 }

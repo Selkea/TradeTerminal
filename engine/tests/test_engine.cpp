@@ -1544,3 +1544,140 @@ TEST_CASE("backtest: the entry cutoff does not touch entries inside the session"
     CHECK(r.fills.size() == 1);
     CHECK(r.fills[0].side == static_cast<uint8_t>(Side::Buy));
 }
+
+// ------------------------------------------------- backtest: order-level risk
+//
+// The third and last parity hole (BacktestConfig::risk). The two above are about
+// WHEN the replay trades; these are about HOW MUCH, which is the one that was
+// silently wrong on every score the optimizer ever produced.
+
+namespace {
+// Sizes exactly the way every shipped strategy does: off ctx.budget(). That is
+// what makes the missing cap a SIZE bug rather than a missing guard rail — with
+// no RiskLimits, budget() returns cash * 0.95 and hands over the whole account.
+struct SizesOffBudget final : IStrategy {
+    int bars = 0;
+    bool bought = false;
+    double asked = 0;               // qty submitted, before any clamp
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar& b) noexcept override {
+        if (++bars != 2 || bought) return;
+        bought = true;
+        asked = std::floor(ctx.budget(sid) / b.close);
+        ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, asked, 0, 0, 0, 0});
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("backtest: with no risk, budget() hands the strategy the whole account") {
+    // THE MEASURED DEFECT, in miniature and without a strategy module. $100,000
+    // of cash, a $10 stock: budget() returns 95,000 and the position is 9,500
+    // shares. Live the same symbol is capped at a few thousand dollars.
+    //
+    // Kept as a case in its own right, and NOT a regression to fix: risk defaults
+    // to empty because a manual backtest and a captured replay must keep judging
+    // the data's own cash. It is the OPTIMIZER that must arm it.
+    Engine eng;
+    SizesOffBudget strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.initial_cash = 100'000.0;
+    cfg.synth_ticks = false;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(strat.asked == doctest::Approx(9500));
+    REQUIRE(r.fills.size() == 1);
+    CHECK(r.fills[0].qty == doctest::Approx(9500));
+}
+
+TEST_CASE("backtest: a notional cap sizes the replay the way live is sized") {
+    // Same fixture, same strategy, one field set — and the position becomes the
+    // 500 shares a $5,000 budget buys. This is the whole fix: the number the
+    // strategy is HANDED changes, not just the number it is allowed to keep.
+    Engine eng;
+    SizesOffBudget strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.initial_cash = 100'000.0;
+    cfg.synth_ticks = false;
+    RiskLimits rl{};
+    rl.max_position_notional = 5'000.0;
+    rl.max_order_qty = 10'000;      // out of the way: this case is about budget()
+    rl.max_position_qty = 10'000;
+    cfg.risk = rl;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(strat.asked == doctest::Approx(500));       // 5,000 / 10.0
+    REQUIRE(r.fills.size() == 1);
+    CHECK(r.fills[0].qty == doctest::Approx(500));
+}
+
+TEST_CASE("backtest: max_order_qty REFUSES, it does not silently down-size") {
+    // The notional cap clamps; the share caps reject. Both reach the replay now,
+    // and they have to stay distinguishable — an optimizer that thought an
+    // oversized order was merely trimmed would still score the trade.
+    //
+    // BuyAndNeverExit asks for a flat 100 shares, so this is independent of
+    // budget() and of the cap above.
+    Engine eng;
+    BuyAndNeverExit strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.synth_ticks = false;
+    RiskLimits rl{};
+    rl.max_order_qty = 50;          // the strategy wants 100
+    rl.max_position_notional = 0;   // no clamp: prove the REFUSAL, not a trim
+    cfg.risk = rl;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(r.fills.empty());         // refused outright, nothing booked
+    CHECK(r.trades == 0);
+}
+
+namespace {
+// Pyramids: two 100-share buys on consecutive bars, regardless of position. The
+// only shape that can tell max_position_qty (cumulative) from max_order_qty
+// (per order) — every other probe here is flat before it buys.
+struct AddsTwice final : IStrategy {
+    int bars = 0;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        if (++bars == 2 || bars == 3)
+            ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0});
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+} // namespace
+
+TEST_CASE("backtest: max_position_qty stops the SECOND entry, not the first") {
+    // Control first, in the same case, because a cap that refused BOTH orders
+    // would satisfy a bare "one fill" assertion just as well as a working one.
+    Engine eng;
+    AddsTwice loose;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.synth_ticks = false;
+    const BacktestResult uncapped = run_backtest_blocking(eng, cfg, &loose);
+    REQUIRE(uncapped.fills.size() == 2);              // both lots, no risk at all
+
+    Engine eng2;
+    AddsTwice strat;
+    RiskLimits rl{};
+    rl.max_order_qty = 10'000;      // per-order cap out of the way
+    rl.max_position_qty = 150;      // one lot fits, two do not
+    rl.max_position_notional = 0;
+    cfg.risk = rl;
+    const BacktestResult r = run_backtest_blocking(eng2, cfg, &strat);
+    REQUIRE(r.fills.size() == 1);
+    CHECK(r.fills[0].qty == doctest::Approx(100));
+}

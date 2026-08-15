@@ -495,8 +495,13 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
     ExecSim exec(cfg.exec);
     Portfolio pf(cfg.initial_cash);
     LatencyHistogram lat;
+    // THE ORDER-LEVEL RISK (BacktestConfig::risk), which this call site defaulted
+    // to nullptr for the engine's whole life — taking ctx.budget()'s cap with it,
+    // so every strategy sized off the entire account. cfg outlives ctx (it is a
+    // by-value member of this frame), so the pointer stays good for the run.
+    const RiskLimits* bt_risk = cfg.risk ? &*cfg.risk : nullptr;
     EngineCtx ctx(*this, cfg.params, std::vector<std::string>{cfg.symbol},
-                  [&clock] { return clock.now_ns(); }, exec, pf, lat);
+                  [&clock] { return clock.now_ns(); }, exec, pf, lat, bt_risk);
     // THE ENTRY GATE, on the replay's own clock (BacktestConfig::entry_cutoff_h).
     // The live gate is asked of the WALL clock because a strategy reacts to a bar
     // that opened one bar-length ago; here the clock IS that later instant —
