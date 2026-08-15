@@ -1103,6 +1103,12 @@ void App::pump_sweep() {
                 // App, so an expression here could be deleted with a green suite
                 // and take the whole fix with it.
                 sweep_base_.eod_flatten_h = sweep_eod_flatten_h(sweep_bar_sec);
+                // The SAME hour gates entries, because live it is the same hour:
+                // entry_cutoff_h is defined as the last minute a position may be
+                // opened because it is the last minute something will still close
+                // it. Scoring an entry the live gate refuses is the same class of
+                // lie as scoring a hold the live backstop flattens.
+                sweep_base_.entry_cutoff_h = sweep_base_.eod_flatten_h;
 
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;

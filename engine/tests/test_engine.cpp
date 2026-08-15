@@ -1457,3 +1457,90 @@ TEST_CASE("hold-only: absent or short vector leaves every symbol tradable") {
     eng.stop_live();
     CHECK(strat.buy_id != 0u);
 }
+
+// ---------------------------------------------------------------------------
+// THE OTHER HALF OF THE DAY (BacktestConfig::entry_cutoff_h).
+//
+// eod_flatten_h stopped the replay scoring holds production flattens away. It
+// does NOT stop the replay scoring ENTRIES production refuses outright: the
+// flatten closes a position after the strategy has already opened it, so the
+// trade is still booked and still scored. Live, EngineCtx::submit_order refuses
+// a position-increasing order past the cutoff with RejectCause::SessionClosed —
+// the gate added after 2026-08-13, when two entries went out at 16:00:12 and
+// 16:00:17 into "error 201: Exchange is closed" and a third at 16:05 rested
+// overnight as a market order for the next open.
+namespace {
+
+// Buys on the LAST bar of the session and nowhere else. On the fixture below
+// that bar completes at 16:05, well past the 15:57 cutoff — the exact shape of
+// the orders IBKR refused.
+struct BuysAfterTheClose final : IStrategy {
+    int bars = 0;
+    int refused = 0;
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext& ctx, uint32_t sid, const Bar&) noexcept override {
+        if (++bars != 79) return;   // i = 78, the 16:05 completion
+        if (ctx.submit_order({sid, Side::Buy, OrdType::Market, {}, 100, 0, 0, 0, 0}) == 0)
+            ++refused;
+    }
+    void on_tick(IStrategyContext&, uint32_t, const Tick&) noexcept override {}
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_order_end(IStrategyContext&, const OrderEnd&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+} // namespace
+
+TEST_CASE("backtest: without an entry cutoff the replay books an order live refuses") {
+    // The positive control. Still the correct behaviour for a manual backtest and
+    // a replay, which is why the field defaults to 0 — but it is a lie in a run
+    // whose whole purpose is to score a fit that will be TRADED.
+    Engine eng;
+    BuysAfterTheClose strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    // TWO sessions, so the 16:05 order has a following bar to fill against. On a
+    // one-day fixture it is accepted and then simply never fills, which would
+    // make this control pass for the wrong reason — and make the armed case below
+    // look like it had worked when it had not.
+    cfg.bars = local_session_bars(2);
+    cfg.synth_ticks = false;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(strat.refused == 0);      // the engine accepted it
+    CHECK(r.fills.size() == 1);     // ...and it filled, and was scored
+    // Filled the NEXT MORNING, which is what the live rejects were about: the
+    // 16:05 order on 2026-08-13 rested overnight as a market order for the open.
+    CHECK(r.fills[0].ts_ns >= local_session_bars(2).back().ts_ns - 86'400LL * 1'000'000'000LL);
+}
+
+TEST_CASE("backtest: the entry cutoff refuses it, on the bar's own clock") {
+    Engine eng;
+    BuysAfterTheClose strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(2);   // same fixture as the control above
+    cfg.synth_ticks = false;
+    cfg.entry_cutoff_h = 15.95;     // mirrors tt::entry_cutoff_h / kEodBackstopH
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+
+    CHECK(strat.refused == 1);      // submit_order returned 0, as it does live
+    CHECK(r.fills.empty());         // nothing was booked, so nothing was scored
+}
+
+TEST_CASE("backtest: the entry cutoff does not touch entries inside the session") {
+    // A cutoff that refuses everything would "fix" the score by silencing the
+    // strategy, which is the failure mode to avoid: this must remove exactly the
+    // unreachable trades and no others. BuyAndNeverExit buys on its second bar,
+    // 09:40, which live would allow.
+    Engine eng;
+    BuyAndNeverExit strat;
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = local_session_bars(1);
+    cfg.synth_ticks = false;
+    cfg.entry_cutoff_h = 15.95;
+    const BacktestResult r = run_backtest_blocking(eng, cfg, &strat);
+    CHECK(r.fills.size() == 1);
+    CHECK(r.fills[0].side == static_cast<uint8_t>(Side::Buy));
+}

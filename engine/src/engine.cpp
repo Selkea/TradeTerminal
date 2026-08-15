@@ -497,6 +497,17 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
     LatencyHistogram lat;
     EngineCtx ctx(*this, cfg.params, std::vector<std::string>{cfg.symbol},
                   [&clock] { return clock.now_ns(); }, exec, pf, lat);
+    // THE ENTRY GATE, on the replay's own clock (BacktestConfig::entry_cutoff_h).
+    // The live gate is asked of the WALL clock because a strategy reacts to a bar
+    // that opened one bar-length ago; here the clock IS that later instant —
+    // BacktestClock is set to ev.ts_event_ns, the bar's COMPLETION — so asking it
+    // reproduces the live question exactly rather than approximating it.
+    if (cfg.entry_cutoff_h > 0.0) {
+        const double cutoff = cfg.entry_cutoff_h;
+        ctx.set_entry_gate([cutoff](int64_t now_ns) {
+            return hour_of_day_local(now_ns) < cutoff;
+        });
+    }
 
     BacktestResult res;
     res.symbol = cfg.symbol;

@@ -60,6 +60,21 @@ struct BacktestConfig {
     // unreachable holds for every time-based parameter of every strategy, and
     // each one has to be caught by hand.
     double eod_flatten_h = 0.0;
+    // THE OTHER HALF OF THE SAME DAY. Local hour from which a position-INCREASING
+    // order is refused (RejectCause::SessionClosed), mirroring LiveConfig::
+    // entry_gate. 0 = off, and off for the same reasons eod_flatten_h is.
+    //
+    // Without it the replay scores entries live refuses outright — the class the
+    // 233-bar time_stop belonged to, where the backtest books a trade production
+    // will not take. eod_flatten_h alone does not cover it: the flatten closes a
+    // position AFTER the strategy has opened it, so the trade is still scored,
+    // and the two are set to the same hour precisely because an entry that has
+    // nothing left to close it is the failure that costs the most.
+    //
+    // Only a CUTOFF, no morning bound: live also refuses before 09:30, but every
+    // history source the optimizer feeds from is RTH-only (useRTH=1), so no bar
+    // before the open exists in the data to refuse.
+    double entry_cutoff_h = 0.0;
 };
 
 struct TradeRow {
