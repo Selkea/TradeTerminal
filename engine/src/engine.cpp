@@ -1482,11 +1482,21 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         const double prev_h = eod_prev_h;
         eod_prev_h = hod;
         if (day == eod_day) return;   // already handled today
+        // TODAY's cutoff, not a constant: 15:57 on a normal session, 12:57 on the
+        // three 13:00 early closes, and 0 on a day the market never opens at all.
+        // See LiveConfig::eod_flatten_h_for_day for what the constant cost.
+        const double flat_h = cfg.eod_flatten_h_for_day
+                                  ? cfg.eod_flatten_h_for_day(tm)
+                                  : kEodBackstopH;
+        // Nothing opens today, so nothing may be force-closed into it either. A
+        // weekend session holding an adopted position used to be liquidated at
+        // 15:57 on a Saturday, at market, against a shut exchange.
+        if (flat_h <= 0.0) return;
         // EDGE-triggered: the session must have been running and watched the
-        // clock cross 15:57. A level trigger would flatten the instant the
+        // clock cross the cutoff. A level trigger would flatten the instant the
         // engine came up at, say, 16:10 — turning a restart into a liquidation
         // of positions the user may well have meant to hold.
-        if (prev_h < 0.0 || prev_h >= kEodBackstopH || hod < kEodBackstopH) return;
+        if (prev_h < 0.0 || prev_h >= flat_h || hod < flat_h) return;
 
         bool any_pos = false;
         for (size_t i = 0; i < n_sym && !any_pos; ++i)
@@ -1494,11 +1504,22 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         eod_day = day;          // mark done either way: don't re-check all evening
         if (!any_pos) return;   // flat already — the normal path, stay quiet
 
+        // The cutoff is in the message because it is no longer always 15:57, and
+        // a log line that names the wrong hour is worse than one that names none:
+        // terminal.log carries no date, so the hour is most of what a post-mortem
+        // has to place the event by.
+        char eod_msg[160];
+        const int flat_hh = static_cast<int>(flat_h);
+        const int flat_mm = static_cast<int>((flat_h - flat_hh) * 60.0 + 0.5);
+
         if (broker) {
             broker->cancel_all();
             broker->flatten();
-            push_log("live: EOD BACKSTOP — open position(s) past 15:57 with no "
-                     "strategy closing them; broker cancel-all + flatten requested");
+            std::snprintf(eod_msg, sizeof(eod_msg),
+                          "live: EOD BACKSTOP — open position(s) past %02d:%02d with "
+                          "no strategy closing them; broker cancel-all + flatten "
+                          "requested", flat_hh, flat_mm);
+            push_log(eod_msg);
             return;
         }
         for (uint64_t id : exec.cancel_all())
@@ -1517,8 +1538,11 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             record_submit(r, exec.submit(r, rt.now_ns()));
             next_is_manual = false;
         }
-        push_log("live: EOD BACKSTOP — open position(s) past 15:57 with no "
-                 "strategy closing them; cancelled + flattening");
+        std::snprintf(eod_msg, sizeof(eod_msg),
+                      "live: EOD BACKSTOP — open position(s) past %02d:%02d with no "
+                      "strategy closing them; cancelled + flattening",
+                      flat_hh, flat_mm);
+        push_log(eod_msg);
     };
 
     // Automated halts: equity-based limits re-checked after every fill/tick.

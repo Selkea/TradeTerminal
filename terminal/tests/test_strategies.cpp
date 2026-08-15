@@ -11,11 +11,19 @@
 #include "tt/strategy_api.h"
 #include "tt/strategy_registry.h"
 
+// The last case in this file is an ACCEPTANCE test rather than a unit test: it
+// drives the real bollinger_reversion through a real Engine replay to prove the
+// day boundary actually removes the incentive that cost -$506. See the block at
+// the bottom of the file.
+#include "engine/engine.h"
+
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace tt;
@@ -698,4 +706,117 @@ TEST_CASE("donchian: the stop covers every partial of the entry") {
                                     120.0, ts);
     CHECK(last_qty_of(sent, OrdType::Stop) == doctest::Approx(150.0));
     s->destroy();
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPTANCE: AN UNREACHABLE TIME STOP MUST STOP BEING WORTH ANYTHING.
+//
+// 2026-08-14. The morning tournament fitted STKH bollinger_reversion's time_stop
+// to 233 bars on a 300 s series and scored that fit +8.60%. Live, the engine
+// force-flattens at 15:57, so one session is 78 bars and a 233-bar hold could
+// never happen. BollRev places no price stop by design and gates its z-exit on
+// the price actually recovering, so on a losing position that time stop is the
+// ONLY exit there is. It could not fire from the moment it was crowned, and the
+// position bled -$506 until the EOD backstop liquidated it.
+//
+// BacktestConfig::eod_flatten_h is the source fix. The property that matters is
+// not "233 scores worse" but something stronger and much harder to regress:
+// ONCE A TIME STOP EXCEEDS ONE SESSION ITS VALUE STOPS MATTERING AT ALL. The
+// boundary always closes the position first, so 233 and 1000 become the same
+// run, bit for bit. A coordinate sweep therefore sees a dead flat surface out
+// there and can never find a spurious peak on it to crown.
+//
+// Guard-railing the sweep range (tt::ui::sweep_param_max) hides the peak. This
+// removes it. The two are checked separately on purpose — if the range cap is
+// ever loosened, this case still holds the line.
+namespace {
+
+BacktestResult replay_blocking(const BacktestConfig& cfg, IStrategy* s) {
+    Engine eng;
+    REQUIRE(eng.start_backtest(cfg, s));
+    BacktestResult res;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!eng.take_result(res)) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return res;
+}
+
+// The STKH shape, reduced to its essentials: a flat stretch, a sharp drop that
+// puts z below the entry band, and then a price that never recovers. Because the
+// close stays UNDER the entry, bollinger's z-exit is gated off (that gate is
+// "bollinger: does not call it a reversion when the mean fell to the price"),
+// and with no price stop the time stop is the only exit that exists.
+//
+// `days` sessions of 5-minute bars on the LOCAL clock, 09:30 through a 16:00
+// open — the same 79-bar session the live feed delivers.
+std::vector<Bar> stkh_shaped_bars(int days) {
+    std::vector<Bar> out;
+    for (int d = 0; d < days; ++d) {
+        const int64_t open = local_ts(2026, 8, 17 + d, 9, 30);
+        for (int i = 0; i <= 78; ++i) {
+            const size_t n = out.size();
+            const double px = n < 12 ? 100.0 : (n == 12 ? 96.0 : 95.5);
+            Bar b{};
+            b.ts_ns = open + static_cast<int64_t>(i) * 300LL * 1'000'000'000LL;
+            b.open = b.close = px;
+            b.high = px + 0.05;
+            b.low = px - 0.05;
+            b.volume = 1e6;
+            out.push_back(b);
+        }
+    }
+    return out;
+}
+
+BacktestResult boll_replay(double time_stop, double eod_flatten_h) {
+    BacktestConfig cfg;
+    cfg.symbol = "STKH";
+    cfg.bars = stkh_shaped_bars(4);   // 316 bars: long enough for 233 to fire
+    cfg.initial_cash = 100'000.0;
+    cfg.eod_flatten_h = eod_flatten_h;
+    cfg.params = {{"length", 5},     {"entry_z", 1.5}, {"exit_z", 0.58},
+                  {"time_stop", time_stop}, {"trend_len", 0}, {"qty", 100}};
+    IStrategy* s = make("bollinger_reversion.cpp");
+    const BacktestResult r = replay_blocking(cfg, s);
+    s->destroy();
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("acceptance: without the day boundary a 233-bar time stop is worth something") {
+    // The world the tournament was scoring in. 233 fires on day 4; 1000 never
+    // fires at all inside the data. Two different runs, so a sweep over time_stop
+    // sees a gradient out there and can crown a value it will never reach live.
+    const BacktestResult reachable = boll_replay(233, 0.0);
+    const BacktestResult never = boll_replay(1000, 0.0);
+    REQUIRE(reachable.fills.size() >= 2);          // it really did trade
+    CHECK(reachable.fills.size() != never.fills.size());
+}
+
+TEST_CASE("acceptance: with the day boundary it is worth exactly nothing") {
+    // The same two fits under production's physics. The boundary closes the
+    // position every afternoon, so neither time stop ever gets to fire and the
+    // parameter has no effect whatsoever — identical fills, identical equity.
+    const BacktestResult a = boll_replay(233, 15.95);
+    const BacktestResult b = boll_replay(1000, 15.95);
+
+    REQUIRE(a.fills.size() >= 2);                  // still trading, not silenced
+    REQUIRE(a.fills.size() == b.fills.size());
+    for (size_t i = 0; i < a.fills.size(); ++i) {
+        CHECK(a.fills[i].ts_ns == b.fills[i].ts_ns);
+        CHECK(a.fills[i].side == b.fills[i].side);
+        CHECK(a.fills[i].qty == doctest::Approx(b.fills[i].qty));
+        CHECK(a.fills[i].price == doctest::Approx(b.fills[i].price));
+    }
+    CHECK(a.final_equity == doctest::Approx(b.final_equity));
+
+    // And the reason they agree is the one that matters: the position does not
+    // survive the afternoon it was opened in. Entry at 10:36 on day one, exit at
+    // 16:00:00 on day one — so a hold cannot span a session and 78 bars is the
+    // hard ceiling, which is what makes every value above it identical.
+    CHECK(a.fills.back().side == static_cast<uint8_t>(Side::Sell));
+    CHECK(a.fills.back().ts_ns < local_ts(2026, 8, 18, 9, 30));
 }

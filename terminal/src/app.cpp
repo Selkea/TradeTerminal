@@ -1098,9 +1098,11 @@ void App::pump_sweep() {
                 // doing that for every time-based parameter of every strategy,
                 // not just time_stop. Optimizer path only: a manual backtest and
                 // a replay must keep judging the data's own clock.
-                // See BacktestConfig::eod_flatten_h.
-                if (sweep_bar_sec > 0 && sweep_bar_sec < 24 * 3600)
-                    sweep_base_.eod_flatten_h = kEodBackstopH;
+                // See BacktestConfig::eod_flatten_h. The predicate lives in
+                // sweep_eod_flatten_h so it is testable — nothing constructs an
+                // App, so an expression here could be deleted with a green suite
+                // and take the whole fix with it.
+                sweep_base_.eod_flatten_h = sweep_eod_flatten_h(sweep_bar_sec);
 
                 sweep_ = SweepPanel::State{};
                 sweep_.holdout_pct = holdout;
@@ -4176,6 +4178,13 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // clock, not the world's; a live session that reads entry_gate.armed false
     // in /diag is therefore a bug HERE, not there.
     cfg.entry_gate = [](int64_t now_ns) { return rth_entry_allowed_at(now_ns); };
+    // THE SAME CALENDAR, HANDED TO THE OTHER END OF THE DAY. entry_cutoff_h is
+    // already "the last minute a position may be OPENED because it is the last
+    // minute something will still CLOSE it" — so it is, by construction, the hour
+    // the backstop must close ON. Sharing the one function keeps the two ends
+    // from drifting apart again: they were 2 h 57 m apart on an early close, the
+    // gate calendar-aware and the backstop pinned to a literal 15.95.
+    cfg.eod_flatten_h_for_day = [](const std::tm& tm) { return entry_cutoff_h(tm); };
     // Every data source is real-time now => spin the engine
     // thread; ticks are handled in ns, not after Sleep(5).
     cfg.busy_spin = true;
