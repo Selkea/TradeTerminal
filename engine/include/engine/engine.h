@@ -166,6 +166,29 @@ struct LiveConfig {
     // how a position ends up naked, which is a far worse failure than a late
     // entry. See EngineCtx::submit_order.
     std::function<bool(int64_t now_ns)> entry_gate;
+    // THE OTHER HALF OF THAT GATE: the local hour at which the EOD backstop
+    // force-flattens, for the DAY it is handed. Return 0 for a day the market
+    // never opens. Empty = the engine's own 15:57 default.
+    //
+    // It exists because the backstop was calendar-BLIND while the entry gate was
+    // not. The gate closes at 12:57 on the three 13:00 early closes (see
+    // entry_cutoff_h) precisely so nothing is opened that cannot be closed; the
+    // backstop meanwhile compared the clock to a hardcoded 15.95, which on those
+    // days is 2 h 57 m after the exchange shuts. Both outcomes were wrong:
+    //
+    //   - normally the session guard stops the day at 13:15 KEEPING positions
+    //     (v0.25.1: do not liquidate into a closed market), so the backstop never
+    //     ran and the position carried overnight to be adopted and paused the
+    //     next morning — naked if its strategy placed no protective order.
+    //   - and on a restart that outlived the guard, it DID fire at 15:57 and sent
+    //     cancel_all + an RTH market flatten into an exchange closed since 13:00,
+    //     retiring the protective orders in exchange for a fill that cannot come
+    //     until the next open. That is the exact defect v0.25.1 fixed in the
+    //     session guard and never applied here.
+    //
+    // Handed a std::tm rather than asked to read the clock itself, so the hour
+    // and the day it is judged against cannot come from two different reads.
+    std::function<double(const std::tm&)> eod_flatten_h_for_day;
     // Optional per-symbol seed bars (parallel to symbols), replayed through the
     // strategy right after on_init so indicators are warm when the session
     // starts. Live bars only ever come from tick aggregation, so a strategy

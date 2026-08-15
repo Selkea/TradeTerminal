@@ -8,6 +8,10 @@
 
 #include "market_calendar.h"
 
+#include <fstream>
+#include <iterator>
+#include <string>
+
 using namespace tt;
 
 // A std::tm the way localtime_s fills one in, so the tests drive the exact
@@ -371,4 +375,68 @@ TEST_CASE("session guard: it does not depend on the panel schedule at all") {
     // guard ends it at the crossing regardless.
     CHECK(session_should_stop(at_s(2026, 8, 14, 16, 15, 0), -1,
                               16 * 3600 + 15 * 60 - 1));
+}
+
+// ---------------------------------------------------------------------------
+// THE BACKSTOP CLOSES WHEN THE GATE CLOSES — ON EVERY KIND OF DAY.
+//
+// A parity audit found the two ends of the session judged by different clocks:
+// entry_cutoff_h walks the calendar and stops entries at 12:57 on an early
+// close, while the engine's EOD backstop compared the wall clock to a hardcoded
+// 15.95. On the three 13:00 days those are 2 h 57 m apart, and both sides of
+// that gap are wrong — either the position carries overnight under a paused
+// strategy, or the backstop fires at 15:57 and sends cancel_all plus an RTH
+// market flatten into an exchange shut since 13:00.
+//
+// LiveConfig::eod_flatten_h_for_day now takes its hour from this same function,
+// which is not a coincidence to be re-derived later: entry_cutoff_h is DEFINED
+// as the last minute a position may be opened because it is the last minute
+// something will still close it. The hour that closes it is therefore the same
+// hour. These pin that identity on all three day shapes.
+
+TEST_CASE("eod backstop: a normal session still flattens at 15:57") {
+    CHECK(entry_cutoff_h(mk(2026, 8, 13)) == doctest::Approx(kEodBackstopH));
+    CHECK(entry_cutoff_h(mk(2026, 8, 17)) == doctest::Approx(kEodBackstopH));
+}
+
+TEST_CASE("eod backstop: an early close flattens before the exchange shuts") {
+    // 12:57, three minutes BEFORE the 13:00 close — not 15:57, which is nearly
+    // three hours after it. The whole point: the flatten must be able to fill.
+    REQUIRE(is_us_early_close(2026, 11, 27));
+    REQUIRE(is_us_early_close(2026, 12, 24));
+    CHECK(entry_cutoff_h(mk(2026, 11, 27)) == doctest::Approx(kRthEarlyCloseH - 0.05));
+    CHECK(entry_cutoff_h(mk(2026, 12, 24)) == doctest::Approx(kRthEarlyCloseH - 0.05));
+    CHECK(entry_cutoff_h(mk(2026, 11, 27)) < kEodBackstopH);
+    // And it is still inside the session, so a market order can actually fill.
+    CHECK(entry_cutoff_h(mk(2026, 11, 27)) < us_market_close_h(mk(2026, 11, 27)));
+}
+
+TEST_CASE("eod backstop: a day the market never opens flattens nothing") {
+    // 0 means "do not fire". A weekend session holding an adopted position used
+    // to be liquidated at 15:57 on a Saturday, at market, into a shut exchange.
+    CHECK(entry_cutoff_h(mk(2026, 8, 15)) == 0.0);   // Saturday
+    CHECK(entry_cutoff_h(mk(2026, 8, 16)) == 0.0);   // Sunday
+    CHECK(entry_cutoff_h(mk(2026, 11, 26)) == 0.0);  // Thanksgiving
+}
+
+TEST_CASE("eod backstop: the engine asks for the day's hour, not a constant") {
+    // Source-text pin. The cases above prove the hour is right; only this proves
+    // the engine still asks for it. The defect being guarded against is a literal
+    // 15.95 in the edge test, which is what shipped for months.
+    const std::string path = std::string(TT_REPO_DIR) + "/engine/src/engine.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+
+    const size_t gate = src.find("cfg.eod_flatten_h_for_day(tm)");
+    REQUIRE(gate != std::string::npos);
+    // The crossing test must compare against that resolved hour. Pinned as the
+    // whole expression: the edge trigger is load-bearing too (a level trigger
+    // turns a restart into a liquidation), so both halves are guarded here.
+    CHECK(src.find("if (prev_h < 0.0 || prev_h >= flat_h || hod < flat_h) return;") !=
+          std::string::npos);
+    // And the old constant must no longer be the thing anything is compared to.
+    CHECK(src.find("hod < kEodBackstopH") == std::string::npos);
+    CHECK(src.find("prev_h >= kEodBackstopH") == std::string::npos);
 }
