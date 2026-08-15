@@ -79,6 +79,74 @@ inline double sweep_eod_flatten_h(int bar_seconds) {
     return bar_seconds > 0 && bar_seconds < kSessionSeconds ? kEodBackstopH : 0.0;
 }
 
+// THE DOLLAR CAP ON ONE POSITION, and therefore — through ctx.budget() — the
+// number every shipped strategy sizes off. Returns the cap to apply to `rl`.
+//
+// Idempotent and explicit-first: a cap already set on the symbol is returned
+// unchanged, so this can be applied to the same RiskLimits twice.
+//
+// Derivation, when nothing was set explicitly. We can't see a strategy's stop at
+// order time, so bound exposure by assuming a worst-case excursion: a $N
+// position loses ~N*move against us, so keep N*move inside a slice of the day's
+// loss budget. 20% adverse move, because these thin low-float names routinely
+// swing that far intraday — a 10% assumption let SNDU lose the whole day's
+// budget on one 20% drop (2026-07-29).
+//
+// With no daily-loss limit there is nothing to derive from, but a symbol must
+// never be left UNCAPPED, and that is not a guard-rail preference: an absent cap
+// makes ctx.budget() return cash * 0.95, which hands one position the entire
+// account. Fall back to the fixed slice of session cash these strategies shipped
+// with before sizing moved onto the budget.
+//
+// It is a free function, shared by the live session AND the optimizer, because
+// the two computing this number separately is exactly the defect
+// BacktestConfig::risk documents: the replay sized at ~19x live for want of it.
+constexpr double kAdverseMove = 0.20;       // assume up to a 20% move against us
+constexpr double kLossBudgetFrac = 0.5;     // one trade risks <= half the budget
+constexpr double kNoLimitAllocFrac = 0.20;  // no daily-loss limit: slice of cash
+inline double position_notional_cap(const RiskLimits& rl, double session_cash) {
+    if (rl.max_position_notional > 0.0) return rl.max_position_notional;
+    if (rl.daily_max_loss > 0.0)
+        return kLossBudgetFrac * rl.daily_max_loss / kAdverseMove;
+    return session_cash > 0.0 ? kNoLimitAllocFrac * session_cash : 0.0;
+}
+
+// The order-level risk an OPTIMIZER run must be scored against: the limits the
+// live session will apply to this symbol, so the replay cannot book a size
+// production refuses. `live_default` is the app's default RiskLimits — the one
+// TradePanel hands every newly added symbol — and `cash` the run's starting
+// cash, used only for the no-daily-loss fallback above.
+//
+// Two things it deliberately does NOT pass through:
+//
+//  - THE EQUITY HALTS (daily_max_loss, max_drawdown_pct, stale_feed_sec). They
+//    are run_live-only; Engine::run has no halt machinery, so carrying them into
+//    a BacktestConfig would read as protection the replay applies and does not.
+//    Zeroed here so the difference is visible in one place instead of being a
+//    silent no-op at the far end. The replay-relevant consequence of
+//    daily_max_loss is already folded in: it is what sized the notional cap.
+//    (A session that halts for the day is itself an unmodelled parity gap — the
+//    replay keeps trading through a loss live stops on. Order-level first; that
+//    is where the measured 19x is.)
+//  - disable_auto_halt, for the same reason in reverse: EngineCtx DOES honour it
+//    in both modes (hold_blocks_loss), but it only means anything alongside the
+//    halts that are gone, so leaving it set would model half a policy.
+//
+// Like sweep_eod_flatten_h, this is a function rather than an expression at the
+// call site so it can be tested: nothing in the suite constructs an App, so the
+// arming line in App::pump_sweep is unreachable from a test and could be deleted
+// with the suite fully green — which is precisely what happened to the day
+// boundary (see 0.26.4).
+inline RiskLimits sweep_risk_limits(const RiskLimits& live_default, double cash) {
+    RiskLimits rl = live_default;
+    rl.max_position_notional = position_notional_cap(live_default, cash);
+    rl.daily_max_loss = 0.0;
+    rl.max_drawdown_pct = 0.0;
+    rl.stale_feed_sec = 0;
+    rl.disable_auto_halt = false;
+    return rl;
+}
+
 // The upper bound the optimizer may actually sweep a parameter to, given the bar
 // size the fit will be traded on.
 //

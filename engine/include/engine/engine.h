@@ -22,11 +22,49 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace tt {
+
+// ORDER-LEVEL RISK. Declared here, above BacktestConfig, because BOTH modes
+// apply it — it used to live under the "live mode" banner below, and that is
+// precisely how the replay ended up with none of it (see BacktestConfig::risk).
+//
+// EngineCtx enforces max_order_qty / max_position_qty / price_band_pct /
+// max_position_notional / disable_auto_halt per order, in both modes. The three
+// halts under "Automated halts" are run_live ONLY: Engine::run has no equity
+// halt machinery at all, so setting them for a backtest reads as protection the
+// replay does not apply. tt::ui::sweep_risk_limits zeroes them for that reason.
+struct RiskLimits {
+    double max_order_qty = 1'000;
+    double max_position_qty = 5'000;
+    // Dollar cap on a position's size (|qty|*price). A position-INCREASING order
+    // that would breach it is DOWN-SIZED to fit (not rejected), so one trade can
+    // never risk more than a slice of the daily-loss budget on an adverse move —
+    // the share caps above are notional-blind and miss this. Reduce/close orders
+    // are never touched. 0 = disabled. Usually derived from daily_max_loss.
+    //
+    // It is ALSO the sizing base every shipped strategy reads through
+    // ctx.budget(), which is why an absent cap does not merely fail to bound a
+    // position — it silently hands the strategy the whole account.
+    double max_position_notional = 0;
+    double price_band_pct = 0.20;   // limit orders within ±20% of last trade
+
+    // Automated halts — the engine pulls the kill switch itself (cancel all,
+    // flatten, halt strategy). 0 = disabled. run_live only; see the note above.
+    double daily_max_loss = 0;      // $ of equity lost since session start
+    double max_drawdown_pct = 0;    // fraction lost from the session equity high
+    int stale_feed_sec = 0;         // no ticks this long with a position open
+    // App-honored preference (the engine ignores it): when set, this symbol does
+    // NOT arm the session's equity halts (daily-loss / drawdown) — positions are
+    // held instead of force-flattened at the limit, to be closed by the strategy
+    // or when they recover. The notional cap and stale-feed halt still apply. App
+    // implements it by dropping the symbol from the halt aggregation.
+    bool disable_auto_halt = false;
+};
 
 struct BacktestConfig {
     std::string symbol;
@@ -75,6 +113,34 @@ struct BacktestConfig {
     // history source the optimizer feeds from is RTH-only (useRTH=1), so no bar
     // before the open exists in the data to refuse.
     double entry_cutoff_h = 0.0;
+    // THE ORDER-LEVEL RISK THE LIVE ENGINE APPLIES AND THE REPLAY DID NOT.
+    // Empty = none, which is what Engine::run has always done: it built its
+    // EngineCtx with SEVEN of twelve arguments defaulted, and the risk pointer
+    // was one of them. So the replay applied no max_order_qty, no
+    // max_position_qty, no price band — and, worst of the four, no
+    // max_position_notional.
+    //
+    // That last one is not a missing guard rail, it is a missing SIZE. Every
+    // shipped strategy sizes off ctx.budget(), which returns
+    // min(max_position_notional, cash * 0.95) — so with no cap it returns
+    // cash * 0.95 and the strategy is handed the whole account. Measured, not
+    // inferred: the 0.26.3 acceptance replay drove the real bollinger_reversion
+    // on $100,000 and it bought 989 shares at 95.5596 — $94,509 against a live
+    // per-symbol budget of $5,000. Roughly NINETEEN TIMES the size production
+    // would trade, on every backtest, for every score ever recorded.
+    //
+    // Sharpe is scale-invariant and survives that; return% and drawdown% are
+    // inflated with it. But the part that actually changes which parameters win
+    // is the trade SEQUENCE: at $94.5k of $100k cash the replay cannot open a
+    // second position at all, so buying-power exhaustion — an artifact of the
+    // missing cap, not a fact about the strategy — shapes the fit. Same class as
+    // eod_flatten_h and entry_cutoff_h above: the replay books what live refuses.
+    //
+    // Default OFF for the same reason as those two: a manual backtest and a
+    // captured replay must keep judging the data's own cash. Armed on the
+    // OPTIMIZER path only, from the same limits the live session will use — see
+    // tt::ui::sweep_risk_limits, which also zeroes the run_live-only halts.
+    std::optional<RiskLimits> risk;
 };
 
 struct TradeRow {
@@ -98,30 +164,6 @@ struct BacktestResult {
 };
 
 // ---------------------------------------------------------------- live mode
-
-struct RiskLimits {
-    double max_order_qty = 1'000;
-    double max_position_qty = 5'000;
-    // Dollar cap on a position's size (|qty|*price). A position-INCREASING order
-    // that would breach it is DOWN-SIZED to fit (not rejected), so one trade can
-    // never risk more than a slice of the daily-loss budget on an adverse move —
-    // the share caps above are notional-blind and miss this. Reduce/close orders
-    // are never touched. 0 = disabled. Usually derived from daily_max_loss.
-    double max_position_notional = 0;
-    double price_band_pct = 0.20;   // limit orders within ±20% of last trade
-
-    // Automated halts — the engine pulls the kill switch itself (cancel all,
-    // flatten, halt strategy). 0 = disabled.
-    double daily_max_loss = 0;      // $ of equity lost since session start
-    double max_drawdown_pct = 0;    // fraction lost from the session equity high
-    int stale_feed_sec = 0;         // no ticks this long with a position open
-    // App-honored preference (the engine ignores it): when set, this symbol does
-    // NOT arm the session's equity halts (daily-loss / drawdown) — positions are
-    // held instead of force-flattened at the limit, to be closed by the strategy
-    // or when they recover. The notional cap and stale-feed halt still apply. App
-    // implements it by dropping the symbol from the halt aggregation.
-    bool disable_auto_halt = false;
-};
 
 class IBrokerAdapter;
 
