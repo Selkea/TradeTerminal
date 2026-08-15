@@ -122,11 +122,17 @@ TEST_CASE("reconcile: the TWS callback routes through the policy, not a bare ret
     // deliberate `if (sid == 0) return;` — an off-lineup resting order is
     // already reported one line earlier by tws_foreign_order_line — and a
     // whole-file search would have banned that too.
-    const size_t arm = src.find("if (!recon_active) return;");
-    REQUIRE(arm != std::string::npos);
-    const size_t row_log = src.find("reconcile: position row", arm);
+    // Anchored at the FUNCTION HEAD, not at the recon_active guard. Scoping the
+    // scan to substr(guard, row_log) leaves a discard placed one line ABOVE the
+    // guard outside the window entirely — and such a line still drops every
+    // off-lineup row before reconciliation sees it, which is the whole defect.
+    // The guard is only the start of the reconcile arm; the audit arm above it
+    // has already returned by then, so scanning from the head is safe.
+    const size_t fn = src.find("void position(");
+    REQUIRE(fn != std::string::npos);
+    const size_t row_log = src.find("reconcile: position row", fn);
     REQUIRE(row_log != std::string::npos);
-    const std::string recon_arm = src.substr(arm, row_log - arm);
+    const std::string recon_arm = src.substr(fn, row_log - fn);
     // The line this replaced. Its comment ("nothing to adopt it into") was true
     // and was never the point: adoption was not the question, being TOLD was.
     CHECK(recon_arm.find("if (sid == 0) return;") == std::string::npos);
@@ -135,5 +141,19 @@ TEST_CASE("reconcile: the TWS callback routes through the policy, not a bare ret
     // reset per reconcile so a position that has since been closed stops being
     // reported forever.
     CHECK(src.find("recon_offlineup_.store") != std::string::npos);
-    CHECK(src.find("recon_offlineup = 0;") != std::string::npos);
+    // Scoped to start_reconcile. A bare search for "recon_offlineup = 0;" is
+    // satisfied by the MEMBER DECLARATION, so it could not fail for the reason
+    // it was written: deleting the per-reconcile reset left the suite green
+    // while the counter accumulated for the whole process lifetime.
+    const size_t begin = src.find("void start_reconcile(");
+    REQUIRE(begin != std::string::npos);
+    const size_t reset = src.find("recon_offlineup = 0;", begin);
+    REQUIRE(reset != std::string::npos);
+    // ...and INSIDE start_reconcile, not merely somewhere after it: no other
+    // member function may open between the two.
+    CHECK(src.substr(begin, reset - begin).find("    void ") ==
+          std::string::npos);
+    // Three states, not two: -1 must survive as "never measured". A reconcile
+    // that timed out without the position stream answering must NOT publish 0.
+    CHECK(src.find("recon_pos_done ? recon_offlineup : -1") != std::string::npos);
 }

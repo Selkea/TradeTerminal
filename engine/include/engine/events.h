@@ -40,7 +40,7 @@ struct alignas(64) EngineEvent {
         // exists so "broker reconciliation complete — 0 symbol(s) held" can stop
         // being said while the account holds 20 shares of something.
         // See engine/reconcile_policy.h.
-        struct { uint32_t offlineup; } recon;
+        struct { int32_t offlineup; } recon;   // -1 = the position stream never answered
     } u{};
 };
 static_assert(sizeof(EngineEvent) == 64, "one cache line per event");

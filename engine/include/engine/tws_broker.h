@@ -132,8 +132,18 @@ public:
     //
     // A number, not a list, because the list is already in the log with its
     // symbol and size — this is the /diag field that tells an operator to go
-    // look. Non-zero means the account holds something no strategy watches, no
+    // look. Positive means the account holds something no strategy watches, no
     // stop protects, and neither flatten() nor the 15:57 EOD backstop can reach.
+    //
+    // THREE STATES, and the third is why this is signed:
+    //    -1  no reconcile has completed WITH the position stream answered
+    //     0  reconciled, and the broker holds nothing outside the lineup
+    //    >0  that many off-lineup positions — go look
+    // A plain unsigned counter reads 0 for both "none" and "never measured", and
+    // check_reconcile_timeout() finishes a reconcile after 20 s having received
+    // no position rows at all. Reporting "nothing off-lineup" when the broker
+    // never answered is the same class of lie as oldest_history_age_ms pinned at
+    // 0 through a five-hour outage.
     int reconcile_offlineup() const {
         return static_cast<int>(recon_offlineup_.load(std::memory_order_acquire));
     }
@@ -195,7 +205,7 @@ private:
     // books agree" — the distinction the whole detector rests on.
     // Published by the I/O thread at the end of every reconcile; read by the UI
     // thread for /diag and the operator page. See reconcile_offlineup().
-    std::atomic<uint32_t> recon_offlineup_{0};
+    std::atomic<int32_t> recon_offlineup_{-1};
     std::atomic<bool> audit_req_{false};
     std::mutex audit_mu_;
     std::vector<BrokerPosition> audit_positions_;
