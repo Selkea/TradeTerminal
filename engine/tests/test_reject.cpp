@@ -755,8 +755,20 @@ TEST_CASE("alerting: a refused EXIT pages even when an ENTRY was refused first")
     cfg.initial_cash = 100'000.0;
     cfg.risk.price_band_pct = 0.20;
     REQUIRE(eng.start_live(cfg, {&strat}));
-    pump(eng, [&] { return strat.bad_exits.load() >= 1; });
-    const LiveSnapshot s = eng.live_snapshot();
+    // Wait for the ENGINE to have PUBLISHED the exit refusal, not merely for the
+    // strategy to have submitted it. bad_exits is bumped on the engine thread the
+    // instant submit_order returns 0, but live_snapshot() serves a snapshot the
+    // engine republishes on its own cadence, so the two are different events.
+    // Waiting on the strategy's counter and then reading the snapshot failed 2
+    // runs in 10 of the RELEASE build, always the same way: the snapshot held the
+    // entry refusal only (count 1, exit_count 0, one Rejected row), because it
+    // was published between the two refusals. Debug never showed it.
+    LiveSnapshot s;
+    pump(eng, [&] {
+        s = eng.live_snapshot();
+        const RefusalStat* pending = row(s, RejectCause::PriceBand);
+        return pending != nullptr && pending->exit_count >= 1;
+    });
     eng.stop_live();
 
     const RefusalStat* r = row(s, RejectCause::PriceBand);
@@ -795,8 +807,17 @@ TEST_CASE("alerting: the repeat Warning cannot be swallowed by a silent branch")
     cfg.initial_cash = 100'000.0;
     cfg.risk.price_band_pct = 0.20;
     REQUIRE(eng.start_live(cfg, {&strat}));
-    pump(eng, [&] { return strat.bad_entries.load() >= 4; });
-    const LiveSnapshot s = eng.live_snapshot();
+    // Snapshot-driven for the same reason as the exit-refusal case above: these
+    // assertions read the PUBLISHED counters, so waiting on the strategy's own
+    // tally can hand us a snapshot taken between two refusals. exit_count == 2 is
+    // an exact equality, which is the shape that turns that race into a failure.
+    LiveSnapshot s;
+    pump(eng, [&] {
+        s = eng.live_snapshot();
+        const RefusalStat* pending = row(s, RejectCause::PriceBand);
+        return pending != nullptr && pending->exit_count >= 2 &&
+               pending->count > kRefusalRepeatAlertAt;
+    });
     eng.stop_live();
 
     const RefusalStat* r = row(s, RejectCause::PriceBand);
