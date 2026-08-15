@@ -1318,11 +1318,11 @@ TEST_CASE("hold-only: the symbol can still REDUCE, or it would trap the position
                s.symbols[0].position.qty == 0.0;
     }, 5000));
     eng.stop_live();
-    const auto snap = eng.live_snapshot();
+    // Both were accepted, and the pump predicate above is what proves the sell
+    // actually REDUCED the position to flat. Re-asserting the quantity after
+    // stop_live() would be racing the teardown for no extra information.
     CHECK(strat.buy_id != 0u);
     CHECK(strat.sell_id != 0u);
-    // Both accepted; the sell reduced the position back to flat.
-    CHECK(snap.symbols[0].position.qty == doctest::Approx(0.0));
 }
 
 TEST_CASE("hold-only: absent or short vector leaves every symbol tradable") {
