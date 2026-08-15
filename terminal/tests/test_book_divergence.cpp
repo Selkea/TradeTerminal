@@ -498,3 +498,61 @@ TEST_CASE("audit: the broker's book belongs to a session, not to the process") {
     CHECK_FALSE(a.broker_holds("NVDA", unknown));
     CHECK(unknown);
 }
+
+// ---- the gate that could never refuse --------------------------------------
+//
+// start_live_session refuses a symbol whose time stop cannot fire within one
+// session (the 2026-08-14 STKH failure: time_stop 233 bars against 78 bars of
+// RTH, no price stop, and a z-exit gated on being above entry — so nothing could
+// close it at a loss, and it fell 10.1%). It carves out "unless the broker might
+// still be holding it", so refusing cannot orphan a real position.
+//
+// That gate runs BETWEEN sessions, after stand_down() has cleared the live book.
+// Reading the live book there made `unknown` unconditionally true, so the
+// carve-out always fired and the gate never refused anything at all.
+
+TEST_CASE("stand_down clears the live book, so broker_holds cannot answer") {
+    BookAudit a;
+    a.arm(1000);
+    a.observe({}, {{"STKH", 0.0}, {"NVDA", 20.0}}, {}, 2000);
+    bool unknown = true;
+    CHECK(a.broker_holds("NVDA", unknown));
+    CHECK_FALSE(unknown);
+    a.stand_down();
+    // The live accessor must still go blank — divergence pages must never be
+    // raised off a dead session's book.
+    CHECK_FALSE(a.broker_holds("NVDA", unknown));
+    CHECK(unknown);
+}
+
+TEST_CASE("the between-sessions accessor survives stand_down") {
+    BookAudit a;
+    a.arm(1000);
+    a.observe({}, {{"STKH", 0.0}, {"NVDA", 20.0}}, {}, 2000);
+    a.stand_down();
+    bool unknown = true;
+    // Held last session -> the start gate keeps the symbol rather than orphaning it.
+    CHECK(a.broker_held_last_session("NVDA", unknown));
+    CHECK_FALSE(unknown);
+    // Confirmed FLAT last session -> `unknown` is false, so `holds || unknown`
+    // is false and the unreachable-time-stop symbol is actually REFUSED. This is
+    // the assertion that fails against the shipped version.
+    CHECK_FALSE(a.broker_held_last_session("STKH", unknown));
+    CHECK_FALSE(unknown);
+}
+
+TEST_CASE("with no answer ever, silence is still not flat") {
+    // The opposite error, and the more dangerous one: treating "nobody has
+    // asked" as "the broker says flat" is what orphaned a live position on
+    // 2026-08-06. A fresh process must report unknown, so the caller keeps the
+    // symbol.
+    BookAudit a;
+    bool unknown = false;
+    CHECK_FALSE(a.broker_held_last_session("STKH", unknown));
+    CHECK(unknown);
+    a.arm(1000);
+    a.stand_down();   // stood down without ever having received a book
+    unknown = false;
+    CHECK_FALSE(a.broker_held_last_session("STKH", unknown));
+    CHECK(unknown);
+}

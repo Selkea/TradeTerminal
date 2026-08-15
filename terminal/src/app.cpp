@@ -4029,8 +4029,13 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
                 keep.push_back(std::move(so));
                 continue;
             }
+            // broker_held_last_session, NOT broker_holds: this runs while no
+            // session is live, so stand_down() has already cleared the live
+            // book and broker_holds() would answer `unknown` every single time —
+            // making the `|| unknown` carve-out below unconditional and this
+            // whole gate incapable of refusing anything.
             bool unknown = false;
-            if (book_audit_.broker_holds(so.symbol, unknown) || unknown) {
+            if (book_audit_.broker_held_last_session(so.symbol, unknown) || unknown) {
                 kept_exposed.push_back(so.symbol);
                 keep.push_back(std::move(so));
                 continue;
