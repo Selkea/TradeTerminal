@@ -2950,6 +2950,24 @@ std::string App::build_diag_json() {
     // "ok" is unreachable without a fresh, agreeing answer. Every failure —
     // including ones nobody has thought of — reads as something else, and
     // book_audit_agreed_age_ms below climbs in all of them.
+    // DID THE PAGES ACTUALLY ARRIVE? An alert the operator never received is
+    // indistinguishable, from inside the app, from one that was never worth
+    // sending — until 0.29.2 the webhook POST discarded its result entirely.
+    // On 2026-08-17 the two Critical pages of the day (an off-lineup broker
+    // position, a confirmed book divergence) were emitted, logged, and never
+    // delivered; nothing anywhere recorded that. `failed` non-zero means the
+    // phone is not a reliable channel right now, whatever the log says.
+    {
+        const AlertNotifier::Delivery d = alerts_.delivery();
+        nlohmann::json a;
+        a["sent"] = d.sent;
+        a["failed"] = d.failed;
+        a["retried"] = d.retried;
+        a["dropped"] = d.dropped;
+        a["last_status"] = d.last_status;
+        a["last_error"] = d.last_error;
+        j["alerts"] = std::move(a);
+    }
     {
         const int64_t steady_now_ms = steady_ms();
         j["book_divergence"] = book_audit_.field(steady_now_ms);

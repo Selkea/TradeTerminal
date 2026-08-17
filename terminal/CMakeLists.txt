@@ -147,6 +147,10 @@ add_executable(tt_terminal_tests
     src/panels/log_console.cpp
     src/journal.cpp
     src/config.cpp   # test_symbol_params round-trips per-symbol params through it
+    # test_alerts drives the REAL AlertNotifier, not a stand-in: the delivery
+    # accounting it pins (a page that failed must never read as sent) lives in
+    # the .cpp, and it was discarding curl's result until 0.29.2.
+    src/alerts.cpp
 )
 # Strategies under test are compiled in the same "promoted" mode tt_terminal
 # uses (self-registering into static_strategy_registry instead of exporting DLL
@@ -172,5 +176,5 @@ target_compile_definitions(tt_terminal_tests PRIVATE
     TT_REPO_DIR="${CMAKE_SOURCE_DIR}")
 # tt_engine: sweep.h scores a BacktestResult, declared in engine/engine.h.
 target_link_libraries(tt_terminal_tests PRIVATE imgui doctest sqlite3 tt_engine
-                                                nlohmann_json)
+                                                nlohmann_json CURL::libcurl ws2_32)
 add_test(NAME terminal_tests COMMAND tt_terminal_tests)
