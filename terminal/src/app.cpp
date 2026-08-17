@@ -3483,7 +3483,6 @@ int App::tick() {
     std::string line;
     bool from_live = false;
     while (engine_.pop_log(line, from_live)) {
-        alert_scan(line);
         // Route on the line's ORIGIN, not on global state. Backtest strategy
         // logs flood in during a sweep/tournament/lineup and belong in the
         // optimizer panel; everything the live session emits belongs in the
@@ -3491,8 +3490,29 @@ int App::tick() {
         // of the trading day because of the 30-minute autopilot, so live fills,
         // strategy entries and risk lines were being filed into the 58 MB
         // optimizer.log where nobody would find them.
-        if (from_live) route(std::move(line));
-        else opt_log_.add(std::move(line));
+        //
+        // A SIMULATED EVENT MUST NEVER PAGE. alert_scan used to sit ABOVE this
+        // branch, so it ran on every line the ring produced — and the engine
+        // that runs the optimizer's backtests is the SAME engine object the live
+        // session uses, so a strategy refused inside a replay woke the operator's
+        // phone exactly like a refusal on the real book. The origin flag needed
+        // to answer that question was already here, one line below, being used
+        // for nothing but which panel the text landed in.
+        //
+        // It went off on 2026-08-17: 73 pages in 90 seconds, all
+        // "[strategy warn] entry rejected", every one of them from a
+        // donchian_trend that exists only inside a sweep cell. The trigger was
+        // 0.28.0/0.29.0 giving replays the live entry gate and the live risk
+        // limits — before that a backtest submit_order essentially never refused,
+        // so the hole was there all along with nothing to fall into it. A
+        // tournament runs thousands of replays; this scales with the fit, not
+        // with anything happening to the account.
+        if (from_live) {
+            alert_scan(line);
+            route(std::move(line));
+        } else {
+            opt_log_.add(std::move(line));
+        }
     }
     if (ibkr_)
         while (ibkr_->pop_log(line)) {
