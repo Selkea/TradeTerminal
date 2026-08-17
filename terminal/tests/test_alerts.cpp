@@ -10,12 +10,19 @@
 
 #include "engine/tws_client_id.h"
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <chrono>
+#include <thread>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 using tt::ui::AlertClass;
 using tt::ui::classify_alert;
+using tt::ui::AlertNotifier;
 using tt::ui::detail::ascii_fold;
 
 TEST_CASE("ascii_fold: pure-ASCII text is unchanged") {
@@ -334,4 +341,177 @@ TEST_CASE("alerts: a SIMULATED event never reaches the alert scan at all") {
     REQUIRE(guard != std::string::npos);
     REQUIRE(scan != std::string::npos);
     CHECK(guard < scan);   // the origin is decided BEFORE anything can page
+}
+
+// ---------------------------------------------------------------------------
+// DELIVERY IS NOT ASSUMED.
+//
+// The webhook worker used to call curl_easy_perform and discard the result, so
+// a 429, a 500 and a DNS failure were all indistinguishable from delivery. On
+// 2026-08-17 the day's two CRITICAL pages — an off-lineup broker position and a
+// confirmed book divergence — were emitted, logged, and never arrived, and
+// nothing in the app recorded it. These pin the accounting that makes that
+// state visible.
+
+TEST_CASE("alerts: a notifier with no webhook counts nothing and never blocks") {
+    AlertNotifier n;
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    const auto d = n.delivery();
+    CHECK(d.sent == 0);
+    CHECK(d.failed == 0);
+    CHECK(d.dropped == 0);   // never queued: no webhook is configured, not a loss
+}
+
+TEST_CASE("alerts: a muted notifier queues nothing") {
+    AlertNotifier n;
+    n.set_muted(true);
+    n.notify(AlertNotifier::Critical, "RISK HALT");
+    CHECK(n.delivery().sent == 0);
+    CHECK(n.delivery().dropped == 0);
+}
+
+TEST_CASE("alerts: an unreachable webhook is recorded as FAILED, not as sent") {
+    // The whole point: a page that did not arrive must leave a trace. Port 9 is
+    // the discard service and nothing listens on it, so this fails at the
+    // transport with no network round trip to anywhere real.
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.notify(AlertNotifier::Warning, "unreachable-on-purpose");
+    // Warning retries twice with a 3s then 6s backoff; wait past that.
+    AlertNotifier::Delivery d{};
+    for (int i = 0; i < 300; ++i) {
+        d = n.delivery();
+        if (d.failed > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(d.failed == 1);
+    CHECK(d.sent == 0);
+    CHECK(d.retried == 2);            // it did not give up on the first refusal
+    CHECK_FALSE(d.last_error.empty());   // and it says why
+}
+
+// A one-shot HTTP server that answers with `status` and nothing else. Needed
+// because the failure that lost the 2026-08-17 Critical pages was a RATE LIMIT
+// — HTTP 429 — which is a perfectly successful transport carrying a refusal.
+// Testing against a closed port only exercises curl's transport error and
+// leaves the status check unproven: with the status check deleted, a
+// closed-port case still passes. This one does not.
+namespace {
+struct OneShotHttp {
+    SOCKET listener = INVALID_SOCKET;
+    std::thread th;
+    unsigned short port = 0;
+
+    explicit OneShotHttp(std::vector<int> statuses) {
+        WSADATA w{};
+        WSAStartup(MAKEWORD(2, 2), &w);
+        listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE(listener != INVALID_SOCKET);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;   // ephemeral
+        REQUIRE(bind(listener, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0);
+        int alen = sizeof a;
+        REQUIRE(getsockname(listener, reinterpret_cast<sockaddr*>(&a), &alen) == 0);
+        port = ntohs(a.sin_port);
+        REQUIRE(listen(listener, 8) == 0);
+        th = std::thread([this, statuses] {
+            for (int status : statuses) {
+                SOCKET c = accept(listener, nullptr, nullptr);
+                if (c == INVALID_SOCKET) return;
+                char buf[2048];
+                recv(c, buf, sizeof buf, 0);   // drain the request
+                const std::string crlf = "\x0d\x0a";
+                const std::string resp = "HTTP/1.1 " + std::to_string(status) +
+                                         " X" + crlf + "Content-Length: 0" + crlf +
+                                         "Connection: close" + crlf + crlf;
+                send(c, resp.c_str(), static_cast<int>(resp.size()), 0);
+                closesocket(c);
+            }
+        });
+    }
+    ~OneShotHttp() {
+        closesocket(listener);
+        if (th.joinable()) th.join();
+    }
+    std::string url() const {
+        return "http://127.0.0.1:" + std::to_string(port) + "/topic";
+    }
+};
+
+AlertNotifier::Delivery wait_settled(const AlertNotifier& n, int tries = 400) {
+    AlertNotifier::Delivery d{};
+    for (int i = 0; i < tries; ++i) {
+        d = n.delivery();
+        if (d.sent > 0 || d.failed > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return d;
+}
+} // namespace
+
+TEST_CASE("alerts: HTTP 429 is a FAILURE, not a delivery") {
+    // THE EXACT FAILURE of 2026-08-17. ntfy.sh answers a depleted rate-limit
+    // bucket with 429; the transport succeeds, so the old code — which only
+    // ever looked at curl's return value — counted it as sent. The Critical
+    // book-divergence page went out into that and nothing recorded its loss.
+    OneShotHttp srv({429, 429, 429});   // all three attempts get 429
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook(srv.url());
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    const auto d = wait_settled(n);
+    CHECK(d.sent == 0);
+    CHECK(d.failed == 1);
+    CHECK(d.last_status == 429);
+    CHECK(d.last_error == "HTTP 429");
+}
+
+TEST_CASE("alerts: a 200 is a delivery, and is not retried") {
+    // The positive control. Without it, a rule that called EVERYTHING a failure
+    // would satisfy the case above just as well.
+    OneShotHttp srv({200});
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook(srv.url());
+    n.notify(AlertNotifier::Critical, "RISK HALT");
+    const auto d = wait_settled(n);
+    CHECK(d.sent == 1);
+    CHECK(d.failed == 0);
+    CHECK(d.retried == 0);
+    CHECK(d.last_status == 200);
+    CHECK(d.last_error.empty());
+}
+
+TEST_CASE("alerts: a Critical page RECOVERS when the bucket refills") {
+    // WHY THE RETRY EXISTS. ntfy replenishes a depleted bucket over seconds, so
+    // the page refused at T is very likely accepted a moment later — and that
+    // is exactly the window a single best-effort shot threw away on
+    // 2026-08-17. First attempt 429, second 200: the page gets through, and the
+    // operator hears about the divergence instead of never knowing.
+    OneShotHttp srv({429, 200});
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook(srv.url());
+    n.notify(AlertNotifier::Critical, "PROTECTIVE STOP REJECTED");
+    const auto d = wait_settled(n);
+    CHECK(d.sent == 1);        // delivered on the retry
+    CHECK(d.failed == 0);
+    CHECK(d.retried == 1);
+    CHECK(d.last_status == 200);
+}
+
+TEST_CASE("alerts: the delivery counters survive a backlog overflow") {
+    // The queue caps at 100 so a dead webhook cannot hoard forever. What is
+    // dropped there was never sent and must not read as success.
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 400; ++i)
+        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    const auto d = n.delivery();
+    CHECK(d.dropped > 0);
+    CHECK(d.sent == 0);
 }
