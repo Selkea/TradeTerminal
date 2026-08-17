@@ -115,6 +115,32 @@ inline AlertClass classify_alert(const std::string& l) {
     // entries the tagged line rates Info. The tag decides the tier; this line
     // exists to carry the order id and the broker's numeric code into the log.
     if (has("refused by broker")) return AlertClass::None;
+    // A STRATEGY'S OWN FREE TEXT, tiered by the LEVEL the strategy chose rather
+    // than by keyword. EngineCtx::log stamps the level into the prefix, and that
+    // is a far better signal than scanning prose written by six different
+    // strategy authors — which is what happened until 2026-08-17.
+    //
+    // Both directions were wrong, in opposite ways:
+    //
+    //  - donchian_trend's level-2 `ctx.log(2, "entry rejected")` contains
+    //    "rejected", so it fell through to the generic rule below and paged
+    //    WARNING — walking straight around the Info tier the rule above builds
+    //    for refusals, and for the reason stated there: a beep per refusal
+    //    trains the operator to ignore beeps. It sent 73 pages in 90 seconds.
+    //  - meanwhile every strategy's level-3 "protective stop rejected —
+    //    position unprotected" ALSO landed on that generic rule, at the same
+    //    Warning, because the Critical tag at the top is UPPERCASE and matched
+    //    only the engine's own spelling (engine.cpp). A strategy reporting a
+    //    naked position was rated exactly as loud as one declining to buy.
+    //
+    // So level 3 is Critical — it is what a strategy uses to say that something
+    // which should be protecting or closing a position is not ("protective stop
+    // rejected", "EOD flatten died — position still open"), which is precisely
+    // the tier's definition. Level 2 is Info: on the channel, no beep. The
+    // engine's own tagged lines are checked ABOVE and still outrank both, so
+    // this cannot downgrade a refusal the engine classified itself.
+    if (has("[strategy error]")) return AlertClass::Critical;
+    if (has("[strategy warn]")) return AlertClass::Info;
     if (has("rejected") || has("stream lost") || has("auth failed") ||
         has("(drops!)") || has("half-open order"))
         return AlertClass::Warning;

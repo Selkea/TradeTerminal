@@ -267,3 +267,71 @@ TEST_CASE("every TWS client that latches a 326 can also clear it and retry") {
         CHECK(count(src, "kTwsClientIdRetrySec") + count(src, "tws_client_id_retry_sec") >= 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A STRATEGY'S OWN LOG LINE, and the 73 pages in 90 seconds of 2026-08-17.
+//
+// EngineCtx::log stamps the strategy's chosen level into the prefix. Tiering on
+// that beats keyword-matching prose written by six different strategy authors,
+// which is what these lines used to get.
+
+TEST_CASE("classify_alert: a strategy's refused entry is Info, not a page") {
+    // THE EXACT LINE that sent 73 pages in 90 seconds during a lineup build
+    // (donchian_trend.cpp: ctx.log(2, "entry rejected")). It contains
+    // "rejected", so it fell through to the generic rule and paged Warning —
+    // walking around the Info tier the engine's own refusal tag sits in.
+    CHECK(classify_alert("[strategy warn] entry rejected") == AlertClass::Info);
+    CHECK(classify_alert("[strategy warn] SOXS: entry rejected") == AlertClass::Info);
+    // Same tier for the other level-2 lines: working-as-designed or self-healing.
+    CHECK(classify_alert("[strategy warn] breakout orders died before triggering "
+                         "— re-arming") == AlertClass::Info);
+    CHECK(classify_alert("[strategy warn] time_stop was 0 (no risk control) — "
+                         "restored to 12 bars") == AlertClass::Info);
+}
+
+TEST_CASE("classify_alert: a strategy reporting a naked position IS Critical") {
+    // The bug in the other direction, and the more dangerous of the two. Every
+    // strategy spells this in LOWERCASE; the Critical tag at the top of the
+    // rules is the engine's UPPERCASE spelling and never matched it. So a
+    // strategy saying its protective stop was refused and the position is
+    // unprotected paged at exactly the same Warning as one declining to buy.
+    CHECK(classify_alert("[strategy error] protective stop rejected — position "
+                         "unprotected") == AlertClass::Critical);
+    CHECK(classify_alert("[strategy error] SOXL: protective stop rejected — "
+                         "flattening") == AlertClass::Critical);
+    CHECK(classify_alert("[strategy error] EOD flatten died — position still "
+                         "open") == AlertClass::Critical);
+}
+
+TEST_CASE("classify_alert: the engine's own tags still outrank strategy prose") {
+    // The strategy rules are checked BELOW every engine tag, so they can only
+    // ever tier a line the engine did not classify itself. If this inverts, a
+    // strategy's wording could silently downgrade a refusal the engine rated.
+    CHECK(classify_alert("PROTECTIVE STOP REJECTED on SOXL — naked") ==
+          AlertClass::Critical);
+    CHECK(classify_alert("[strategy warn] live: KILL SWITCH — flattening") ==
+          AlertClass::Critical);
+}
+
+TEST_CASE("alerts: a SIMULATED event never reaches the alert scan at all") {
+    // Source-text pin, and the only tool available: nothing in the suite
+    // constructs an App, so App::tick's drain loop is unreachable from a test.
+    //
+    // The optimizer's backtests run on the SAME Engine object as the live
+    // session, so its log ring carries both. alert_scan used to run above the
+    // origin branch and paged for both. The pin asserts the scan is INSIDE the
+    // from_live arm — the rules above would all still pass with it hoisted back
+    // out, and the phone would ring for a strategy that only exists in a sweep.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    const size_t drain = src.find("while (engine_.pop_log(line, from_live))");
+    REQUIRE(drain != std::string::npos);
+    const size_t guard = src.find("if (from_live) {", drain);
+    const size_t scan = src.find("alert_scan(line);", drain);
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(scan != std::string::npos);
+    CHECK(guard < scan);   // the origin is decided BEFORE anything can page
+}
