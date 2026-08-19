@@ -13,7 +13,16 @@ size_t sink_cb(char*, size_t sz, size_t nm, void*) { return sz * nm; }
 } // namespace
 
 AlertNotifier::~AlertNotifier() {
-    stop_.store(true, std::memory_order_release);
+    // UNDER THE MUTEX. The worker evaluates stop_ inside a predicate held on
+    // mu_, and the lock is held continuously from that load returning false
+    // into cv_.wait's atomic unlock-and-block. A destructor that never
+    // contends for mu_ can run entirely inside that window, find no waiter
+    // registered, and lose the notification — leaving join() below blocked
+    // forever on a thread waiting for a signal that already happened.
+    {
+        std::lock_guard lock(mu_);
+        stop_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
     if (th_.joinable()) th_.join();
 }
@@ -39,9 +48,27 @@ void AlertNotifier::notify(Severity sev, const std::string& text) {
     {
         std::lock_guard lock(mu_);
         if (webhook_.empty()) return;
-        if (q_.size() >= 100) {   // webhook down: don't hoard forever
-            ++del_.dropped;
-            return;
+        // THE CAP IS SEVERITY-AWARE. It used to drop whatever arrived once the
+        // queue held 100, consulting only the size — so a Critical raised during
+        // an Info backlog was discarded while the stale Infos ahead of it were
+        // kept. That is precisely backwards, and it is the in-process twin of the
+        // 2026-08-17 loss: there the two Critical pages died at the receiver, here
+        // they would die before a socket was ever opened.
+        //
+        // A higher tier now evicts the OLDEST strictly-lower-tier item instead of
+        // being refused. Equal-or-higher tiers are never evicted, so a flood of
+        // Criticals still bounds the queue rather than cannibalising itself, and
+        // an Info arriving into a full queue is dropped exactly as before.
+        if (q_.size() >= 100) {
+            auto victim = q_.end();
+            for (auto it = q_.begin(); it != q_.end(); ++it)
+                if (it->sev < sev) { victim = it; break; }   // oldest lower tier
+            if (victim == q_.end()) {
+                ++del_.dropped;      // nothing outranked: this one goes
+                return;
+            }
+            q_.erase(victim);
+            ++del_.evicted;          // the evicted item is still a loss; count it
         }
         q_.push_back({sev, text});
         ensure_worker();
@@ -88,7 +115,7 @@ void AlertNotifier::worker() {
         std::string url;
         {
             std::unique_lock lock(mu_);
-            cv_.wait(lock, [this] { return stop_.load() || !q_.empty(); });
+            cv_.wait(lock, [this] { return stop_.load() || (!q_.empty() && !paused_); });
             if (stop_.load() && q_.empty()) return;
             item = std::move(q_.front());
             q_.pop_front();

@@ -17,8 +17,15 @@ enum class AlertClass { None, Info, Warning, Critical };
 inline AlertClass classify_alert(const std::string& l) {
     auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
     if (has("KILL SWITCH") || has("RISK HALT") || has("WATCHDOG") ||
-        has("PROTECTIVE STOP REJECTED"))
+        has("PROTECTIVE STOP REJECTED") || has("EOD BACKSTOP"))
         return AlertClass::Critical;
+    // EOD BACKSTOP is on that list as of 0.29.3, and was AlertClass::None for its
+    // whole life. It is the app's LAST RESORT: reaching it means every
+    // strategy-level exit failed and the engine had to cancel-all and force-flatten
+    // a position it should never still have been holding (engine.cpp, both the
+    // broker and the sim branch). It sat one tier below "lineup: EXCLUDED" and level
+    // with ordinary prose. If it ever starts firing daily, that frequency is itself
+    // the alarm and must not be silenced by demoting it again.
     // A TWS client-id collision (IB error 326). Critical rather than Warning
     // because while it lasts it is TOTAL for the client that drew it: on the
     // data client there are no candles — no charts, no warmup, no lineup — and
@@ -144,7 +151,15 @@ inline AlertClass classify_alert(const std::string& l) {
     if (has("rejected") || has("stream lost") || has("auth failed") ||
         has("(drops!)") || has("half-open order"))
         return AlertClass::Warning;
-    if (has("live: fill"))
+    // A LIVE FILL. Info: on the channel, no beep.
+    //
+    // This tested has("live: fill") until 0.29.3 and had therefore matched NOTHING
+    // since 0.4.3 (f93b0c3, "name the symbol in log lines"), which rewrote the
+    // emitter to "live: %s fill %s %.0f @ %.2f (order #%llu)" — the SYMBOL is
+    // interpolated between "live: " and "fill", so the substring never occurs and
+    // every fill silently fell through to None. Matched on two fragments that
+    // straddle the interpolation instead, so the same edit cannot break it twice.
+    if (has(" fill ") && has("(order #"))
         return AlertClass::Info;
     return AlertClass::None;
 }

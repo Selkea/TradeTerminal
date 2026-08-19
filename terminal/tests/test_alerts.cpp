@@ -148,7 +148,14 @@ TEST_CASE("classify_alert: a refusal the BROKER caused is tiered by its tag") {
 }
 
 TEST_CASE("classify_alert: fills are Info, plain lines are None") {
-    CHECK(classify_alert("live: fill #7 BUY 100 @ 12.34") == AlertClass::Info);
+    // THIS CASE IS WHY THE DEAD RULE SURVIVED. It pinned "live: fill #7 ...", the
+    // PRE-0.4.3 emitter format, and kept passing for two weeks while production
+    // emitted "live: SOXL fill BUY 100 @ 12.34 (order #7)" and every real fill
+    // classified as None. A rule and its test can agree with each other and both
+    // disagree with the code that actually emits the line — so the string here is
+    // now the one engine.cpp really produces (see the 0.29.3 case below).
+    CHECK(classify_alert("live: SOXL fill BUY 100 @ 12.34 (order #7)") ==
+          AlertClass::Info);
     CHECK(classify_alert("candles: SOXL 5m x9750") == AlertClass::None);
     CHECK(classify_alert("tws: reconcile: complete") == AlertClass::None);
 }
@@ -514,4 +521,74 @@ TEST_CASE("alerts: the delivery counters survive a backlog overflow") {
     const auto d = n.delivery();
     CHECK(d.dropped > 0);
     CHECK(d.sent == 0);
+}
+
+// ---------------------------------------------------------------------------
+// FINDINGS FROM THE 2026-08-19 ALERT-PATH AUDIT (0.29.3).
+
+TEST_CASE("classify_alert: the EOD backstop is the last resort and pages Critical") {
+    // It was AlertClass::None for its entire life. Reaching this line means every
+    // strategy-level exit failed and the engine had to cancel-all and force-flatten
+    // a position it should never still have been holding.
+    CHECK(classify_alert("live: EOD BACKSTOP \xE2\x80\x94 open position(s) past 15:57 with no "
+                         "strategy closing them; broker cancel-all + flatten requested") ==
+          AlertClass::Critical);
+    CHECK(classify_alert("live: EOD BACKSTOP \xE2\x80\x94 open position(s) past 12:57 with no "
+                         "strategy closing them; broker cancel-all + flatten requested") ==
+          AlertClass::Critical);
+}
+
+TEST_CASE("classify_alert: a live fill is Info, in the format actually emitted") {
+    // THE DEAD RULE. It tested has("live: fill"), but engine.cpp emits
+    // "live: %s fill %s %.0f @ %.2f (order #%llu)" — the SYMBOL sits between
+    // "live: " and "fill", so the substring never occurred and every fill since
+    // 0.4.3 (2026-08-05) classified as None.
+    CHECK(classify_alert("live: SOXL fill BUY 100 @ 12.34 (order #7)") == AlertClass::Info);
+    CHECK(classify_alert("live: SPCH fill SELL 533 @ 9.56 (order #41)") == AlertClass::Info);
+    // The literal the old rule looked for must not be what makes it pass now.
+    CHECK(classify_alert("live: fill") == AlertClass::None);
+    // ...and ordinary prose containing the word must stay silent.
+    CHECK(classify_alert("optimizer: 312 backtests, no fill model change") ==
+          AlertClass::None);
+}
+
+TEST_CASE("alerts: a Critical is not discarded because Infos filled the queue") {
+    // The in-process twin of the 2026-08-17 loss. The cap consulted only size, so
+    // a Critical arriving into a full queue was dropped while the stale Infos
+    // ahead of it were kept.
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_worker_paused(true);   // hold the drain: the ADMISSION policy is the unit
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 400; ++i)
+        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    const auto before = n.delivery();
+    REQUIRE(before.dropped > 0);        // the queue really is saturated
+    // A Critical now evicts the oldest Info rather than being refused. It is
+    // accepted, so the only observable is that `dropped` rises by exactly one
+    // (the evicted Info) and never by two (evicted + refused).
+    const auto a = n.delivery();
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    const auto b = n.delivery();
+    // ACCEPTED by evicting an Info, not refused. The two are separate counters
+    // precisely because they are otherwise indistinguishable: a dropped-only
+    // accounting rises by exactly one either way, so the test could not tell
+    // the fix from its absence (it did not, until this was split out).
+    CHECK(b.evicted == a.evicted + 1);
+    CHECK(b.dropped == a.dropped);
+}
+
+TEST_CASE("alerts: an Info arriving into a full queue is still simply dropped") {
+    // The other half, so the eviction rule cannot degenerate into "always evict".
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 400; ++i)
+        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    const uint64_t d0 = n.delivery().dropped;
+    const uint64_t e0 = n.delivery().evicted;
+    n.notify(AlertNotifier::Info, "one more");
+    CHECK(n.delivery().dropped == d0 + 1);   // refused at the door
+    CHECK(n.delivery().evicted == e0);       // and no peer was sacrificed for it
 }
