@@ -73,6 +73,11 @@ public:
         uint64_t failed = 0;      // gave up after the retries below
         uint64_t retried = 0;     // attempts beyond the first
         uint64_t dropped = 0;     // never even queued (backlog full)
+        // A LOWER-TIER alert removed to make room for a higher one. Distinct
+        // from `dropped`: that is "we refused the new page", this is "we made
+        // room for it". Both are losses and both must be visible, but only the
+        // second means the severity rule did its job.
+        uint64_t evicted = 0;
         long last_status = 0;     // last HTTP status seen (0 = transport error)
         std::string last_error;   // curl's message, or "HTTP <code>"
     };
@@ -81,6 +86,15 @@ public:
     // TEST SEAM. Production waits whole seconds because that is the timescale a
     // rate-limit bucket refills on; a suite cannot afford to. Only the delay
     // changes — the attempt counts and the success rule are the shipping ones.
+    // TEST SEAM. Holds the worker so the QUEUE ADMISSION POLICY can be tested
+    // deterministically. The policy is the unit under test; the drain is not,
+    // and a test that races them cannot say whether a full queue evicted or
+    // simply had room. Never set in production.
+    void set_worker_paused(bool p) {
+        { std::lock_guard lock(mu_); paused_ = p; }
+        cv_.notify_all();
+    }
+
     void set_retry_backoff_ms(int ms) {
         retry_backoff_ms_.store(ms, std::memory_order_relaxed);
     }
@@ -102,6 +116,7 @@ private:
     std::deque<Item> q_;
     std::string webhook_;
     Delivery del_;
+    bool paused_ = false;
     std::atomic<int> retry_backoff_ms_{3000};
     std::atomic<bool> muted_{false};
     std::atomic<bool> stop_{false};

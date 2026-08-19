@@ -2964,6 +2964,7 @@ std::string App::build_diag_json() {
         a["failed"] = d.failed;
         a["retried"] = d.retried;
         a["dropped"] = d.dropped;
+        a["evicted"] = d.evicted;
         a["last_status"] = d.last_status;
         a["last_error"] = d.last_error;
         j["alerts"] = std::move(a);
