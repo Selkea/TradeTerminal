@@ -252,9 +252,11 @@ inline constexpr const char* kExitOrderRefusedTag = "EXIT ORDER REFUSED";
 // (silent, for exactly this reason). On 2026-08-13 all six lineup symbols
 // signalled into a closed exchange and each one paged here, unthrottled.
 //
-// Tagging it lets the classifier tier it as what it is: a trace. It stays on
-// the channel at Info because it is the ONLY report of the IB errors that are
-// not order-scoped, and every tag that outranks Info is checked before it.
+// Tagging it lets the classifier tier it as what it is: a trace, kept in the
+// log and off the phone. Every IB error worth paging for already has a louder
+// path — the tagged refusal lines here, the client-id and duplicate-id tags, and
+// pump_broker_watchdog for a sustained upstream loss — and all of them are
+// checked above it.
 //
 // UPPERCASE for the same reason as the tags above, and it was not academic: the
 // first cut used "IB error", which is exactly how tws_client_id_waiting_line

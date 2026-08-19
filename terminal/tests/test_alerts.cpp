@@ -701,13 +701,24 @@ TEST_CASE("classify_alert: the raw IB error trace is a trace, not a third page")
     // at a LOUDER tier than the tagged line that decides the policy, and with no
     // throttle of any kind.
     CHECK(classify_alert("tws: IB ERROR 201 (id 5): Order rejected - reason:Exchange "
-                         "is closed.") == AlertClass::Info);
+                         "is closed.") == AlertClass::None);
     CHECK(classify_alert("tws: IB ERROR 202 (id 7): Order Canceled - reason:") ==
-          AlertClass::Info);
-    // Still on the channel, because for a NON order-scoped IB error this trace
-    // is the only report there is.
-    CHECK(classify_alert("tws: IB ERROR 502 (id -1): Couldn't connect to TWS") ==
-          AlertClass::Info);
+          AlertClass::None);
+    // THE LINES THAT SETTLED THE TIER, taken verbatim from the VPS log for one
+    // ordinary overnight IBC restart: six 1100s inside 42 seconds and a pair of
+    // 502s, all routine, all silent before this tag existed. Info still posts to
+    // the webhook, so tiering the trace there would have added phone traffic to
+    // a nightly maintenance window while claiming to fix a flood.
+    CHECK(classify_alert("tws-data: IB ERROR 1100 (id -1): Connectivity between IBKR "
+                         "and Trader Workstation has been lost.") == AlertClass::None);
+    CHECK(classify_alert("tws-data: IB ERROR 502 (id -1): Couldn't connect to TWS. "
+                         "Confirm that \"Enable ActiveX and Socket Clients\" is "
+                         "enabled") == AlertClass::None);
+    // What actually reports a gateway that does NOT come back: state, not the
+    // callback, and only once it has lasted.
+    CHECK(classify_alert("alert: WATCHDOG gateway lost its connection to IBKR (error "
+                         "1100) for 62s during a live session - check IB Gateway") ==
+          AlertClass::Critical);
 }
 
 TEST_CASE("classify_alert: a Critical tag inside a trace still outranks it") {
@@ -727,7 +738,7 @@ TEST_CASE("classify_alert: a Critical tag inside a trace still outranks it") {
     CHECK(classify_alert(naked) == AlertClass::Critical);
     // ...while the same shape with nothing louder in it stays a trace.
     CHECK(classify_alert(std::string("tws: ") + tt::kIbErrorTraceTag +
-                         " 201 (id 7): Order rejected - reason:") == AlertClass::Info);
+                         " 201 (id 7): Order rejected - reason:") == AlertClass::None);
 }
 
 TEST_CASE("the adapters do not word a pre-send refusal 'order rejected'") {

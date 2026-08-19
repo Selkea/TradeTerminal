@@ -123,12 +123,24 @@ inline AlertClass classify_alert(const std::string& l) {
     // exists to carry the order id and the broker's numeric code into the log.
     if (has("refused by broker")) return AlertClass::None;
     // The TWS adapter's raw trace of an IB error callback — see kIbErrorTraceTag
-    // for why it is a trace and not the report. Info, not the Warning the
-    // generic rule below gave it: IB's own text for a refused order contains
-    // "rejected", so every refusal paged a third time, at a LOUDER tier than the
-    // tagged line the policy actually tiers it by. Below every Critical tag, so
-    // a trace whose text carries one still pages Critical.
-    if (has(kIbErrorTraceTag)) return AlertClass::Info;
+    // for why it is a trace and not the report. None, exactly like the "refused
+    // by broker" line above it and for the same reason: every IB error worth
+    // hearing about already has a louder path, and they are all checked above.
+    // An order refusal has its tagged ORDER REFUSED line (tiered AND throttled);
+    // a client-id collision, a duplicate order id and a foreign order have their
+    // own tags; a sustained loss of the gateway's upstream link is raised as
+    // STATE by pump_broker_watchdog, which pages Critical after 60 s rather than
+    // on each callback.
+    //
+    // It was briefly Info instead, on the theory that a non order-scoped IB
+    // error has no other report. The VPS log says otherwise: one ordinary
+    // overnight IBC restart produces six 1100s in 42 seconds and a pair of 502s,
+    // all of them routine, all of them silent before this tag existed. Info
+    // still posts to the webhook, so that reasoning would have added phone
+    // traffic to a nightly maintenance window while fixing a flood — and the
+    // 60 s watchdog is what tells the operator when one of those restarts does
+    // NOT come back.
+    if (has(kIbErrorTraceTag)) return AlertClass::None;
     // A STRATEGY'S OWN FREE TEXT, tiered by the LEVEL the strategy chose rather
     // than by keyword. EngineCtx::log stamps the level into the prefix, and that
     // is a far better signal than scanning prose written by six different
