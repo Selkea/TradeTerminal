@@ -2965,6 +2965,15 @@ std::string App::build_diag_json() {
         a["retried"] = d.retried;
         a["dropped"] = d.dropped;
         a["evicted"] = d.evicted;
+        // 0.30.0. What the flood defence swallowed, and how it was reported.
+        // `coalesced` is repeats folded into a page already sent; `throttled` is
+        // the per-severity rate cap refusing distinct alerts; `summaries` is the
+        // pages that told the operator about both. A rising coalesced/throttled
+        // with summaries stuck at zero would mean suppression had become
+        // silence, which is the failure this layer was built to avoid.
+        a["coalesced"] = d.coalesced;
+        a["throttled"] = d.throttled;
+        a["summaries"] = d.summaries;
         a["last_status"] = d.last_status;
         a["last_error"] = d.last_error;
         j["alerts"] = std::move(a);
