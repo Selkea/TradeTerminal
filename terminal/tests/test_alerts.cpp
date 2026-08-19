@@ -13,7 +13,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <atomic>
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <fstream>
 #include <iterator>
@@ -24,6 +28,27 @@ using tt::ui::AlertClass;
 using tt::ui::classify_alert;
 using tt::ui::AlertNotifier;
 using tt::ui::detail::ascii_fold;
+
+// A UNIT SUITE MUST NOT MAKE NOISE. notify() calls MessageBeep for every
+// admitted Warning and Critical, which is a real system sound on whatever
+// desktop the suite runs on — and the flood tests below raise them by the
+// dozen. Running the suite was audible; running a mutation sweep, which runs it
+// once per mutant, was continuous. Silenced before main, process-wide.
+static const bool kSuiteIsSilent = [] {
+    AlertNotifier::set_beeps_enabled(false);
+    return true;
+}();
+
+// The emitters whose TIER depends on their prose live behind a live socket, so
+// they are audited as text. Loud, not skipped: an audit that quietly no-ops when
+// it cannot find its subject is how the hole stays open.
+static std::string read_repo_file(const char* rel) {
+    const std::string path = std::string(TT_REPO_DIR) + rel;
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    return std::string{std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>()};
+}
 
 TEST_CASE("ascii_fold: pure-ASCII text is unchanged") {
     const std::string s = "WATCHDOG broker disconnected for 62s - check IB Gateway (2FA?)";
@@ -409,6 +434,20 @@ struct OneShotHttp {
     SOCKET listener = INVALID_SOCKET;
     std::thread th;
     unsigned short port = 0;
+    mutable std::mutex m;
+    std::vector<std::string> reqs;   // what actually went out on the wire
+
+    // The bodies received, so a test can assert what the operator would read
+    // rather than only that a counter moved.
+    std::vector<std::string> bodies() const {
+        std::lock_guard lk(m);
+        std::vector<std::string> out;
+        for (const std::string& r : reqs) {
+            const size_t h = r.find("\x0d\x0a\x0d\x0a");
+            out.push_back(h == std::string::npos ? r : r.substr(h + 4));
+        }
+        return out;
+    }
 
     explicit OneShotHttp(std::vector<int> statuses) {
         WSADATA w{};
@@ -429,7 +468,11 @@ struct OneShotHttp {
                 SOCKET c = accept(listener, nullptr, nullptr);
                 if (c == INVALID_SOCKET) return;
                 char buf[2048];
-                recv(c, buf, sizeof buf, 0);   // drain the request
+                const int got = recv(c, buf, sizeof buf, 0);   // drain the request
+                if (got > 0) {
+                    std::lock_guard lk(m);
+                    reqs.emplace_back(buf, static_cast<size_t>(got));
+                }
                 const std::string crlf = "\x0d\x0a";
                 const std::string resp = "HTTP/1.1 " + std::to_string(status) +
                                          " X" + crlf + "Content-Length: 0" + crlf +
@@ -456,6 +499,48 @@ AlertNotifier::Delivery wait_settled(const AlertNotifier& n, int tries = 400) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return d;
+}
+
+// ---------------------------------------------------------------------------
+// 0.30.0 SEAMS. Two things changed underneath the queue tests below.
+//
+// First, "flood 1".."flood 400" is now ONE burst key: burst_key folds numbers
+// precisely so a repeating event with a rolling order id collapses instead of
+// looking like 400 new events. That is the flood defence doing its job, and it
+// means a test can no longer reach the QUEUE by repeating itself.
+//
+// Second, distinct lines are rate-capped per severity, so 400 unique Infos do
+// not reach it either.
+//
+// So the queue tests vary their text non-numerically AND drive a fake clock
+// forward far enough to keep a token available, which leaves the backlog cap as
+// the only policy still in the way — the thing they were written to test.
+
+struct TestClock {
+    std::shared_ptr<std::atomic<int64_t>> t =
+        std::make_shared<std::atomic<int64_t>>(1);
+    void advance(int64_t ms) { t->fetch_add(ms); }
+    std::function<int64_t()> fn() const {
+        auto p = t;
+        return [p] { return p->load(); };
+    }
+};
+
+// Letters, not digits: a numeric suffix folds to a single burst key.
+std::string distinct_line(int i) {
+    std::string s = "flood ";
+    for (int k = 0, v = i; k < 3; ++k, v /= 26) s.push_back(char('a' + v % 26));
+    return s;
+}
+
+// Info refills at kRatePerMin[Info] = 6/min, i.e. one token per 10 s.
+constexpr int64_t kInfoTokenMs = 10000;
+
+void saturate_backlog(AlertNotifier& n, TestClock& clk, int count = 400) {
+    for (int i = 0; i < count; ++i) {
+        clk.advance(kInfoTokenMs);
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    }
 }
 } // namespace
 
@@ -514,10 +599,12 @@ TEST_CASE("alerts: the delivery counters survive a backlog overflow") {
     // The queue caps at 100 so a dead webhook cannot hoard forever. What is
     // dropped there was never sent and must not read as success.
     AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
     n.set_retry_backoff_ms(20);
+    n.set_worker_paused(true);   // the ADMISSION accounting is the unit, not the drain
     n.set_webhook("x-no-such-scheme://drop");
-    for (int i = 0; i < 400; ++i)
-        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    saturate_backlog(n, clk);
     const auto d = n.delivery();
     CHECK(d.dropped > 0);
     CHECK(d.sent == 0);
@@ -557,11 +644,12 @@ TEST_CASE("alerts: a Critical is not discarded because Infos filled the queue") 
     // a Critical arriving into a full queue was dropped while the stale Infos
     // ahead of it were kept.
     AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
     n.set_retry_backoff_ms(20);
     n.set_worker_paused(true);   // hold the drain: the ADMISSION policy is the unit
     n.set_webhook("x-no-such-scheme://drop");
-    for (int i = 0; i < 400; ++i)
-        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    saturate_backlog(n, clk);
     const auto before = n.delivery();
     REQUIRE(before.dropped > 0);        // the queue really is saturated
     // A Critical now evicts the oldest Info rather than being refused. It is
@@ -581,14 +669,386 @@ TEST_CASE("alerts: a Critical is not discarded because Infos filled the queue") 
 TEST_CASE("alerts: an Info arriving into a full queue is still simply dropped") {
     // The other half, so the eviction rule cannot degenerate into "always evict".
     AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
     n.set_retry_backoff_ms(20);
     n.set_worker_paused(true);
     n.set_webhook("x-no-such-scheme://drop");
-    for (int i = 0; i < 400; ++i)
-        n.notify(AlertNotifier::Info, "flood " + std::to_string(i));
+    saturate_backlog(n, clk);
     const uint64_t d0 = n.delivery().dropped;
     const uint64_t e0 = n.delivery().evicted;
-    n.notify(AlertNotifier::Info, "one more");
+    clk.advance(kInfoTokenMs);   // hand it a token, so it is the QUEUE that refuses
+    n.notify(AlertNotifier::Info, "one more line free of digits");
     CHECK(n.delivery().dropped == d0 + 1);   // refused at the door
     CHECK(n.delivery().evicted == e0);       // and no peer was sacrificed for it
+}
+
+// ---------------------------------------------------------------------------
+// 0.30.0: BURST COALESCING AND THE PER-SEVERITY RATE CAP.
+//
+// Everything above this line bounds what happens to an alert AFTER something
+// decides to raise one. None of it bounds how MANY get raised, which is what
+// actually went wrong on 2026-08-17 — and 0.29.1 fixed that one emitter, by
+// hand, leaving every other repeat-emitter in the codebase able to do it again.
+// The audit found four more. This layer stops the class instead of the
+// instances.
+
+TEST_CASE("classify_alert: the raw IB error trace is a trace, not a third page") {
+    // 2026-08-13: all six lineup symbols signalled into a closed exchange. IB's
+    // text is "Order rejected - reason:Exchange is closed.", which contains
+    // "rejected", so the adapter's raw trace fell through to the generic keyword
+    // rule and paged WARNING — a third copy of an event the policy rates Info,
+    // at a LOUDER tier than the tagged line that decides the policy, and with no
+    // throttle of any kind.
+    CHECK(classify_alert("tws: IB ERROR 201 (id 5): Order rejected - reason:Exchange "
+                         "is closed.") == AlertClass::Info);
+    CHECK(classify_alert("tws: IB ERROR 202 (id 7): Order Canceled - reason:") ==
+          AlertClass::Info);
+    // Still on the channel, because for a NON order-scoped IB error this trace
+    // is the only report there is.
+    CHECK(classify_alert("tws: IB ERROR 502 (id -1): Couldn't connect to TWS") ==
+          AlertClass::Info);
+}
+
+TEST_CASE("classify_alert: a Critical tag inside a trace still outranks it") {
+    // The trace rule sits below every Critical tag on purpose, so it can only
+    // ever demote lines that nothing louder has claimed.
+    //
+    // These lines carry BOTH a Critical tag and the trace tag, which is the only
+    // shape that can tell the ordering apart. The obvious test — a plain
+    // DUPLICATE ORDER ID line — asserts nothing about it: that line contains no
+    // "IB ERROR" at all, so it passes just as happily with the trace rule moved
+    // to the top of the function. Its mutant SURVIVED until these existed.
+    const std::string dup = std::string("tws: ") + tt::kIbErrorTraceTag + " 103 (id 5): " +
+                            tt::kTwsDuplicateOrderIdTag + " on this account";
+    CHECK(classify_alert(dup) == AlertClass::Critical);
+    const std::string naked = std::string("tws: ") + tt::kIbErrorTraceTag +
+                              " 201 (id 7): PROTECTIVE STOP REJECTED";
+    CHECK(classify_alert(naked) == AlertClass::Critical);
+    // ...while the same shape with nothing louder in it stays a trace.
+    CHECK(classify_alert(std::string("tws: ") + tt::kIbErrorTraceTag +
+                         " 201 (id 7): Order rejected - reason:") == AlertClass::Info);
+}
+
+TEST_CASE("the adapters do not word a pre-send refusal 'order rejected'") {
+    // SOURCE-TEXT PIN, because no test constructs a broker: TwsBroker::submit
+    // needs an EClientSocket and a live gateway to reach.
+    //
+    // The classifier test above proves what the CLASSIFIER does with the new
+    // wording. It cannot prove the adapter still uses it — a mutant that reverted
+    // the log string sailed through the whole suite, because the test feeds
+    // classify_alert a literal and never asks what the emitter emits. The tier
+    // here is decided by a keyword in prose, so the prose is the contract.
+    const std::string tws = read_repo_file("/engine/src/tws_broker.cpp");
+    const std::string ibkr = read_repo_file("/engine/src/ibkr_broker.cpp");
+    CHECK(tws.find("log(\"order rejected") == std::string::npos);
+    CHECK(ibkr.find("log(\"order rejected") == std::string::npos);
+    CHECK(tws.find("log(\"order refused before send:") != std::string::npos);
+    CHECK(ibkr.find("log(\"order refused before send:") != std::string::npos);
+    // And the raw IB error trace goes out under the tag, not bare "error N".
+    CHECK(tws.find("b.log(std::string(kIbErrorTraceTag)") != std::string::npos);
+}
+
+TEST_CASE("the feeds pace a dropped session instead of retrying on a fixed 1s") {
+    // SOURCE-TEXT PIN, same reason: the reconnect loops need a live websocket.
+    // The defect was written out three times and could be reintroduced in any
+    // one of them, so all three are audited — a fix that holds in two feeds and
+    // regresses in the third is the shape this project keeps finding.
+    for (const char* rel : {"/engine/src/finnhub_feed.cpp",
+                            "/engine/src/polygon_feed.cpp",
+                            "/engine/src/ibkr_feed.cpp"}) {
+        const std::string src = read_repo_file(rel);
+        CHECK_MESSAGE(src.find("on_session_lost(net_steady_ms())") != std::string::npos, rel);
+        // The exact expression that produced 60 pages a minute.
+        CHECK_MESSAGE(src.find("next_connect_ms = net_steady_ms() + 1000;") ==
+                      std::string::npos, rel);
+        // ...and no feed resets the pacing merely because a handshake returned.
+        CHECK_MESSAGE(src.find("backoff_s = 1;") == std::string::npos, rel);
+    }
+}
+
+TEST_CASE("classify_alert: a refusal the adapter caught before sending does not page twice") {
+    // These logged "order rejected: ..." and so tripped the generic rule at
+    // Warning, once per SUBMIT and outside note_refusal's repeat throttle — a
+    // gateway that was down while six strategies kept signalling paged on every
+    // bar. The tagged ORDER REFUSED line is the one that carries the tier.
+    CHECK(classify_alert("tws: order refused before send: the TWS socket API is not "
+                         "connected") == AlertClass::None);
+    CHECK(classify_alert("ibkr: order refused before send: the gateway session is not "
+                         "ready") == AlertClass::None);
+    // ...and the tagged line still says it, at the tier the policy chose.
+    CHECK(classify_alert(std::string("live: ") + tt::kOrderRefusedTag +
+                         " SOXL broker_not_connected") == AlertClass::Info);
+}
+
+TEST_CASE("classify_alert: the feed reconnect line still pages, and still coalesces") {
+    // Retiering was NOT the fix for the feed flood — the pacing was (see
+    // engine/feed_reconnect.h). This line must keep its Warning: a feed that
+    // genuinely cannot hold a session is worth hearing about once.
+    CHECK(classify_alert("finnhub: stream lost, reconnecting in 1s") ==
+          AlertClass::Warning);
+    CHECK(classify_alert("finnhub: stream lost, reconnecting in 30s") ==
+          AlertClass::Warning);
+    // And because burst_key folds the number, the climbing backoff does not turn
+    // one repeating event into thirty distinct ones.
+    CHECK(tt::ui::detail::burst_key("finnhub: stream lost, reconnecting in 1s") ==
+          tt::ui::detail::burst_key("finnhub: stream lost, reconnecting in 30s"));
+}
+
+using tt::ui::detail::burst_key;
+
+TEST_CASE("burst_key: a rolling id does not make one repeating event look like many") {
+    // The reason exact-text matching would have been useless here: the same
+    // event almost never repeats byte-for-byte. It carries an order id, a share
+    // count, a price.
+    CHECK(burst_key("error 201 (id 5): Order rejected - reason:Exchange is closed.") ==
+          burst_key("error 201 (id 6): Order rejected - reason:Exchange is closed."));
+    CHECK(burst_key("live: SPCH fill BUY 533 @ 9.38") ==
+          burst_key("live: SPCH fill BUY 486 @ 10.27"));
+}
+
+TEST_CASE("burst_key: a sentence-ending period is not swallowed as part of a number") {
+    // If '.' folded unconditionally, "closed." and "closed" would be different
+    // keys — and IB's own text ends in one, so the burst would never coalesce.
+    CHECK(burst_key("Exchange is closed.") == "Exchange is closed.");
+    CHECK(burst_key("saw 12.5 pct") == "saw # pct");
+    CHECK(burst_key("qty 1,250 filled") == "qty # filled");
+    // The cases that actually pin the rule down. Above, the '.' is nowhere near
+    // a digit, so a build that folded separators unconditionally would pass all
+    // three — and one did: this test's own mutant SURVIVED until these two lines
+    // existed. The separator has to be reached from inside a number run for the
+    // distinction to be observable at all.
+    CHECK(burst_key("closed 20. next") == "closed #. next");
+    CHECK(burst_key("a 5, b 6") == "a #, b #");
+}
+
+TEST_CASE("burst_key: genuinely different prose stays different") {
+    // Folding numbers must not fold everything: two unrelated failures have to
+    // stay two keys or one would silence the other.
+    CHECK(burst_key("stream lost, reconnecting") !=
+          burst_key("gateway lost its connection to IBKR"));
+    CHECK(burst_key("BOOK DIVERGENCE NVDA app=0 broker=20") !=
+          burst_key("OFF-LINEUP BROKER POSITION NVDA 20 @ 209.17"));
+}
+
+TEST_CASE("alerts: 2026-08-17 replayed - one line repeated 73 times pages ONCE") {
+    // THE INCIDENT, at the layer that now stops it. donchian_trend emitted the
+    // same refusal from inside 73 sweep cells and every copy paged the phone.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 73; ++i) {
+        clk.advance(100);   // 7.3 s: the whole burst inside one window
+        n.notify(AlertNotifier::Info, "[strategy warn] SOXL entry rejected");
+    }
+    const auto d = n.delivery();
+    CHECK(d.coalesced == 72);   // one page; seventy-two folded into it
+    CHECK(d.throttled == 0);    // and the rate cap was never even reached
+}
+
+TEST_CASE("alerts: at the incident's real pace the window turns over, and no more") {
+    // 73 pages in 90 s against a 60 s window: the burst spans one boundary, so
+    // the honest outcome is two pages and a summary — not one, and emphatically
+    // not seventy-three.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 73; ++i) {
+        clk.advance(90000 / 73);
+        n.notify(AlertNotifier::Info, "[strategy warn] SOXL entry rejected");
+    }
+    const auto d = n.delivery();
+    const uint64_t paged = 73 - d.coalesced - d.throttled;
+    CHECK(paged <= 2);
+    CHECK(d.summaries >= 1);   // and the operator is told what was swallowed
+}
+
+TEST_CASE("alerts: the swallowed copies are REPORTED when the window closes") {
+    // Suppression that leaves no trace is the 0.29.2 bug rebuilt one layer up.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 50; ++i)
+        n.notify(AlertNotifier::Warning, "stream lost, reconnecting");
+    CHECK(n.delivery().coalesced == 49);
+    CHECK(n.delivery().summaries == 0);   // the window is still open
+    clk.advance(61000);
+    n.notify(AlertNotifier::Info, "an unrelated line");   // drives the flush
+    CHECK(n.delivery().summaries == 1);
+}
+
+TEST_CASE("alerts: a flood that STOPS still gets its summary, with nothing to trigger it") {
+    // The case a lazy flush would miss, and the one that matters most: the
+    // burst ends, nothing else is ever raised, and the operator is left holding
+    // the single page that opened it with no idea 49 more followed. The worker
+    // has to close the window on its own clock.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_flush_interval_ms(10);
+    n.set_retry_backoff_ms(5);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 50; ++i)
+        n.notify(AlertNotifier::Warning, "stream lost, reconnecting");
+    clk.advance(61000);
+    // Deliberately no further notify().
+    for (int i = 0; i < 400 && n.delivery().summaries == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(n.delivery().summaries == 1);
+}
+
+TEST_CASE("alerts: the first page is immediate and the summary carries the count") {
+    // End to end, on a real socket: what the operator actually reads. The first
+    // copy must never be delayed or batched — suppression applies only to the
+    // second and later copies of something already sent.
+    OneShotHttp srv({200, 200});
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_flush_interval_ms(10);
+    n.set_retry_backoff_ms(5);
+    n.set_webhook(srv.url());
+    for (int i = 0; i < 50; ++i)
+        n.notify(AlertNotifier::Warning, "stream lost, reconnecting");
+    clk.advance(61000);
+    for (int i = 0; i < 400 && n.delivery().sent < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto b = srv.bodies();
+    REQUIRE(b.size() == 2);
+    CHECK(b[0] == "stream lost, reconnecting");   // sent on the first copy, unaltered
+    CHECK(b[1].find("[+49 more like this in the last 61s]") != std::string::npos);
+}
+
+TEST_CASE("alerts: a burst summary keeps the severity of the burst it closes") {
+    // Observable through the retry rule: Warning/Critical retry, Info does not.
+    // A summary silently demoted to Info would become the tier nobody is woken
+    // for, which is how this defence would turn back into the silence it
+    // replaced.
+    OneShotHttp srv({200, 500, 500, 500});
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_flush_interval_ms(10);
+    n.set_retry_backoff_ms(5);
+    n.set_webhook(srv.url());
+    for (int i = 0; i < 4; ++i)
+        n.notify(AlertNotifier::Critical, "PROTECTIVE STOP REJECTED on SOXL");
+    clk.advance(61000);
+    for (int i = 0; i < 400 && n.delivery().failed == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto d = n.delivery();
+    CHECK(d.summaries == 1);
+    CHECK(d.retried == 2);   // 3 attempts on the summary: it is still Critical
+    CHECK(d.failed == 1);
+}
+
+TEST_CASE("alerts: a flood of DISTINCT alerts is capped, and the cap is counted") {
+    // Coalescing cannot help when every line differs — the per-severity bucket
+    // is the backstop for that, and reaching it must never be silent.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 40; ++i)   // no clock advance: no refill
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    const auto d = n.delivery();
+    CHECK(d.coalesced == 0);                 // every line really was its own key
+    CHECK(d.throttled == 40 - 6);            // Info's bucket holds six
+}
+
+TEST_CASE("alerts: an Info flood cannot spend the budget a Critical needs") {
+    // The starvation the per-severity buckets exist to prevent, and the same
+    // property the queue's severity-aware eviction gives one layer down. A
+    // single shared cap would have let the 73 junk pages lock out the two
+    // Criticals that followed them.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 200; ++i)
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    const uint64_t t0 = n.delivery().throttled;
+    REQUIRE(t0 > 0);   // Info's bucket really is empty
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    CHECK(n.delivery().throttled == t0);   // the Critical went straight out
+}
+
+TEST_CASE("alerts: the rate cap refills, so a capped channel recovers on its own") {
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 40; ++i)
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    const uint64_t t0 = n.delivery().throttled;
+    REQUIRE(t0 > 0);
+    clk.advance(kInfoTokenMs);   // exactly one Info token
+    n.notify(AlertNotifier::Info, distinct_line(900));
+    CHECK(n.delivery().throttled == t0);   // admitted, not refused
+}
+
+TEST_CASE("alerts: rate-capped alerts are summarised ONCE, not once each") {
+    // WHAT MUTATION TESTING FOUND, and the reason this counter is per-severity.
+    // The first cut recorded every throttled alert as its own burst, so 194
+    // refused Infos became 194 summary pages the instant the window closed —
+    // and summaries bypass the rate cap deliberately, so the defence would have
+    // emitted a bigger flood than the one it exists to stop. Nothing caught it
+    // because nothing yet asserted what a throttled alert TURNS INTO.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    for (int i = 0; i < 200; ++i)
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    REQUIRE(n.delivery().throttled > 100);
+    clk.advance(61000);
+    n.notify(AlertNotifier::Warning, "an unrelated line to drive the flush");
+    CHECK(n.delivery().summaries == 1);   // one report, not one per swallowed line
+}
+
+TEST_CASE("alerts: the rate-cap report says how many it swallowed, on the wire") {
+    // Info's bucket holds six, so twenty distinct lines page six times and the
+    // other fourteen are refused — then reported, once, in terms the operator
+    // can act on.
+    OneShotHttp srv({200, 200, 200, 200, 200, 200, 200});
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_flush_interval_ms(10);
+    n.set_retry_backoff_ms(5);
+    n.set_webhook(srv.url());
+    for (int i = 0; i < 20; ++i)
+        n.notify(AlertNotifier::Info, distinct_line(i));
+    clk.advance(61000);
+    for (int i = 0; i < 400 && n.delivery().sent < 7; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto b = srv.bodies();
+    REQUIRE(b.size() == 7);   // six pages plus exactly one report
+    CHECK(b.back().find("ALERT RATE CAP: 14 further alerts suppressed") !=
+          std::string::npos);
+    CHECK(b.back().find("most recent:") != std::string::npos);
+}
+
+TEST_CASE("alerts: a single alert is never coalesced, throttled or delayed") {
+    // The overwhelmingly common case, and the one this layer must not touch.
+    OneShotHttp srv({200});
+    AlertNotifier n;
+    n.set_retry_backoff_ms(20);
+    n.set_webhook(srv.url());
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    const auto d = wait_settled(n);
+    CHECK(d.sent == 1);
+    CHECK(d.coalesced == 0);
+    CHECK(d.throttled == 0);
+    CHECK(d.summaries == 0);
 }

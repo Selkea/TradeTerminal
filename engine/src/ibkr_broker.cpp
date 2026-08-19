@@ -593,7 +593,9 @@ uint64_t IbkrBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
                       reject_cause_text(RejectCause::BrokerReadOnly));
     }
     if (!ready()) {
-        log("order rejected: gateway session not ready");
+        // See TwsBroker::submit: "rejected" here paged Warning per submit,
+        // outside note_refusal's throttle, duplicating the tagged line.
+        log("order refused before send: the gateway session is not ready");
         return refuse(RejectCause::BrokerNotConnected,
                       "the Client-Portal gateway session is not ready, so the "
                       "order was never sent");

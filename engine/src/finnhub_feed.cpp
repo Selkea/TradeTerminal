@@ -3,6 +3,7 @@
 #include "net_util.h"
 #include "net_ws.h"
 #include "engine/clock.h"
+#include "engine/feed_reconnect.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -212,7 +213,7 @@ void FinnhubFeed::io_loop() {
         }
     };
 
-    int backoff_s = 1;
+    FeedBackoff backoff;   // see engine/feed_reconnect.h
     int64_t next_connect_ms = 0;
     while (!stop_.load(std::memory_order_relaxed)) {
         if (!ws.open()) {
@@ -222,15 +223,14 @@ void FinnhubFeed::io_loop() {
             }
             if (handshake()) {
                 connected_.store(true, std::memory_order_release);
-                backoff_s = 1;
+                backoff.on_connected(net_steady_ms());
                 std::string joined;
                 for (const std::string& s : cfg_.symbols)
                     joined += (joined.empty() ? "" : ",") + s;
                 log("streaming " + joined + " (real-time US trades)");
             } else {
                 ws.close();
-                next_connect_ms = net_steady_ms() + backoff_s * 1000;
-                backoff_s = std::min(backoff_s * 2, 30);
+                next_connect_ms = net_steady_ms() + backoff.on_handshake_failed() * 1000;
             }
             continue;
         }
@@ -238,8 +238,12 @@ void FinnhubFeed::io_loop() {
         if (r < 0) {
             connected_.store(false, std::memory_order_release);
             ws.close();
-            next_connect_ms = net_steady_ms() + 1000;
-            log("stream lost, reconnecting");
+            // A dropped session used to retry on a hardcoded 1 s and reset the
+            // backoff on every handshake, so a link that connected and died
+            // immediately logged this once a second forever — at Warning.
+            const int wait_s = backoff.on_session_lost(net_steady_ms());
+            next_connect_ms = net_steady_ms() + wait_s * 1000;
+            log("stream lost, reconnecting in " + std::to_string(wait_s) + "s");
         } else if (r == 0) {
             if (cfg_.busy_poll) {
 #if defined(__x86_64__) || defined(_M_X64)

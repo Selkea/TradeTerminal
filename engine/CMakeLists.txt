@@ -41,6 +41,7 @@ add_executable(tt_engine_tests
     tests/test_ack_latency.cpp
     tests/test_symbol_rank.cpp
     tests/test_reconcile_policy.cpp
+    tests/test_feed_reconnect.cpp
     # Compiled a SECOND time here (see below), statically-linked instead of as
     # a DLL -- test_strategy_registry.cpp's regression guard for the
     # TT_STRATEGY_STATIC_LINK path (terminal/CMakeLists.txt's real usage:

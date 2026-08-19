@@ -122,6 +122,13 @@ inline AlertClass classify_alert(const std::string& l) {
     // entries the tagged line rates Info. The tag decides the tier; this line
     // exists to carry the order id and the broker's numeric code into the log.
     if (has("refused by broker")) return AlertClass::None;
+    // The TWS adapter's raw trace of an IB error callback — see kIbErrorTraceTag
+    // for why it is a trace and not the report. Info, not the Warning the
+    // generic rule below gave it: IB's own text for a refused order contains
+    // "rejected", so every refusal paged a third time, at a LOUDER tier than the
+    // tagged line the policy actually tiers it by. Below every Critical tag, so
+    // a trace whose text carries one still pages Critical.
+    if (has(kIbErrorTraceTag)) return AlertClass::Info;
     // A STRATEGY'S OWN FREE TEXT, tiered by the LEVEL the strategy chose rather
     // than by keyword. EngineCtx::log stamps the level into the prefix, and that
     // is a far better signal than scanning prose written by six different
