@@ -141,7 +141,11 @@ bool AlertNotifier::flush_bursts(int64_t now) {
 }
 
 void AlertNotifier::notify(Severity sev, const std::string& text) {
-    if (muted()) return;
+    if (muted()) {
+        std::lock_guard lock(mu_);
+        ++del_.muted_discarded;   // silence is a state, not an absence of events
+        return;
+    }
     bool admit = false;
     bool wake = false;
     {

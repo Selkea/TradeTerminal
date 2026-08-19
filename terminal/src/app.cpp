@@ -2974,6 +2974,11 @@ std::string App::build_diag_json() {
         a["coalesced"] = d.coalesced;
         a["throttled"] = d.throttled;
         a["summaries"] = d.summaries;
+        // THE CHANNEL CAN BE TURNED OFF FROM A MENU. When it is, every page —
+        // Criticals included — is discarded, and until 0.31.2 nothing recorded
+        // it, so a muted app looked exactly like a quiet one.
+        a["muted"] = alerts_.muted();
+        a["muted_discarded"] = d.muted_discarded;
         a["last_status"] = d.last_status;
         a["last_error"] = d.last_error;
         j["alerts"] = std::move(a);

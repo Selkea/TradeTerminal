@@ -402,6 +402,44 @@ TEST_CASE("alerts: a muted notifier queues nothing") {
     CHECK(n.delivery().dropped == 0);
 }
 
+TEST_CASE("alerts: a MUTED notifier records what it threw away") {
+    // The Alerts menu item can turn the whole channel off, and until 0.31.2 a
+    // muted notifier discarded everything — Criticals included — leaving no
+    // trace anywhere that it had. A muted app and a quiet one produced byte-for-
+    // byte identical diagnostics, which is the confusion 0.29.2 exists to end,
+    // reachable from a menu.
+    AlertNotifier n;
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_muted(true);
+    n.notify(AlertNotifier::Critical, "BOOK DIVERGENCE NVDA app=0 broker=20");
+    n.notify(AlertNotifier::Critical, "PROTECTIVE STOP REJECTED on SOXL");
+    n.notify(AlertNotifier::Info, "live: SOXL fill BUY 100 @ 12.34 (order #7)");
+    const auto d = n.delivery();
+    CHECK(d.muted_discarded == 3);
+    CHECK(d.sent == 0);
+    // Counted apart from every other loss: a backlog overflow, a rate cap and a
+    // muted channel are three different problems with three different fixes.
+    CHECK(d.dropped == 0);
+    CHECK(d.throttled == 0);
+    CHECK(d.coalesced == 0);
+}
+
+TEST_CASE("alerts: unmuting resumes delivery, and the discard count stands") {
+    // The count is a record of what was missed, so it must not be reset by
+    // turning the channel back on.
+    AlertNotifier n;
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_muted(true);
+    n.notify(AlertNotifier::Critical, "RISK HALT while muted");
+    REQUIRE(n.delivery().muted_discarded == 1);
+    n.set_muted(false);
+    n.notify(AlertNotifier::Critical, "RISK HALT after unmuting");
+    const auto d = n.delivery();
+    CHECK(d.muted_discarded == 1);   // still says one page was lost
+    CHECK(d.coalesced == 0);         // and the second one really was admitted
+}
+
 TEST_CASE("alerts: an unreachable webhook is recorded as FAILED, not as sent") {
     // The whole point: a page that did not arrive must leave a trace. Port 9 is
     // the discard service and nothing listens on it, so this fails at the

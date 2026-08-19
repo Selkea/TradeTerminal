@@ -141,6 +141,12 @@ public:
         // accounted for by exactly one of these, which is what keeps
         // suppression from becoming the silence it replaced.
         uint64_t summaries = 0;
+        // Discarded because the operator turned the channel OFF (Alerts menu).
+        // A muted notifier threw away Criticals and left no trace of having done
+        // so, which made "alerts are muted" indistinguishable from "nothing
+        // happened" — the exact confusion 0.29.2 was written to end, reachable
+        // from a menu item. /diag reports the flag and this count together.
+        uint64_t muted_discarded = 0;
         long last_status = 0;     // last HTTP status seen (0 = transport error)
         std::string last_error;   // curl's message, or "HTTP <code>"
     };
