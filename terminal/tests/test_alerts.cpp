@@ -39,6 +39,17 @@ static const bool kSuiteIsSilent = [] {
     return true;
 }();
 
+// The emitters whose TIER depends on their prose live behind a live socket, so
+// they are audited as text. Loud, not skipped: an audit that quietly no-ops when
+// it cannot find its subject is how the hole stays open.
+static std::string read_repo_file(const char* rel) {
+    const std::string path = std::string(TT_REPO_DIR) + rel;
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    return std::string{std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>()};
+}
+
 TEST_CASE("ascii_fold: pure-ASCII text is unchanged") {
     const std::string s = "WATCHDOG broker disconnected for 62s - check IB Gateway (2FA?)";
     CHECK(ascii_fold(s) == s);
@@ -681,6 +692,108 @@ TEST_CASE("alerts: an Info arriving into a full queue is still simply dropped") 
 // hand, leaving every other repeat-emitter in the codebase able to do it again.
 // The audit found four more. This layer stops the class instead of the
 // instances.
+
+TEST_CASE("classify_alert: the raw IB error trace is a trace, not a third page") {
+    // 2026-08-13: all six lineup symbols signalled into a closed exchange. IB's
+    // text is "Order rejected - reason:Exchange is closed.", which contains
+    // "rejected", so the adapter's raw trace fell through to the generic keyword
+    // rule and paged WARNING — a third copy of an event the policy rates Info,
+    // at a LOUDER tier than the tagged line that decides the policy, and with no
+    // throttle of any kind.
+    CHECK(classify_alert("tws: IB ERROR 201 (id 5): Order rejected - reason:Exchange "
+                         "is closed.") == AlertClass::Info);
+    CHECK(classify_alert("tws: IB ERROR 202 (id 7): Order Canceled - reason:") ==
+          AlertClass::Info);
+    // Still on the channel, because for a NON order-scoped IB error this trace
+    // is the only report there is.
+    CHECK(classify_alert("tws: IB ERROR 502 (id -1): Couldn't connect to TWS") ==
+          AlertClass::Info);
+}
+
+TEST_CASE("classify_alert: a Critical tag inside a trace still outranks it") {
+    // The trace rule sits below every Critical tag on purpose, so it can only
+    // ever demote lines that nothing louder has claimed.
+    //
+    // These lines carry BOTH a Critical tag and the trace tag, which is the only
+    // shape that can tell the ordering apart. The obvious test — a plain
+    // DUPLICATE ORDER ID line — asserts nothing about it: that line contains no
+    // "IB ERROR" at all, so it passes just as happily with the trace rule moved
+    // to the top of the function. Its mutant SURVIVED until these existed.
+    const std::string dup = std::string("tws: ") + tt::kIbErrorTraceTag + " 103 (id 5): " +
+                            tt::kTwsDuplicateOrderIdTag + " on this account";
+    CHECK(classify_alert(dup) == AlertClass::Critical);
+    const std::string naked = std::string("tws: ") + tt::kIbErrorTraceTag +
+                              " 201 (id 7): PROTECTIVE STOP REJECTED";
+    CHECK(classify_alert(naked) == AlertClass::Critical);
+    // ...while the same shape with nothing louder in it stays a trace.
+    CHECK(classify_alert(std::string("tws: ") + tt::kIbErrorTraceTag +
+                         " 201 (id 7): Order rejected - reason:") == AlertClass::Info);
+}
+
+TEST_CASE("the adapters do not word a pre-send refusal 'order rejected'") {
+    // SOURCE-TEXT PIN, because no test constructs a broker: TwsBroker::submit
+    // needs an EClientSocket and a live gateway to reach.
+    //
+    // The classifier test above proves what the CLASSIFIER does with the new
+    // wording. It cannot prove the adapter still uses it — a mutant that reverted
+    // the log string sailed through the whole suite, because the test feeds
+    // classify_alert a literal and never asks what the emitter emits. The tier
+    // here is decided by a keyword in prose, so the prose is the contract.
+    const std::string tws = read_repo_file("/engine/src/tws_broker.cpp");
+    const std::string ibkr = read_repo_file("/engine/src/ibkr_broker.cpp");
+    CHECK(tws.find("log(\"order rejected") == std::string::npos);
+    CHECK(ibkr.find("log(\"order rejected") == std::string::npos);
+    CHECK(tws.find("log(\"order refused before send:") != std::string::npos);
+    CHECK(ibkr.find("log(\"order refused before send:") != std::string::npos);
+    // And the raw IB error trace goes out under the tag, not bare "error N".
+    CHECK(tws.find("b.log(std::string(kIbErrorTraceTag)") != std::string::npos);
+}
+
+TEST_CASE("the feeds pace a dropped session instead of retrying on a fixed 1s") {
+    // SOURCE-TEXT PIN, same reason: the reconnect loops need a live websocket.
+    // The defect was written out three times and could be reintroduced in any
+    // one of them, so all three are audited — a fix that holds in two feeds and
+    // regresses in the third is the shape this project keeps finding.
+    for (const char* rel : {"/engine/src/finnhub_feed.cpp",
+                            "/engine/src/polygon_feed.cpp",
+                            "/engine/src/ibkr_feed.cpp"}) {
+        const std::string src = read_repo_file(rel);
+        CHECK_MESSAGE(src.find("on_session_lost(net_steady_ms())") != std::string::npos, rel);
+        // The exact expression that produced 60 pages a minute.
+        CHECK_MESSAGE(src.find("next_connect_ms = net_steady_ms() + 1000;") ==
+                      std::string::npos, rel);
+        // ...and no feed resets the pacing merely because a handshake returned.
+        CHECK_MESSAGE(src.find("backoff_s = 1;") == std::string::npos, rel);
+    }
+}
+
+TEST_CASE("classify_alert: a refusal the adapter caught before sending does not page twice") {
+    // These logged "order rejected: ..." and so tripped the generic rule at
+    // Warning, once per SUBMIT and outside note_refusal's repeat throttle — a
+    // gateway that was down while six strategies kept signalling paged on every
+    // bar. The tagged ORDER REFUSED line is the one that carries the tier.
+    CHECK(classify_alert("tws: order refused before send: the TWS socket API is not "
+                         "connected") == AlertClass::None);
+    CHECK(classify_alert("ibkr: order refused before send: the gateway session is not "
+                         "ready") == AlertClass::None);
+    // ...and the tagged line still says it, at the tier the policy chose.
+    CHECK(classify_alert(std::string("live: ") + tt::kOrderRefusedTag +
+                         " SOXL broker_not_connected") == AlertClass::Info);
+}
+
+TEST_CASE("classify_alert: the feed reconnect line still pages, and still coalesces") {
+    // Retiering was NOT the fix for the feed flood — the pacing was (see
+    // engine/feed_reconnect.h). This line must keep its Warning: a feed that
+    // genuinely cannot hold a session is worth hearing about once.
+    CHECK(classify_alert("finnhub: stream lost, reconnecting in 1s") ==
+          AlertClass::Warning);
+    CHECK(classify_alert("finnhub: stream lost, reconnecting in 30s") ==
+          AlertClass::Warning);
+    // And because burst_key folds the number, the climbing backoff does not turn
+    // one repeating event into thirty distinct ones.
+    CHECK(tt::ui::detail::burst_key("finnhub: stream lost, reconnecting in 1s") ==
+          tt::ui::detail::burst_key("finnhub: stream lost, reconnecting in 30s"));
+}
 
 using tt::ui::detail::burst_key;
 

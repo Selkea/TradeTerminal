@@ -2,6 +2,7 @@
 
 #include "engine/clock.h"
 #include "engine/tws_client_id.h"   // error 326: what it means, in words
+#include "engine/reject.h"          // kIbErrorTraceTag
 
 #include "Contract.h"
 #include "Decimal.h"
@@ -188,8 +189,8 @@ struct TwsFeed::Io final : DefaultEWrapper {
             return;
         }
         if (id >= kBidAskBase && id < kBidAskBase + 999) return;   // quotes optional
-        f.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
-              "): " + errorString);
+        f.log(std::string(kIbErrorTraceTag) + " " + std::to_string(errorCode) + " (id " +
+              std::to_string(id) + "): " + errorString);
     }
 
     void tickByTickAllLast(int reqId, int /*tickType*/, time_t time, double price,

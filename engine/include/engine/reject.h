@@ -240,6 +240,30 @@ inline constexpr const char* kOrderRefusedTag = "ORDER REFUSED";
 inline constexpr const char* kOrderRefusedRepeatTag = "ORDER REFUSED REPEATEDLY";
 inline constexpr const char* kExitOrderRefusedTag = "EXIT ORDER REFUSED";
 
+// The TWS adapter's RAW TRACE of an IB error callback (tws_broker.cpp). Every
+// IB error that is not data-farm status noise passes through it, carrying IB's
+// own text — and for a refused order that text is "Order rejected -
+// reason:Exchange is closed.", which contains "rejected" and so fell through to
+// classify_alert's generic keyword rule and paged WARNING.
+//
+// That is a THIRD copy of one event, at a tier the policy explicitly rejects.
+// The same refusal already produces the tagged line above (Info, and throttled
+// by note_refusal's repeat counter) and the engine's "refused by broker" trace
+// (silent, for exactly this reason). On 2026-08-13 all six lineup symbols
+// signalled into a closed exchange and each one paged here, unthrottled.
+//
+// Tagging it lets the classifier tier it as what it is: a trace. It stays on
+// the channel at Info because it is the ONLY report of the IB errors that are
+// not order-scoped, and every tag that outranks Info is checked before it.
+//
+// UPPERCASE for the same reason as the tags above, and it was not academic: the
+// first cut used "IB error", which is exactly how tws_client_id_waiting_line
+// spells it in ordinary prose ("...this will page (IB error 326)."). That line
+// is deliberately SILENT — the 2026-08-11 lesson was to explain a brief
+// collision immediately without paging for it — and the lowercase tag quietly
+// promoted it onto the channel. Caught by the test that pins it.
+inline constexpr const char* kIbErrorTraceTag = "IB ERROR";
+
 // How many times one (symbol, cause) pair may be refused before it stops being a
 // decision and starts being a strategy stuck in a loop. 3, not 2, because a
 // single bar can legitimately produce an entry plus its bracket leg and have

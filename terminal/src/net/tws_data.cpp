@@ -5,6 +5,7 @@
 #include "net/hist_requests.h"
 
 #include "engine/tws_client_id.h"   // error 326: what it means, in words
+#include "engine/reject.h"          // kIbErrorTraceTag
 
 #include "Contract.h"          // Contract + ContractDetails
 #include "Decimal.h"
@@ -696,8 +697,8 @@ struct TwsData::Io final : DefaultEWrapper {
             if (cb) cb({});
             return;
         }
-        d.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
-              "): " + errorString);
+        d.log(std::string(kIbErrorTraceTag) + " " + std::to_string(errorCode) + " (id " +
+              std::to_string(id) + "): " + errorString);
     }
 
     void historicalData(TickerId reqId, const ::Bar& bar) override {

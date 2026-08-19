@@ -348,8 +348,8 @@ struct TwsBroker::Io final : DefaultEWrapper {
             // order's fills to the refused one. Falls through to the reject
             // below, which is what unsticks the engine.
         }
-        b.log("error " + std::to_string(errorCode) + " (id " + std::to_string(id) +
-              "): " + errorString);
+        b.log(std::string(kIbErrorTraceTag) + " " + std::to_string(errorCode) + " (id " +
+              std::to_string(id) + "): " + errorString);
         const auto it = local_by_tws.find(id);
         if (it != local_by_tws.end() && fatal_order_error(errorCode) &&
             !done.count(it->second)) {
@@ -1122,7 +1122,13 @@ uint64_t TwsBroker::submit(const OrderRequest& r, int64_t /*now_ns*/) {
                       reject_cause_text(RejectCause::BrokerReadOnly));
     }
     if (!ready()) {
-        log("order rejected: socket API not connected");
+        // "refused before send", not "order rejected": the old wording tripped
+        // classify_alert's generic "rejected" keyword and paged Warning once per
+        // SUBMIT, outside note_refusal's repeat throttle — so a gateway that was
+        // down while six strategies kept signalling paged on every bar. The
+        // tagged ORDER REFUSED line the engine raises from last_submit_reject_
+        // is the one that carries the policy tier, and it is throttled.
+        log("order refused before send: the TWS socket API is not connected");
         return refuse(RejectCause::BrokerNotConnected,
                       "the TWS socket API is not connected (no nextValidId), so "
                       "the order was never written to the gateway");

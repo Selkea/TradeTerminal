@@ -3,6 +3,7 @@
 #include "net_util.h"
 #include "net_ws.h"
 #include "engine/clock.h"
+#include "engine/feed_reconnect.h"
 #include "engine/ibkr_broker.h"   // ibkr_parse_conid, ibkr_parse_first_account
 
 #ifdef _WIN32
@@ -295,7 +296,7 @@ void IbkrFeed::io_loop() {
         if (!sink_(ev)) dropped_.fetch_add(1, std::memory_order_relaxed);
     };
 
-    int backoff_s = 1;
+    FeedBackoff backoff;   // see engine/feed_reconnect.h
     int64_t next_connect_ms = 0;
     while (!stop_.load(std::memory_order_relaxed)) {
         if (!ws.open()) {
@@ -305,13 +306,12 @@ void IbkrFeed::io_loop() {
             }
             if (resolve() && connect_ws()) {
                 connected_.store(true, std::memory_order_release);
-                backoff_s = 1;
+                backoff.on_connected(net_steady_ms());
                 log("streaming via gateway (conflated top-of-book)");
                 if (last_event_ns > 0) backfill(last_event_ns);
             } else {
                 ws.close();
-                next_connect_ms = net_steady_ms() + backoff_s * 1000;
-                backoff_s = std::min(backoff_s * 2, 30);
+                next_connect_ms = net_steady_ms() + backoff.on_handshake_failed() * 1000;
             }
             continue;
         }
@@ -326,8 +326,11 @@ void IbkrFeed::io_loop() {
         if (r < 0) {
             connected_.store(false, std::memory_order_release);
             ws.close();
-            next_connect_ms = net_steady_ms() + 1000;
-            log("stream lost, reconnecting");
+            // See finnhub_feed.cpp: a dropped session used to retry on a
+            // hardcoded 1 s, so a flapping link paged once a second.
+            const int wait_s = backoff.on_session_lost(net_steady_ms());
+            next_connect_ms = net_steady_ms() + wait_s * 1000;
+            log("stream lost, reconnecting in " + std::to_string(wait_s) + "s");
         } else if (r == 0) {
             ws.wait_readable(200);
         }
