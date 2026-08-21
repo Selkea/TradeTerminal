@@ -111,9 +111,14 @@ struct TwsBroker::Io final : DefaultEWrapper {
     // disables start_audit(), i.e. the position auditor. The ENGINE lifts its
     // own gate after 10 s (engine.cpp) and arms the auditor regardless, so the
     // two clocks disagreed and the app reported an armed detector that could
-    // never be answered. 20 s is comfortably past a healthy replay (sub-second)
-    // and past the engine's own failsafe, so this only ever fires on a stall.
-    static constexpr int64_t kReconcileTimeoutMs = 20'000;
+    // never be answered. 20 s is comfortably past a healthy replay (sub-second).
+    //
+    // 0.34.3: "and past the engine's own failsafe" is what this comment used to
+    // claim, and it was the wrong way round — the engine lifted at 10 s and this
+    // gave up at 20 s, leaving 10 s in which the engine traded while adoption
+    // was still arriving. The ordering is now a compile-time invariant next to
+    // both numbers; see engine/reconcile_policy.h for what that window costs.
+    static constexpr int64_t kReconcileTimeoutMs = kBrokerReconcileTimeoutMs;
     bool recon_ever = false;
     bool recon_active = false;
     bool recon_pos_done = false, recon_ord_done = false, recon_acct_done = false;
@@ -871,33 +876,27 @@ struct TwsBroker::Io final : DefaultEWrapper {
     }
 
     long place(uint64_t local, uint32_t sid, const Order& order, const Contract& c) {
-        // NEVER spend an id this session already has a mapping for.
+        // THE ID IS SAFE HERE BY AN INVARIANT, NOT BY A CHECK.
         //
-        // next_tws_id is a high-water mark, so in the normal case this loop runs
-        // zero times. It exists for the seam: engine.cpp lifts its reconcile
-        // gate on a 10 s failsafe while this broker's own deadline is
-        // kReconcileTimeoutMs (20 s), and order_path_ready() does not consult
-        // recon_active — so on a slow reqAllOpenOrders a placement can be drained
-        // BEFORE adoption has advanced the counter past the ids of the orders it
-        // is still adopting.
+        // Every key in local_by_tws is strictly below next_tws_id, always: the
+        // two writers are this line (key = next_tws_id - 1) and openOrder, which
+        // advances next_tws_id past orderId + 1 BEFORE it inserts. next_tws_id
+        // never decreases (tws_advance_order_id is max, drop_connection
+        // deliberately does not reset it), and erases only remove keys.
         //
-        // Without this, the write below overwrites the ADOPTED order's row.
-        // orderStatus() and execDetails() both early-return on an id they cannot
-        // find, so from that moment every fill and every cancel that order
-        // reports is dropped on the floor and the app's book silently diverges
-        // from the broker's — the 2026-08-13 phantom-position mechanism, reached
-        // from the machinery meant to prevent it. The 103 handler cannot undo it
-        // either: by the time IB refuses the placement the row is already gone,
-        // which is why its comment can only choose "unheard" over "misattributed".
+        // 0.34.0 added a skip loop here — advance past any id already present as
+        // a key — and 0.34.3 removed it: by that invariant such a lookup can
+        // never hit, so it was dead code carrying a comment that claimed a
+        // protection it did not provide. The worst kind: it reads as a closed
+        // hole, so nobody looks again.
+        // In the window it was written for, the colliding id is precisely the
+        // one NOT yet in the map (adoption has not delivered it), so there was
+        // nothing to skip and the placement spent it anyway.
         //
-        // It also closes the case IB does NOT refuse: same contract, same side,
-        // same type collides as a silent MODIFICATION, so a fresh entry could
-        // amend a resting protective stop with no error, no log and no page.
-        //
-        // Residual, and it is why the collision handler stays: ids spent by this
-        // client in an EARLIER session that are no longer open are invisible to
-        // reqAllOpenOrders, so they are not in this map to be skipped.
-        while (local_by_tws.count(next_tws_id)) ++next_tws_id;
+        // What actually closes that window is the ORDER of the two reconcile
+        // deadlines — the engine must not resume trading while this client could
+        // still be adopting. See engine/reconcile_policy.h, where the ordering
+        // is a static_assert next to both numbers.
         const long tws_id = next_tws_id++;
         local_by_tws[tws_id] = local;
         tws_by_local[local] = tws_id;
