@@ -137,6 +137,19 @@ struct TwsData::Io final : DefaultEWrapper {
     std::unordered_set<std::string> held_logged_;
     // Distinct farm-status codes already reported (the stream repeats them).
     std::unordered_set<int> farm_codes_seen;
+    // 326 episode bookkeeping (0.34.2). Steady ms at which the episode began,
+    // 0 while there is no conflict.
+    //
+    // ONE clock for BOTH levers it drives — the delayed page
+    // (kTwsClientIdPageAfterSec) and settle_orphaned_requests
+    // (kConflictSettleMs). They measure the same episode from the same instant,
+    // and this file already having a 60 s constant and a conflict timestamp
+    // spent on only ONE of them is precisely how the other went unnoticed: the
+    // clock and the number were both here, and it still paged instantly.
+    int64_t conflict_since_ms = 0;
+    // Did this episode outlive the window and actually page? Decides which
+    // all-clear nextValidId emits — see the WatchdogTimer rule there.
+    bool conflict_paged = false;
     // When the last BIG historicalDataEnd landed. IB stops answering a request
     // issued too soon after a large delivery — see kBigBatchQuietMs.
     //
@@ -576,8 +589,18 @@ struct TwsData::Io final : DefaultEWrapper {
         // EPISODE rather than a death sentence: /diag stops reporting it, the
         // retry returns to 3 s, and the operator who was paged Critical gets
         // told, in the log, that they no longer have anything to do.
-        if (d.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
-            d.log(tws_client_id_cleared_line("market data", d.client_id_));
+        if (d.client_id_conflict_.exchange(false, std::memory_order_acq_rel)) {
+            // ...but only the operator who was PAGED gets the tagged all-clear.
+            // It pages Warning, and a Warning closing an outage nobody was told
+            // about is the other half of the noise this window exists to stop.
+            if (conflict_paged)
+                d.log(tws_client_id_cleared_line("market data", d.client_id_));
+            else
+                d.log("API client id " + std::to_string(d.client_id_) +
+                      " was released; market data is connected.");
+        }
+        conflict_since_ms = 0;
+        conflict_paged = false;
         if (!d.connected_.exchange(true, std::memory_order_acq_rel)) {
             d.conn_gen_.fetch_add(1, std::memory_order_relaxed);
             d.log("session up (IB Gateway " + d.host_ + ":" +
@@ -668,10 +691,23 @@ struct TwsData::Io final : DefaultEWrapper {
             //
             // The exchange also dedups: the gateway answers every connect
             // attempt already in flight, so several 326s arrive per episode.
-            if (!d.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
-                d.log(tws_client_id_conflict_line(
-                    "market data", "no charts, no warmup, no daily lineup",
-                    d.host_, d.port_, d.client_id_));
+            //
+            // AND IT STARTS QUIET (0.34.2). This called the TAGGED builder from
+            // the callback, so a 326 paged Critical the instant IB refused. That
+            // is worst here of the three clients, not best: id 9 is the only
+            // FIXED data id and TwsData starts in the App constructor, so every
+            // fast restart against a gateway still holding our socket is a
+            // self-collision BY CONSTRUCTION — a guaranteed Critical page, plus
+            // a Warning all-clear seconds later, for a condition that ended
+            // before the phone stopped buzzing. It also contradicted /diag's own
+            // documented threshold, which tells the operator this gauge needs a
+            // human only if it does not clear "within a minute or two".
+            if (!d.client_id_conflict_.exchange(true, std::memory_order_acq_rel)) {
+                conflict_since_ms = steady_ms();
+                conflict_paged = false;
+                d.log(tws_client_id_waiting_line("market data", d.client_id_,
+                                                 kTwsClientIdRetrySec));
+            }
             return;
         }
         // A request WE cancelled to retry it. IB answers cancelHistoricalData
@@ -957,14 +993,14 @@ void TwsData::io_loop() {
     auto last_connect = std::chrono::steady_clock::time_point{};
     auto last_hist_reset = std::chrono::steady_clock::time_point{};
     int64_t last_nag_ms = 0;
-    // Steady ms at which THIS loop first saw the client-id latch set, 0 while
-    // there is no conflict. Local rather than a member: only this thread needs
-    // it, and it must reset on every recovery.
-    int64_t conflict_since = 0;
     while (running_.load(std::memory_order_acquire)) {
         const bool conflict = client_id_conflict_.load(std::memory_order_acquire);
-        if (!conflict) conflict_since = 0;
-        else if (conflict_since == 0) conflict_since = steady_ms();
+        // Io::error stamps this the moment the refusal lands; the fallback
+        // covers a latch that somehow appears without passing through it.
+        // 0.34.2 moved the stamp from a loop local into Io so nextValidId can
+        // reset it and the delayed page can read it.
+        if (!conflict) io.conflict_since_ms = 0;
+        else if (io.conflict_since_ms == 0) io.conflict_since_ms = steady_ms();
         if (!io.client || !io.client->isConnected()) {
             io.drop_connection();
             const auto now = std::chrono::steady_clock::now();
@@ -979,6 +1015,19 @@ void TwsData::io_loop() {
             // attempts cost nothing in the log.
             const auto gap = conflict ? std::chrono::seconds(kTwsClientIdRetrySec)
                                       : std::chrono::seconds(3);
+            // THE DELAYED PAGE. The explanation went out the moment the refusal
+            // arrived; the uppercase tag — the one that pages Critical — waits
+            // until the conflict has outlived kTwsClientIdPageAfterSec and so
+            // proved it is not our own socket clearing. Emitted here rather than
+            // in the callback because this is the loop that knows how long it
+            // has been going on. Same shape as TwsBroker::io_loop.
+            if (conflict && !io.conflict_paged && io.conflict_since_ms &&
+                steady_ms() - io.conflict_since_ms >= kTwsClientIdPageAfterSec * 1000) {
+                io.conflict_paged = true;
+                log(tws_client_id_conflict_line(
+                    "market data", "no charts, no warmup, no daily lineup", host_,
+                    port_, client_id_));
+            }
             if (now - last_connect >= gap) {
                 last_connect = now;
                 if (!io.connect_gateway()) {
@@ -1004,7 +1053,7 @@ void TwsData::io_loop() {
             // previous session's id, released within seconds; settling instantly
             // would fail a lineup's fetches for a blip that a plain reconnect
             // rides out silently — and that reconnect is what 0.19.1 did.
-            if (conflict && steady_ms() - conflict_since > kConflictSettleMs)
+            if (conflict && steady_ms() - io.conflict_since_ms > kConflictSettleMs)
                 settle_orphaned_requests();
         } else {
             io.signal.waitForSignal();

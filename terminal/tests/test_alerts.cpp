@@ -302,9 +302,79 @@ TEST_CASE("every TWS client that latches a 326 can also clear it and retry") {
         // client id is now fixed at kTwsOrdersClientId: with no other id to move
         // to, the retry cadence IS the recovery, and 15 s on every lineup swap
         // would be a 15 s order-path outage with positions live at the broker.
-        // The feed and data clients still rotate and still use the constant.
+        // The FEED client still rotates (App hands out 40-59) and uses the flat
+        // constant. The DATA client does NOT rotate — tws_data.h pins it to 9 —
+        // and this comment claimed for three versions that it did. That was not
+        // idle: the fixed-id premise is the whole reason the 60 s page window
+        // exists, so a comment asserting the opposite is part of why the data
+        // path went on paging instantly until 0.34.2.
         CHECK(count(src, "kTwsClientIdRetrySec") + count(src, "tws_client_id_retry_sec") >= 1);
+
+        // 0.34.2: ALL THREE now hold the page for kTwsClientIdPageAfterSec.
+        //
+        // The window was written for a fixed id, where the overwhelmingly common
+        // 326 is our own just-reaped socket clearing in seconds — and only the
+        // ORDER client honoured it. The other two called the TAGGED builder
+        // straight from EWrapper::error, so the same gateway, at the same
+        // instant, for the same cause, paged Critical from two clients and
+        // stayed silent from the third.
+        INFO("the delayed page must live in the loop that knows the elapsed time");
+        CHECK(count(src, "kTwsClientIdPageAfterSec") >= 1);
+        // The immediate line is the UNTAGGED one...
+        CHECK(count(src, "tws_client_id_waiting_line") == 1);
+        // ...and the tagged builder is called exactly once, from the io_loop.
+        CHECK(count(src, "tws_client_id_conflict_line") == 1);
+        // The tagged ALL-CLEAR is gated too: it pages Warning, and closing an
+        // outage nobody was told about is the same noise from the other side.
+        CHECK(count(src, "if (conflict_paged)") == 1);
     }
+}
+
+TEST_CASE("the data client's two 60s levers are distinct and both still armed") {
+    // tws_data.cpp carries TWO sixty-second constants for the same episode, and
+    // they do different things: kConflictSettleMs errors queued candle requests
+    // back to their callers, kTwsClientIdPageAfterSec releases the paging tag.
+    // 0.34.2 put them on ONE clock (io.conflict_since_ms) because the file
+    // having the timestamp for only the first is exactly how the second went
+    // missing for three versions — the clock and the number were both already
+    // here, and it still paged instantly.
+    const std::string src = read_repo_file("/terminal/src/net/tws_data.cpp");
+    CHECK(src.find("steady_ms() - io.conflict_since_ms > kConflictSettleMs") !=
+          std::string::npos);
+    CHECK(src.find("steady_ms() - io.conflict_since_ms >= kTwsClientIdPageAfterSec * 1000") !=
+          std::string::npos);
+    // Neither may collapse into "the latch is set, act now": settling on sight
+    // would fail a lineup's fetches for a blip a plain reconnect rides out.
+    CHECK(src.find("kConflictSettleMs") != std::string::npos);
+    CHECK(src.find("conflict_since = ") == std::string::npos);   // the old loop local
+}
+
+TEST_CASE("the first thing a refused client says never pages") {
+    // The tier contract the window rests on, exercised for real rather than
+    // audited: the immediate sentence explains itself and stays silent, and only
+    // the line io_loop emits after kTwsClientIdPageAfterSec pages Critical.
+    for (const char* who : {"market data", "the live tick stream", "the ORDER path"}) {
+        const std::string quiet =
+            tt::tws_client_id_waiting_line(who, 9, tt::kTwsClientIdRetrySec);
+        INFO("who=" << who);
+        CHECK(tt::ui::classify_alert(quiet) == tt::ui::AlertClass::None);
+        // Silent is not the same as absent — 2026-08-11's defect was SILENCE,
+        // so the sentence must still name the id and say it is retrying.
+        CHECK(quiet.find("client id 9") != std::string::npos);
+        CHECK(quiet.find("retrying") != std::string::npos);
+        // And it must promise the page, or the operator cannot tell a withheld
+        // alert from a missing one.
+        CHECK(quiet.find(std::to_string(tt::kTwsClientIdPageAfterSec)) !=
+              std::string::npos);
+        // It must NOT carry the paging tag. This is the whole mechanism: the
+        // difference between the two lines is the tag, not the words.
+        CHECK(quiet.find(tt::kTwsClientIdConflictTag) == std::string::npos);
+    }
+    // ...and the delayed one still pages, from every client.
+    const std::string loud = tt::tws_client_id_conflict_line(
+        "market data", "no charts, no warmup, no daily lineup", "127.0.0.1", 4002, 9);
+    CHECK(tt::ui::classify_alert(loud) == tt::ui::AlertClass::Critical);
+    CHECK(tt::ui::classify_alert_category(loud) == tt::ui::AlertCategory::Connection);
 }
 
 // ---------------------------------------------------------------------------

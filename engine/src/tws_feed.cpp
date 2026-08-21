@@ -44,6 +44,11 @@ struct TwsFeed::Io final : DefaultEWrapper {
     // Handshake rejected (e.g. paper disclaimer not accepted yet): tear down
     // and retry from io_loop — destroying the reader inside a callback is unsafe.
     bool reset_conn = false;
+    // 326 episode bookkeeping, for the delayed page. Steady ms. Same three
+    // fields TwsBroker::Io carries, for the same reason: the callback knows the
+    // refusal happened, only io_loop knows how long it has been going on.
+    int64_t conflict_since_ms = 0;
+    bool conflict_paged = false;
 
     struct BidAsk {
         double bid = 0.0, ask = 0.0;
@@ -140,9 +145,20 @@ struct TwsFeed::Io final : DefaultEWrapper {
         f.connected_.store(true, std::memory_order_release);
         // The handshake is the proof the id is ours again; clear the 326 latch
         // and say so, or /diag keeps reporting a conflict that has ended.
-        if (f.client_id_conflict_.exchange(false, std::memory_order_acq_rel))
-            f.log(tws_client_id_cleared_line("the live tick stream",
-                                             f.cfg_.client_id));
+        if (f.client_id_conflict_.exchange(false, std::memory_order_acq_rel)) {
+            // The WatchdogTimer rule, as on the order path: only announce the
+            // recovery to whoever was told about the outage. The all-clear tag
+            // pages Warning, and a Warning for a three-second collision nobody
+            // heard about is the other half of the same noise problem.
+            if (conflict_paged)
+                f.log(tws_client_id_cleared_line("the live tick stream",
+                                                 f.cfg_.client_id));
+            else
+                f.log("API client id " + std::to_string(f.cfg_.client_id) +
+                      " was released; the live tick stream is connected.");
+        }
+        conflict_since_ms = 0;
+        conflict_paged = false;
         if (!subscribed && client) subscribe_all();
     }
 
@@ -168,10 +184,22 @@ struct TwsFeed::Io final : DefaultEWrapper {
             // keeps trying. Not silently re-homed onto a spare id either — an
             // "id + 1" scheme walks straight into another TradeTerminal's
             // clients and turns one legible failure into three.
-            if (!f.client_id_conflict_.exchange(true, std::memory_order_acq_rel))
-                f.log(tws_client_id_conflict_line(
-                    "the live tick stream", "the session gets no prices",
-                    f.cfg_.host, f.cfg_.port, f.cfg_.client_id));
+            //
+            // THE EPISODE STARTS QUIET (0.34.2). This called the TAGGED builder
+            // straight from the callback, so a 326 paged Critical the instant IB
+            // refused — while the ORDER client, on the same gateway, for the
+            // same cause, stayed silent for kTwsClientIdPageAfterSec and then
+            // usually never paged at all. The window exists precisely because
+            // the common 326 is our own just-reaped socket, and it clears in
+            // seconds. The sentence still goes out immediately: 2026-08-11's
+            // defect was SILENCE, and withholding the TAG is not silence.
+            if (!f.client_id_conflict_.exchange(true, std::memory_order_acq_rel)) {
+                conflict_since_ms = now_ms();
+                conflict_paged = false;
+                f.log(tws_client_id_waiting_line("the live tick stream",
+                                                 f.cfg_.client_id,
+                                                 kTwsClientIdRetrySec));
+            }
             return;
         }
         // Tick-by-tick refused (no subscription / stream limit): fall back to
@@ -323,9 +351,21 @@ void TwsFeed::io_loop() {
             // hands out 40-59 in rotation for that reason), and a stream that
             // never came back leaves the live session with no prices at all for
             // the rest of the day. See engine/tws_client_id.h.
-            const auto gap = client_id_conflict_.load(std::memory_order_acquire)
-                                 ? std::chrono::seconds(kTwsClientIdRetrySec)
-                                 : std::chrono::seconds(3);
+            const bool conflict = client_id_conflict_.load(std::memory_order_acquire);
+            const auto gap = conflict ? std::chrono::seconds(kTwsClientIdRetrySec)
+                                      : std::chrono::seconds(3);
+            // THE DELAYED PAGE. The explanation went out the moment the refusal
+            // arrived; the uppercase tag — the one that pages Critical — waits
+            // until the conflict has proved it is not our own socket clearing.
+            // Emitted here rather than in the callback because this is the loop
+            // that knows how long it has been going on.
+            if (conflict && !io.conflict_paged && io.conflict_since_ms &&
+                now_ms() - io.conflict_since_ms >= kTwsClientIdPageAfterSec * 1000) {
+                io.conflict_paged = true;
+                log(tws_client_id_conflict_line(
+                    "the live tick stream", "the session gets no prices",
+                    cfg_.host, cfg_.port, cfg_.client_id));
+            }
             if (now - last_connect >= gap) {
                 last_connect = now;
                 if (!io.connect_gateway())
