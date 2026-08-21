@@ -1224,3 +1224,86 @@ TEST_CASE("alerts: a single alert is never coalesced, throttled or delayed") {
     CHECK(d.throttled == 0);
     CHECK(d.summaries == 0);
 }
+
+// ---------------------------------------------------------------------------
+// 0.34.1: UNREACHABLE TIME STOP — severity has to track HAZARD, not the tag.
+
+TEST_CASE("an unreachable time stop that is still LIVE keeps paging Critical") {
+    // Unchanged, and the reason the tag exists: 2026-08-14, STKH live on a
+    // 233-bar time stop against a 77-bar day, no price stop, -$506 in 2h16m.
+    const std::string kept =
+        std::string("live: ") + tt::ui::kUnreachableStopTag +
+        " on STKH - KEPT in the session because the broker book is not confirmed "
+        "flat there";
+    CHECK(tt::ui::classify_alert(kept) == tt::ui::AlertClass::Critical);
+    CHECK(tt::ui::classify_alert_category(kept) == tt::ui::AlertCategory::Risk);
+    CHECK(tt::ui::alert_category_is_safety(
+        tt::ui::classify_alert_category(kept)));
+
+    // ...and "no symbol survived, there is no trading day" stays Critical too.
+    const std::string none = std::string("live: not starting - every symbol has an ") +
+                             tt::ui::kUnreachableStopTag + ". Refit them.";
+    CHECK(tt::ui::classify_alert(none) == tt::ui::AlertClass::Critical);
+    CHECK(tt::ui::classify_alert_category(none) == tt::ui::AlertCategory::Risk);
+}
+
+TEST_CASE("a guard that SUCCEEDED does not page Critical") {
+    // THE DEFECT. classify_alert matched the tag alone, with no regard for the
+    // verb, so "we refused the unrealizable fit and kept a good one" arrived at
+    // the same tier, in the same safety category, as "we are live on one". The
+    // autopilot re-runs every 30 minutes, so that is a Critical channel being
+    // trained out of the operator — the 2026-08-17 failure mode exactly.
+    const std::string declined =
+        std::string("autopilot: STKH - ") + tt::ui::kUnreachableStopDeclinedTag +
+        " (233 bars, only 77 fit in a trading day at this bar size). Keeping the "
+        "incumbent; the fit is unrealizable, not merely worse.";
+    CHECK(tt::ui::classify_alert(declined) == tt::ui::AlertClass::None);
+
+    // Session start dropped them: real news, once a day, nothing exposed.
+    const std::string refused =
+        std::string("live: ") + tt::ui::kUnreachableStopRefusedTag +
+        " on STKH, SNDQ: longer than a trading day. Starting without them.";
+    CHECK(tt::ui::classify_alert(refused) == tt::ui::AlertClass::Warning);
+
+    // NEITHER is Risk. Risk is a safety category and therefore unsilenceable;
+    // filing "the app declined a bad fit" there is what made the tier useless.
+    // Both are news about what trades today, which is what Lineup means — and
+    // it is where the lineup's own EXCLUDED verdict for this same fact lands.
+    for (const std::string& l : {declined, refused}) {
+        CHECK(tt::ui::classify_alert_category(l) == tt::ui::AlertCategory::Lineup);
+        CHECK_FALSE(tt::ui::alert_category_is_safety(
+            tt::ui::classify_alert_category(l)));
+    }
+}
+
+TEST_CASE("the quiet variants nest inside the loud tag, and order decides") {
+    // Both CONTAIN kUnreachableStopTag on purpose: the operator keeps seeing the
+    // phrase they already know and only the tier changes. That makes both
+    // classifiers order-dependent — test the trap, not just the result.
+    const std::string d = tt::ui::kUnreachableStopDeclinedTag;
+    const std::string r = tt::ui::kUnreachableStopRefusedTag;
+    REQUIRE(d.find(tt::ui::kUnreachableStopTag) != std::string::npos);
+    REQUIRE(r.find(tt::ui::kUnreachableStopTag) != std::string::npos);
+    // ...so the specific cases must be answered BEFORE the general one.
+    const std::string src = read_repo_file("/terminal/src/alert_rules.h");
+    const size_t decl = src.find("has(kUnreachableStopDeclinedTag)) return AlertClass::None");
+    const size_t refu = src.find("has(kUnreachableStopRefusedTag)) return AlertClass::Warning");
+    const size_t base = src.find("has(kUnreachableStopTag)) return AlertClass::Critical");
+    REQUIRE(decl != std::string::npos);
+    REQUIRE(refu != std::string::npos);
+    REQUIRE(base != std::string::npos);
+    CHECK(decl < base);
+    CHECK(refu < base);
+    // Same ordering trap in the CATEGORY function, where getting it wrong is
+    // worse: Risk is a safety category, so the line becomes unsilenceable.
+    // Scoped to the function body: "KILL SWITCH" also appears in classify_alert
+    // and in prose above it, and an unscoped find lands on the first of those.
+    const size_t fn = src.find("inline AlertCategory classify_alert_category(");
+    REQUIRE(fn != std::string::npos);
+    const size_t cat_quiet = src.find(
+        "has(kUnreachableStopDeclinedTag) || has(kUnreachableStopRefusedTag)", fn);
+    const size_t cat_risk = src.find("has(\"KILL SWITCH\")", fn);
+    REQUIRE(cat_quiet != std::string::npos);
+    REQUIRE(cat_risk != std::string::npos);
+    CHECK(cat_quiet < cat_risk);
+}

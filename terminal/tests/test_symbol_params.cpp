@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using namespace tt::ui;
@@ -475,4 +477,74 @@ TEST_CASE("plan_lineup: unreachable stops are excluded AND named separately") {
     const LineupPlan none = plan_lineup({{"STKH", bad}, {"SNDQ", bad}});
     CHECK_FALSE(none.start);
     CHECK(none.unreachable_stop.size() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// 0.34.1: ALL THREE GATES MUST ASK THE SAME QUESTION.
+//
+// time_stop_reachable itself is well covered above. What was wrong was an
+// ARGUMENT LIST at one of its three call sites, and no unit test can see that —
+// nothing in the suite constructs an App. Audited as text, which is weaker than
+// running it and is the strongest thing available here.
+
+TEST_CASE("the autopilot judges a fit the way the other two gates do") {
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+
+    // THE DEFECT: the autopilot was the only site measuring against the GLOBAL
+    // bar size, which is the LAST tab's (trade.cpp def_bar_sec_), and the only
+    // one dropping the hold-until-flat exemption. A "hold — don't halt" symbol
+    // is exempt at both other gates and may legitimately carry a long time stop,
+    // and coordinate descent RETAINS the incumbent's value when no swept point
+    // wins — so this gate re-proposed and re-rejected the same legal number
+    // every cycle, forever, and the condition could never clear.
+    CHECK(src.find("time_stop_reachable(champ->params, cfg_.trade_bar_sec)") ==
+          std::string::npos);
+    CHECK(src.find("time_stop_reachable(champ->params, bar_sec, tp.found && tp.hold_dont_halt)") !=
+          std::string::npos);
+    // The bar size it judges against is the SYMBOL's, with the global only as a
+    // fallback when the tab is gone.
+    CHECK(src.find("tp.found && tp.bar_seconds > 0 ? tp.bar_seconds : cfg_.trade_bar_sec") !=
+          std::string::npos);
+
+    // ...and the other two still pass both, so a future edit cannot "fix" the
+    // asymmetry by levelling DOWN to the broken call.
+    CHECK(src.find("time_stop_reachable(tp.params, tp.bar_seconds, tp.hold_dont_halt)") !=
+          std::string::npos);
+    CHECK(src.find("time_stop_reachable(so.params, so.bar_seconds,") != std::string::npos);
+    CHECK(src.find("so.risk.disable_auto_halt)") != std::string::npos);
+
+    // Every reachability verdict in app.cpp reports the bar size it actually
+    // judged against. Printing session_bars(cfg_.trade_bar_sec) beside a verdict
+    // reached with tp.bar_seconds would be a line that contradicts itself.
+    CHECK(src.find("session_bars(bar_sec)") != std::string::npos);
+    // ...and it says so out loud. The figure is bar-size-relative, and now that
+    // the gate reads each SYMBOL's bar size rather than one global, a bare "only
+    // 77 fit in a trading day" is a number the operator cannot check against
+    // anything — two symbols can legitimately print different ones on the same
+    // day. Pinned because a wording revert is invisible to every other test here.
+    CHECK(src.find("\" fit in a trading day at this bar size)") != std::string::npos);
+}
+
+TEST_CASE("the two quiet verdicts are the ones where nothing is exposed") {
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    // Declined a challenger (incumbent still running) and refused symbols out of
+    // the session: the guard ACTED in both, so both carry a nested tag.
+    CHECK(src.find("kUnreachableStopDeclinedTag") != std::string::npos);
+    CHECK(src.find("kUnreachableStopRefusedTag") != std::string::npos);
+    // The two where the hazard is LIVE keep the bare tag and keep Critical:
+    // kept-exposed, and no-symbol-survived.
+    CHECK(src.find("kUnreachableStopTag + \" on \" + list +") != std::string::npos);
+    CHECK(src.find("kUnreachableStopTag + \". Refit them and start again.\"") !=
+          std::string::npos);
+    // The old wording must not survive anywhere: it carried the bare tag on a
+    // success path, which is the whole defect.
+    CHECK(src.find("champion REJECTED - \" +") == std::string::npos);
 }

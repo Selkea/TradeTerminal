@@ -2615,14 +2615,36 @@ void App::autopilot_evaluate() {
     // stop, so that time stop is the ONLY thing that would ever close a losing
     // position. Keep the incumbent: it is at least a set the session was allowed
     // to start on. See tt::ui::time_stop_reachable.
-    if (!time_stop_reachable(champ->params, cfg_.trade_bar_sec)) {
+    //
+    // ASK THE SAME QUESTION THE OTHER TWO GATES ASK. Until 0.34.1 this was the
+    // only one of the three call sites that judged against the GLOBAL bar size
+    // and dropped the hold-until-flat exemption:
+    //
+    //   lineup      tp.bar_seconds   tp.hold_dont_halt
+    //   start_live  so.bar_seconds   so.risk.disable_auto_halt
+    //   here        cfg_.trade_bar_sec   (defaulted false)
+    //
+    // Both omissions produce the same failure, and it is self-sustaining rather
+    // than one-off. cfg_.trade_bar_sec is the LAST tab's bar size (trade.cpp
+    // def_bar_sec_), so a symbol on a coarser series than its neighbour is
+    // measured against the wrong day length. And a "hold — don't halt" symbol is
+    // exempt at both other gates, may legitimately carry a long time stop, and
+    // the coordinate descent RETAINS the incumbent's value whenever no swept
+    // point beats it (sweep_param_max bounds the search grid, not the champion)
+    // — so this gate re-proposed and re-rejected that same legal value every
+    // cycle, forever, and the condition could never clear.
+    const TradePanel::TabParams tp = trade_.tab_params(S.symbol, param_specs_fn());
+    const int bar_sec = tp.found && tp.bar_seconds > 0 ? tp.bar_seconds : cfg_.trade_bar_sec;
+    if (!time_stop_reachable(champ->params, bar_sec, tp.found && tp.hold_dont_halt)) {
         const auto it = champ->params.find("time_stop");
-        route_operator("autopilot: " + S.symbol + " champion REJECTED - " +
-                       kUnreachableStopTag + " (" +
+        // DECLINED, not the bare tag: the guard just succeeded. The incumbent
+        // still running is a set that passed this very gate, so nothing is
+        // exposed and nothing needs a human tonight. See kUnreachableStopTag.
+        route_operator("autopilot: " + S.symbol + " - " +
+                       kUnreachableStopDeclinedTag + " (" +
                        std::to_string(static_cast<int>(it != champ->params.end()
                                                            ? it->second : 0.0)) +
-                       " bars, only " +
-                       std::to_string(session_bars(cfg_.trade_bar_sec)) +
+                       " bars, only " + std::to_string(session_bars(bar_sec)) +
                        " fit in a trading day at this bar size). Keeping the "
                        "incumbent; the fit is unrealizable, not merely worse.");
         S.challenger.clear();
@@ -4168,8 +4190,12 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
             std::string list;
             for (const std::string& s : refused)
                 list += (list.empty() ? "" : ", ") + s;
-            route_operator(std::string("live: REFUSED ") + list + " - " +
-                           kUnreachableStopTag +
+            // REFUSED, not the bare tag: these symbols are OUT of the session,
+            // so nothing is exposed on an unrealizable fit. Warning + Lineup —
+            // it is news about what will trade today, which is exactly what the
+            // lineup's own EXCLUDED verdict for this same fact already is.
+            route_operator(std::string("live: ") + kUnreachableStopRefusedTag +
+                           " on " + list +
                            ": longer than a trading day, and these strategies place no "
                            "price stop, so nothing would ever close a losing position "
                            "(2026-08-14 STKH: -$506 in 2h16m). Starting the session "

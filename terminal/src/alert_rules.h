@@ -64,6 +64,15 @@ inline AlertClass classify_alert(const std::string& l) {
     // strategies precisely because they are SUPPOSED to hold without a stop.
     // That exemption is only sound while the time stop is reachable, which is
     // what this line now says out loud.
+    //
+    // ...but ONLY where the hazard is still live. Both variants below nest
+    // inside that tag and mean the guard already acted, so they are tested
+    // first — the same substring ordering kExitOrderRefusedTag needs, for the
+    // opposite reason: there a nested tag had to be made LOUDER, here quieter.
+    // Severity has to track hazard in both directions or the tier stops meaning
+    // anything.
+    if (has(kUnreachableStopDeclinedTag)) return AlertClass::None;
+    if (has(kUnreachableStopRefusedTag)) return AlertClass::Warning;
     if (has(kUnreachableStopTag)) return AlertClass::Critical;
     // An off-lineup broker position found at reconciliation: real stock this
     // session does not trade, cannot audit, and cannot flatten. 20 NVDA shares
@@ -231,6 +240,13 @@ inline constexpr bool alert_category_is_safety(AlertCategory c) {
 
 inline AlertCategory classify_alert_category(const std::string& l) {
     auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
+    // The two "the guard already acted" variants nest inside kUnreachableStopTag
+    // and are NOT Risk — nothing is exposed in either. They have to be answered
+    // BEFORE the Risk branch reads the base tag out of them, or a set the app
+    // declined would file under a safety category and be unsilenceable. Lineup,
+    // because both are news about which symbols and which numbers trade today.
+    if (has(kUnreachableStopDeclinedTag) || has(kUnreachableStopRefusedTag))
+        return AlertCategory::Lineup;
     // RISK first, for the same reason classify_alert checks Critical first: a
     // line that is both a fill and a forced flatten is about the flatten.
     if (has("KILL SWITCH") || has("RISK HALT") || has("EOD BACKSTOP") ||
