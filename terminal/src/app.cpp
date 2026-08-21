@@ -6107,6 +6107,15 @@ void App::draw_menu_bar() {
                                     ? "ntfy categories"
                                     : "No webhook set (config.json alert_webhook)");
             ImGui::Separator();
+            // KEEP THE MENU OPEN while toggling. MenuItem() closes its parent
+            // popup on click by default, which is right for a command ("Build
+            // today's lineup") and wrong for a row of switches: setting up
+            // notifications means flipping several, and re-opening
+            // Settings > Notifications between each one is four clicks per
+            // switch instead of one. Cleared at the end of the submenu so
+            // everything else keeps the normal behaviour; the menu still closes
+            // the moment the pointer leaves it or clicks away.
+            ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
             struct Row {
                 const char* label;
                 bool* flag;
@@ -6168,6 +6177,7 @@ void App::draw_menu_bar() {
                     : "Beeps on halts/rejects/disconnects. Set \"alert_webhook\"\n"
                       "in config.json (or TT_ALERT_WEBHOOK) to page a phone, e.g.\n"
                       "an ntfy.sh topic URL.");
+            ImGui::PopItemFlag();   // paired with the PushItemFlag above
             ImGui::EndMenu();
         }
         ImGui::EndMenu();
