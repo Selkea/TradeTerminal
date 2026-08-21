@@ -78,6 +78,34 @@ namespace tt::ui {
 // ordinary prose about time stops cannot page anybody.
 inline constexpr const char* kUnreachableStopTag = "UNREACHABLE TIME STOP";
 
+// ...and the two variants that mean THE GUARD ALREADY ACTED.
+//
+// 0.34.1. The tag above paged Critical on the tag alone, with no regard for the
+// verb in the sentence, so "we refused the unrealizable fit and kept a good one"
+// arrived at the same tier and in the same safety category as "we are LIVE on an
+// unrealizable fit". Two of the four emit sites were the former. That is how a
+// Critical channel stops being read — and this app has already paid for it once
+// (2026-08-17: a flood, after which the day's two genuine Criticals went
+// unnoticed).
+//
+// Both nest inside kUnreachableStopTag, so alert_rules.h must test them FIRST.
+// Same substring trap kExitOrderRefusedTag documents there, deliberately reused:
+// the operator still sees the phrase they already know, and the tier is what
+// changes. Keeping the base phrase visible is the point — a reworded line is a
+// line nobody recognises at 09:41.
+//
+//   DECLINED  the autopilot refused a challenger; the incumbent — a set that
+//             already passed THIS SAME gate — keeps running. Nothing changed,
+//             nothing is exposed, and it can recur every cycle. Logged, never
+//             paged: Info still posts to the webhook, which is the 0.31.1
+//             lesson (a tier meant to reduce phone traffic that added it).
+//   REFUSED   session start dropped those symbols from the day's lineup. Real
+//             news about what will trade, at most once a day, nothing exposed.
+inline constexpr const char* kUnreachableStopDeclinedTag =
+    "UNREACHABLE TIME STOP DECLINED";
+inline constexpr const char* kUnreachableStopRefusedTag =
+    "UNREACHABLE TIME STOP REFUSED";
+
 // Bars of one FULL regular session at this bar size — from the open to the
 // engine's 15:57 EOD flatten, which is the last moment a position can still be
 // closed today. 77 at 300 s.
