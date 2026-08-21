@@ -75,6 +75,18 @@ struct AppConfig {
     // Plain-text POST target for fill/halt/disconnect alerts (ntfy.sh-style);
     // TT_ALERT_WEBHOOK env var overrides. Empty = beeps only.
     std::string alert_webhook;
+    // PER-CATEGORY ntfy/webhook muting (Settings > Notifications). Indexed by
+    // tt::ui::AlertCategory; all default ON, because the failure this system
+    // keeps rediscovering is silence nobody chose. Persisted so a restart does
+    // not quietly re-enable a category the operator turned off — or, worse,
+    // leave one off that they only meant to silence for an afternoon.
+    bool notify_trades = true;
+    bool notify_orders = true;
+    bool notify_risk = true;
+    bool notify_connection = true;
+    bool notify_integrity = true;
+    bool notify_lineup = true;
+    bool notify_system = true;
     // Command that starts the IBKR Client Portal Gateway (e.g. its run.bat
     // with the conf path); enables the Launch button in Sign In. Empty = off.
     std::string ibkr_gateway_cmd;

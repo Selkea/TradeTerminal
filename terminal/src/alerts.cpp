@@ -146,6 +146,21 @@ void AlertNotifier::notify(Severity sev, const std::string& text) {
         ++del_.muted_discarded;   // silence is a state, not an absence of events
         return;
     }
+    {
+        // THE CATEGORY GATE. Ahead of coalescing and the rate cap on purpose: an
+        // alert the operator has switched off should not spend a token or open a
+        // burst window that a later, wanted alert of the same shape would then be
+        // folded into. Counted per category, because "you are not being paged
+        // about X" has to be answerable without reading the config.
+        std::lock_guard lock(mu_);
+        if (categorize_) {
+            const int cat = categorize_(text);
+            if (cat >= 0 && cat < kMaxCategories && !cat_enabled_[cat]) {
+                ++del_.category_discarded[cat];
+                return;
+            }
+        }
+    }
     bool admit = false;
     bool wake = false;
     {

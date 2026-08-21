@@ -658,6 +658,13 @@ App::App(std::string gateway_url)
                              cfg_.strategy_tourn_excluded);
     const char* wh = std::getenv("TT_ALERT_WEBHOOK");
     alerts_.set_webhook(wh && *wh ? wh : cfg_.alert_webhook);
+    // The gate lives in AlertNotifier (one place, every caller), but the POLICY
+    // deciding which category a line belongs to stays here in the UI layer —
+    // alerts.cpp must not pull in the engine's tag headers just to mute a fill.
+    alerts_.set_categorizer([](const std::string& l) {
+        return static_cast<int>(classify_alert_category(l));
+    });
+    apply_notification_settings();
     if (alerts_.has_webhook()) route("alerts: webhook configured");
 
     if (!journal_.open((data_dir() / "journal.db").string()))
@@ -2979,6 +2986,16 @@ std::string App::build_diag_json() {
         // it, so a muted app looked exactly like a quiet one.
         a["muted"] = alerts_.muted();
         a["muted_discarded"] = d.muted_discarded;
+        // WHICH CATEGORIES ARE OFF, and what that has cost so far. Keyed by NAME
+        // so the answer survives a reordering of the enum, and only categories
+        // actually switched off appear — a fully-armed channel says nothing
+        // here, so anything present is a deliberate silence.
+        nlohmann::json off = nlohmann::json::object();
+        for (int i = 0; i < static_cast<int>(AlertCategory::COUNT); ++i)
+            if (!alerts_.category_enabled(i))
+                off[alert_category_name(static_cast<AlertCategory>(i))] =
+                    d.category_discarded[i];
+        a["categories_off"] = std::move(off);
         a["last_status"] = d.last_status;
         a["last_error"] = d.last_error;
         j["alerts"] = std::move(a);
@@ -4953,6 +4970,22 @@ void App::draw_data_menu() {
 // classify_alert is pure, AlertNotifier::notify is mutex-guarded, and
 // dry_.active is written once in the constructor — before any of those threads
 // exists — and never again.
+// Push the persisted Settings > Notifications switches into the notifier.
+// Called at startup and on every toggle, so the live gate and config.json can
+// never disagree — a category that LOOKS off in the menu but still pages (or
+// worse, looks on and does not) is the kind of thing nobody notices until an
+// alert they wanted never arrives.
+void App::apply_notification_settings() {
+    using C = AlertCategory;
+    alerts_.set_category_enabled(static_cast<int>(C::Trades), cfg_.notify_trades);
+    alerts_.set_category_enabled(static_cast<int>(C::Orders), cfg_.notify_orders);
+    alerts_.set_category_enabled(static_cast<int>(C::Risk), cfg_.notify_risk);
+    alerts_.set_category_enabled(static_cast<int>(C::Connection), cfg_.notify_connection);
+    alerts_.set_category_enabled(static_cast<int>(C::Integrity), cfg_.notify_integrity);
+    alerts_.set_category_enabled(static_cast<int>(C::Lineup), cfg_.notify_lineup);
+    alerts_.set_category_enabled(static_cast<int>(C::System), cfg_.notify_system);
+}
+
 void App::alert_scan(const std::string& l) {
     // A dry run runs the REAL lineup, so it emits the real verdicts — including
     // "lineup: ABORTED", which classify_alert rates Critical and which would page
@@ -6020,6 +6053,23 @@ void App::draw_menu_bar() {
     if (!ImGui::BeginMainMenuBar()) return;
     draw_account_menu();
     draw_data_menu();
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Chart", nullptr, &show_chart_);
+        ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
+        ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
+        ImGui::MenuItem("Replay", nullptr, &show_replay_);
+        ImGui::MenuItem("Optimizer", nullptr, &show_sweep_);
+        ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
+        ImGui::MenuItem("Build Output", nullptr, &show_build_output_);
+        ImGui::MenuItem("Trade", nullptr, &show_trade_);
+        ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
+        ImGui::MenuItem("Positions", nullptr, &show_positions_);
+        ImGui::MenuItem("Journal", nullptr, &show_journal_);
+        ImGui::MenuItem("Log Console", nullptr, &show_log_);
+        ImGui::MenuItem("Optimizer Log", nullptr, &show_opt_log_);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Settings")) {
     if (ImGui::BeginMenu("Trade")) {
         const bool busy = lineup_active();
         const bool ok = use_tws_data_ && data_.connected() && !engine_.running() &&
@@ -6052,29 +6102,74 @@ void App::draw_menu_bar() {
         ImGui::EndDisabled();
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu("View")) {
-        ImGui::MenuItem("Chart", nullptr, &show_chart_);
-        ImGui::MenuItem("Watchlist", nullptr, &show_watchlist_);
-        ImGui::MenuItem("Backtest", nullptr, &show_backtest_);
-        ImGui::MenuItem("Replay", nullptr, &show_replay_);
-        ImGui::MenuItem("Optimizer", nullptr, &show_sweep_);
-        ImGui::MenuItem("Strategy", nullptr, &show_strategy_);
-        ImGui::MenuItem("Build Output", nullptr, &show_build_output_);
-        ImGui::MenuItem("Trade", nullptr, &show_trade_);
-        ImGui::MenuItem("Blotter", nullptr, &show_blotter_);
-        ImGui::MenuItem("Positions", nullptr, &show_positions_);
-        ImGui::MenuItem("Journal", nullptr, &show_journal_);
-        ImGui::MenuItem("Log Console", nullptr, &show_log_);
-        ImGui::MenuItem("Optimizer Log", nullptr, &show_opt_log_);
-        ImGui::Separator();
-        bool alerts_on = !alerts_.muted();
-        if (ImGui::MenuItem("Alerts", nullptr, &alerts_on)) alerts_.set_muted(!alerts_on);
-        ImGui::SetItemTooltip(alerts_.has_webhook()
-                                  ? "Beep + webhook on halts, rejects, disconnects, fills"
-                                  : "Beeps on halts/rejects/disconnects. Set "
-                                    "\"alert_webhook\" in config.json (or "
-                                    "TT_ALERT_WEBHOOK) for phone push, e.g. an "
-                                    "ntfy.sh topic URL");
+        if (ImGui::BeginMenu("Notifications")) {
+            ImGui::TextDisabled(alerts_.has_webhook()
+                                    ? "ntfy categories"
+                                    : "No webhook set (config.json alert_webhook)");
+            ImGui::Separator();
+            struct Row {
+                const char* label;
+                bool* flag;
+                AlertCategory cat;
+                const char* tip;
+            };
+            const Row rows[] = {
+                {"Trades", &cfg_.notify_trades, AlertCategory::Trades,
+                 "Every live fill. The chattiest category by far, though a\n"
+                 "partially filled order pages once per burst, not once per fill."},
+                {"Orders", &cfg_.notify_orders, AlertCategory::Orders,
+                 "Orders refused or rejected. A refused ENTRY is routine; a\n"
+                 "refused EXIT counts as Risk, not Orders, and stays on that switch."},
+                {"Risk", &cfg_.notify_risk, AlertCategory::Risk,
+                 "Risk halts, the kill switch, the EOD backstop, and any position\n"
+                 "left with nothing to close it.\n\n"
+                 "OFF MEANS NO PAGE when a position is naked. The event still\n"
+                 "happens and is still logged - you simply are not told."},
+                {"Connection", &cfg_.notify_connection, AlertCategory::Connection,
+                 "Gateway, broker socket, data feed and client-id collisions.\n"
+                 "The nightly IBKR restart is routine and already stays quiet;\n"
+                 "what reaches you here is an outage that LASTED."},
+                {"Integrity", &cfg_.notify_integrity, AlertCategory::Integrity,
+                 "The app and the broker disagreeing about what is held, and\n"
+                 "positions this session can neither see nor close.\n\n"
+                 "OFF MEANS NO PAGE when the book is wrong. On 2026-08-13 that\n"
+                 "state went unnoticed for four hours."},
+                {"Lineup", &cfg_.notify_lineup, AlertCategory::Lineup,
+                 "The daily build - symbols excluded, a day refused outright -\n"
+                 "and the session guard that ends the trading day."},
+                {"System", &cfg_.notify_system, AlertCategory::System,
+                 "Anything matching no category above."},
+            };
+            for (const Row& r : rows) {
+                if (ImGui::MenuItem(r.label, nullptr, r.flag)) {
+                    alerts_.set_category_enabled(static_cast<int>(r.cat), *r.flag);
+                    save_config();   // persist the instant it is toggled
+                }
+                ImGui::SetItemTooltip("%s", r.tip);
+                // The two categories that report a position nothing is
+                // protecting are marked when off, so a silenced safety channel
+                // is visible without opening the tooltip.
+                if (alert_category_is_safety(r.cat) && !*r.flag) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(!)");
+                }
+            }
+            ImGui::Separator();
+            // The master switch, moved here from View: View is about which
+            // PANELS are open, and this was the only notification control there
+            // was - all or nothing, which is why it stayed on.
+            bool alerts_on = !alerts_.muted();
+            if (ImGui::MenuItem("All notifications", nullptr, &alerts_on))
+                alerts_.set_muted(!alerts_on);
+            ImGui::SetItemTooltip(
+                alerts_.has_webhook()
+                    ? "Master switch. Off silences the beep AND the webhook for\n"
+                      "every category, including any marked (!)."
+                    : "Beeps on halts/rejects/disconnects. Set \"alert_webhook\"\n"
+                      "in config.json (or TT_ALERT_WEBHOOK) to page a phone, e.g.\n"
+                      "an ntfy.sh topic URL.");
+            ImGui::EndMenu();
+        }
         ImGui::EndMenu();
     }
 #ifdef TT_DEBUG

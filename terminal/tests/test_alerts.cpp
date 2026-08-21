@@ -844,6 +844,129 @@ TEST_CASE("classify_alert: the feed reconnect line still pages, and still coales
           tt::ui::detail::burst_key("finnhub: stream lost, reconnecting in 30s"));
 }
 
+// ---------------------------------------------------------------------------
+// SETTINGS > NOTIFICATIONS: per-category muting.
+
+using tt::ui::AlertCategory;
+using tt::ui::classify_alert_category;
+
+TEST_CASE("alert categories: each kind of event lands where the menu says") {
+    // The axis the operator actually wants to silence along. classify_alert says
+    // how URGENT; this says ABOUT WHAT, and they must not disagree about which
+    // tag wins — both check Risk-tier tags first.
+    CHECK(classify_alert_category("live: SOXL fill BUY 100 @ 12.34 (order #7)") ==
+          AlertCategory::Trades);
+    CHECK(classify_alert_category("live: ORDER REFUSED [session_closed] KORU buy 234") ==
+          AlertCategory::Orders);
+    CHECK(classify_alert_category("live: RISK HALT (daily loss limit)") ==
+          AlertCategory::Risk);
+    CHECK(classify_alert_category("live: EOD BACKSTOP - open position(s) past 15:57") ==
+          AlertCategory::Risk);
+    CHECK(classify_alert_category("PROTECTIVE STOP REJECTED on SOXL") ==
+          AlertCategory::Risk);
+    CHECK(classify_alert_category("WATCHDOG broker disconnected for 62s") ==
+          AlertCategory::Connection);
+    CHECK(classify_alert_category("finnhub: stream lost, reconnecting in 4s") ==
+          AlertCategory::Connection);
+    CHECK(classify_alert_category("alert: BOOK DIVERGENCE NVDA app=0 broker=20") ==
+          AlertCategory::Integrity);
+    CHECK(classify_alert_category("tws: reconcile: OFF-LINEUP BROKER POSITION NVDA 20") ==
+          AlertCategory::Integrity);
+    CHECK(classify_alert_category("lineup: EXCLUDED MSTZ, KORU, RAM - no fit") ==
+          AlertCategory::Lineup);
+    // Anything unrecognised is System, never silently folded into Trades — a
+    // new alert must not arrive pre-muted because someone had fills switched off.
+    CHECK(classify_alert_category("something nobody has categorised yet") ==
+          AlertCategory::System);
+}
+
+TEST_CASE("alert categories: a refused EXIT is Risk, not Orders") {
+    // THE ONE THAT MATTERS. "Orders" is the category an operator switches off to
+    // stop hearing about routine refusals — and a refused exit leaves a position
+    // open with one fewer thing watching it. classify_alert already rates it
+    // Critical; it must not be silenceable by the Orders switch.
+    const std::string exit_refused =
+        "live: EXIT ORDER REFUSED [max_order_qty] MUU sell 161: the order "
+        "quantity exceeds the per-order share limit";
+    CHECK(classify_alert(exit_refused) == AlertClass::Critical);
+    CHECK(classify_alert_category(exit_refused) == AlertCategory::Risk);
+    CHECK(tt::ui::alert_category_is_safety(AlertCategory::Risk));
+    CHECK(tt::ui::alert_category_is_safety(AlertCategory::Integrity));
+    CHECK_FALSE(tt::ui::alert_category_is_safety(AlertCategory::Trades));
+}
+
+TEST_CASE("alerts: a disabled category is discarded, and the loss is counted") {
+    AlertNotifier n;
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_categorizer([](const std::string& l) {
+        return static_cast<int>(classify_alert_category(l));
+    });
+    n.set_category_enabled(static_cast<int>(AlertCategory::Trades), false);
+    n.notify(AlertNotifier::Info, "live: SOXL fill BUY 100 @ 12.34 (order #7)");
+    n.notify(AlertNotifier::Info, "live: SNDQ fill SELL 343 @ 15.35 (order #2)");
+    const auto d = n.delivery();
+    CHECK(d.category_discarded[static_cast<int>(AlertCategory::Trades)] == 2);
+    // Counted apart from every other loss: a muted channel, a full backlog, a
+    // rate cap and a switched-off category are four different problems.
+    CHECK(d.muted_discarded == 0);
+    CHECK(d.dropped == 0);
+    CHECK(d.throttled == 0);
+    CHECK(d.coalesced == 0);
+}
+
+TEST_CASE("alerts: switching one category off leaves the others armed") {
+    // The whole point. Silencing fills must not silence a naked position.
+    AlertNotifier n;
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_categorizer([](const std::string& l) {
+        return static_cast<int>(classify_alert_category(l));
+    });
+    n.set_category_enabled(static_cast<int>(AlertCategory::Trades), false);
+    n.notify(AlertNotifier::Info, "live: SOXL fill BUY 100 @ 12.34 (order #7)");
+    n.notify(AlertNotifier::Critical, "PROTECTIVE STOP REJECTED on SOXL");
+    n.notify(AlertNotifier::Critical, "alert: BOOK DIVERGENCE NVDA app=0 broker=20");
+    const auto d = n.delivery();
+    CHECK(d.category_discarded[static_cast<int>(AlertCategory::Trades)] == 1);
+    CHECK(d.category_discarded[static_cast<int>(AlertCategory::Risk)] == 0);
+    CHECK(d.category_discarded[static_cast<int>(AlertCategory::Integrity)] == 0);
+}
+
+TEST_CASE("alerts: with no categoriser set, nothing is ever gated") {
+    // The pre-0.32.0 behaviour, kept reachable so a notifier constructed without
+    // App wiring (every other test in this file) cannot silently drop alerts.
+    AlertNotifier n;
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_category_enabled(0, false);   // would gate everything, if it applied
+    n.notify(AlertNotifier::Critical, "live: RISK HALT (daily loss limit)");
+    for (int i = 0; i < AlertNotifier::kMaxCategories; ++i)
+        CHECK(n.delivery().category_discarded[i] == 0);
+}
+
+TEST_CASE("alerts: the gate runs BEFORE coalescing, so a muted burst costs nothing") {
+    // Order matters: a switched-off alert must not open a burst window that a
+    // later WANTED alert of the same shape would then be folded into, nor spend
+    // a rate-cap token.
+    AlertNotifier n;
+    TestClock clk;
+    n.set_clock_for_test(clk.fn());
+    n.set_worker_paused(true);
+    n.set_webhook("x-no-such-scheme://drop");
+    n.set_categorizer([](const std::string& l) {
+        return static_cast<int>(classify_alert_category(l));
+    });
+    n.set_category_enabled(static_cast<int>(AlertCategory::Trades), false);
+    for (int i = 0; i < 40; ++i)
+        n.notify(AlertNotifier::Info, "live: SOXL fill BUY 100 @ 12.34 (order #7)");
+    const auto d = n.delivery();
+    CHECK(d.category_discarded[static_cast<int>(AlertCategory::Trades)] == 40);
+    CHECK(d.coalesced == 0);    // no burst was ever opened
+    CHECK(d.throttled == 0);    // and no token was spent
+    CHECK(d.summaries == 0);    // nothing to summarise: it was never in flight
+}
+
 using tt::ui::detail::burst_key;
 
 TEST_CASE("burst_key: a rolling id does not make one repeating event look like many") {

@@ -109,6 +109,34 @@ public:
     // whether one happens is, and that is observable without making noise.
     static void set_beeps_enabled(bool e) { s_beeps_.store(e, std::memory_order_relaxed); }
 
+    // PER-CATEGORY MUTING. The only control before this was set_muted(), which
+    // silenced everything including the pages that mean a position is naked —
+    // all or nothing, so in practice it stayed on and the operator ate the
+    // fills. Categories let "stop telling me about fills" be said without also
+    // saying "stop telling me the book is wrong".
+    //
+    // The CATEGORISER is injected rather than called directly, so this file
+    // stays free of the classification policy (alert_rules.h pulls in the
+    // engine's tag headers) and a test can drive the gate with its own trivial
+    // mapping. Unset = every alert is category 0 and nothing is ever gated,
+    // which is the behaviour before this existed.
+    static constexpr int kMaxCategories = 8;
+    using Categorizer = int (*)(const std::string&);
+    void set_categorizer(Categorizer f) {
+        std::lock_guard lock(mu_);
+        categorize_ = f;
+    }
+    void set_category_enabled(int cat, bool on) {
+        if (cat < 0 || cat >= kMaxCategories) return;
+        std::lock_guard lock(mu_);
+        cat_enabled_[cat] = on;
+    }
+    bool category_enabled(int cat) const {
+        if (cat < 0 || cat >= kMaxCategories) return true;
+        std::lock_guard lock(mu_);
+        return cat_enabled_[cat];
+    }
+
     // UI thread. Info: webhook only. Warning/Critical: system beep + webhook.
     void notify(Severity sev, const std::string& text);
 
@@ -147,6 +175,11 @@ public:
         // happened" — the exact confusion 0.29.2 was written to end, reachable
         // from a menu item. /diag reports the flag and this count together.
         uint64_t muted_discarded = 0;
+        // Discarded because the operator turned this CATEGORY off. Separate from
+        // muted_discarded: one is "the channel is off", the other is "this kind
+        // of event is off", and they call for different responses. Per category,
+        // so /diag can say which switch swallowed what.
+        uint64_t category_discarded[kMaxCategories] = {};
         long last_status = 0;     // last HTTP status seen (0 = transport error)
         std::string last_error;   // curl's message, or "HTTP <code>"
     };
@@ -238,6 +271,8 @@ private:
     uint64_t throttled_pending_[3] = {0, 0, 0};
     int64_t throttled_since_ms_[3] = {0, 0, 0};
     std::string throttled_sample_[3];
+    Categorizer categorize_ = nullptr;
+    bool cat_enabled_[kMaxCategories] = {true, true, true, true, true, true, true, true};
     static inline std::atomic<bool> s_beeps_{true};
     std::function<int64_t()> clock_;
     bool paused_ = false;

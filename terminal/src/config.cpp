@@ -45,6 +45,13 @@ AppConfig AppConfig::load(const std::string& path) {
     c.lineup_top_n = j.value("lineup_top_n", c.lineup_top_n);
     c.lineup_atr_len = j.value("lineup_atr_len", c.lineup_atr_len);
     c.alert_webhook = j.value("alert_webhook", c.alert_webhook);
+    c.notify_trades = j.value("notify_trades", c.notify_trades);
+    c.notify_orders = j.value("notify_orders", c.notify_orders);
+    c.notify_risk = j.value("notify_risk", c.notify_risk);
+    c.notify_connection = j.value("notify_connection", c.notify_connection);
+    c.notify_integrity = j.value("notify_integrity", c.notify_integrity);
+    c.notify_lineup = j.value("notify_lineup", c.notify_lineup);
+    c.notify_system = j.value("notify_system", c.notify_system);
     c.ibkr_gateway_cmd = j.value("ibkr_gateway_cmd", c.ibkr_gateway_cmd);
     c.risk_max_order_qty = j.value("risk_max_order_qty", c.risk_max_order_qty);
     c.risk_max_position_qty = j.value("risk_max_position_qty", c.risk_max_position_qty);
@@ -147,6 +154,13 @@ void AppConfig::save(const std::string& path) const {
         {"lineup_top_n", lineup_top_n},
         {"lineup_atr_len", lineup_atr_len},
         {"alert_webhook", alert_webhook},
+        {"notify_trades", notify_trades},
+        {"notify_orders", notify_orders},
+        {"notify_risk", notify_risk},
+        {"notify_connection", notify_connection},
+        {"notify_integrity", notify_integrity},
+        {"notify_lineup", notify_lineup},
+        {"notify_system", notify_system},
         {"ibkr_gateway_cmd", ibkr_gateway_cmd},
         {"risk_max_order_qty", risk_max_order_qty},
         {"risk_max_position_qty", risk_max_position_qty},

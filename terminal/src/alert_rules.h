@@ -183,4 +183,84 @@ inline AlertClass classify_alert(const std::string& l) {
     return AlertClass::None;
 }
 
+
+// ---------------------------------------------------------------------------
+// WHAT KIND of event this is, independent of how loud it is.
+//
+// classify_alert answers "how urgent"; this answers "about what". They are
+// different questions and the operator wants to silence along the second axis:
+// "stop paging me about fills" must not also silence a naked position, and
+// muting the whole channel (the old Alerts toggle) was the only control there
+// was — all or nothing, which is why it was never used.
+//
+// Kept next to classify_alert, and in the SAME ORDER, so one line cannot be
+// urgent-because-of-tag-X but categorised-by-tag-Y. Anything unrecognised is
+// System, never silently Trades.
+enum class AlertCategory {
+    Trades = 0,      // fills: the strategy did something
+    Orders,          // an order refused or rejected before/at the broker
+    Risk,            // halts, kill switch, EOD backstop, a position with no exit
+    Connection,      // gateway, broker socket, data feed, client-id collisions
+    Integrity,       // the app and the broker disagree about what is held
+    Lineup,          // the daily build, and the session guard that ends the day
+    System,          // everything else
+    COUNT
+};
+
+inline constexpr const char* alert_category_name(AlertCategory c) {
+    switch (c) {
+    case AlertCategory::Trades:     return "Trades";
+    case AlertCategory::Orders:     return "Orders";
+    case AlertCategory::Risk:       return "Risk";
+    case AlertCategory::Connection: return "Connection";
+    case AlertCategory::Integrity:  return "Integrity";
+    case AlertCategory::Lineup:     return "Lineup";
+    default:                        return "System";
+    }
+}
+
+// True for the categories that report a position nothing is protecting or a book
+// nobody can trust. They are toggleable like the rest — it is the operator's
+// terminal — but the UI says out loud what turning them off costs, and every
+// suppressed page is still counted in /diag. Silence that no one chose is the
+// failure this whole subsystem exists to prevent; silence someone DID choose
+// still has to be visible.
+inline constexpr bool alert_category_is_safety(AlertCategory c) {
+    return c == AlertCategory::Risk || c == AlertCategory::Integrity;
+}
+
+inline AlertCategory classify_alert_category(const std::string& l) {
+    auto has = [&](const char* p) { return l.find(p) != std::string::npos; };
+    // RISK first, for the same reason classify_alert checks Critical first: a
+    // line that is both a fill and a forced flatten is about the flatten.
+    if (has("KILL SWITCH") || has("RISK HALT") || has("EOD BACKSTOP") ||
+        has("PROTECTIVE STOP REJECTED") || has(kUnreachableStopTag) ||
+        has("unprotected") || has("orphaned position") ||
+        // A refused EXIT is Risk, NOT Orders. "Orders" is the switch someone
+        // flips to stop hearing about routine refusals, and this tag nests
+        // inside kOrderRefusedTag ("EXIT ORDER REFUSED" contains "ORDER
+        // REFUSED") — so without this line it fell through to Orders and a
+        // position left open with nothing watching it became silenceable by
+        // the category for the most routine event there is. Same substring
+        // trap classify_alert documents for the same three tags.
+        has(kExitOrderRefusedTag))
+        return AlertCategory::Risk;
+    if (has(net::kBookDivergenceTag) || has(net::kBookAuditBlindTag) ||
+        has("OFF-LINEUP BROKER POSITION") || has(kTwsForeignOrderTag) ||
+        has("half-open order"))
+        return AlertCategory::Integrity;
+    // A duplicate order id paralyses the ORDER path — it is a broker-session
+    // fault, not a decision about one order.
+    if (has(kTwsClientIdConflictTag) || has(kTwsClientIdClearedTag) ||
+        has(kTwsDuplicateOrderIdTag) || has("stream lost") || has("auth failed") ||
+        has("disconnected") || has("reconnected") || has("gateway") ||
+        has("stale candles"))
+        return AlertCategory::Connection;
+    if (has("lineup:") || has("session guard")) return AlertCategory::Lineup;
+    if (has(kOrderRefusedTag) || has("rejected") || has("refused"))
+        return AlertCategory::Orders;
+    if (has(" fill ") && has("(order #")) return AlertCategory::Trades;
+    return AlertCategory::System;
+}
+
 } // namespace tt::ui

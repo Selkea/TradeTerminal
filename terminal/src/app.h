@@ -129,6 +129,8 @@ private:
     std::string build_logs_sse(uint64_t& cursor);  // server (stream) thread; advances cursor
     void refresh_ibkr_accounts();     // reload labels from ibkr-accounts.json
     void alert_scan(const std::string& log_line);
+    // Push the persisted Settings > Notifications switches into the notifier.
+    void apply_notification_settings();
     void setup_default_layout(ImGuiID dockspace_id);
     // Signed-in Polygon key, falling back to POLYGON_API_KEY; "" = none.
     std::string polygon_key() const;
