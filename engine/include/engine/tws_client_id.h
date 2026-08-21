@@ -325,8 +325,21 @@ inline constexpr bool tws_order_id_collision(int code) {
 }
 
 // 104/105's operator line. Carries kTwsDuplicateOrderIdTag deliberately: it is
-// the same fault with a different IB code, so it must classify, categorise and
-// COALESCE with 103 rather than opening a second burst key for one episode.
+// the same fault with a different IB code, so it classifies and categorises with
+// 103 — one tier, one switch, one name in the log for one fault.
+//
+// It does NOT coalesce with the 103 line, and 0.34.0's comment here claimed it
+// did. detail::burst_key folds only DIGIT runs to '#', so two lines share a
+// burst key only when everything else is byte-identical; these deliberately say
+// different things about why, and 104's clause differs from 105's. Three codes
+// in one episode therefore cost up to three pages rather than one.
+//
+// Left that way on purpose. The reason is the diagnosis — "already FILLED" and
+// "does not match" send an operator to different places — and an episode
+// realistically carries ONE code, since which one IB answers with is decided by
+// the state of the colliding order, not by chance. The per-severity rate cap
+// bounds the pathological case regardless. Buying the fold would mean spending
+// the only words that distinguish the three.
 inline std::string tws_modify_collision_line(int code, long tws_order_id,
                                              long next_id, int our_client_id) {
     return std::string(kTwsDuplicateOrderIdTag) + ": IB refused TWS order id " +

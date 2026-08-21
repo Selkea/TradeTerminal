@@ -21,6 +21,8 @@
 #include "doctest.h"
 
 #include "alert_rules.h"
+#include "alerts.h"                    // detail::burst_key, for the coalescing pin
+#include "engine/reconcile_policy.h"   // the two reconcile deadlines
 #include "engine/tws_client_id.h"
 
 #include <fstream>
@@ -403,30 +405,99 @@ TEST_CASE("104/105 are FATAL, which is the whole point") {
     CHECK(src.find("if (errorCode == kTwsDuplicateOrderId) {") == std::string::npos);
 }
 
-TEST_CASE("place() never spends an id it already has a live order on") {
-    // THE ONE THAT MATTERS. engine.cpp lifts its reconcile gate on a 10 s
-    // failsafe while this broker's deadline is kReconcileTimeoutMs (20 s), and
-    // order_path_ready() does not consult recon_active — so a placement can be
-    // drained before adoption has advanced the counter past the ids it is still
-    // adopting. local_by_tws[tws_id] = local is UNCONDITIONAL, so that write
-    // overwrites the adopted order's row; orderStatus() and execDetails() both
-    // early-return on an id they cannot find, and from that moment the app hears
-    // none of that order's fills or cancels. That is the 2026-08-13 phantom
-    // position, reached from the machinery meant to prevent it.
+TEST_CASE("the engine cannot resume trading while the broker may still adopt") {
+    // THE REAL GUARD, and 0.34.3's correction of 0.34.0.
     //
-    // The collision handler CANNOT undo this: by the time IB answers, the row is
-    // already gone. Nor is an error guaranteed — same contract, same side, same
-    // type amends price or quantity SILENTLY. The guard has to be at the spend.
+    // Two components each deadline reconciliation, and their ORDER is the safety
+    // property. The engine lifted its gate at 10 s while TwsBroker gives up
+    // adopting at 20 s, so for 10 s the engine believed it could trade while
+    // adoption was still in flight. A placement there spends an id an adopted
+    // order is about to claim; openOrder then takes its "already ours this
+    // session" early return and that resting order is NEVER adopted, so every
+    // fill and cancel it reports is dropped — the 2026-08-13 phantom position.
+    //
+    // This runs, unlike the source-text pin it replaces. reconcile_policy.h also
+    // carries the invariant as a static_assert, so a bad edit fails to COMPILE;
+    // this case is what says why, out loud, when someone reads the failure.
+    CHECK(tt::kEngineReconcileFailsafeMs > tt::kBrokerReconcileTimeoutMs);
+    CHECK(tt::kEngineReconcileFailsafeMs - tt::kBrokerReconcileTimeoutMs >= 5'000);
+    // Both ends must actually USE the shared constants, or the invariant holds
+    // over numbers nothing reads.
+    const std::string eng = read_repo_file("/engine/src/engine.cpp");
+    CHECK(eng.find("kEngineReconcileFailsafeMs * 1'000'000LL") != std::string::npos);
+    CHECK(eng.find("+ 10'000'000'000LL") == std::string::npos);   // the old literal
+    const std::string brk = read_repo_file("/engine/src/tws_broker.cpp");
+    CHECK(brk.find("kReconcileTimeoutMs = kBrokerReconcileTimeoutMs") !=
+          std::string::npos);
+    // The compile-time half must survive too. The CHECKs above are the real
+    // guard — they fail whatever the header says — but the static_assert is what
+    // turns a bad edit into a BUILD error at the line being edited, instead of a
+    // test failure somewhere else. Losing it costs no safety and a lot of speed,
+    // and nothing else can notice it going.
+    const std::string pol = read_repo_file("/engine/include/engine/reconcile_policy.h");
+    CHECK(pol.find("static_assert(kEngineReconcileFailsafeMs >= kBrokerReconcileTimeoutMs") !=
+          std::string::npos);
+}
+
+TEST_CASE("place() spends a fresh id by invariant, with no dead guard") {
+    // The id place() spends is fresh because of an INVARIANT, so there must be
+    // no runtime check here pretending otherwise.
+    //
+    // Every key in local_by_tws is strictly below next_tws_id at all times. The
+    // two writers are place() (key = next_tws_id - 1) and openOrder, which
+    // advances next_tws_id past orderId + 1 BEFORE inserting. next_tws_id never
+    // decreases. So `local_by_tws.count(next_tws_id)` is identically 0.
+    //
+    // 0.34.0 added a skip loop on exactly that expression and 0.34.3 removed it:
+    // dead code under a comment asserting a protection it did not deliver, which
+    // is worse than no code because it reads as a closed hole and stops anyone
+    // looking. The window it was written for is one where the colliding id is
+    // NOT in the map yet, so there was never anything to skip. The guard is the
+    // deadline ordering — see the case above and engine/reconcile_policy.h.
     const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
     const std::string place = between(src, "long place(uint64_t local,", "return tws_id;");
-    REQUIRE_FALSE(place.empty());
-    const size_t skip = place.find("while (local_by_tws.count(next_tws_id)) ++next_tws_id;");
     const size_t spend = place.find("const long tws_id = next_tws_id++;");
     const size_t write = place.find("local_by_tws[tws_id] = local;");
-    REQUIRE(skip != std::string::npos);
     REQUIRE(spend != std::string::npos);
     REQUIRE(write != std::string::npos);
-    // Order is the invariant: skipping AFTER the spend would guard nothing.
-    CHECK(skip < spend);
     CHECK(spend < write);
+    // The dead guard must not come back, in this spelling or the obvious ones.
+    CHECK(place.find("local_by_tws.count(next_tws_id)") == std::string::npos);
+    CHECK(place.find("while (") == std::string::npos);
+    // ...and the invariant it relied on must still hold at the OTHER writer:
+    // advance first, insert second. Reversing those two lines is the only edit
+    // that could make a collision real here, and it would be silent.
+    const std::string adopt = between(src, "void openOrder(OrderId orderId,", "void openOrderEnd(");
+    const size_t adv = adopt.find("next_tws_id = tws_advance_order_id(next_tws_id,");
+    const size_t ins = adopt.find("local_by_tws[orderId] = local;");
+    REQUIRE(adv != std::string::npos);
+    REQUIRE(ins != std::string::npos);
+    CHECK(adv < ins);
+}
+
+TEST_CASE("104/105 share 103's tier and switch, but NOT its burst key") {
+    // 0.34.0's comment claimed these coalesce with the 103 line. They do not,
+    // and saying so was a claim about the alert channel that the channel does
+    // not honour: detail::burst_key folds DIGIT runs only, so two lines share a
+    // key only when every other byte matches, and these deliberately differ on
+    // why. Pinned as the real behaviour rather than left as an aspiration.
+    const std::string l103 = tws_duplicate_order_id_line(59, 76, kTwsOrdersClientId);
+    const std::string l104 =
+        tws_modify_collision_line(kTwsModifyFilledOrderId, 59, 76, kTwsOrdersClientId);
+    const std::string l105 =
+        tws_modify_collision_line(kTwsModifyMismatchId, 59, 76, kTwsOrdersClientId);
+    // What they DO share, which is what the tag is for.
+    CHECK(tt::ui::classify_alert(l103) == tt::ui::classify_alert(l104));
+    CHECK(tt::ui::classify_alert(l104) == tt::ui::classify_alert(l105));
+    CHECK(tt::ui::classify_alert_category(l103) == tt::ui::classify_alert_category(l104));
+    // What they do NOT share. If a later edit makes the prose identical these
+    // become equal and the fold is real — that is a fine outcome, but it must be
+    // a decision, not a surprise, so it fails here first.
+    CHECK(tt::ui::detail::burst_key(l103) != tt::ui::detail::burst_key(l104));
+    CHECK(tt::ui::detail::burst_key(l104) != tt::ui::detail::burst_key(l105));
+    // The digits ARE folded, so two 103s from one episode still collapse — the
+    // property the channel actually provides for a repeating fault.
+    CHECK(tt::ui::detail::burst_key(l103) ==
+          tt::ui::detail::burst_key(tws_duplicate_order_id_line(88, 89,
+                                                                kTwsOrdersClientId)));
 }

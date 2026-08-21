@@ -1,6 +1,7 @@
 #include "engine/engine.h"
 
 #include "engine/broker.h"
+#include "engine/reconcile_policy.h"   // the two reconcile deadlines, and their order
 
 #include <windows.h>
 
@@ -1770,8 +1771,16 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         // window (connect fine but the replay stalled) so a stall can't wedge
         // trading (degrades to no adoption). Anchored to ready, not session
         // start — see reconcile_deadline_ns above.
+        //
+        // LONGER THAN THE BROKER'S OWN DEADLINE, and that ordering is the whole
+        // point (engine/reconcile_policy.h, enforced by a static_assert there).
+        // At 10 s this lifted while TwsBroker was still adopting — it gives up
+        // at kBrokerReconcileTimeoutMs — and a placement drained in that window
+        // spends an order id an adopted order is about to claim, after which
+        // that resting order is never adopted and the app stops hearing its
+        // fills at all.
         if (reconciling && reconcile_deadline_ns == 0 && broker && broker->ready())
-            reconcile_deadline_ns = rt.now_ns() + 10'000'000'000LL;
+            reconcile_deadline_ns = rt.now_ns() + kEngineReconcileFailsafeMs * 1'000'000LL;
         if (reconciling && reconcile_deadline_ns != 0 &&
             rt.now_ns() > reconcile_deadline_ns) {
             reconciling = false;

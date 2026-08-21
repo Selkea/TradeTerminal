@@ -93,4 +93,51 @@ inline std::string offlineup_position_line(const std::string& symbol, double qty
            "(no strategy, no stop, and flatten/kill-switch cannot reach it)";
 }
 
+// ---------------------------------------------------------------------------
+// THE TWO RECONCILE DEADLINES, AND WHY THEIR ORDER IS THE SAFETY PROPERTY.
+//
+// 0.34.3. Two independent components each give reconciliation a deadline:
+//
+//   TwsBroker   gives up adopting after kBrokerReconcileTimeoutMs and clears
+//               recon_active, so a stalled reqAllOpenOrders cannot disable the
+//               position auditor for the session.
+//   Engine      lifts its own `reconciling` gate after kEngineReconcileFailsafeMs
+//               (anchored on broker->ready()), so a broker that never signals
+//               completion cannot wedge trading.
+//
+// The engine's was 10 s and the broker's 20 s, and that ORDER is a defect. In
+// the 10 s between them the engine believes it may trade while this broker has
+// not yet been told which order ids the account is already using — adoption is
+// still arriving. A placement drained there spends an id an adopted order is
+// about to claim, and openOrder's "already ours this session" early return then
+// discards the real resting order permanently: it is never adopted, so every
+// fill and every cancel it reports is dropped and the app's book diverges from
+// the broker's with nothing saying so. That is the 2026-08-13 phantom position,
+// reached through the machinery meant to prevent it.
+//
+// It cannot be fixed at the placement instead. 0.34.0 tried, with a loop in
+// place() skipping ids already in local_by_tws — provably dead code: openOrder
+// advances next_tws_id past orderId + 1 BEFORE inserting, so every key in that
+// map is always below next_tws_id and the loop can never take an iteration. In
+// the seam the colliding id is precisely the one NOT yet in the map. The guard
+// has to be the deadline ordering, which is the only thing that makes the
+// dangerous window not exist.
+//
+// Nor can it be fixed by refusing placements while recon_active is true in
+// order_path_ready(): that gate also covers Cancel, CancelAll and Flatten, and a
+// kill switch that silently placed nothing for the first 20 s of a session is far
+// worse than a collision. Safety actions must never wait on adoption.
+inline constexpr int64_t kBrokerReconcileTimeoutMs = 20'000;
+inline constexpr int64_t kEngineReconcileFailsafeMs = 25'000;
+
+// The invariant, enforced at compile time. A margin, not just >: the two clocks
+// are anchored at slightly different instants (the broker's at start_reconcile,
+// the engine's at broker->ready()), so equality would leave the outcome to
+// scheduling.
+static_assert(kEngineReconcileFailsafeMs >= kBrokerReconcileTimeoutMs + 5'000,
+              "the engine must not resume trading while the broker could still "
+              "be adopting: a placement in that window spends an order id an "
+              "adopted order is about to claim, and that order is then never "
+              "adopted at all");
+
 } // namespace tt
