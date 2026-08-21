@@ -16,3 +16,9 @@ imgui.ini
 
 # IBKR Client Portal Gateway lives in tools/ (binary distribution + runtime logs; never committed)
 tools/clientportal.gw/
+
+# doctest scratch dbs — the journal cases need a real file for WAL, and they
+# land in whatever cwd the suite was run from (0.34.0: one reached a commit).
+test_journal_*.db
+test_journal_*.db-wal
+test_journal_*.db-shm

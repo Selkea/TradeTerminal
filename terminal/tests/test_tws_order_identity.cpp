@@ -345,3 +345,88 @@ TEST_CASE("the direct start path WAITS for its own socket to close") {
     CHECK(src.find("[this] { safe_stop_live(") != std::string::npos);
     CHECK(src.find("[this] { engine_.stop_live(") == std::string::npos);
 }
+
+// ---- 0.34.0: the two ways an id collision was still silent -------------------
+
+TEST_CASE("all three collision codes are one fault") {
+    // 103 is only the case where IB considers the colliding order FINISHED. If
+    // it is still OPEN on this client, placeOrder is a MODIFICATION request and
+    // the refusal arrives as 104 or 105 instead. Same consequence: the placement
+    // never reached the market.
+    CHECK(kTwsDuplicateOrderId == 103);
+    CHECK(kTwsModifyFilledOrderId == 104);
+    CHECK(kTwsModifyMismatchId == 105);
+    CHECK(tws_order_id_collision(103));
+    CHECK(tws_order_id_collision(104));
+    CHECK(tws_order_id_collision(105));
+    // ...and nothing adjacent. 106/110/201 are ordinary order errors with their
+    // own meanings; sweeping them in here would erase a real reject reason.
+    for (int code : {0, 102, 106, 107, 110, 200, 201, 202, 203, 321, 326, 504, 1100})
+        CHECK_FALSE(tws_order_id_collision(code));
+}
+
+TEST_CASE("104 and 105 page Critical and coalesce WITH 103") {
+    for (int code : {kTwsModifyFilledOrderId, kTwsModifyMismatchId}) {
+        const std::string line =
+            tws_modify_collision_line(code, 59, 76, kTwsOrdersClientId);
+        // The tier that made 103 audible in 0.22.0 must apply to these too.
+        CHECK(tt::ui::classify_alert(line) == tt::ui::AlertClass::Critical);
+        CHECK(line.find("NEVER REACHED THE MARKET") != std::string::npos);
+        CHECK(line.find("76") != std::string::npos);      // where the counter went
+        CHECK(line.find(std::to_string(code)) != std::string::npos);
+        // SAME TAG as 103, deliberately: one episode can emit a mixture of the
+        // three codes, and a second tag would open a second burst key and page
+        // twice for one fault. burst_key folds the digits, so identical prose
+        // outside the numbers is what makes them fold together.
+        CHECK(line.find(kTwsDuplicateOrderIdTag) != std::string::npos);
+    }
+    // The two codes still say different things about WHY, or the operator cannot
+    // tell a filled order from a mismatched one.
+    CHECK(tws_modify_collision_line(kTwsModifyFilledOrderId, 59, 76, 20) !=
+          tws_modify_collision_line(kTwsModifyMismatchId, 59, 76, 20));
+}
+
+TEST_CASE("104/105 are FATAL, which is the whole point") {
+    // SOURCE-TEXT PIN. fatal_order_error is file-static inside an anonymous
+    // namespace, so it cannot be linked against. Being absent from that switch
+    // is exactly the defect: push_reject never fires, the engine leaves the
+    // order Working forever, and the only line emitted is the IB trace — which
+    // classify_alert rates None BY DESIGN. Silent, indefinite, no page.
+    const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
+    const std::string fatal =
+        between(src, "bool fatal_order_error(int code) {", "} // namespace");
+    REQUIRE(fatal.find("case 103:") != std::string::npos);
+    CHECK(fatal.find("case 104:") != std::string::npos);
+    CHECK(fatal.find("case 105:") != std::string::npos);
+    // ...and the handler treats all three alike, rather than testing 103 alone.
+    CHECK(src.find("if (tws_order_id_collision(errorCode)) {") != std::string::npos);
+    CHECK(src.find("if (errorCode == kTwsDuplicateOrderId) {") == std::string::npos);
+}
+
+TEST_CASE("place() never spends an id it already has a live order on") {
+    // THE ONE THAT MATTERS. engine.cpp lifts its reconcile gate on a 10 s
+    // failsafe while this broker's deadline is kReconcileTimeoutMs (20 s), and
+    // order_path_ready() does not consult recon_active — so a placement can be
+    // drained before adoption has advanced the counter past the ids it is still
+    // adopting. local_by_tws[tws_id] = local is UNCONDITIONAL, so that write
+    // overwrites the adopted order's row; orderStatus() and execDetails() both
+    // early-return on an id they cannot find, and from that moment the app hears
+    // none of that order's fills or cancels. That is the 2026-08-13 phantom
+    // position, reached from the machinery meant to prevent it.
+    //
+    // The collision handler CANNOT undo this: by the time IB answers, the row is
+    // already gone. Nor is an error guaranteed — same contract, same side, same
+    // type amends price or quantity SILENTLY. The guard has to be at the spend.
+    const std::string src = read_repo_file("/engine/src/tws_broker.cpp");
+    const std::string place = between(src, "long place(uint64_t local,", "return tws_id;");
+    REQUIRE_FALSE(place.empty());
+    const size_t skip = place.find("while (local_by_tws.count(next_tws_id)) ++next_tws_id;");
+    const size_t spend = place.find("const long tws_id = next_tws_id++;");
+    const size_t write = place.find("local_by_tws[tws_id] = local;");
+    REQUIRE(skip != std::string::npos);
+    REQUIRE(spend != std::string::npos);
+    REQUIRE(write != std::string::npos);
+    // Order is the invariant: skipping AFTER the spend would guard nothing.
+    CHECK(skip < spend);
+    CHECK(spend < write);
+}
