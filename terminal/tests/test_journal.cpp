@@ -128,3 +128,21 @@ TEST_CASE("journal mode: the call site asks about BOTH brokers") {
     CHECK(src.find("live_broker_mode(tws_ != nullptr, ibkr_ != nullptr)") !=
           std::string::npos);
 }
+
+TEST_CASE("diag names the strategy that ran, not one that no longer exists") {
+    // SOURCE-TEXT PIN, same reason as the journal mode above: nothing constructs
+    // an App. "" stopped being a separate built-in when it was merged into
+    // kBuiltinStrategyKey ("sma_crossover.cpp") — a real promoted strategy that
+    // sizes off ctx.budget(). The /diag literal survived the merge, so the
+    // endpoint reported a strategy that does not exist, and on 2026-08-20 that
+    // label alone produced a wrong conclusion about a live session: the log said
+    // "SOXL: SMA(dll)" and /diag said "built-in SMA".
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    CHECK(src.find("? \"built-in SMA\" :") == std::string::npos);
+    CHECK(src.find("strat_key.empty() ? kBuiltinStrategyKey : ts->strat_key") !=
+          std::string::npos);
+}

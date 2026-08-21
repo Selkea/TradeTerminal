@@ -3133,7 +3133,19 @@ std::string App::build_diag_json() {
                 psrc != live_param_source_.end())
                 e["params_source"] = psrc->second;
         if (const TradeSymbol* ts = strat_for(ss.symbol)) {
-            e["strategy"] = ts->strat_key.empty() ? "built-in SMA" : ts->strat_key;
+            // NAME THE STRATEGY THAT ACTUALLY RAN. "" is not a separate built-in
+            // any more — App::acquire_strategy maps it to kBuiltinStrategyKey
+            // ("sma_crossover.cpp"), a real promoted strategy that sizes off
+            // ctx.budget() like every other one. The old literal survived that
+            // merge and made /diag report a strategy which no longer exists.
+            //
+            // Not cosmetic: on 2026-08-20 this label alone led an analysis of a
+            // live session to conclude SOXL was running a fixed-qty demo that
+            // bypassed risk sizing. The log said "SOXL: SMA(dll)" — the truth —
+            // and /diag said "built-in SMA". Same family as the journal's
+            // mode='sim' (0.31.3): a display string left behind by a refactor,
+            // in a field someone reads to decide whether something is wrong.
+            e["strategy"] = ts->strat_key.empty() ? kBuiltinStrategyKey : ts->strat_key;
             if (!engine_.live_running() || ss.params.empty())
                 e["params"] = ts->params;   // not live yet: config is all there is
             else if (ts->params != ss.params)
