@@ -346,8 +346,9 @@ void StrategyManagerPanel::draw(bool* open) {
             start_build(
                 (fs::path(dir_) / files_[static_cast<size_t>(build_sel_)]).string());
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Compile + hot-load into a tab. Compiler output is in "
-                              "the Build Output window (View menu).");
+        ImGui::SetItemTooltip("Compile this strategy and load it without restarting.\n"
+                              "Compiler messages appear in the Build Output window "
+                              "(View menu)");
     }
     ImGui::Separator();
 
@@ -452,8 +453,8 @@ void StrategyManagerPanel::draw_strategy_tab(const std::string& key,
         else tourn_excluded_.erase(key);
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Skip this strategy when a tournament / auto-pick / autopilot "
-                          "chooses the best strategy for a symbol.");
+        ImGui::SetTooltip("Never pick this strategy automatically.\n"
+                          "It stays available to select by hand");
     ImGui::Separator();
 
     if (mod) {

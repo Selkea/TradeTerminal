@@ -307,12 +307,13 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                                           ImGui::GetStyle().WindowPadding.x - 6.0f));
         ImGui::SetNextItemWidth(combo_w);
         ImGui::Combo("data", &data_idx_, kData, IM_ARRAYSIZE(kData));
-        ImGui::SetItemTooltip("IBKR (web): ~250 ms conflated top-of-book via the CP "
-                              "gateway session — no extra data bill.\n"
-                              "Polygon: full tick stream, needs a Polygon key.\n"
-                              "Finnhub: real-time US trade prints, free key.\n"
-                              "IBKR (TWS): tick-by-tick via IB Gateway's socket API "
-                              "(real-time needs a market-data subscription).");
+        ImGui::SetItemTooltip("Where live prices come from.\n"
+                              "IBKR (web): best bid/ask only, about 250 ms behind. "
+                              "No extra data bill.\n"
+                              "Polygon: every trade. Needs a Polygon key.\n"
+                              "Finnhub: every US trade. Free key.\n"
+                              "IBKR (TWS): every trade, via IB Gateway. Real time "
+                              "needs a market-data subscription.");
         if (data_idx_ == 1 && !polygon_available)
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.2f, 1), "data feed needs a Polygon key");
         else if (data_idx_ == 2 && !finnhub_available)
@@ -331,10 +332,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         ImGui::SetNextItemWidth(90);
         ImGui::Combo("route", &route_, kRoutes, IM_ARRAYSIZE(kRoutes));
         ImGui::SetItemTooltip(
-            "Which IBKR interface orders use.\n"
-            "Web API: the Client Portal gateway (~75 ms orders; auto-login).\n"
-            "TWS: IB Gateway's socket API (~5-20 ms orders; needs IB Gateway "
-            "running and logged in, port 4002 paper / 4001 live).");
+            "Where orders are sent.\n"
+            "Web API: Client Portal gateway. About 75 ms, logs in by itself.\n"
+            "TWS: IB Gateway. About 5-20 ms, but IB Gateway must already be "
+            "running and logged in (port 4002 paper, 4001 live).");
 
         // Shared cash pool for the simulator. A real IBKR account uses its own
         // balance; with sub-accounts, each symbol picks one instead (below).
@@ -455,9 +456,9 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::SetItemTooltip("Strategy this symbol trades");
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Auto-pick") && autopick) autopick(r.symbol);
-                    ImGui::SetItemTooltip("Tournament: optimize every loaded strategy on "
-                                          "recent data (Optimizer panel's settings) and "
-                                          "apply the best holdout score here");
+                    ImGui::SetItemTooltip("Try every strategy on recent data and apply the "
+                                          "winner to this symbol.\n"
+                                          "Uses the Optimizer panel's settings.");
                     // This symbol's own copy of the strategy's parameters.
                     const std::vector<StratParam> specs = strat_params(r.strat_key);
                     if (!specs.empty() && ImGui::CollapsingHeader("Parameters")) {
@@ -480,11 +481,11 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                     ImGui::Combo("autopilot", &r.ap_mode, kApModes,
                                  IM_ARRAYSIZE(kApModes));
                     ImGui::SetItemTooltip(
-                        "Re-optimize this symbol while it trades (applied only while "
-                        "flat, holdout-scored with hysteresis).\n"
-                        "Params: re-tune the current strategy's parameters.\n"
-                        "Full: params + the strategy itself can be swapped when a "
-                        "challenger wins decisively twice in a row.");
+                        "Keep re-optimizing this symbol while it trades. Changes are "
+                        "only applied when the symbol is flat.\n"
+                        "Params: re-tune the current strategy's numbers.\n"
+                        "Full: may also switch strategy, but only after a challenger "
+                        "wins clearly twice in a row.");
                     if (r.ap_mode > 0) {
                         ImGui::SameLine();
                         ImGui::SetNextItemWidth(90);
@@ -512,30 +513,38 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputDouble("max order qty", &r.risk.max_order_qty, 0, 0,
                                            "%.0f");
+                        ImGui::SetItemTooltip("Largest number of shares a single order "
+                                              "may be for. Bigger orders are refused");
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputDouble("max position qty", &r.risk.max_position_qty, 0,
                                            0, "%.0f");
+                        ImGui::SetItemTooltip("Most shares this symbol may hold at once. "
+                                              "Orders that would exceed it are refused");
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputDouble("daily max loss $", &r.risk.daily_max_loss, 0, 0,
                                            "%.0f");
-                        ImGui::SetItemTooltip("Kill switch when this symbol's equity drops "
-                                              "this much below the session start. 0 = off");
+                        ImGui::SetItemTooltip("Flatten and halt this symbol if it loses "
+                                              "this many dollars from where the session "
+                                              "started. 0 = off");
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputDouble("max drawdown %", &r.risk_dd_pct, 0, 0, "%.1f");
-                        ImGui::SetItemTooltip("Kill switch this far below the session equity "
-                                              "high. 0 = off");
+                        ImGui::SetItemTooltip("Flatten and halt this symbol if it falls "
+                                              "this far below its best point this "
+                                              "session. 0 = off");
                         ImGui::SetNextItemWidth(90);
                         ImGui::InputInt("stale feed sec", &r.risk.stale_feed_sec);
-                        ImGui::SetItemTooltip("Kill switch when no ticks arrive for this "
-                                              "long while a position is open. 0 = off");
+                        ImGui::SetItemTooltip("Flatten and halt if no prices arrive for "
+                                              "this many seconds while a position is "
+                                              "open. 0 = off");
                         r.risk.stale_feed_sec = std::max(0, r.risk.stale_feed_sec);
                         r.risk_dd_pct = std::clamp(r.risk_dd_pct, 0.0, 99.0);
                         ImGui::Checkbox("hold — don't halt", &r.risk.disable_auto_halt);
-                        ImGui::SetItemTooltip("Don't auto-flatten on the daily-loss / drawdown "
-                                              "limits — hold positions until the strategy "
-                                              "exits or they recover. The size cap and "
-                                              "stale-feed guard still apply. Removes the "
-                                              "session's daily-loss safety net.");
+                        ImGui::SetItemTooltip("Turns OFF the two loss limits above for this "
+                                              "symbol.\n"
+                                              "Positions are held until the strategy exits "
+                                              "them or they recover.\n"
+                                              "The size caps and stale-feed guard still "
+                                              "apply.");
                     }
                     ImGui::PopID();
                     ImGui::EndTabItem();
@@ -832,9 +841,10 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     }
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("Lmt", &manual_lmt_, 0, 0, "%.2f");
-    ImGui::SetItemTooltip("Limit price. 0 = a marketable limit auto-computed from the quote "
-                          "(buy the ask, sell the bid). Every manual order routes as an "
-                          "outside-RTH limit, so it fills in regular AND extended hours.");
+    ImGui::SetItemTooltip("Limit price. 0 = take the current quote (buy at the ask, sell "
+                          "at the bid).\n"
+                          "Manual orders are always sent as limits that stay valid outside "
+                          "regular hours.");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(70);
     ImGui::InputDouble("TP", &manual_tp_, 0, 0, "%.2f");

@@ -71,15 +71,17 @@ void ReplayPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     ImGui::SetNextItemWidth(70);
     ImGui::InputInt("bar sec", &bar_sec_, 0, 0);
     bar_sec_ = std::max(0, bar_sec_);
-    ImGui::SetItemTooltip("Re-bar the recording at this many seconds for on_bar "
-                          "strategies. 0 = use the size it was recorded with.");
+    ImGui::SetItemTooltip("Group the recorded prices into bars this many seconds long.\n"
+                          "0 = keep the size it was recorded with");
 
     ImGui::BeginDisabled(eng_.running());
     if (ImGui::Button("Replay", ImVec2(-1, 0)) && replay)
         replay(sessions_dir_ + "\\" + files_[file_idx_], bar_sec_, strat_key_, cash_);
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("Re-run these captured ticks through the strategy + fill "
-                          "simulator (deterministic; results land in Backtest)");
+    ImGui::SetItemTooltip("Run the recorded prices through the strategy and the fill "
+                          "simulator.\n"
+                          "Same input always gives the same result. Results appear in "
+                          "the Backtest panel");
 
     ImGui::End();
 }
