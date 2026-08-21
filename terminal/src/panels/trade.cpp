@@ -587,6 +587,28 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
             def_bar_sec_ = pending_.back().bar_sec;
             def_record_ = pending_.back().record;
             def_risk_ = pending_.back().risk;
+            // ...EXCEPT the one field that is not a setting.
+            //
+            // 0.34.4. `disable_auto_halt` ("hold — don't halt") is an OPT-OUT
+            // FROM A SAFETY NET: its own tooltip says it removes the session's
+            // daily-loss net. app.cpp aggregates session_risk.daily_max_loss and
+            // max_drawdown_pct ONLY over symbols that do NOT carry it, so if
+            // every symbol carries it those limits stay 0 and the equity kill
+            // switch — the one that caught the $2000 day on 2026-07-28 — is
+            // simply gone.
+            //
+            // Inheriting it is how one deliberate exemption became a silent
+            // session-wide one. This latch re-reads the LAST tab every frame and
+            // set_lineup stamps def_risk_ onto EVERY row of the next lineup, so
+            // checking the box on one tab disarmed the halt for all six symbols
+            // at the next daily rebuild, with nothing logged and nothing shown.
+            // It also silently disabled the unreachable-time-stop gate at all
+            // three of its call sites, since time_stop_reachable returns true
+            // unconditionally on this flag.
+            //
+            // A default may never be an opt-out from a safety net. Deliberate
+            // per-symbol choices are made per symbol.
+            def_risk_.disable_auto_halt = false;
             def_risk_dd_pct_ = pending_.back().risk_dd_pct;
             def_strat_key_ = pending_.back().strat_key;
             def_ap_mode_ = pending_.back().ap_mode;

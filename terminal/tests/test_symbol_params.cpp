@@ -529,6 +529,50 @@ TEST_CASE("the autopilot judges a fit the way the other two gates do") {
     CHECK(src.find("\" fit in a trading day at this bar size)") != std::string::npos);
 }
 
+TEST_CASE("the hold-until-flat exemption is never inherited by a new tab") {
+    // 0.34.4, found by an adversarial review of 0.34.1 rather than by anything
+    // going wrong. TradePanel re-latches def_risk_ from the LAST tab every
+    // frame, and set_lineup stamps def_risk_ onto EVERY row it builds. So
+    // checking "hold — don't halt" on one tab propagated it to all six symbols
+    // at the next daily lineup rebuild.
+    //
+    // That is not one setting leaking. app.cpp aggregates
+    // session_risk.daily_max_loss and max_drawdown_pct ONLY over symbols without
+    // the flag, so once every symbol carries it those limits stay 0 and the
+    // session equity kill switch is gone — the one that halted the $2000 day on
+    // 2026-07-28. And time_stop_reachable returns true unconditionally on the
+    // flag, so all THREE unreachable-time-stop gates go quiet at once: not
+    // refusing anything, and not saying they stopped.
+    //
+    // Source-text: nothing in the suite constructs a TradePanel, and trade.h
+    // pulls ImGui. The unit half of the rule is the case above, which already
+    // proves time_stop_reachable exempts on the flag — what cannot be reached
+    // any other way is whether the flag ARRIVES by inheritance.
+    const std::string path =
+        std::string(TT_REPO_DIR) + "/terminal/src/panels/trade.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+
+    // The latch must clear it, immediately after copying the rest.
+    const size_t copy = src.find("def_risk_ = pending_.back().risk;");
+    const size_t clear = src.find("def_risk_.disable_auto_halt = false;");
+    REQUIRE(copy != std::string::npos);
+    REQUIRE(clear != std::string::npos);
+    CHECK(copy < clear);
+    // ...and it must be the ONLY latch, so every construction site that spreads
+    // def_risk_ (add_symbol, set_lineup, the add-tab path) is covered by it.
+    CHECK(src.find("def_risk_ = pending_.back().risk;", copy + 1) == std::string::npos);
+
+    // The per-tab checkbox stays: this is a real choice, made per symbol.
+    CHECK(src.find("Checkbox(\"hold — don't halt\", &r.risk.disable_auto_halt)") !=
+          std::string::npos);
+    // And restoring the operator's SAVED per-tab choice is not inheritance.
+    CHECK(src.find("r.risk.disable_auto_halt = ts.risk_disable_halt;") !=
+          std::string::npos);
+}
+
 TEST_CASE("the two quiet verdicts are the ones where nothing is exposed") {
     const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
     std::ifstream in(path, std::ios::binary);
