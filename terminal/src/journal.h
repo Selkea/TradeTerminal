@@ -15,6 +15,32 @@ struct sqlite3;
 
 namespace tt::ui {
 
+// WHICH BROKER ACTUALLY PLACED THESE ORDERS. This is the one field in the
+// authoritative trade record that separates "this was real" from "this was a
+// rehearsal", and it was wrong for every live session on the TWS route.
+//
+// The call site read `ibkr_ ? "ibkr" : "sim"` — a ternary written when IBKR's
+// Client-Portal gateway was the only real route. When the TWS socket route was
+// added it became the VPS's ONLY route, and `ibkr_` is null on it, so every
+// session since 2026-07-08 was journalled as a SIMULATION while placing real
+// orders against the paper account. 107 sessions, and the line immediately
+// below the ternary already handled `tws_` explicitly, so the omission was
+// invisible in review.
+//
+// Why it matters more than a label: journal.db is the only place a fill carries
+// a symbol, so it is what a post-mortem reads. Reading mode='sim' after an
+// incident says "no orders reached the market" — the exact wrong conclusion
+// about the 2026-08-13 phantom position, and the exact wrong conclusion about
+// any future one.
+//
+// Free function taking bools rather than another inline ternary so it can be
+// tested: nothing in the suite constructs an App.
+inline const char* live_broker_mode(bool has_tws, bool has_ibkr) {
+    if (has_tws) return "tws";      // real orders, TWS socket route
+    if (has_ibkr) return "ibkr";    // real orders, Client-Portal gateway route
+    return "sim";                   // no broker: the internal simulator
+}
+
 class TradeJournal {
 public:
     ~TradeJournal();

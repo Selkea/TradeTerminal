@@ -10,6 +10,8 @@
 #include "journal.h"
 
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using tt::ui::TradeJournal;
@@ -89,4 +91,40 @@ TEST_CASE("an open session (no end_session) reports open and zero PnL") {
         CHECK(fills[0].qty == doctest::Approx(5.0));
     }
     for (const char* s : {"", "-wal", "-shm"}) std::remove((db + s).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// WHICH BROKER PLACED THE ORDERS — the field that separates a real session from
+// a rehearsal, and the field that was wrong for 107 consecutive sessions.
+
+TEST_CASE("journal mode: the TWS route is a REAL broker, not a simulation") {
+    // THE DEFECT, found on 2026-08-20 by reading the day's journal. The call
+    // site was `ibkr_ ? "ibkr" : "sim"`, written when the Client-Portal gateway
+    // was the only real route. The TWS socket route is the VPS's ONLY route and
+    // leaves ibkr_ null, so every live session since 2026-07-08 was journalled
+    // as a SIMULATION while placing real orders against the paper account.
+    CHECK(std::string(tt::ui::live_broker_mode(true, false)) == "tws");
+    CHECK(std::string(tt::ui::live_broker_mode(false, true)) == "ibkr");
+    // Only the absence of BOTH is a simulation.
+    CHECK(std::string(tt::ui::live_broker_mode(false, false)) == "sim");
+    // Belt and braces: a real broker must never report "sim", whichever it is.
+    for (int t = 0; t < 2; ++t)
+        for (int i = 0; i < 2; ++i)
+            if (t || i)
+                CHECK(std::string(tt::ui::live_broker_mode(t != 0, i != 0)) != "sim");
+}
+
+TEST_CASE("journal mode: the call site asks about BOTH brokers") {
+    // SOURCE-TEXT PIN. Nothing in the suite constructs an App, so the function
+    // above can be right while the call site still ignores tws_ — which is
+    // precisely the state this defect lived in for six weeks, one line above a
+    // statement that DID handle tws_ correctly.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    CHECK(src.find("ibkr_ ? \"ibkr\" : \"sim\"") == std::string::npos);
+    CHECK(src.find("live_broker_mode(tws_ != nullptr, ibkr_ != nullptr)") !=
+          std::string::npos);
 }

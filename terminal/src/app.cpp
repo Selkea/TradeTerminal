@@ -3624,8 +3624,8 @@ int App::tick() {
         // arm a re-anchor below once reconciliation completes. Otherwise (sim /
         // ibkr) the starting equity IS the baseline; leave it alone.
         const LiveSnapshot s0 = engine_.live_snapshot();
-        journal_session_ =
-            journal_.begin_session(jsyms, ibkr_ ? "ibkr" : "sim", s0.equity);
+        journal_session_ = journal_.begin_session(
+            jsyms, live_broker_mode(tws_ != nullptr, ibkr_ != nullptr), s0.equity);
         journal_baseline_pending_ =
             (tws_ && tws_->reconciles()) || (ibkr_ && ibkr_->reconciles());
     }
