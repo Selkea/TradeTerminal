@@ -220,10 +220,24 @@ public:
     // Persisted session schedule: auto start/stop times ("HH:MM", local clock,
     // weekdays only). The stop flattens via the kill switch.
     bool sched_on() const { return sched_on_; }
+    // THE STOP HALF, gated independently of the start half. One flag used to arm
+    // both, so "stop the session on a clock" could not be had without also
+    // arming a timed auto-start — and on the VPS, where the daily lineup starts
+    // the session, that made the schedule unusable: trade_sched_on stayed false,
+    // nothing on any clock ended the day, and the 16:15 session-guard backstop
+    // had to end it every single day.
+    bool sched_stop_on() const { return sched_stop_on_; }
+    // Direct access for Settings > Trade, which now owns these controls. ImGui
+    // binds to storage, so the panel hands out its own rather than the menu
+    // keeping a mirror — a mirror is a second source of truth for the value
+    // that decides when trading stops.
+    bool& sched_stop_on_ref() { return sched_stop_on_; }
+    char* sched_stop_buf() { return sched_stop_; }
+    size_t sched_stop_buf_size() const { return sizeof sched_stop_; }
     std::string sched_start() const { return sched_start_; }
     std::string sched_stop() const { return sched_stop_; }
     void restore_schedule(bool on, const std::string& start, const std::string& stop,
-                          int blocked_day = -1);
+                          int blocked_day = -1, bool stop_on = false);
     // tm_yday the lineup blocked the auto-start on; -1 = not blocked. Persisted
     // so a restart cannot resurrect a session the lineup refused.
     int sched_blocked_day() const { return sched_blocked_day_; }
@@ -280,6 +294,7 @@ private:
 
     // Session schedule (persisted: sched_on_ + the two "HH:MM" strings).
     bool sched_on_ = false;
+    bool sched_stop_on_ = false;
     char sched_start_[8] = "09:25";
     char sched_stop_[8] = "15:55";
     int sched_last_start_day_ = -1;   // tm_yday: one auto-start per day

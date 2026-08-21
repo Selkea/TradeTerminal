@@ -578,7 +578,8 @@ App::App(std::string gateway_url)
     trade_.restore(cfg_.trade_cash, cfg_.trade_bar_sec, cfg_.trade_data_idx,
                    cfg_.trade_record, cfg_.trade_route);
     trade_.restore_schedule(cfg_.trade_sched_on, cfg_.trade_sched_start,
-                            cfg_.trade_sched_stop, cfg_.trade_sched_blocked_day);
+                            cfg_.trade_sched_stop, cfg_.trade_sched_blocked_day,
+                            cfg_.trade_sched_stop_on);
     if (!cfg_.lineup_build_time.empty() &&
         cfg_.lineup_build_time.size() < sizeof lineup_build_buf_)
         std::snprintf(lineup_build_buf_, sizeof lineup_build_buf_, "%s",
@@ -2739,6 +2740,7 @@ void App::save_config() {
     cfg_.trade_record = trade_.record();
     cfg_.trade_route = trade_.route();
     cfg_.trade_sched_on = trade_.sched_on();
+    cfg_.trade_sched_stop_on = trade_.sched_stop_on();
     cfg_.trade_sched_start = trade_.sched_start();
     cfg_.trade_sched_stop = trade_.sched_stop();
     cfg_.trade_sched_blocked_day = trade_.sched_blocked_day();
@@ -3741,7 +3743,10 @@ int App::tick() {
         // The scheduled stop goes through the App, not the engine, so the TWS
         // adapter is actually torn down at 15:55 instead of holding the fixed
         // orders client id until the next morning's start collided with it.
-        [this] { safe_stop_live(); });
+        // The scheduled stop fires inside market hours, so "Flatten on stop"
+        // means what it says here: kill switch, or a graceful stop that leaves
+        // the position and its resting orders for the next session to adopt.
+        [this] { safe_stop_live(!cfg_.trade_flatten_on_stop); });
 
     // Daily-lineup auto-start: a scheduled (non-propose-only) build reached Done,
     // so start the live session through the exact path the Start button uses.
@@ -5438,7 +5443,17 @@ void App::pump_session_guard() {
     // the next session's reconcile-and-adopt, which is the same mechanism the
     // lineup swap already depends on. The point of this guard is to end an
     // unattended SESSION, not to liquidate into a closed market.
-    safe_stop_live(true);
+    // "Flatten on stop" reaches here, but ONLY while the exchange is actually
+    // open — which at close + kSessionEndLagH it never is, so in practice this
+    // still keeps positions and everything above still holds. The flag is
+    // honoured rather than ignored because the guard is not guaranteed to fire
+    // after the close: session_end_h follows the DAY's real close, and a human
+    // who starts a session on a non-trading day, or any future change to the
+    // lag, could put this branch inside market hours. Then flattening is what
+    // the operator asked for and is safe. Liquidating into a shut exchange
+    // never is, whatever the switch says.
+    const bool market_open = rth_open_elapsed_ms(tm) > 0;
+    safe_stop_live(!(cfg_.trade_flatten_on_stop && market_open));
 }
 
 void App::pump_history_watchdog() {
@@ -6105,6 +6120,42 @@ void App::draw_menu_bar() {
             "On: after the daily build, start trading the picks automatically.\n"
             "Off (default): build + log the picks only — you start the session.");
         ImGui::EndDisabled();
+
+        ImGui::Separator();
+        // AUTO-STOP, armed independently of the timed auto-start. These used to
+        // be one checkbox and two time boxes beside the Start button in the
+        // Trade panel, and one flag armed both halves — so ending the day on a
+        // clock could only be had together with a 09:25 auto-start. On a box
+        // where the daily lineup starts the session that is not a trade anyone
+        // wants to make, which is why trade_sched_on has sat false and the
+        // 16:15 session-guard backstop has ended every single day.
+        ImGui::MenuItem("Auto-stop the session", nullptr, &trade_.sched_stop_on_ref());
+        ImGui::SetItemTooltip(
+            "Stop the live session at the time below (local clock, weekdays).\n"
+            "Independent of any auto-start: arming this does not arm that.\n\n"
+            "Leaving it off does not mean the session runs forever — the guard\n"
+            "still ends it shortly after the close. It means the day ends on the\n"
+            "backstop rather than on a time you chose.");
+        ImGui::BeginDisabled(!trade_.sched_stop_on_ref());
+        ImGui::SetNextItemWidth(52);
+        ImGui::InputText("stop time", trade_.sched_stop_buf(),
+                         trade_.sched_stop_buf_size());
+        ImGui::SetItemTooltip("Local clock, HH:MM (24h). 15:55 leaves a few minutes\n"
+                              "before the close for a flatten to actually fill.");
+        ImGui::EndDisabled();
+
+        ImGui::MenuItem("Flatten on stop", nullptr, &cfg_.trade_flatten_on_stop);
+        ImGui::SetItemTooltip(
+            "On (default): a scheduled stop runs the kill switch - cancel every\n"
+            "order, flatten every position, end the day flat.\n\n"
+            "Off: the session stops but positions and their resting stop/TP\n"
+            "orders are LEFT LIVE at the broker, to be re-adopted by the next\n"
+            "session. That is the hold-until-flat behaviour a restart relies on.\n\n"
+            "Never applies while the exchange is shut: cancelling a resting stop\n"
+            "and sending a market order that cannot fill until the next open\n"
+            "leaves the position naked overnight, which is strictly worse than\n"
+            "carrying it (2026-08-06, $846).");
+
         ImGui::PopItemFlag();   // paired with the PushItemFlag above the toggles
         ImGui::EndMenu();
     }

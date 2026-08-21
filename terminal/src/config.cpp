@@ -30,6 +30,8 @@ AppConfig AppConfig::load(const std::string& path) {
     c.trade_record = j.value("trade_record", c.trade_record);
     c.trade_route = j.value("trade_route", c.trade_route);
     c.trade_sched_on = j.value("trade_sched_on", c.trade_sched_on);
+    c.trade_sched_stop_on = j.value("trade_sched_stop_on", c.trade_sched_stop_on);
+    c.trade_flatten_on_stop = j.value("trade_flatten_on_stop", c.trade_flatten_on_stop);
     c.trade_sched_start = j.value("trade_sched_start", c.trade_sched_start);
     c.trade_sched_stop = j.value("trade_sched_stop", c.trade_sched_stop);
     c.trade_sched_blocked_day =
@@ -140,6 +142,8 @@ void AppConfig::save(const std::string& path) const {
         {"trade_record", trade_record},
         {"trade_route", trade_route},
         {"trade_sched_on", trade_sched_on},
+        {"trade_sched_stop_on", trade_sched_stop_on},
+        {"trade_flatten_on_stop", trade_flatten_on_stop},
         {"trade_sched_start", trade_sched_start},
         {"trade_sched_stop", trade_sched_stop},
         {"trade_sched_blocked_day", trade_sched_blocked_day},

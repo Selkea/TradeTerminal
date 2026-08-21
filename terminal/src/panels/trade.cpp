@@ -23,8 +23,10 @@ int parse_hhmm(const char* s) {
 } // namespace
 
 void TradePanel::restore_schedule(bool on, const std::string& start,
-                                  const std::string& stop, int blocked_day) {
+                                  const std::string& stop, int blocked_day,
+                                  bool stop_on) {
     sched_on_ = on;
+    sched_stop_on_ = stop_on;
     // A refusal to trade must outlive a restart. The VPS reboots and relaunches
     // unattended, and the auto-start is level-triggered anywhere inside the
     // session window — so an in-memory-only block would be undone by any restart
@@ -204,7 +206,9 @@ TradePanel::StartOpts TradePanel::build_start_opts(const AccountInfo& account,
 // the declaration for the incident). Touches no ImGui — there is no frame here.
 void TradePanel::pump_schedule(const ScheduledStartFn& start,
                                const ScheduledStopFn& stop) {
-    if (!sched_on_) return;
+    // Either half armed is reason to run: the start branch tests sched_on_ and
+    // the stop branch tests sched_stop_on_, so arming one never arms the other.
+    if (!sched_on_ && !sched_stop_on_) return;
     std::time_t now_tt = std::time(nullptr);
     std::tm tm{};
     localtime_s(&tm, &now_tt);
@@ -225,7 +229,8 @@ void TradePanel::pump_schedule(const ScheduledStartFn& start,
         // crossing, so the stop is not merely late — it never fires at all.
         const int stop_min = parse_hhmm(sched_stop_);
         sched_last_start_day_ = tm.tm_yday;
-        if (stop_min >= 0 && sched_prev_min_ >= 0 && sched_prev_min_ < stop_min &&
+        if (sched_stop_on_ && stop_min >= 0 && sched_prev_min_ >= 0 &&
+            sched_prev_min_ < stop_min &&
             now_min >= stop_min) {
             // App::safe_stop_live: kill switch + stop_live + REAP THE BROKER.
             // Calling the engine directly left the TWS adapter connected all
@@ -245,7 +250,7 @@ void TradePanel::pump_schedule(const ScheduledStartFn& start,
     // Auto-start: level-triggered inside the window so a reboot mid-morning
     // still brings the session up; the once-per-day guard (also set while a
     // session runs, above) keeps a manual stop from bouncing right back.
-    if (pending_.empty() || !start || eng_.running()) return;
+    if (!sched_on_ || pending_.empty() || !start || eng_.running()) return;
     const int start_min = parse_hhmm(sched_start_);
     const int stop_min = parse_hhmm(sched_stop_);
     const bool weekday = tm.tm_wday >= 1 && tm.tm_wday <= 5;
@@ -599,26 +604,15 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
         if (ImGui::Button("Start Trading") && !pending_.empty() && start) do_start();
         ImGui::EndDisabled();
 
-        // ---- session schedule (auto start/stop, local time, weekdays) ----
-        ImGui::SameLine();
-        ImGui::Checkbox("auto", &sched_on_);
-        ImGui::SetItemTooltip(
-            "Start the session at the first time and stop it at the second\n"
-            "(local clock, weekdays only). The stop cancels orders and flattens\n"
-            "positions via the kill switch. A manually stopped session does not\n"
-            "auto-restart the same day.");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(48);
-        ImGui::InputText("##schedstart", sched_start_, sizeof sched_start_);
-        ImGui::SameLine();
-        ImGui::TextUnformatted("-");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(48);
-        ImGui::InputText("##schedstop", sched_stop_, sizeof sched_stop_);
-
-        // The schedule ITSELF lives in pump_schedule(), off App::tick(). Only its
-        // controls are here: a scheduler that runs from draw() is one an operator
-        // switches off by clicking a neighbouring dock tab.
+        // The schedule's CONTROLS now live in Settings > Trade; only its status
+        // is shown here. They were a checkbox and two 48px time boxes wedged
+        // beside the Start button, which is the wrong home for a setting you
+        // touch once: it put an armed/disarmed scheduler one stray click from
+        // being flipped, in the panel you are looking at while trading.
+        //
+        // The schedule ITSELF lives in pump_schedule(), off App::tick(). It was
+        // never driven from draw(): a scheduler that runs from draw() is one an
+        // operator switches off by clicking a neighbouring dock tab.
         if (sched_on_) {
             std::time_t now_tt = std::time(nullptr);
             std::tm tm{};
@@ -657,7 +651,7 @@ void TradePanel::draw(bool* open, const std::vector<std::string>& strat_sources,
     }
     ImGui::SameLine();
     ImGui::Text("   equity %.2f   cash %.2f", s.equity, s.cash);
-    if (sched_on_) {
+    if (sched_stop_on_) {
         ImGui::SameLine();
         ImGui::TextDisabled("(auto-stop %s)", sched_stop_);
     }

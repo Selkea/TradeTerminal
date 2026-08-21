@@ -46,6 +46,17 @@ struct AppConfig {
     int trade_route = 0;         // order route: 0 IBKR web API, 1 TWS socket
     // Session schedule: auto start/stop ("HH:MM", local clock, weekdays).
     bool trade_sched_on = false;
+    // The STOP half of the session schedule, armed independently of the start
+    // half. Before this, one flag armed both, so ending the day on a clock was
+    // only available together with a timed auto-start — unusable on a box where
+    // the daily lineup starts the session, which is why trade_sched_on has sat
+    // false and the 16:15 session-guard backstop has ended every day.
+    bool trade_sched_stop_on = false;
+    // Does a scheduled stop CLOSE the book? The scheduled stop has always
+    // flattened (safe_stop_live defaults keep_positions=false); the session
+    // guard has always kept positions for restart re-adoption. This one switch
+    // now decides for both, so "how does my day end" has a single answer.
+    bool trade_flatten_on_stop = true;
     std::string trade_sched_start = "09:25";
     std::string trade_sched_stop = "15:55";
     // tm_yday the daily lineup refused to start a session on (-1 = none). The

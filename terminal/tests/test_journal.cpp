@@ -146,3 +146,80 @@ TEST_CASE("diag names the strategy that ran, not one that no longer exists") {
     CHECK(src.find("strat_key.empty() ? kBuiltinStrategyKey : ts->strat_key") !=
           std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// 0.33.0: AUTO-STOP AND FLATTEN-ON-STOP (Settings > Trade).
+//
+// Source-text pins throughout: the schedule needs a wall clock and a live
+// broker, and nothing in the suite constructs an App or a TradePanel.
+
+static std::string repo_file(const char* rel) {
+    const std::string path = std::string(TT_REPO_DIR) + rel;
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    return std::string{std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>()};
+}
+
+TEST_CASE("the schedule's stop half is armed independently of its start half") {
+    // One flag armed both, so ending the day on a clock was only available
+    // together with a timed auto-start. On a box where the daily lineup starts
+    // the session that is not a trade anyone makes — which is why the VPS ran
+    // trade_sched_on=false and the 16:15 guard ended every single day.
+    const std::string src = repo_file("/terminal/src/panels/trade.cpp");
+    CHECK(src.find("if (!sched_on_ || pending_.empty()") != std::string::npos);
+    CHECK(src.find("if (sched_stop_on_ && stop_min >= 0") != std::string::npos);
+    // The pump must run when EITHER is armed, or arming the stop alone would
+    // return on the first line and do nothing at all.
+    CHECK(src.find("if (!sched_on_ && !sched_stop_on_) return;") != std::string::npos);
+}
+
+TEST_CASE("flatten-on-stop never liquidates into a shut exchange") {
+    // THE ONE THAT MATTERS. The session guard fires at close + lag, and running
+    // the kill switch there CANCELS the resting protective stop and sends a
+    // market order that cannot fill until the next open — leaving the position
+    // naked overnight, strictly worse than carrying it (2026-08-06 orphan,
+    // $846). The switch is honoured, but gated on the exchange being open.
+    const std::string src = repo_file("/terminal/src/app.cpp");
+    CHECK(src.find("const bool market_open = rth_open_elapsed_ms(tm) > 0;") !=
+          std::string::npos);
+    CHECK(src.find("safe_stop_live(!(cfg_.trade_flatten_on_stop && market_open));") !=
+          std::string::npos);
+}
+
+TEST_CASE("the scheduled stop still reaps the broker, and honours the switch") {
+    // Both halves of one line: it must keep going through App::safe_stop_live
+    // (which reaps the TWS adapter — Engine::stop_live does not, and that left
+    // the fixed orders client id held overnight), and it must read the switch.
+    const std::string src = repo_file("/terminal/src/app.cpp");
+    CHECK(src.find("[this] { safe_stop_live(!cfg_.trade_flatten_on_stop); });") !=
+          std::string::npos);
+}
+
+TEST_CASE("the schedule's controls left the Trade panel") {
+    // They were a checkbox and two 48px time boxes beside the Start button — an
+    // armed/disarmed scheduler one stray click away, in the panel you look at
+    // while trading. Moved to Settings > Trade; only the status readout stays.
+    const std::string panel = repo_file("/terminal/src/panels/trade.cpp");
+    CHECK(panel.find("Checkbox(\"auto\", &sched_on_)") == std::string::npos);
+    CHECK(panel.find("##schedstart") == std::string::npos);
+    CHECK(panel.find("##schedstop") == std::string::npos);
+    // The read-only indicator remains, and now tracks the STOP flag.
+    CHECK(panel.find("if (sched_stop_on_) {") != std::string::npos);
+    // ...and the menu owns the controls.
+    const std::string app = repo_file("/terminal/src/app.cpp");
+    CHECK(app.find("\"Auto-stop the session\"") != std::string::npos);
+    CHECK(app.find("\"Flatten on stop\"") != std::string::npos);
+    CHECK(app.find("trade_.sched_stop_buf()") != std::string::npos);
+}
+
+TEST_CASE("both new switches are persisted") {
+    // A scheduler that forgets it was armed is worse than one never armed: the
+    // operator believes the day ends on a clock, and it does not.
+    const std::string cfg = repo_file("/terminal/src/config.cpp");
+    for (const char* k : {"trade_sched_stop_on", "trade_flatten_on_stop"}) {
+        const std::string key = k;
+        CHECK_MESSAGE(cfg.find("j.value(\"" + key + "\"") != std::string::npos, k);
+        CHECK_MESSAGE(cfg.find("{\"" + key + "\", " + key + "}") != std::string::npos, k);
+    }
+}

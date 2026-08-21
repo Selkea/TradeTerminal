@@ -337,5 +337,11 @@ TEST_CASE("the direct start path WAITS for its own socket to close") {
     // ...and the scheduled stop reaps the broker at 15:55, not at 09:25.
     const std::string sched = read_repo_file("/terminal/src/panels/trade.cpp");
     CHECK(sched.find("if (stop) stop();") != std::string::npos);
-    CHECK(src.find("[this] { safe_stop_live(); });") != std::string::npos);
+    // The invariant is WHICH function the scheduled stop calls, not how its
+    // argument is spelled: App::safe_stop_live reaps the broker, Engine::stop_live
+    // does not. Pinned as a prefix so adding the "Flatten on stop" argument
+    // (0.33.0) does not read as the defect this test exists to catch — while a
+    // switch back to the engine still does.
+    CHECK(src.find("[this] { safe_stop_live(") != std::string::npos);
+    CHECK(src.find("[this] { engine_.stop_live(") == std::string::npos);
 }
