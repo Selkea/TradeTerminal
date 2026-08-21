@@ -144,6 +144,7 @@ add_executable(tt_terminal_tests
     tests/test_symbol_params.cpp
     tests/test_lineup_dryrun.cpp
     tests/test_tick_clock.cpp
+    tests/test_ui_tooltips.cpp
     src/panels/log_console.cpp
     src/journal.cpp
     src/config.cpp   # test_symbol_params round-trips per-symbol params through it

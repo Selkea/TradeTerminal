@@ -9,7 +9,7 @@ namespace tt::ui {
 // anchors to the tab even when the window itself is hidden behind another tab.
 inline void tab_drag_hint() {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip("Click and drag to move or undock this panel.");
+        ImGui::SetTooltip("Drag to move or undock this panel");
 }
 
 } // namespace tt::ui

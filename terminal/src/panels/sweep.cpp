@@ -85,10 +85,10 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
     ImGui::Combo("metric", &metric_, kSweepMetrics, IM_ARRAYSIZE(kSweepMetrics));
     ImGui::SameLine();
     ImGui::Checkbox("holdout", &use_holdout_);
-    ImGui::SetItemTooltip("Optimize on the older data only, then score the winner "
-                          "on the newest slice it never saw.\nIf the holdout number "
-                          "collapses vs the in-sample best, the parameters are "
-                          "overfit.");
+    ImGui::SetItemTooltip("Optimize on the older data only, then score the winner on the "
+                          "most recent slice it never saw.\n"
+                          "If that second score is far worse, the values are tuned to the "
+                          "past and unlikely to hold up.");
     ImGui::SameLine();
     ImGui::BeginDisabled(!use_holdout_);
     ImGui::SetNextItemWidth(60);
@@ -126,15 +126,17 @@ void SweepPanel::draw(bool* open, const std::vector<std::string>& strat_keys,
         std::snprintf(label, sizeof label, "Optimize (%d backtests)",
                       kSweepPasses * n_params * kSweepSteps);
         if (ImGui::Button(label) && run) run(make_request());
-        ImGui::SetItemTooltip("Coordinate descent over every declared parameter: each "
-                              "pass sweeps each param across its range with the others "
-                              "fixed at the best so far; pass 2 refines around the "
-                              "winner. The best values are applied to the strategy.");
+        ImGui::SetItemTooltip("Search for this strategy's best parameter values and "
+                              "apply them.\n"
+                              "Tries one parameter at a time, holding the others at the "
+                              "best found so far, then does a second, finer pass around "
+                              "the winner.");
         ImGui::SameLine();
         if (ImGui::Button("Tournament") && tournament) tournament(make_request());
-        ImGui::SetItemTooltip("Optimize EVERY loaded strategy (plus the built-in) on the "
-                              "same data and crown the best holdout score; the champion "
-                              "strategy + params are applied to this symbol's Trade tab.");
+        ImGui::SetItemTooltip("Optimize every strategy on the same data and pick the one "
+                              "that scores best on data it never saw.\n"
+                              "The winning strategy and its values are applied to this "
+                              "symbol's Trade tab.");
         ImGui::EndDisabled();
     }
 

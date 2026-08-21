@@ -6033,8 +6033,9 @@ void App::draw_data_modal() {
     static constexpr const char* kFeeds[] = {"Polygon", "Finnhub"};
     ImGui::SetNextItemWidth(280);
     ImGui::Combo("Provider", &signin_.provider, kFeeds, IM_ARRAYSIZE(kFeeds));
-    ImGui::SetItemTooltip("Real-time market-data source. The IBKR gateway is also a "
-                          "feed, needs no key, and is picked in the Trade panel.");
+    ImGui::SetItemTooltip("Which provider this key is for.\n"
+                          "IBKR can also supply prices, needs no key, and is chosen in "
+                          "the Trade panel instead.");
     ImGui::SetNextItemWidth(280);
     ImGui::InputText("Name", signin_.name, sizeof signin_.name);
     ImGui::SetItemTooltip("Label shown in the Data menu (e.g. \"data\")");
@@ -6119,9 +6120,9 @@ void App::draw_menu_bar() {
                             nullptr, false, ok && !busy))
             start_daily_lineup();
         ImGui::SetItemTooltip(
-            "Scan IBKR for high-volatility movers, rank by ATR%%, run the strategy "
-            "tournament on the top picks, and load them into the Trade tabs.\n"
-            "Requires the IBKR (TWS) data route with no live session running.");
+            "Pick today's symbols: scan IBKR for the biggest movers, try every "
+            "strategy on the top ones, and load the winners into the Trade tabs.\n"
+            "Needs the IBKR (TWS) data route, with no session running.");
 
         ImGui::Separator();
         // Sticky from here down, but NOT above it: "Build today's lineup" is a
@@ -6157,11 +6158,10 @@ void App::draw_menu_bar() {
         // 16:15 session-guard backstop has ended every single day.
         ImGui::MenuItem("Auto-stop the session", nullptr, &trade_.sched_stop_on_ref());
         ImGui::SetItemTooltip(
-            "Stop the live session at the time below (local clock, weekdays).\n"
-            "Independent of any auto-start: arming this does not arm that.\n\n"
-            "Leaving it off does not mean the session runs forever — the guard\n"
-            "still ends it shortly after the close. It means the day ends on the\n"
-            "backstop rather than on a time you chose.");
+            "Stop the live session at the time below, on weekdays.\n"
+            "Turning this on does NOT turn on the auto-start above.\n\n"
+            "Left off, the session still ends shortly after the close — just on\n"
+            "the safety backstop rather than a time you picked.");
         ImGui::BeginDisabled(!trade_.sched_stop_on_ref());
         ImGui::SetNextItemWidth(52);
         ImGui::InputText("stop time", trade_.sched_stop_buf(),
@@ -6172,15 +6172,12 @@ void App::draw_menu_bar() {
 
         ImGui::MenuItem("Flatten on stop", nullptr, &cfg_.trade_flatten_on_stop);
         ImGui::SetItemTooltip(
-            "On (default): a scheduled stop runs the kill switch - cancel every\n"
-            "order, flatten every position, end the day flat.\n\n"
-            "Off: the session stops but positions and their resting stop/TP\n"
-            "orders are LEFT LIVE at the broker, to be re-adopted by the next\n"
-            "session. That is the hold-until-flat behaviour a restart relies on.\n\n"
-            "Never applies while the exchange is shut: cancelling a resting stop\n"
-            "and sending a market order that cannot fill until the next open\n"
-            "leaves the position naked overnight, which is strictly worse than\n"
-            "carrying it (2026-08-06, $846).");
+            "What a scheduled stop does with open positions.\n\n"
+            "On (default): cancel every order, close every position, end flat.\n"
+            "Off: stop trading but leave positions and their stop/take-profit\n"
+            "orders live at the broker for the next session to pick up.\n\n"
+            "Ignored once the exchange is shut, where closing out would cancel\n"
+            "your stop and leave the position unprotected until the next open.");
 
         ImGui::PopItemFlag();   // paired with the PushItemFlag above the toggles
         ImGui::EndMenu();
@@ -6207,30 +6204,29 @@ void App::draw_menu_bar() {
             };
             const Row rows[] = {
                 {"Trades", &cfg_.notify_trades, AlertCategory::Trades,
-                 "Every live fill. The chattiest category by far, though a\n"
-                 "partially filled order pages once per burst, not once per fill."},
+                 "Every fill. The noisiest category by far, though an order that\n"
+                 "fills in pieces alerts once, not once per piece."},
                 {"Orders", &cfg_.notify_orders, AlertCategory::Orders,
-                 "Orders refused or rejected. A refused ENTRY is routine; a\n"
-                 "refused EXIT counts as Risk, not Orders, and stays on that switch."},
+                 "Orders the broker refused. A refused entry is routine; a refused\n"
+                 "EXIT is treated as Risk and stays on that switch instead."},
                 {"Risk", &cfg_.notify_risk, AlertCategory::Risk,
-                 "Risk halts, the kill switch, the EOD backstop, and any position\n"
-                 "left with nothing to close it.\n\n"
-                 "OFF MEANS NO PAGE when a position is naked. The event still\n"
-                 "happens and is still logged - you simply are not told."},
+                 "Loss limits, the kill switch, the end-of-day close-out, and any\n"
+                 "position left with nothing to close it.\n\n"
+                 "OFF = NO ALERT when a position is unprotected. It still happens\n"
+                 "and is still logged - you just are not told."},
                 {"Connection", &cfg_.notify_connection, AlertCategory::Connection,
-                 "Gateway, broker socket, data feed and client-id collisions.\n"
-                 "The nightly IBKR restart is routine and already stays quiet;\n"
-                 "what reaches you here is an outage that LASTED."},
+                 "Gateway, broker and data-feed outages.\n"
+                 "Brief drops stay quiet on their own; what reaches you here is an\n"
+                 "outage that lasted."},
                 {"Integrity", &cfg_.notify_integrity, AlertCategory::Integrity,
-                 "The app and the broker disagreeing about what is held, and\n"
+                 "The app and the broker disagreeing about what you hold, and\n"
                  "positions this session can neither see nor close.\n\n"
-                 "OFF MEANS NO PAGE when the book is wrong. On 2026-08-13 that\n"
-                 "state went unnoticed for four hours."},
+                 "OFF = NO ALERT when your position list is wrong."},
                 {"Lineup", &cfg_.notify_lineup, AlertCategory::Lineup,
-                 "The daily build - symbols excluded, a day refused outright -\n"
-                 "and the session guard that ends the trading day."},
+                 "The daily symbol build - what was picked, what was skipped, and\n"
+                 "the guard that ends the trading day."},
                 {"System", &cfg_.notify_system, AlertCategory::System,
-                 "Anything matching no category above."},
+                 "Anything that fits none of the categories above."},
             };
             for (const Row& r : rows) {
                 if (ImGui::MenuItem(r.label, nullptr, r.flag)) {
@@ -6255,11 +6251,11 @@ void App::draw_menu_bar() {
                 alerts_.set_muted(!alerts_on);
             ImGui::SetItemTooltip(
                 alerts_.has_webhook()
-                    ? "Master switch. Off silences the beep AND the webhook for\n"
-                      "every category, including any marked (!)."
-                    : "Beeps on halts/rejects/disconnects. Set \"alert_webhook\"\n"
-                      "in config.json (or TT_ALERT_WEBHOOK) to page a phone, e.g.\n"
-                      "an ntfy.sh topic URL.");
+                    ? "Master switch for everything below.\n"
+                      "Off silences both the beep and your phone, in every\n"
+                      "category - including any marked (!)."
+                    : "Currently beeps only. To also alert your phone, set\n"
+                      "\"alert_webhook\" in config.json to an ntfy.sh topic URL.");
             ImGui::PopItemFlag();   // paired with the PushItemFlag above
             ImGui::EndMenu();
         }
