@@ -295,6 +295,57 @@ inline std::string tws_duplicate_order_id_line(long tws_order_id, long next_id,
            "2026-08-13 (IB error " + std::to_string(kTwsDuplicateOrderId) + ").";
 }
 
+// THE OTHER TWO WAYS A SPENT ID COMES BACK, neither handled before 0.34.0.
+//
+// 103 is what IB answers when the colliding id belongs to an order it considers
+// finished. When the id belongs to an order that is still OPEN on this client,
+// placeOrder is a MODIFICATION request instead, and the refusal arrives as:
+//   104  the order being modified is already filled
+//   105  the replacement does not match the original (contract, side or type)
+// Same consequence as 103 in every way that matters — the placement did not
+// reach the market, and the mapping place() wrote for it has already overwritten
+// whatever sat at that id — but neither was in fatal_order_error, so neither
+// pushed a reject. The engine left the order Working forever and the only thing
+// that said anything was the AlertClass::None IB trace line, which by design
+// does not page. That is precisely the pre-0.22.0 103 behaviour, rebuilt under
+// two adjacent error codes and just as silent.
+//
+// Narrower than 103 but not unreachable: same contract, same side, same type
+// amends only price or quantity, which IB accepts SILENTLY — no error at all.
+// The guard for that is not here, it is place() refusing to spend a live id.
+inline constexpr int kTwsModifyFilledOrderId = 104;
+inline constexpr int kTwsModifyMismatchId = 105;
+
+// Did this placement collide with an id that was already spent? The three codes
+// share a consequence, so they share a handler: reject the local order so the
+// engine stops waiting, and drop the mapping the collision corrupted.
+inline constexpr bool tws_order_id_collision(int code) {
+    return code == kTwsDuplicateOrderId || code == kTwsModifyFilledOrderId ||
+           code == kTwsModifyMismatchId;
+}
+
+// 104/105's operator line. Carries kTwsDuplicateOrderIdTag deliberately: it is
+// the same fault with a different IB code, so it must classify, categorise and
+// COALESCE with 103 rather than opening a second burst key for one episode.
+inline std::string tws_modify_collision_line(int code, long tws_order_id,
+                                             long next_id, int our_client_id) {
+    return std::string(kTwsDuplicateOrderIdTag) + ": IB refused TWS order id " +
+           std::to_string(tws_order_id) + " on client " +
+           std::to_string(our_client_id) +
+           (code == kTwsModifyFilledOrderId
+                ? " because that id belongs to an order that is already FILLED"
+                : " because that id belongs to an open order this placement does "
+                  "not match") +
+           ", so the order NEVER REACHED THE MARKET. The id counter has been "
+           "advanced to " +
+           std::to_string(next_id) +
+           " and the order rejected so the engine stops waiting on it. This is "
+           "the 2026-08-13 paralysis under a different code - the colliding id "
+           "was live, not finished, so IB answered the placement as a "
+           "MODIFICATION (IB error " +
+           std::to_string(code) + ").";
+}
+
 // The account-wide high-water mark this session must not seed below.
 //
 // Pure, so the one rule that matters is testable without a gateway: the next id

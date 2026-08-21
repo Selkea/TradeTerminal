@@ -42,6 +42,8 @@ int64_t now_ms() {
 bool fatal_order_error(int code) {
     switch (code) {
     case 103:   // duplicate order id — the placement never reached the market
+    case 104:   // ...same, when the colliding id is an already-FILLED order
+    case 105:   // ...same, when it is an open order this placement does not match
     case 110:   // price out of range
     case 200:   // no security definition
     case 201:   // order rejected
@@ -329,18 +331,27 @@ struct TwsBroker::Io final : DefaultEWrapper {
             }
             return;
         }
-        if (errorCode == kTwsDuplicateOrderId) {
+        if (tws_order_id_collision(errorCode)) {
             // Mechanism B of 2026-08-13. The placement did NOT reach the market;
             // before 0.22.0 nothing said so — 103 was not in fatal_order_error,
             // so no reject was pushed and the engine left the order Working
             // forever while check_stuck muttered once after 15 s. The operator's
             // manual sell was refused this way for four hours.
             //
+            // 104/105 are the same fault when the colliding id belongs to an
+            // order still OPEN on this client: IB reads the placement as a
+            // modification and refuses it under those codes instead of 103.
+            // They were not in fatal_order_error until 0.34.0, so they rebuilt
+            // the pre-0.22.0 silence — see tws_order_id_collision().
+            //
             // Self-heal first: advance past the colliding id so the NEXT
             // placement has a chance. `id` is the TWS order id IB refused.
             next_tws_id = tws_advance_order_id(next_tws_id, static_cast<long>(id) + 1);
-            b.log(tws_duplicate_order_id_line(static_cast<long>(id), next_tws_id,
-                                              b.cfg_.client_id));
+            b.log(errorCode == kTwsDuplicateOrderId
+                      ? tws_duplicate_order_id_line(static_cast<long>(id), next_tws_id,
+                                                    b.cfg_.client_id)
+                      : tws_modify_collision_line(errorCode, static_cast<long>(id),
+                                                  next_tws_id, b.cfg_.client_id));
             // Then drop the mapping this collision would otherwise corrupt.
             // place() writes local_by_tws[tws_id] = local unconditionally, so a
             // reused id has already overwritten whatever the ADOPTED order at
@@ -366,7 +377,7 @@ struct TwsBroker::Io final : DefaultEWrapper {
             const uint32_t sid = sid_by_local.count(local) ? sid_by_local[local] : 0;
             b.push_reject(local, RejectCause::BrokerRejected, errorCode, errorString,
                           sid, prot);
-            if (errorCode == kTwsDuplicateOrderId) {
+            if (tws_order_id_collision(errorCode)) {
                 local_by_tws.erase(id);
                 tws_by_local.erase(local);
             }
@@ -860,6 +871,33 @@ struct TwsBroker::Io final : DefaultEWrapper {
     }
 
     long place(uint64_t local, uint32_t sid, const Order& order, const Contract& c) {
+        // NEVER spend an id this session already has a mapping for.
+        //
+        // next_tws_id is a high-water mark, so in the normal case this loop runs
+        // zero times. It exists for the seam: engine.cpp lifts its reconcile
+        // gate on a 10 s failsafe while this broker's own deadline is
+        // kReconcileTimeoutMs (20 s), and order_path_ready() does not consult
+        // recon_active — so on a slow reqAllOpenOrders a placement can be drained
+        // BEFORE adoption has advanced the counter past the ids of the orders it
+        // is still adopting.
+        //
+        // Without this, the write below overwrites the ADOPTED order's row.
+        // orderStatus() and execDetails() both early-return on an id they cannot
+        // find, so from that moment every fill and every cancel that order
+        // reports is dropped on the floor and the app's book silently diverges
+        // from the broker's — the 2026-08-13 phantom-position mechanism, reached
+        // from the machinery meant to prevent it. The 103 handler cannot undo it
+        // either: by the time IB refuses the placement the row is already gone,
+        // which is why its comment can only choose "unheard" over "misattributed".
+        //
+        // It also closes the case IB does NOT refuse: same contract, same side,
+        // same type collides as a silent MODIFICATION, so a fresh entry could
+        // amend a resting protective stop with no error, no log and no page.
+        //
+        // Residual, and it is why the collision handler stays: ids spent by this
+        // client in an EARLIER session that are no longer open are invisible to
+        // reqAllOpenOrders, so they are not in this map to be skipped.
+        while (local_by_tws.count(next_tws_id)) ++next_tws_id;
         const long tws_id = next_tws_id++;
         local_by_tws[tws_id] = local;
         tws_by_local[local] = tws_id;
