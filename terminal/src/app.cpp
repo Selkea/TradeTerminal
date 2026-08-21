@@ -6083,6 +6083,11 @@ void App::draw_menu_bar() {
             "Requires the IBKR (TWS) data route with no live session running.");
 
         ImGui::Separator();
+        // Sticky from here down, but NOT above it: "Build today's lineup" is a
+        // command and should close the menu and get on with it, while these are
+        // switches you may want to set together. The separator is the boundary
+        // between the two kinds, so it is also the boundary for the flag.
+        ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
         ImGui::MenuItem("Auto-build daily", nullptr, &cfg_.lineup_enabled);
         ImGui::SetItemTooltip(
             "Run the lineup build automatically each weekday at the time below.\n"
@@ -6100,6 +6105,7 @@ void App::draw_menu_bar() {
             "On: after the daily build, start trading the picks automatically.\n"
             "Off (default): build + log the picks only — you start the session.");
         ImGui::EndDisabled();
+        ImGui::PopItemFlag();   // paired with the PushItemFlag above the toggles
         ImGui::EndMenu();
     }
         if (ImGui::BeginMenu("Notifications")) {
