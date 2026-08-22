@@ -299,3 +299,116 @@ TEST_CASE("sweep: pump_sweep still arms the risk through that predicate") {
     CHECK(src.find("position_notional_cap(rl, opts.session_cash)") !=
           std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// 0.35.0: THE SAMPLE MUST BE PROPORTIONAL TO THE WINDOW.
+//
+// 2026-08-21 took ZERO trades on all four symbols. Each had been crowned with a
+// lookback longer than a session - SOXL slow = 285 bars of 300 s, about 3.7
+// trading days - so no fast/slow pair could cross inside a day that flattens at
+// 15:57. The feed was healthy and nothing was refused; nothing signalled.
+//
+// A FLAT floor cannot catch it, because the fit runs over SIX MONTHS: across
+// ~126 sessions that same average still crosses a few dozen times and clears
+// "20 in-sample / 5 holdout" easily. The sample was real, drawn from a horizon
+// live never gets.
+
+namespace {
+// A result whose equity curve spans `sessions` distinct UTC days. Regular US
+// hours never cross a UTC midnight, so one sample per day is enough to count.
+BacktestResult mk_span(int trades, double sharpe, int sessions) {
+    BacktestResult r = mk(trades, sharpe, 0.05);
+    for (int d = 0; d < sessions; ++d) {
+        // 14:30 UTC on consecutive days = 10:30 New York, inside RTH.
+        r.eq_ts.push_back(static_cast<double>(d) * 86400.0 + 14.5 * 3600.0);
+        r.eq_val.push_back(100000.0);
+    }
+    return r;
+}
+}  // namespace
+
+TEST_CASE("sessions are counted from the equity curve, not assumed") {
+    CHECK(sweep_result_sessions(mk_span(10, 1.0, 1)) == 1);
+    CHECK(sweep_result_sessions(mk_span(10, 1.0, 32)) == 32);
+    CHECK(sweep_result_sessions(mk_span(10, 1.0, 126)) == 126);
+    // No curve at all: nothing to say, and the flat floor must still apply
+    // rather than the window silently becoming zero and waving everything past.
+    CHECK(sweep_result_sessions(mk(10, 1.0, 0.05)) == 0);
+    CHECK(sweep_min_trades(kSweepMinTrades, 0) == kSweepMinTrades);
+
+    // Several samples inside ONE day count once - the curve is per bar, and a
+    // 6-month 5m fit has ~78 points a day. Counting points would make the floor
+    // absurd and reject everything, which is a worse failure than the bug.
+    BacktestResult intraday = mk(10, 1.0, 0.05);
+    for (int i = 0; i < 78; ++i)
+        intraday.eq_ts.push_back(14.5 * 3600.0 + i * 300.0);
+    CHECK(sweep_result_sessions(intraday) == 1);
+}
+
+TEST_CASE("the floor is the HARDER of the flat minimum and the per-session rate") {
+    // Short window: the flat floor still rules, unchanged from before.
+    CHECK(sweep_min_trades(kSweepMinHoldoutTrades, 1) == kSweepMinHoldoutTrades);
+    CHECK(sweep_min_trades(kSweepMinTrades, 4) == kSweepMinTrades);
+    // Long window: the rate takes over. A 6-month fit with a 25% holdout is
+    // ~32 sessions on the holdout and ~94 in-sample.
+    CHECK(sweep_min_trades(kSweepMinHoldoutTrades, 32) == 16);   // ceil(0.5*32)
+    CHECK(sweep_min_trades(kSweepMinTrades, 94) == 47);          // ceil(0.5*94)
+    // Monotonic, and never below the flat floor at any window length.
+    int prev = 0;
+    for (int s = 0; s <= 200; ++s) {
+        const int need = sweep_min_trades(kSweepMinHoldoutTrades, s);
+        CHECK(need >= kSweepMinHoldoutTrades);
+        CHECK(need >= prev);
+        prev = need;
+    }
+}
+
+TEST_CASE("the 2026-08-21 shape is rejected where it used to pass") {
+    // THE REGRESSION THIS EXISTS FOR. A long-horizon set that crossed ~30 times
+    // across a six-month holdout: comfortably past the old flat 5, and unable to
+    // trade a single day.
+    const BacktestResult thin = mk_span(30, 1.9, 126);
+    CHECK(thin.trades >= kSweepMinHoldoutTrades);                 // old bar: passed
+    CHECK(thin.trades < sweep_min_trades(kSweepMinHoldoutTrades,
+                                         sweep_result_sessions(thin)));
+    // ...and scoring it now returns the reject value on every metric, including
+    // the MINIMISED one where a thin run would otherwise win outright.
+    for (int m : {kSharpe, kReturn, kWinRate})
+        CHECK(std::isinf(sweep_metric_scored(thin, m, kSweepMinHoldoutTrades)));
+    CHECK(std::isinf(sweep_metric_scored(thin, kMaxDD, kSweepMinHoldoutTrades)));
+
+    // A set that actually trades the day is untouched: two round trips a day
+    // across the same window.
+    const BacktestResult live_able = mk_span(252, 1.4, 126);
+    CHECK(sweep_metric_scored(live_able, kSharpe, kSweepMinHoldoutTrades) ==
+          doctest::Approx(1.4));
+
+    // And the boundary is where it says it is, not one either side.
+    const int need = sweep_min_trades(kSweepMinHoldoutTrades, 126);   // ceil(0.5*126)
+    CHECK(need == 63);
+    CHECK(std::isinf(sweep_metric_scored(mk_span(need - 1, 1.4, 126), kSharpe,
+                                         kSweepMinHoldoutTrades)));
+    CHECK(sweep_metric_scored(mk_span(need, 1.4, 126), kSharpe,
+                              kSweepMinHoldoutTrades) == doctest::Approx(1.4));
+}
+
+TEST_CASE("every scoring path uses the scaled floor, and they agree") {
+    // SOURCE-TEXT PIN. Three places ask "did this clear the bar" - the score,
+    // the fit-adoption gate, and the tournament's validity test. A floor that
+    // disagreed between them would adopt a set it had just scored as worthless,
+    // which is exactly how the flat floor and the six-month window drifted apart.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    CHECK(src.find("sweep_metric_scored(r, sweep_.metric, kSweepMinTrades)") !=
+          std::string::npos);
+    CHECK(src.find("sweep_min_trades(kSweepMinHoldoutTrades, sweep_.holdout_sessions)") !=
+          std::string::npos);
+    CHECK(src.find("sweep_.holdout_trades >= sweep_.holdout_need") != std::string::npos);
+    CHECK(src.find("sweep_.holdout_trades < sweep_.holdout_need") != std::string::npos);
+    // The flat constant must no longer be compared against directly.
+    CHECK(src.find("holdout_trades >= kSweepMinHoldoutTrades") == std::string::npos);
+    CHECK(src.find("holdout_trades < kSweepMinHoldoutTrades") == std::string::npos);
+}
