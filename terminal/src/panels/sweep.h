@@ -222,6 +222,13 @@ public:
         bool has_holdout = false;     // holdout_val is valid
         double holdout_val = 0;       // winner's metric on unseen data
         int holdout_trades = 0;       // sample size behind holdout_val
+        // The bar that sample had to clear, and the window it was drawn from.
+        // Stored rather than recomputed because three places ask the question -
+        // the score, the fit-adoption gate and the tournament's validity test -
+        // and a floor that disagreed between them would accept a set it had
+        // just scored as worthless.
+        int holdout_need = 0;         // sweep_min_trades(...) for this run
+        int holdout_sessions = 0;     // sessions the holdout slice covered
 
         // Strategy tournament (auto-pick): every loaded strategy is optimized
         // on the same data; the champion (best holdout score) is applied.
@@ -350,6 +357,59 @@ constexpr int kSweepMinTrades = 20;
 // The holdout is only the last slice of the window (holdout_pct, default 25%),
 // so it gets a proportionally smaller floor - but still not zero.
 constexpr int kSweepMinHoldoutTrades = 5;
+
+// ...AND THE SAMPLE MUST BE PROPORTIONAL TO THE WINDOW, which is what the
+// paragraph above always claimed and the two constants above never did.
+//
+// 2026-08-21 was a ZERO-TRADE day. All four symbols were crowned with lookbacks
+// longer than a session — SOXL slow=285 bars of 300 s, about 3.7 trading days —
+// so no fast/slow pair could cross inside a day that flattens at 15:57. The feed
+// was healthy (76,562 ticks, none dropped) and nothing was refused: nothing
+// signalled.
+//
+// A FLAT floor cannot catch that, because the optimizer fits on SIX MONTHS. Over
+// ~126 sessions a 285-bar average still crosses a few dozen times, clearing "20
+// in-sample / 5 holdout" comfortably — and then produces nothing at all in the
+// 77 bars live actually gets. The sample was real; it was drawn from a horizon
+// live never sees.
+//
+// So the bar is a RATE. Live runs one session at a time and flattens at the end
+// of it, so a set must be able to express itself inside one:
+constexpr double kSweepMinTradesPerSession = 0.5;   // a round trip every other day
+
+// Sessions a result spans, counted from its equity curve.
+//
+// Regular US hours (09:30-16:00 New York = 13:30-20:00 UTC) never cross a UTC
+// midnight, so a UTC day index counts sessions exactly — and keeps a calendar
+// out of this header, the same reason sweep_param_max restates its own span.
+// eq_ts is ascending (it is an equity curve), so adjacent comparison suffices.
+inline int sweep_result_sessions(const BacktestResult& r) {
+    int n = 0;
+    double prev = 0;
+    bool have = false;
+    for (const double ts : r.eq_ts) {
+        const double day = std::floor(ts / 86400.0);
+        if (!have || day != prev) {
+            ++n;
+            prev = day;
+            have = true;
+        }
+    }
+    return n;
+}
+
+// The floor this result must clear: the flat minimum, or the per-session rate
+// over the window it covers, whichever is HARDER. A short window keeps its hard
+// floor; a six-month one has to show it can trade six months' worth of days.
+// No zero/negative guard: it would be dead. ceil(rate * 0) is 0, which never
+// exceeds flat_floor, so an absent equity curve already yields the flat floor by
+// arithmetic. A guard clause that cannot change an outcome is the 0.34.0 mistake
+// in miniature - it reads as a decision and is not one.
+inline int sweep_min_trades(int flat_floor, int sessions) {
+    const double scaled = std::ceil(kSweepMinTradesPerSession * sessions);
+    const int by_rate = static_cast<int>(scaled);
+    return by_rate > flat_floor ? by_rate : flat_floor;
+}
 inline double sweep_reject_score(int m) {
     return sweep_metric_minimize(m) ? std::numeric_limits<double>::infinity()
                                     : -std::numeric_limits<double>::infinity();
@@ -366,6 +426,14 @@ inline double sweep_metric_of(const BacktestResult& r, int m, int min_trades) {
 // Back-compat overload: no sample-size opinion. Prefer the 3-arg form.
 inline double sweep_metric_of(const BacktestResult& r, int m) {
     return sweep_metric_of(r, m, 0);
+}
+
+// Score a result against a floor SCALED to the window it covers. This is the
+// form every scoring call site should use; the fixed-floor overloads above stay
+// for the places that genuinely have no window (and for the tests).
+inline double sweep_metric_scored(const BacktestResult& r, int m, int flat_floor) {
+    return sweep_metric_of(r, m,
+                           sweep_min_trades(flat_floor, sweep_result_sessions(r)));
 }
 
 } // namespace tt::ui

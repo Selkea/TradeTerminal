@@ -1199,13 +1199,23 @@ void App::consume_sweep_result(BacktestResult& r) {
     if (sweep_holdout_phase_) {   // the winner's run on unseen data
         sweep_.has_holdout = true;
         sweep_.holdout_trades = r.trades;
-        sweep_.holdout_val = sweep_metric_of(r, sweep_.metric, kSweepMinHoldoutTrades);
+        // The floor SCALES with the window (sweep.h): a set is judged on whether
+        // it can trade a session, not on a six-month total that a lookback
+        // longer than a session still accumulates. 2026-08-21 took zero trades
+        // on four symbols crowned exactly that way.
+        sweep_.holdout_sessions = sweep_result_sessions(r);
+        sweep_.holdout_need =
+            sweep_min_trades(kSweepMinHoldoutTrades, sweep_.holdout_sessions);
+        sweep_.holdout_val = sweep_metric_of(r, sweep_.metric, sweep_.holdout_need);
         sweep_holdout_phase_ = false;
         sweep_.running = false;
-        char buf[128];
-        std::snprintf(buf, sizeof buf, "optimizer: holdout %s %.4g (last %.0f%%, unseen)",
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                      "optimizer: holdout %s %.4g (last %.0f%%, unseen; %d trades "
+                      "over %d sessions, need %d)",
                       kSweepMetrics[sweep_.metric], sweep_.holdout_val,
-                      sweep_.holdout_pct);
+                      sweep_.holdout_pct, sweep_.holdout_trades,
+                      sweep_.holdout_sessions, sweep_.holdout_need);
         route(buf);
         // Now — and only now — does the swept symbol get this set as its OWN.
         // Same bar finish_tournament applies to a champion: a score on unseen
@@ -1214,7 +1224,7 @@ void App::consume_sweep_result(BacktestResult& r) {
         if (!sweep_fit_symbol_.empty()) {
             const bool minimize = sweep_metric_minimize(sweep_.metric);
             const bool ok = std::isfinite(sweep_.holdout_val) &&
-                            sweep_.holdout_trades >= kSweepMinHoldoutTrades &&
+                            sweep_.holdout_trades >= sweep_.holdout_need &&
                             (minimize || sweep_.holdout_val > 0.0);
             if (ok && trade_.merge_symbol_params(sweep_fit_symbol_, opt_.key,
                                                  sweep_fit_params_)) {
@@ -1240,7 +1250,7 @@ void App::consume_sweep_result(BacktestResult& r) {
     }
 
     sweep_.vals[static_cast<size_t>(opt_.step)] =
-        sweep_metric_of(r, sweep_.metric, kSweepMinTrades);
+        sweep_metric_scored(r, sweep_.metric, kSweepMinTrades);
     ++sweep_.done;
     ++opt_.step;
     if (opt_.step < kSweepSteps) {
@@ -1557,13 +1567,15 @@ void App::pump_tournament() {
                 // its score is noise, and on the minimised metric a zero-trade
                 // run would win outright.
                 const bool thin =
-                    sweep_.has_holdout && sweep_.holdout_trades < kSweepMinHoldoutTrades;
+                    sweep_.has_holdout && sweep_.holdout_trades < sweep_.holdout_need;
                 e.valid = !thin && std::isfinite(e.score);
                 if (!e.valid)
                     route("tournament: " + strat_mgr_.display_name(e.key) +
                              " rejected (" + std::to_string(sweep_.holdout_trades) +
-                             " holdout trades, need " +
-                             std::to_string(kSweepMinHoldoutTrades) + ")");
+                             " holdout trades over " +
+                             std::to_string(sweep_.holdout_sessions) +
+                             " sessions, need " + std::to_string(sweep_.holdout_need) +
+                             " - a set that cannot trade a session cannot trade live)");
             }
             advance(std::move(e));
         }
