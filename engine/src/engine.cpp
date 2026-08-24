@@ -229,6 +229,13 @@ public:
         const double cap = rl ? rl->max_position_notional : 0.0;
         return cap > 0.0 ? std::min(cap, spendable) : spendable;
     }
+    // The loss allowance (see IStrategyContext::risk_budget). Unlike budget()
+    // this is NOT clamped against cash: it is a bound on how much a trade may
+    // lose, not on what it may spend, and the two have no common ceiling.
+    double risk_budget(uint32_t symbol_id) const noexcept override {
+        const RiskLimits* rl = resolve_risk(symbol_id);
+        return rl && rl->per_trade_risk > 0.0 ? rl->per_trade_risk : 0.0;
+    }
     int64_t now_ns() const noexcept override { return now_(); }
 
     uint32_t symbol_id(const char* symbol) noexcept override {

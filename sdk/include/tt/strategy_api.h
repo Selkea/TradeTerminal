@@ -14,13 +14,15 @@
 
 #include <ctime>
 
+// v5: IStrategyContext gained risk_budget() — dollars of LOSS a single trade may
+//     take, for strategies that know their own stop (see below).
 // v4: IStrategy gained on_order_end() — an order dying without filling is now
 //     reported (see below).
 // v3: IStrategyContext gained budget() — the sizing base every strategy must
 //     use instead of cash() (see below).
 // v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
 // OrdType gained Stop. Old DLLs are rejected by the version check.
-#define TT_SDK_VERSION 4u
+#define TT_SDK_VERSION 5u
 
 namespace tt {
 
@@ -63,6 +65,29 @@ public:
     // (a plain backtest). Reducing/closing orders are never capped — an exit
     // can always leave, whatever budget() says.
     virtual double   budget(uint32_t symbol_id) const noexcept = 0;
+    // Dollars of LOSS one trade in `symbol_id` may take. 0 = not configured.
+    //
+    // budget() above bounds EXPOSURE and this bounds RISK; they are different
+    // questions and only one of them can be answered without knowing the stop.
+    // The notional cap has to assume a worst-case adverse excursion (see
+    // tt::ui::position_notional_cap, which divides the loss allowance by an
+    // assumed 20% move) because the engine cannot see a strategy's stop at order
+    // time. A strategy that places a protective stop DOES know that distance, so
+    // it can convert this straight into a size:
+    //
+    //     qty = risk_budget(sym) / (entry - stop)
+    //
+    // and stop relying on the assumption. Size off BOTH — take the smaller of
+    // this and the budget()-derived qty. They bind in different regimes: a wide
+    // stop is bounded by risk, a tight one by exposure (a 3%-stop position sized
+    // purely on risk would be enormous, and a stop does not survive a gap).
+    //
+    // NOT a percentage of cash. That is the mistake this exists to end: on a $1M
+    // paper account with a $2k daily loss limit, "1% of cash" is $10k of risk —
+    // five times the whole day's budget — and every value above 0.2% means the
+    // same thing, so the knob is inert. See the ParamDesc note in
+    // strategies/orb_breakout.cpp.
+    virtual double   risk_budget(uint32_t symbol_id) const noexcept = 0;
     // Engine time (backtest or real): epoch nanoseconds.
     virtual int64_t  now_ns() const noexcept = 0;
     // Interns a symbol string to the id used in events.

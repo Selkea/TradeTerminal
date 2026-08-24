@@ -585,6 +585,17 @@ private:
         int step = 0;                         // index into sweep_.xs
         double best_metric = 0;
         bool metric_valid = false;
+        // What each 1-D sweep learned about its parameter, OR-ed across passes
+        // (see tt::ui::sweep_param_verdict). Accumulated rather than taken from
+        // the last pass because pass 2 refines inside a narrow window around the
+        // winner, where a genuinely useful parameter can look flat simply
+        // because it is no longer being moved very far. A parameter is only
+        // reported as doing nothing if it did nothing on EVERY pass, including
+        // the full-range one.
+        static constexpr uint8_t kVerdictInformative = 1;
+        static constexpr uint8_t kVerdictInert = 2;
+        static constexpr uint8_t kVerdictRejected = 4;
+        std::map<std::string, uint8_t> verdicts;
     };
     AutoOpt opt_;
 

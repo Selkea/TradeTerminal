@@ -29,7 +29,14 @@ namespace {
 constexpr ParamDesc kParams[] = {
     {"range_min", 15, 1, 120},     // opening range length (minutes)
     {"tp_r", 2.0, 0.5, 10},        // take-profit in range-heights
-    {"risk_pct", 1.0, 0.05, 5},    // % of cash risked (stop = far range side)
+    // % of CASH risked (stop = far range side). INERT on any account big enough
+    // for the caps to bind, and kept only for the ones where it still moves:
+    // against a per-symbol notional cap and a per-trade risk budget, cash is the
+    // loosest of the three bounds, so on the $1M paper account every value from
+    // ~0.1 up sizes identically. The 1.0 here is this default, not a fitted
+    // number -- risk_pct is in tt::ui::sweep_param_is_fixed, so no sweep has ever
+    // moved it. Anything that needs to bound a loss must use ctx.risk_budget().
+    {"risk_pct", 1.0, 0.05, 5},
     {"session_min", 390, 60, 1440},// session length (minutes, 390 = US RTH)
     {"eod_min", 5, 0, 60},         // flatten this early (minutes)
     {"allow_short", 0, 0, 1},      // 1 = also arm the downside break
@@ -151,6 +158,21 @@ public:
             range_h_ = h;
             const double cash = ctx.cash();
             double qty = std::floor(cash * (risk_pct_ / 100.0) / h);
+            // THE RISK CEILING, and the only one of the three that knows what
+            // this trade can actually lose. The protective stop goes at the far
+            // side of the range (see enter_bracket), so `h` is not an assumed
+            // excursion — it is the exact per-share loss if the stop fills.
+            //
+            // This is what risk_pct_ above was trying to compute and could not:
+            // it is a percentage of CASH, and on a $1M paper account against a
+            // $2k daily limit every value it can be swept to means the same
+            // thing (see the ParamDesc note). Left in place rather than removed
+            // because it still binds on an account small enough for it to matter
+            // — but it is no longer the thing standing between a wide stop and
+            // the day's loss budget.
+            const double risk_dollars = ctx.risk_budget(sym_);
+            if (risk_dollars > 0.0)
+                qty = std::min(qty, std::floor(risk_dollars / h));
             // Notional bound is the risk budget, not the raw balance: the engine
             // caps the position there anyway, and the tp/stop legs below are
             // sized off this qty, so they must match what will actually fill.
@@ -162,9 +184,16 @@ public:
             if (allow_short_)
                 short_stop_id_ = ctx.submit_order({sym_, Side::Sell, OrdType::Stop, {},
                                                    qty, 0.0, range_lo_, 0.0, 0.0});
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "range %.2f-%.2f armed, qty %.0f",
-                          range_lo_, range_hi_, qty);
+            char buf[160];
+            // Report the RISK, not just the size. A breakout arms hours before it
+            // can fill, so this line is the only chance to see what the trade
+            // would cost before it costs it — 2026-08-24's CAPR armed a 20.7%
+            // stop and nothing said so until the numbers were worked out by hand.
+            std::snprintf(buf, sizeof(buf),
+                          "range %.2f-%.2f armed, qty %.0f, risking $%.0f "
+                          "(stop %.1f%% away)",
+                          range_lo_, range_hi_, qty, qty * h,
+                          range_hi_ > 0.0 ? 100.0 * h / range_hi_ : 0.0);
             ctx.log(0, buf);
         }
     }

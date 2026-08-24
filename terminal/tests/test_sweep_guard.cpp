@@ -412,3 +412,142 @@ TEST_CASE("every scoring path uses the scaled floor, and they agree") {
     CHECK(src.find("holdout_trades >= kSweepMinHoldoutTrades") == std::string::npos);
     CHECK(src.find("holdout_trades < kSweepMinHoldoutTrades") == std::string::npos);
 }
+
+// ---- the per-trade risk budget ---------------------------------------------
+// position_notional_cap answers "how much may this position COST" without being
+// able to see the stop, so it assumes a 20% adverse move. per_trade_risk_budget
+// answers "how much may this trade LOSE", for the strategies that do know their
+// stop and can size against it exactly.
+
+TEST_CASE("risk budget: a quarter of the daily loss limit") {
+    RiskLimits rl{};
+    rl.daily_max_loss = 2'000.0;
+    CHECK(tt::ui::per_trade_risk_budget(rl) == doctest::Approx(500.0));
+    // Four full losers to reach the halt. The notional cap spends half the
+    // budget per trade because it is guessing at the stop; this one measures it.
+    CHECK(tt::ui::per_trade_risk_budget(rl) * 4.0 ==
+          doctest::Approx(rl.daily_max_loss));
+}
+
+TEST_CASE("risk budget: an explicit figure wins, and it is idempotent") {
+    RiskLimits rl{};
+    rl.daily_max_loss = 2'000.0;
+    rl.per_trade_risk = 125.0;
+    CHECK(tt::ui::per_trade_risk_budget(rl) == doctest::Approx(125.0));
+    // Applied twice, as the live wiring does when a session restarts on limits
+    // it already stamped.
+    rl.per_trade_risk = tt::ui::per_trade_risk_budget(rl);
+    CHECK(tt::ui::per_trade_risk_budget(rl) == doctest::Approx(125.0));
+}
+
+TEST_CASE("risk budget: no daily-loss limit means no ceiling, not a zero size") {
+    // There is no loss budget to slice, and inventing one from cash would put a
+    // risk ceiling on a plain backtest that live never applies — a parity gap
+    // pointing the wrong way. Strategies read 0 as "size as you did before".
+    RiskLimits rl{};
+    CHECK(tt::ui::per_trade_risk_budget(rl) == doctest::Approx(0.0));
+}
+
+TEST_CASE("risk budget: survives the optimizer zeroing the equity halts") {
+    // THE PARITY CASE, and the reason per_trade_risk is stored rather than
+    // recomputed where it is used. sweep_risk_limits zeroes daily_max_loss (the
+    // halts are run_live-only), so a risk budget derived at the point of use
+    // evaluates to 0 in replay: the optimizer would score sizes live refuses,
+    // which is the 19x defect BacktestConfig::risk documents, in miniature.
+    RiskLimits live{};
+    live.daily_max_loss = 2'000.0;
+    const RiskLimits swept = tt::ui::sweep_risk_limits(live, 100'000.0);
+
+    CHECK(swept.daily_max_loss == doctest::Approx(0.0));      // halt is gone...
+    CHECK(swept.per_trade_risk == doctest::Approx(500.0));    // ...its size is not
+    // The replay and the live session must size against the identical number.
+    CHECK(swept.per_trade_risk ==
+          doctest::Approx(tt::ui::per_trade_risk_budget(live)));
+    // And the exposure cap keeps its own, separately derived value alongside it.
+    CHECK(swept.max_position_notional ==
+          doctest::Approx(tt::ui::position_notional_cap(live, 100'000.0)));
+}
+
+TEST_CASE("risk budget: the live session stamps it, and the sweep verdict is read") {
+    // SOURCE-TEXT PIN, and the weakest kind of proof in this file — it fails
+    // when the WORDS change, not when the behaviour does. It is here because
+    // nothing in the suite constructs an App, so App::start_live's stamping line
+    // and the verdict switch in App::pump_sweep are unreachable from a test and
+    // could both be deleted with everything above still green. That is not
+    // hypothetical: the day boundary was deleted exactly that way (0.26.4), and
+    // a "fix" that was pure dead code passed 7/7 mutants on pins like these
+    // (0.34.3). Treat a green run here as "the call site exists", nothing more.
+    const std::string path = std::string(TT_REPO_DIR) + "/terminal/src/app.cpp";
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+    const std::string src{std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>()};
+    // Live sizing gets the ceiling; without this line every live session runs
+    // with per_trade_risk 0 and the strategies silently revert to pre-0.36.0.
+    CHECK(src.find("rl.per_trade_risk = per_trade_risk_budget(rl)") !=
+          std::string::npos);
+    // And the exposure cap is still stamped alongside it, not replaced by it.
+    CHECK(src.find("rl.max_position_notional = position_notional_cap(rl, opts.session_cash)") !=
+          std::string::npos);
+    CHECK(src.find("sweep_param_verdict(sweep_.vals)") != std::string::npos);
+}
+
+TEST_CASE("risk budget: the two ceilings are different numbers") {
+    // If these ever coincide the tests above stop distinguishing them, and a
+    // change that dropped one and read the other would pass everything.
+    RiskLimits rl{};
+    rl.daily_max_loss = 2'000.0;
+    CHECK(tt::ui::per_trade_risk_budget(rl) !=
+          doctest::Approx(tt::ui::position_notional_cap(rl, 100'000.0)));
+}
+
+// ---- did the parameter matter ----------------------------------------------
+
+TEST_CASE("verdict: a flat sweep is inert") {
+    CHECK(tt::ui::sweep_param_verdict({1.5, 1.5, 1.5, 1.5}) ==
+          tt::ui::SweepParamVerdict::Inert);
+}
+
+TEST_CASE("verdict: one differing point is enough to be informative") {
+    // The bar is "moved the score at all", not "moved it much". A parameter with
+    // a small real effect is still a fitted parameter, and a tolerance here would
+    // have to decide how small is too small.
+    CHECK(tt::ui::sweep_param_verdict({1.5, 1.5, 1.5000001, 1.5}) ==
+          tt::ui::SweepParamVerdict::Informative);
+}
+
+TEST_CASE("verdict: all points rejected is NOT the same as inert") {
+    // Both are flat lines; they call for opposite actions. Rejected means the
+    // sample floor turned every point away and the WINDOW may be the problem —
+    // 2026-08-21's failure. Reporting that as "this knob does nothing" would
+    // send the operator to delete a parameter that was never measured.
+    const double rej = tt::ui::sweep_reject_score(0);   // -inf for a maximised metric
+    CHECK(tt::ui::sweep_param_verdict({rej, rej, rej}) ==
+          tt::ui::SweepParamVerdict::AllRejected);
+    CHECK(tt::ui::sweep_param_verdict({rej, rej, rej}) !=
+          tt::ui::SweepParamVerdict::Inert);
+    // A minimised metric rejects to +inf; the sign must not decide the verdict.
+    const double rmin = tt::ui::sweep_reject_score(2);
+    CHECK(tt::ui::sweep_param_verdict({rmin, rmin, rmin}) ==
+          tt::ui::SweepParamVerdict::AllRejected);
+}
+
+TEST_CASE("verdict: one admissible point among rejections is informative") {
+    const double rej = tt::ui::sweep_reject_score(0);
+    CHECK(tt::ui::sweep_param_verdict({rej, rej, 0.8}) ==
+          tt::ui::SweepParamVerdict::Informative);
+}
+
+TEST_CASE("verdict: too few points to judge is never a verdict") {
+    // A cancelled sweep leaves the array at its NaN fill. Calling a parameter
+    // inert on one sample — or on none — would be an accusation from no evidence.
+    CHECK(tt::ui::sweep_param_verdict({}) == tt::ui::SweepParamVerdict::Informative);
+    CHECK(tt::ui::sweep_param_verdict({1.5}) ==
+          tt::ui::SweepParamVerdict::Informative);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    CHECK(tt::ui::sweep_param_verdict({1.5, nan, nan}) ==
+          tt::ui::SweepParamVerdict::Informative);
+    // NaNs are skipped, not counted as equal to each other.
+    CHECK(tt::ui::sweep_param_verdict({1.5, nan, 1.5}) ==
+          tt::ui::SweepParamVerdict::Inert);
+}

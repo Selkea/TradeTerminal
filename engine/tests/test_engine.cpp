@@ -798,6 +798,61 @@ TEST_CASE("sizing: budget() is bounded by cash even when the cap exceeds it") {
     CHECK(run_sized(100.0, 500'000.0, 10'000.0) == doctest::Approx(190.0));
 }
 
+namespace {
+// Reports what the engine answered for risk_budget(), from inside a callback.
+struct RiskBudgetProbe : IStrategy {
+    std::atomic<double> saw{-1.0};
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        saw = ctx.risk_budget(sid);
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+double probe_risk_budget(double per_trade_risk, double notional_cap) {
+    Engine eng;
+    RiskBudgetProbe strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.initial_cash = 1'000'000.0;
+    cfg.risk.max_position_notional = notional_cap;
+    cfg.risk.per_trade_risk = per_trade_risk;
+    REQUIRE(eng.start_live(cfg, {&strat}));
+    pump_until(eng, [&] { return strat.saw.load() >= 0.0; });
+    const double got = strat.saw.load();
+    eng.stop_live();
+    return got;
+}
+}  // namespace
+
+// EXPOSURE and RISK are two different ceilings and the engine hands out both.
+// Nothing exercised this accessor when it was added: every sizing test drives a
+// strategy through a fake context, so a risk_budget() that returned the notional
+// cap instead passed the entire suite. The numbers below are deliberately
+// unequal so that confusion cannot hide.
+TEST_CASE("sizing: risk_budget() is the loss allowance, not the notional cap") {
+    CHECK(probe_risk_budget(500.0, 5'000.0) == doctest::Approx(500.0));
+}
+
+TEST_CASE("sizing: an unset risk budget is 0 even when a notional cap exists") {
+    // 0 is the plain-backtest case and strategies read it as "no ceiling from
+    // here". Falling back to the notional cap would silently hand them an
+    // exposure figure to divide by a stop distance — a number 4x too large here,
+    // and wrong by an unbounded factor in general.
+    CHECK(probe_risk_budget(0.0, 5'000.0) == doctest::Approx(0.0));
+}
+
+TEST_CASE("sizing: the risk budget is not clamped by cash the way budget() is") {
+    // budget() is what you may SPEND, so cash bounds it. risk_budget() is what
+    // you may LOSE; the two have no common ceiling and clamping this one against
+    // an account balance would be a category error.
+    CHECK(probe_risk_budget(2'000'000.0, 5'000.0) == doctest::Approx(2'000'000.0));
+}
+
 // ---- the snapshot reports the params that are actually running -------------
 // /diag used to read the terminal's Trade-tab copy, which the optimizer
 // overwrites with every crowned champion whether or not the live engine took
