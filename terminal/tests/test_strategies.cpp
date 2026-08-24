@@ -40,6 +40,11 @@ struct FakeCtx final : IStrategyContext {
     std::map<std::string, double> params;
     double cash_ = 100'000.0;
     double budget_ = 5'000.0;
+    // 0 = no risk ceiling configured, which is the plain-backtest case and what
+    // every pre-0.36.0 expectation in this file was written against. Tests that
+    // exercise the ceiling set it explicitly, so a default of 0 keeps the two
+    // regimes from being confused for each other.
+    double risk_budget_ = 0.0;
     Position pos{};
     int64_t now = 0;
     std::vector<OrderRequest> sent;
@@ -57,6 +62,7 @@ struct FakeCtx final : IStrategyContext {
     Position position(uint32_t) const noexcept override { return pos; }
     double cash() const noexcept override { return cash_; }
     double budget(uint32_t) const noexcept override { return budget_; }
+    double risk_budget(uint32_t) const noexcept override { return risk_budget_; }
     int64_t now_ns() const noexcept override { return now; }
     uint32_t symbol_id(const char*) noexcept override { return 1; }
     double param(const char* n, double fallback) const noexcept override {
@@ -684,6 +690,110 @@ TEST_CASE("orb: a single-print fill still places exactly one bracket") {
     CHECK(sent.size() == 2);            // one stop + one take-profit
     CHECK(ctx.cancelled.size() == 1);   // only the untriggered breakout sibling
     s->destroy();
+}
+
+// ---- orb_breakout: the per-trade risk ceiling ------------------------------
+// 2026-08-24. CAPR opened on a 6.35-8.01 range, so the breakout armed a buy stop
+// at 8.01 with its protective stop 1.66 BELOW it — a 20.7% loss per share if it
+// filled and stopped out. The only ceilings on size were a $5,000 notional cap
+// and risk_pct, a percentage of a $1M paper balance, and neither of them can see
+// a stop: 624 shares were armed, risking $1,036 against a $2,000 daily limit.
+//
+// The notional cap was not malfunctioning — it assumes a 20% adverse move and
+// this stop was 20.7% away, so it landed within 4% of its own design. That is
+// the point. It was RIGHT BY LUCK about a number it never looked at, and on a
+// tighter or wider range it would have been wrong by the same mechanism.
+namespace {
+// Arm ORB on a range of [lo, hi] and return the qty on the breakout buy stop.
+// The range is built from the first three bars; the fourth arms (the arming bar
+// does not join the range).
+double armed_qty(IStrategy* s, FakeCtx& ctx, double lo, double hi) {
+    int64_t ts = local_ts(2026, 8, 24, 9, 30);
+    for (const double px : {lo, hi, (lo + hi) / 2.0, (lo + hi) / 2.0}) {
+        s->on_bar(ctx, 1, mk_bar(ts, px));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    for (const OrderRequest& r : ctx.sent)
+        if (r.side == Side::Buy && r.type == OrdType::Stop) return r.qty;
+    return 0.0;
+}
+}  // namespace
+
+TEST_CASE("orb: the risk ceiling sizes the 2026-08-24 CAPR breakout") {
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.budget_ = 5'000.0;        // position_notional_cap(daily_max_loss 2000)
+    ctx.risk_budget_ = 500.0;     // per_trade_risk_budget: 0.25 * 2000
+    s->on_init(ctx);
+
+    // 500 / 1.66 = 301.2. The other two ceilings are looser and must lose:
+    // notional gives floor(5000/8.01) = 624, and risk_pct 1% of $100k cash over
+    // the same 1.66 gives 602. Both are what shipped before the ceiling existed.
+    CHECK(armed_qty(s, ctx, 6.35, 8.01) == doctest::Approx(301.0));
+    s->destroy();
+}
+
+TEST_CASE("orb: with no risk budget configured the old sizing stands") {
+    // 0 means "no ceiling from here" (a plain backtest), NOT "risk nothing".
+    // Read the other way this would size every backtest at zero and every score
+    // in the repo would quietly become a flat line.
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.budget_ = 5'000.0;
+    ctx.risk_budget_ = 0.0;
+    s->on_init(ctx);
+
+    // risk_pct 1% of $100k over 1.66 = 602, under the notional 624.
+    CHECK(armed_qty(s, ctx, 6.35, 8.01) == doctest::Approx(602.0));
+    s->destroy();
+}
+
+TEST_CASE("orb: a tight stop is still bounded by exposure, not by risk") {
+    // The ceiling is an ADDITIONAL bound, not a replacement. A 2-point stop on a
+    // 101 stock risks little per share, so the risk ceiling permits 250 shares —
+    // but 250 * 101 is $25,250 of a thin name against a $5,000 cap, and a stop
+    // does not survive a gap through it. Exposure has to keep binding here.
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.budget_ = 5'000.0;
+    ctx.risk_budget_ = 500.0;
+    s->on_init(ctx);
+
+    CHECK(armed_qty(s, ctx, 99.0, 101.0) == doctest::Approx(49.0));  // 5000/101
+    s->destroy();
+}
+
+TEST_CASE("orb: the armed risk never exceeds the budget, at any range width") {
+    // The property the two numeric cases above are instances of. Stated over a
+    // sweep of widths so a ceiling that happens to be right at 1.66 but wrong
+    // elsewhere — an off-by-one, a cap applied to price instead of distance —
+    // cannot pass. Widths cross the notional cap's assumed 20% excursion in both
+    // directions, which is the regime the cap alone gets wrong.
+    for (const double hi : {7.0, 8.01, 9.5, 12.0, 20.0}) {
+        IStrategy* s = make("orb_breakout.cpp");
+        FakeCtx ctx;
+        ctx.params["range_min"] = 15;
+        ctx.params["session_min"] = 390;
+        ctx.params["eod_min"] = 5;
+        ctx.budget_ = 5'000.0;
+        ctx.risk_budget_ = 500.0;
+        s->on_init(ctx);
+
+        const double lo = 6.35;
+        const double qty = armed_qty(s, ctx, lo, hi);
+        CHECK(qty * (hi - lo) <= 500.0);
+        CHECK(qty >= 1.0);   // and the ceiling must not size the trade out of existence
+        s->destroy();
+    }
 }
 
 TEST_CASE("donchian: the stop covers every partial of the entry") {

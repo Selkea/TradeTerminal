@@ -111,6 +111,36 @@ inline double position_notional_cap(const RiskLimits& rl, double session_cash) {
     return session_cash > 0.0 ? kNoLimitAllocFrac * session_cash : 0.0;
 }
 
+// Dollars of LOSS one trade may take (RiskLimits::per_trade_risk), for the
+// strategies that know their own stop and can size against it directly.
+//
+// The cap above answers the same question WITHOUT the stop, and pays for that
+// with kAdverseMove: it assumes the worst excursion it can think of and bounds
+// exposure so that assumption stays inside the loss budget. When the stop IS
+// known the assumption is not needed, and every place it was wrong stops
+// mattering -- a 5% stop is no longer sized as though it were 20%, and a 25% one
+// is no longer quietly over the budget it was supposed to respect.
+//
+// WHY THIS FRACTION IS TIGHTER THAN kLossBudgetFrac (0.25 vs 0.5). They bound
+// different things and the precision differs. kLossBudgetFrac spends half the
+// day's budget on a GUESS about the stop, so it has to leave room for the guess
+// being wrong. This spends a quarter of it on a MEASUREMENT, and buys back the
+// difference as trades: four full losers to reach the daily halt instead of two,
+// which is the point of knowing the number. Operator's call, 2026-08-24; it is
+// one constant, and the effect on any symbol is linear in it.
+//
+// No session_cash fallback, deliberately. With no daily-loss limit there is no
+// loss budget to slice, and inventing one from cash would produce a risk ceiling
+// on a plain backtest that live never applies -- a parity gap pointing the wrong
+// way. 0 means "no ceiling from here", and strategies fall back to their own
+// sizing, which is exactly what they did before this existed.
+constexpr double kPerTradeRiskFrac = 0.25;  // one trade risks <= 1/4 the budget
+inline double per_trade_risk_budget(const RiskLimits& rl) {
+    if (rl.per_trade_risk > 0.0) return rl.per_trade_risk;   // explicit wins
+    if (rl.daily_max_loss > 0.0) return kPerTradeRiskFrac * rl.daily_max_loss;
+    return 0.0;
+}
+
 // The order-level risk an OPTIMIZER run must be scored against: the limits the
 // live session will apply to this symbol, so the replay cannot book a size
 // production refuses. `live_default` is the app's default RiskLimits — the one
@@ -140,6 +170,12 @@ inline double position_notional_cap(const RiskLimits& rl, double session_cash) {
 inline RiskLimits sweep_risk_limits(const RiskLimits& live_default, double cash) {
     RiskLimits rl = live_default;
     rl.max_position_notional = position_notional_cap(live_default, cash);
+    // Both derived from live_default BEFORE the halts are zeroed below, because
+    // both are derived FROM daily_max_loss. Reading them off `rl` after the
+    // zeroing would silently produce 0 and hand the replay a strategy with no
+    // risk ceiling -- the same shape as the missing notional cap, and just as
+    // invisible, since a backtest with no ceiling still runs and still scores.
+    rl.per_trade_risk = per_trade_risk_budget(live_default);
     rl.daily_max_loss = 0.0;
     rl.max_drawdown_pct = 0.0;
     rl.stale_feed_sec = 0;
@@ -426,6 +462,61 @@ inline double sweep_metric_of(const BacktestResult& r, int m, int min_trades) {
 // Back-compat overload: no sample-size opinion. Prefer the 3-arg form.
 inline double sweep_metric_of(const BacktestResult& r, int m) {
     return sweep_metric_of(r, m, 0);
+}
+
+// ------------------------------------------------- did this parameter matter?
+//
+// What a 1-D sweep learned about the parameter it just swept, judged from the
+// scores alone.
+//
+// A parameter whose every tried value produced the SAME score was not fitted --
+// the optimizer picked the first index off a flat line and reported it in the
+// champion's parameter map, where it is indistinguishable from a number that was
+// actually measured. A flat sweep and a decisive one produce the same shape of
+// result, so nothing downstream can tell them apart.
+//
+// The hazard was found from the other direction, 2026-08-24. ORB's risk_pct is a
+// percentage of a $1M paper balance, so the notional cap cuts it down at every
+// value it could take: the knob is inert in production and its 1.0 means nothing
+// -- but it is in sweep_param_is_fixed, so the optimizer never swept it and no
+// report of this kind would have caught it. That is the point. A parameter can be
+// inert whether or not anyone is fitting it, and the swept ones are the half
+// where a flat line is measurable, so it is the half that gets measured here.
+//
+// AllRejected is kept separate from Inert because they read identically in the
+// scores (every point equal) and mean opposite things. Inert = "this knob does
+// nothing, stop sweeping it". AllRejected = "every value failed the sample floor,
+// the knob may be fine and the WINDOW is the problem" -- 2026-08-21's failure,
+// and telling an operator to ignore a parameter on that evidence would be wrong.
+enum class SweepParamVerdict { Informative, Inert, AllRejected };
+
+inline SweepParamVerdict sweep_param_verdict(const std::vector<double>& vals) {
+    double first = 0.0;
+    bool have_first = false;
+    int seen = 0, rejected = 0, differing = 0;
+    for (const double v : vals) {
+        if (std::isnan(v)) continue;   // step never ran (cancelled mid-sweep)
+        ++seen;
+        if (std::isinf(v)) ++rejected;         // sweep_reject_score sentinel
+        // By VALUE. `v` is a fresh copy each iteration of a range-for over
+        // doubles, so a pointer to it dangles immediately and — because the
+        // stack slot gets reused — compares equal to whatever is being examined
+        // right now. Every sweep then reads as flat. Caught by the mixed
+        // rejected/admissible case, which is the only shape where a real
+        // difference and a rejection sentinel appear in the same array.
+        if (!have_first) { first = v; have_first = true; continue; }
+        // EXACT equality, not a tolerance. A backtest is deterministic, so a
+        // parameter that changed nothing produces bit-identical arithmetic; one
+        // that shifted a single trade does not. A tolerance here would have to
+        // decide how small a real effect is allowed to be, which is a judgement
+        // this function has no basis to make -- and it would report a parameter
+        // with a genuine but tiny effect as doing nothing at all.
+        if (v != first) ++differing;
+    }
+    if (seen < 2) return SweepParamVerdict::Informative;  // nothing to compare
+    if (differing > 0) return SweepParamVerdict::Informative;
+    return rejected == seen ? SweepParamVerdict::AllRejected
+                            : SweepParamVerdict::Inert;
 }
 
 // Score a result against a floor SCALED to the window it covers. This is the

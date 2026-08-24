@@ -1261,6 +1261,25 @@ void App::consume_sweep_result(BacktestResult& r) {
     // This param's 1-D sweep is done: adopt its best point if it doesn't
     // worsen the best metric seen so far (the current value may sit between
     // grid points, so a blind adopt could regress).
+    //
+    // Record what the sweep learned about the parameter FIRST, while its scores
+    // are still in hand. The adoption below picks an index off this same line
+    // whether the line is flat or not, which is exactly why a flat one has to be
+    // noticed here rather than inferred later from the winner.
+    switch (sweep_param_verdict(sweep_.vals)) {
+    case SweepParamVerdict::Inert:
+        opt_.verdicts[opt_.params[static_cast<size_t>(opt_.pi)].name] |=
+            AutoOpt::kVerdictInert;
+        break;
+    case SweepParamVerdict::AllRejected:
+        opt_.verdicts[opt_.params[static_cast<size_t>(opt_.pi)].name] |=
+            AutoOpt::kVerdictRejected;
+        break;
+    case SweepParamVerdict::Informative:
+        opt_.verdicts[opt_.params[static_cast<size_t>(opt_.pi)].name] |=
+            AutoOpt::kVerdictInformative;
+        break;
+    }
     const bool minimize = sweep_metric_minimize(sweep_.metric);
     int bi = 0;
     for (int i = 1; i < kSweepSteps; ++i) {
@@ -1288,6 +1307,30 @@ void App::consume_sweep_result(BacktestResult& r) {
     if (opt_.pass < kSweepPasses) {
         start_opt_param();
         return;
+    }
+
+    // Name the parameters that did nothing, before the winner is reported. A
+    // crowned map lists every parameter with equal authority; these are the ones
+    // whose value in it was chosen off a flat line and carries no information.
+    {
+        std::string inert, rejected;
+        for (const auto& [name, flags] : opt_.verdicts) {
+            if (flags & AutoOpt::kVerdictInformative) continue;  // moved somewhere
+            std::string& into = (flags & AutoOpt::kVerdictInert) ? inert : rejected;
+            if (!into.empty()) into += ", ";
+            into += name;
+        }
+        if (!inert.empty())
+            route("sweep: " + inert +
+                  " changed nothing at any value tried — the crowned value is "
+                  "arbitrary, not fitted");
+        // Distinct message and distinct action: the parameter may be fine and the
+        // WINDOW too short to show it. Telling the operator to stop sweeping it
+        // on this evidence would repeat 2026-08-21 in the other direction.
+        if (!rejected.empty())
+            route("sweep: " + rejected +
+                  " scored no admissible result at any value tried — every point "
+                  "was below the sample floor");
     }
 
     // All passes done. Where the winner goes depends on WHO asked for the sweep.
@@ -4270,15 +4313,23 @@ void App::start_live_session(const TradePanel::StartOpts& opts_in) {
     // The derivation moved to tt::ui::position_notional_cap so the OPTIMIZER can
     // apply the identical number (see sweep_risk_limits). While it was inline
     // here, the replay had no cap at all and sized ~19x what this line permits.
-    for (RiskLimits& rl : sym_risk)
+    for (RiskLimits& rl : sym_risk) {
         rl.max_position_notional = position_notional_cap(rl, opts.session_cash);
+        rl.per_trade_risk = per_trade_risk_budget(rl);
+    }
     // Sizing is invisible otherwise: the strategy asks for a qty, the engine
     // may shrink it, and nothing says what the ceiling was. Name it per symbol
     // so a "why is this position so small" question has an answer in the log.
     for (size_t i = 0; i < syms.size(); ++i) {
-        char buf[128];
-        std::snprintf(buf, sizeof buf, "live: %s position budget $%.0f%s",
+        char buf[160];
+        // Both ceilings, because they bind in different regimes and "why is this
+        // position so small" has two possible answers. A wide stop is bounded by
+        // risk, a tight one by exposure; printing only the notional cap made the
+        // risk ceiling invisible for exactly the trades it exists to shrink.
+        std::snprintf(buf, sizeof buf,
+                      "live: %s position budget $%.0f, risk per trade $%.0f%s",
                       syms[i].c_str(), sym_risk[i].max_position_notional,
+                      sym_risk[i].per_trade_risk,
                       sym_risk[i].daily_max_loss > 0.0 ? "" : " (no daily-loss limit set)");
         route(buf);
     }

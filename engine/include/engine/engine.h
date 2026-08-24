@@ -41,16 +41,42 @@ namespace tt {
 struct RiskLimits {
     double max_order_qty = 1'000;
     double max_position_qty = 5'000;
-    // Dollar cap on a position's size (|qty|*price). A position-INCREASING order
-    // that would breach it is DOWN-SIZED to fit (not rejected), so one trade can
-    // never risk more than a slice of the daily-loss budget on an adverse move —
-    // the share caps above are notional-blind and miss this. Reduce/close orders
-    // are never touched. 0 = disabled. Usually derived from daily_max_loss.
+    // Dollar cap on a position's EXPOSURE (|qty|*price). A position-INCREASING
+    // order that would breach it is DOWN-SIZED to fit (not rejected); the share
+    // caps above are notional-blind and miss this. Reduce/close orders are never
+    // touched. 0 = disabled. Usually derived from daily_max_loss.
+    //
+    // IT DOES NOT BOUND RISK, and until 0.36.0 the comment here said it did
+    // ("one trade can never risk more than a slice of the daily-loss budget").
+    // Exposure is not risk: $5,000 behind a 2% stop risks $100 and $5,000 behind
+    // a 21% stop risks $1,036. The cap is only a risk bound under an ASSUMED
+    // worst-case excursion, which is what position_notional_cap divides by --
+    // honest where it is derived, overclaimed here. The number that actually
+    // bounds a loss is per_trade_risk below, and it needs the strategy's stop.
+    //
+    // 2026-08-24 is why the wording matters: CAPR armed a breakout whose stop sat
+    // a full 20.7% range-width away, so the $5,000 cap permitted $1,036 of risk
+    // against a $2,000 daily limit. That is the DESIGNED 50% slice, not a
+    // malfunction -- but nothing in the code had checked it against the real stop
+    // distance, because this comment said the check was already done.
     //
     // It is ALSO the sizing base every shipped strategy reads through
     // ctx.budget(), which is why an absent cap does not merely fail to bound a
     // position — it silently hands the strategy the whole account.
     double max_position_notional = 0;
+    // Dollars of LOSS one trade may take, handed to strategies through
+    // ctx.risk_budget(). 0 = not configured (a plain backtest), which strategies
+    // must read as "no ceiling from here", never as "risk nothing".
+    //
+    // Carried as an absolute dollar figure rather than recomputed from
+    // daily_max_loss at the point of use, for one specific reason: the optimizer
+    // ZEROES daily_max_loss (the equity halts are run_live-only, see
+    // sweep_risk_limits), so anything derived from it at use-time evaluates to 0
+    // in replay and the fit is scored on sizes live will not take. That is the
+    // 19x parity defect BacktestConfig::risk documents, and it is avoided the
+    // same way max_position_notional avoids it -- derive ONCE, in a free function
+    // both paths call, and store the answer.
+    double per_trade_risk = 0;
     double price_band_pct = 0.20;   // limit orders within ±20% of last trade
 
     // Automated halts — the engine pulls the kill switch itself (cancel all,
