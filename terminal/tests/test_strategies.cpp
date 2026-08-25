@@ -796,6 +796,124 @@ TEST_CASE("orb: the armed risk never exceeds the budget, at any range width") {
     }
 }
 
+// ---- orb_breakout: bar_sec_ is inferred from ONE pair, and a bad one is fatal
+// 2026-08-25. CAPR ran ORB all day and never armed. The re-seed at 10:11:16
+// replayed ~51 historical sessions and called submit_order ZERO times, while the
+// 09:40:02 replay on nearly the same data submitted 51 (proved live: the
+// warmup_replay refusal row's last_ts equals its first_ts, while every other
+// symbol's re-init replay advanced it). Same binary, same history — so what
+// differed had to be state derived from the seed.
+//
+// bar_sec_ is latched from the FIRST strictly-ascending adjacent pair of bars
+// (orb_breakout.cpp:82) and on_init zeroes it, so every re-seed re-derives it
+// from wherever that seed happens to start. A seed whose first pair straddles a
+// session boundary yields the OVERNIGHT GAP — 63,300 s instead of 300, a factor
+// of 211 — and then `minutes = bars_today_ * bar_sec_ / 60` is 1055 on the first
+// bar of every day, past session_min - eod_min = 385. The EOD branch latches
+// eod_done_ AND entered_ ("no re-arming today") and returns before the range and
+// arming blocks are ever reached. Silently: its only two log calls need a
+// non-zero position, and the strategy was flat.
+namespace {
+// Feed a full session of 5-minute bars, preceded by `lead_in` bars whose spacing
+// is `lead_gap_sec`. Returns the qty on the breakout buy stop, 0 if it never armed.
+double armed_qty_after_lead(IStrategy* s, FakeCtx& ctx, int64_t lead_gap_sec) {
+    // One bar the day BEFORE, then the session open: the adjacent pair the
+    // strategy measures is that overnight (or contiguous) gap.
+    int64_t ts = local_ts(2026, 8, 24, 9, 30) - lead_gap_sec * 1'000'000'000LL;
+    s->on_bar(ctx, 1, mk_bar(ts, 7.0));
+    ts = local_ts(2026, 8, 24, 9, 30);
+    for (int i = 0; i < 40; ++i) {   // well past the 24-bar opening range
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 8.01 : 6.35));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    for (const OrderRequest& r : ctx.sent)
+        if (r.side == Side::Buy && r.type == OrdType::Stop) return r.qty;
+    return 0.0;
+}
+
+IStrategy* orb_for_range(FakeCtx& ctx) {
+    IStrategy* s = make("orb_breakout.cpp");
+    ctx.params["range_min"] = 120;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.budget_ = 5'000.0;
+    s->on_init(ctx);
+    return s;
+}
+}  // namespace
+
+TEST_CASE("orb: a contiguous first pair infers the bar size and arms normally") {
+    // The control. 300 s between the first two bars is the true interval, so
+    // range_bars = 24 and the 25th bar of the session arms.
+    FakeCtx ctx;
+    IStrategy* s = orb_for_range(ctx);
+    CHECK(armed_qty_after_lead(s, ctx, 300) > 0.0);
+    s->destroy();
+}
+
+TEST_CASE("orb: a first pair that straddles the session boundary no longer kills the day") {
+    // THE 2026-08-25 REGRESSION. 63,300 s is 15:55 to the next 09:30. Under the
+    // old first-pair rule this measured the overnight gap, tripped the EOD gate
+    // on bar 1 of every day, and the symbol sat out the session in silence.
+    // Nothing else differs from the control above — same params, same bars.
+    FakeCtx ctx;
+    IStrategy* s = orb_for_range(ctx);
+    CHECK(armed_qty_after_lead(s, ctx, 63'300) > 0.0);
+    s->destroy();
+}
+
+TEST_CASE("orb: a Friday-to-Monday gap is survived too") {
+    // 236,100 s. Pinned separately because a fix that clamped to some "one day"
+    // bound would let this one straight through.
+    FakeCtx ctx;
+    IStrategy* s = orb_for_range(ctx);
+    CHECK(armed_qty_after_lead(s, ctx, 236'100) > 0.0);
+    s->destroy();
+}
+
+TEST_CASE("orb: a merely WRONG bar size had a SECOND silent failure path") {
+    // A fix aimed only at the overnight case would have missed this one, which
+    // is why it is pinned. At 11,400 s the EOD gate does NOT trip early
+    // (2 * 11400/60 = 380, just under session_min - eod_min = 385). It used to
+    // fail further down instead: range_bars = max(1, (int)(120*60/11400 + 0.5))
+    // collapses to 1, the opening range gets built from a SINGLE bar, h is 0,
+    // and the arming block returns at its degenerate-range guard.
+    //
+    // Pinned after getting it wrong: this case was first written as "just under
+    // the threshold, so it must still arm", on arithmetic that only considered
+    // the EOD gate. It did not arm, for a reason that arithmetic never mentions.
+    FakeCtx ctx;
+    IStrategy* s = orb_for_range(ctx);
+    CHECK(armed_qty_after_lead(s, ctx, 11'400) > 0.0);
+    s->destroy();
+}
+
+TEST_CASE("orb: the smallest gap wins even when it arrives late") {
+    // The estimator must keep refining, not latch the first plausible value.
+    // Here the first three gaps are all wrong and only the fourth pair is
+    // contiguous — which is the real shape, since a seed's bad pair is at its
+    // start and the contiguous ones follow.
+    FakeCtx ctx;
+    IStrategy* s = orb_for_range(ctx);
+    // Ascending and all safely before the session below.
+    int64_t ts = local_ts(2026, 8, 18, 10, 0);
+    for (const int64_t gap : {236'100LL, 63'300LL, 900LL}) {
+        s->on_bar(ctx, 1, mk_bar(ts, 7.0));
+        ts += gap * 1'000'000'000LL;
+    }
+    s->on_bar(ctx, 1, mk_bar(ts, 7.0));
+    ts = local_ts(2026, 8, 24, 9, 30);
+    for (int i = 0; i < 40; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 8.01 : 6.35));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    bool armed = false;
+    for (const OrderRequest& r : ctx.sent)
+        if (r.side == Side::Buy && r.type == OrdType::Stop) armed = true;
+    CHECK(armed);
+    s->destroy();
+}
+
 TEST_CASE("donchian: the stop covers every partial of the entry") {
     IStrategy* s = make("donchian_trend.cpp");
     FakeCtx ctx;

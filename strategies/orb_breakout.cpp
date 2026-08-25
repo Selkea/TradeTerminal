@@ -77,10 +77,34 @@ public:
         if (sym_ == 0) sym_ = symbol_id;
         if (symbol_id != sym_) return;
 
-        // Bar interval, measured once from the first adjacent pair. Nothing
-        // arms until it's known.
-        if (bar_sec_ == 0 && prev_ts_ > 0 && bar.ts_ns > prev_ts_)
-            bar_sec_ = static_cast<int>((bar.ts_ns - prev_ts_) / 1'000'000'000);
+        // Bar interval, measured as the SMALLEST adjacent gap seen so far.
+        //
+        // It used to latch the FIRST adjacent pair, and that lost a whole
+        // trading day on 2026-08-25. The seed handed to a re-init is the last
+        // 4000 candles of the cached series, so where it starts slides every
+        // time the series grows; land on a cut whose first pair straddles a
+        // session boundary and this measured the OVERNIGHT GAP — 63,300 s for
+        // 15:55 to the next 09:30, 236,100 s across a weekend, against a true
+        // 300. Then `minutes` below is 1055 on the first bar of every day, the
+        // EOD branch latches eod_done_ AND entered_ ("no re-arming today"), and
+        // on_bar returns above the range and arming blocks for the rest of the
+        // session. Silently: the EOD branch only logs when it has a position to
+        // flatten, and the symbol was flat. CAPR sat out the day and /diag could
+        // not show it — nothing compares this against cfg.symbol_bar_seconds,
+        // which the engine has known all along.
+        //
+        // A minimum is the right estimator because every wrong answer available
+        // here is too LARGE: gaps come from session boundaries, halts and thin
+        // symbols that do not print every interval. Any one contiguous pair
+        // anywhere in the seed gives the true size, and 4000 bars of history
+        // always contain one. Timestamps are bar OPEN times from the feed, so a
+        // delayed batch delivering six bars at once still carries their real
+        // spacing and cannot shrink this.
+        if (prev_ts_ > 0 && bar.ts_ns > prev_ts_) {
+            const int gap =
+                static_cast<int>((bar.ts_ns - prev_ts_) / 1'000'000'000);
+            if (gap > 0 && (bar_sec_ == 0 || gap < bar_sec_)) bar_sec_ = gap;
+        }
         prev_ts_ = bar.ts_ns;
 
         const int64_t day = bar.ts_ns / kDayNs;
@@ -118,7 +142,23 @@ public:
             // unaffected. Assumes an Eastern-time box, as US RTH gates do.
             const bool by_clock =
                 bar_sec_ < 23 * 3600 && hour_of_day_local(bar.ts_ns) >= kEodBackstopH;
-            if (minutes >= session_min_ - eod_min_ || by_clock) {
+            // The bar-COUNT test needs at least two bars in the session, the
+            // clock test does not. minutes is bars_today_ * bar_sec_, so on the
+            // first bar of a day it is one sample multiplied by an estimate that
+            // nothing inside this session has yet corroborated — and if that
+            // estimate is a session boundary rather than a bar (see the gap
+            // measurement above) the product clears session_min on the spot.
+            //
+            // That is not a small error. eod_done_ and entered_ latch together
+            // and reset_session only runs on a day rollover, so tripping here on
+            // bar 1 disables the strategy for the WHOLE session, before the
+            // second bar has arrived to correct the estimate. It is what
+            // silenced CAPR on 2026-08-25. A session cannot end on its first
+            // bar; requiring two costs one bar of EOD latency in the worst case
+            // and the clock backstop below is unaffected either way.
+            const bool by_count =
+                bars_today_ >= 2 && minutes >= session_min_ - eod_min_;
+            if (by_count || by_clock) {
                 if (!eod_done_) {
                     eod_done_ = true;
                     entered_ = true;  // no re-arming today
@@ -152,7 +192,14 @@ public:
 
         // Range complete: arm the breakout stops, once per session.
         if (!armed_ && !entered_ && long_stop_id_ == 0 && short_stop_id_ == 0) {
-            armed_ = true;
+            // NOT latched yet. armed_ used to be set here, above every check
+            // below it, so a range that was not usable YET disabled the
+            // breakout for the rest of the day — and the range can become
+            // usable: bar_sec_ refines downward (see the gap measurement), which
+            // raises range_bars, which re-opens the range-building branch above
+            // and lets a one-bar degenerate range fill out properly. Latching on
+            // the intent to arm rather than on arming is the same mistake as
+            // latching it before ctx.submit_order, one scope out.
             const double h = range_hi_ - range_lo_;
             if (h < std::max(0.01, range_hi_ * 1e-6)) return;  // degenerate range
             range_h_ = h;
@@ -179,6 +226,11 @@ public:
             qty = std::min(qty, std::floor(ctx.budget(sym_) / range_hi_));
             qty = std::min(qty, max_qty_);
             if (qty < 1.0) return;
+            // NOW it is armed: every reason not to be has been ruled out and the
+            // submit is next. Anything above this line that returns leaves the
+            // strategy free to try again on the following bar, which is what a
+            // "not yet" answer should mean.
+            armed_ = true;
             long_stop_id_ = ctx.submit_order({sym_, Side::Buy, OrdType::Stop, {},
                                               qty, 0.0, range_hi_, 0.0, 0.0});
             if (allow_short_)
