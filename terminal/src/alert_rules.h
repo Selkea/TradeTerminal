@@ -5,6 +5,7 @@
 
 #include "engine/reject.h"          // kOrderRefusedTag and friends
 #include "engine/tws_client_id.h"   // kTwsClientIdConflictTag
+#include "eod_report.h"             // kEodReportTag
 #include "net/book_divergence.h"    // kBookDivergenceTag
 #include "symbol_params.h"          // kUnreachableStopTag
 
@@ -212,6 +213,7 @@ enum class AlertCategory {
     Connection,      // gateway, broker socket, data feed, client-id collisions
     Integrity,       // the app and the broker disagree about what is held
     Lineup,          // the daily build, and the session guard that ends the day
+    EndOfDay,        // the once-a-day summary of what the day made and still holds
     System,          // everything else
     COUNT
 };
@@ -224,6 +226,7 @@ inline constexpr const char* alert_category_name(AlertCategory c) {
     case AlertCategory::Connection: return "Connection";
     case AlertCategory::Integrity:  return "Integrity";
     case AlertCategory::Lineup:     return "Lineup";
+    case AlertCategory::EndOfDay:   return "EndOfDay";
     default:                        return "System";
     }
 }
@@ -247,6 +250,15 @@ inline AlertCategory classify_alert_category(const std::string& l) {
     // because both are news about which symbols and which numbers trade today.
     if (has(kUnreachableStopDeclinedTag) || has(kUnreachableStopRefusedTag))
         return AlertCategory::Lineup;
+    // BEFORE EVERYTHING, including Risk. The day summary QUOTES the day: it
+    // names halts, positions nothing is protecting, the loss limit, and the word
+    // EOD. Every one of those is a substring some branch below matches, so
+    // classified by content this page would file itself under Risk on exactly
+    // the days it has the most to say — and Risk is deliberately the category an
+    // operator cannot silence, so a routine daily digest would have become
+    // unsilenceable noise in the one channel that must never be ignored.
+    // It carries its own tag and is answered first for that reason.
+    if (has(kEodReportTag)) return AlertCategory::EndOfDay;
     // RISK first, for the same reason classify_alert checks Critical first: a
     // line that is both a fill and a forced flatten is about the flatten.
     if (has("KILL SWITCH") || has("RISK HALT") || has("EOD BACKSTOP") ||

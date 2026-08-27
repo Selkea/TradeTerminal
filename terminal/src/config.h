@@ -97,6 +97,10 @@ struct AppConfig {
     bool notify_connection = true;
     bool notify_integrity = true;
     bool notify_lineup = true;
+    // The once-a-day close-of-business summary (AlertCategory::EndOfDay). One
+    // page, after the close, on every day the market opened — including the days
+    // nothing traded, which is the case it is most worth reading.
+    bool notify_eod = true;
     bool notify_system = true;
     // Command that starts the IBKR Client Portal Gateway (e.g. its run.bat
     // with the conf path); enables the Launch button in Sign In. Empty = off.

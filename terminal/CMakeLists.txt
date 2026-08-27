@@ -26,6 +26,7 @@ add_executable(tt_terminal
     src/config.cpp
     src/update_check.cpp
     src/journal.cpp
+    src/eod_report.cpp
     src/panels/journal_panel.cpp
     src/candle_plot.cpp
     src/net/gateway_data.cpp
@@ -145,8 +146,10 @@ add_executable(tt_terminal_tests
     tests/test_lineup_dryrun.cpp
     tests/test_tick_clock.cpp
     tests/test_ui_tooltips.cpp
+    tests/test_eod_report.cpp
     src/panels/log_console.cpp
     src/journal.cpp
+    src/eod_report.cpp
     src/config.cpp   # test_symbol_params round-trips per-symbol params through it
     # test_alerts drives the REAL AlertNotifier, not a stand-in: the delivery
     # accounting it pins (a page that failed must never read as sent) lives in

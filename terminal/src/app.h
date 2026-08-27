@@ -13,6 +13,7 @@
 #include "engine/strategy_host.h"
 #include "engine/symbol_rank.h"
 #include "tt/strategy_registry.h"
+#include "eod_report.h"      // EodReport, held between the crossing and the send
 #include "journal.h"
 #include "lineup_dryrun.h"
 #include "market_data.h"
@@ -502,6 +503,28 @@ private:
     // edge-triggered on the close crossing, so a session started AFTER the
     // cutoff — every evening deploy — is left alone. See session_should_stop.
     int session_guard_prev_sod_ = -1;
+
+    // THE CLOSE-OF-BUSINESS SUMMARY. One Info page per trading day: what the day
+    // made, what it banked against what it is still holding, and how much of the
+    // loss limit it used. See eod_report.h for what each number means and why
+    // the split is reported rather than one figure.
+    //
+    // Triggered by the same session_should_stop crossing as pump_session_guard,
+    // and runs immediately BEFORE it, because the guard stops the session and
+    // the per-symbol realized/open split only exists while one is live. The
+    // journal half is not ready in that frame — end_session lands on the next
+    // frame's live_running transition — so the report is captured at the
+    // crossing and EMITTED once journal_session_ clears.
+    //
+    // Its own day/sod pair rather than the guard's: the guard stops observing
+    // whenever no session is running, and the day this most needs to report is
+    // the day none ever started.
+    void pump_eod_report();
+    int eod_report_day_ = -1;        // tm_yday last reported (-1 = never)
+    int eod_report_prev_sod_ = -1;   // seconds-of-day last observed (-1 = never)
+    bool eod_report_pending_ = false;
+    double eod_report_armed_at_ = 0;   // mono_s() at the crossing (grace deadline)
+    EodReport eod_pending_;
 
     // History-staleness watchdog: pages when a traded symbol's bars stop being
     // refreshed while the data socket still reports connected. The 2026-08-07

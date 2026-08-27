@@ -3783,6 +3783,9 @@ int App::tick() {
     pump_book_audit();        // alert if the app's book and the broker's disagree
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
     pump_preopen_gateway_check();   // 08:45 window: is the gateway actually LOGGED IN?
+    // BEFORE the guard, on the same crossing: the guard stops the session, and
+    // the per-symbol realized/open split only exists while one is live.
+    pump_eod_report();        // one summary page per trading day, after the close
     pump_session_guard();     // a live session must not outlive its trading day
 
     // Deferred strategy loads, strategy-switch backtests, and finished-run
@@ -5077,8 +5080,19 @@ void App::apply_notification_settings() {
     alerts_.set_category_enabled(static_cast<int>(C::Connection), cfg_.notify_connection);
     alerts_.set_category_enabled(static_cast<int>(C::Integrity), cfg_.notify_integrity);
     alerts_.set_category_enabled(static_cast<int>(C::Lineup), cfg_.notify_lineup);
+    alerts_.set_category_enabled(static_cast<int>(C::EndOfDay), cfg_.notify_eod);
     alerts_.set_category_enabled(static_cast<int>(C::System), cfg_.notify_system);
 }
+
+// The category gate is a fixed-width array in AlertNotifier and the enum is the
+// index into it. Overrun it and the extra categories are silently ungated —
+// which reads as "the switch does nothing" and would take an incident to spot.
+// Adding a ninth category means bumping kMaxCategories AND its all-true
+// initializer (a short aggregate initialiser leaves the new slots FALSE, i.e.
+// silenced, which is the one default this subsystem must never have).
+static_assert(static_cast<int>(AlertCategory::COUNT) <=
+                  AlertNotifier::kMaxCategories,
+              "AlertCategory outgrew AlertNotifier::kMaxCategories");
 
 void App::alert_scan(const std::string& l) {
     // A dry run runs the REAL lineup, so it emits the real verdicts — including
@@ -5543,6 +5557,93 @@ void App::pump_session_guard() {
     // never is, whatever the switch says.
     const bool market_open = rth_open_elapsed_ms(tm) > 0;
     safe_stop_live(!(cfg_.trade_flatten_on_stop && market_open));
+}
+
+// The close-of-business summary. See App::pump_eod_report in app.h for the
+// two-phase capture and eod_report.h for what the numbers mean.
+void App::pump_eod_report() {
+    // How long the emit may wait for the journal to close the day. The stop it
+    // is waiting on happens on the very next frame, so this is not a timeout in
+    // normal operation — it is the deadline that stops "wait for a condition"
+    // from becoming a report that silently never arrives (a swap mid-stop, a
+    // session a human restarts at 16:15, a stop that wedges). Past it the page
+    // goes out anyway and says which figure is incomplete.
+    static constexpr double kEodReportGraceSec = 180.0;
+
+    std::time_t now_tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now_tt);
+    const int sod_now = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    const bool cross =
+        session_should_stop(tm, eod_report_day_, eod_report_prev_sod_);
+    // Observed EVERY frame, unlike the guard's, which stops tracking whenever no
+    // session runs. A day that never started one still has to be reported, and
+    // an edge trigger that was not watching cannot see its own crossing.
+    eod_report_prev_sod_ = sod_now;
+    if (cross) {
+        eod_report_day_ = tm.tm_yday;   // once per day, whatever happens below
+        eod_pending_ = EodReport{};
+        char d[16];
+        std::snprintf(d, sizeof d, "%04d-%02d-%02d", tm.tm_year + 1900,
+                      tm.tm_mon + 1, tm.tm_mday);
+        eod_pending_.date = d;
+        eod_pending_.journal_available = journal_.ok();
+        if (engine_.live_running()) {
+            const LiveSnapshot s = engine_.live_snapshot();
+            eod_pending_.halted = s.halted;
+            eod_pending_.daily_loss = s.risk.daily_loss;
+            eod_pending_.daily_loss_limit = s.risk.daily_loss_limit;
+            for (const auto& ss : s.symbols)
+                // The gross-to-net conversion lives in eod_row_from, where a
+                // test can reach it — realized_pnl here is GROSS of commissions.
+                eod_pending_.symbols.push_back(
+                    eod_row_from(ss.symbol, ss.position.realized_pnl, ss.fees,
+                                 ss.position.qty, ss.position.avg_price,
+                                 ss.position.unrealized_pnl));
+        }
+        eod_report_pending_ = true;
+        eod_report_armed_at_ = mono_s();
+    }
+    if (!eod_report_pending_) return;
+    // Wait for the journal to close the day before reading its totals: the guard
+    // stops the session on this same crossing, but end_session runs on the NEXT
+    // frame's live_running transition, so reporting in the crossing frame would
+    // find today's own session still open and publish a net of zero for it.
+    const bool timed_out = mono_s() - eod_report_armed_at_ >= kEodReportGraceSec;
+    if (journal_session_ != 0 && !timed_out) return;
+    eod_report_pending_ = false;
+    eod_pending_.session_still_open = journal_session_ != 0;
+    if (journal_.ok()) {
+        // Newest first; 3 is slack for a clock that rolls the date between the
+        // crossing and the send, not a search window.
+        for (const TradeJournal::DayRow& row : journal_.days(3))
+            if (row.date == eod_pending_.date) {
+                eod_pending_.sessions = row.sessions;
+                eod_pending_.fills = row.fills;
+                eod_pending_.net = row.pnl;
+                break;
+            }
+        // THE HALT FLAG COMES FROM THE JOURNAL, not only from the snapshot
+        // above. A day that tripped its loss limit halts and stops THERE — at
+        // 11:00, say — so by the close there is no live session left to ask, and
+        // reading it from the snapshot alone would drop "HALTED" from the report
+        // for precisely the days it is the headline. The journal keeps it per
+        // session; any halted session makes it a halted day.
+        for (const TradeJournal::SessionRow& row : journal_.sessions(20)) {
+            if (row.started.rfind(eod_pending_.date, 0) != 0) continue;
+            if (row.halted) eod_pending_.halted = true;
+        }
+    }
+    const std::string body = format_eod_report(eod_pending_);
+    alerts_.notify(AlertNotifier::Info, body);
+    // route(), NOT route_operator(): the latter runs alert_scan, which would
+    // page the whole summary a second time. Line by line, because the ring the
+    // console and /logs serve stores one line per entry.
+    for (size_t i = 0, start = 0; i <= body.size(); ++i) {
+        if (i != body.size() && body[i] != '\n') continue;
+        if (i > start) route(body.substr(start, i - start));
+        start = i + 1;
+    }
 }
 
 void App::pump_history_watchdog() {
@@ -6288,6 +6389,12 @@ void App::draw_menu_bar() {
                 {"Lineup", &cfg_.notify_lineup, AlertCategory::Lineup,
                  "The daily symbol build - what was picked, what was skipped, and\n"
                  "the guard that ends the trading day."},
+                {"End of day", &cfg_.notify_eod, AlertCategory::EndOfDay,
+                 "One page after the close, every day the market opened: what the\n"
+                 "day made, what it banked against what it is still holding, and\n"
+                 "how much of the loss limit it used.\n\n"
+                 "Also sent on a day that traded NOTHING, which is the day it is\n"
+                 "most worth reading."},
                 {"System", &cfg_.notify_system, AlertCategory::System,
                  "Anything that fits none of the categories above."},
             };
