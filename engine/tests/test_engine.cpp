@@ -1736,3 +1736,74 @@ TEST_CASE("backtest: max_position_qty stops the SECOND entry, not the first") {
     REQUIRE(r.fills.size() == 1);
     CHECK(r.fills[0].qty == doctest::Approx(100));
 }
+
+// A strategy that rests ONE order at a price the feed will never reach, then
+// does nothing. It is flat the whole time, which is exactly the state the swap
+// gate used to read as "safe to rebuild".
+struct RestingOrderStrat : IStrategy {
+    std::atomic<int> inits{0};
+    std::atomic<unsigned long long> order{0};
+    std::atomic<bool> cancel_now{false};
+    void on_init(IStrategyContext& ctx) noexcept override {
+        // First init only: a re-init that DOES happen must be visible as
+        // inits==2 without a second order confusing what is resting.
+        if (inits.fetch_add(1) != 0) return;
+        // Buy-stop far above the market: accepted, working, never triggered.
+        OrderRequest r{};
+        r.symbol_id = 1;
+        r.side = Side::Buy;
+        r.type = OrdType::Stop;
+        r.qty = 10.0;
+        r.stop_price = 10'000.0;
+        order = ctx.submit_order(r);
+    }
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t, const Tick&) noexcept override {
+        if (cancel_now.exchange(false) && order.load() != 0)
+            ctx.cancel_order(order.load());
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+// 2026-08-27, SPCH. orb_breakout armed a 555-share buy-stop at 10:05, the
+// autopilot re-seeded the symbol at 10:08, and the stop triggered at 10:35 into
+// a strategy instance whose long_stop_id_ had been wiped by on_init. None of
+// on_fill's branches matched the fill, so there was no OCO cancel, no protective
+// stop and no take-profit: $4,995 of stock with nothing to close it but the
+// 15:57 backstop. The swap gate tested only for a flat POSITION, and a strategy
+// resting an entry order has no position yet.
+TEST_CASE("live swap: a re-init waits for resting orders, not just a flat book") {
+    Engine eng;
+    RestingOrderStrat s;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 300;
+    CHECK(eng.start_live(cfg, {&s}));
+    CHECK(wait_for([&] { return s.inits.load() >= 1; }));
+    CHECK(s.order.load() != 0);   // the order was accepted and is resting
+
+    // The symbol is FLAT — the old gate's whole test — but not idle.
+    eng.update_symbol_params(1, {{"foo", 1.0}});
+    for (int i = 0; i < 200; ++i) {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);   // swaps apply on the live loop
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(eng.live_snapshot().symbols[0].position.qty == 0.0);   // flat throughout
+    // The point of the case: rebuilding here would wipe the id of an order that
+    // is still live at the broker.
+    CHECK(s.inits.load() == 1);
+
+    // DEFERRED, NOT DROPPED. Once the order is gone the same queued swap must
+    // still land — otherwise this fix would silently stop params updates
+    // reaching any strategy that ever rests an order.
+    s.cancel_now = true;
+    const bool applied = wait_for([&] {
+        eng.push_live_tick("AAA", 1, 50.0, 0.0);
+        return s.inits.load() >= 2;
+    });
+    CHECK(applied);
+    CHECK(s.inits.load() == 2);
+    eng.stop_live();
+}

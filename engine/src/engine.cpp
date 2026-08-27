@@ -1682,11 +1682,36 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         if (d > watchdog_ns) halt_symbol(sid, d);
     };
 
-    // Apply queued hot-swaps for symbols that are FLAT: install the new params
+    // Apply queued hot-swaps for symbols that are QUIET: install the new params
     // (and instance, for a strategy swap), lift any watchdog halt, and re-init
-    // so the strategy re-reads its params with clean state. Symbols holding a
-    // position stay queued until they go flat. (Instances are per-symbol in
-    // the app; a shared instance would be reset for all its symbols.)
+    // so the strategy re-reads its params with clean state. Symbols still in a
+    // trade stay queued. (Instances are per-symbol in the app; a shared instance
+    // would be reset for all its symbols.)
+    //
+    // QUIET IS NOT THE SAME AS FLAT, and until 0.39.0 this only tested flat.
+    // on_init wipes the strategy's state — every order id it is holding — while
+    // the orders themselves stay live at the broker, because nothing here
+    // cancels them. A strategy resting an ENTRY order has no position yet, so it
+    // read as safe to rebuild, and the reborn instance then did not recognise
+    // its own order when it filled.
+    //
+    // 2026-08-27, SPCH: orb_breakout armed a 555-share buy-stop at 10:05, the
+    // autopilot re-seeded it at 10:08, and the stop triggered at 10:35 into an
+    // instance whose long_stop_id_ was 0. None of on_fill's branches matched, so
+    // there was no OCO cancel, no protective stop and no take-profit: $4,995 of
+    // stock held with nothing to close it but the 15:57 backstop, and the
+    // strategy's own "position unprotected" log could not fire because
+    // arm_bracket was never reached. The naked position was the SILENT outcome.
+    //
+    // Deferring rather than cancelling the resting order, deliberately: this
+    // path exists to avoid disturbing a symbol mid-trade, and an armed breakout
+    // IS mid-trade. Cancelling would let a 30-minute re-seed quietly delete a
+    // legitimately armed entry and re-arm it off a different range.
+    auto symbol_has_working_order = [&](uint32_t sid) {
+        for (const auto& o : orders)
+            if (o.symbol_id == sid && o.status == OrderStatus::Working) return true;
+        return false;
+    };
     auto apply_swaps = [&] {
         std::vector<PendingSwap> ready;
         {
@@ -1698,7 +1723,19 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                                          static_cast<ptrdiff_t>(i));
                     continue;
                 }
-                if (pf.position(s.symbol_id).qty != 0.0) {   // wait for flat
+                const bool holds = pf.position(s.symbol_id).qty != 0.0;
+                const bool resting = !holds && symbol_has_working_order(s.symbol_id);
+                if (holds || resting) {   // wait for flat AND for nothing resting
+                    // Once per swap. A swap that waits all afternoon must say so
+                    // once, not every cycle and not never — the deferral used to
+                    // be invisible either way.
+                    if (resting && !s.announced_wait) {
+                        s.announced_wait = true;
+                        push_log("live: " + cfg.symbols[s.symbol_id - 1] +
+                                 ": re-init deferred - flat, but an order is "
+                                 "still working. Rebuilding the strategy now "
+                                 "would lose track of it.");
+                    }
                     ++i;
                     continue;
                 }

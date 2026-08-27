@@ -605,6 +605,11 @@ private:
         // True: this swap exists ONLY to deliver warmup bars; leave the
         // symbol's current params untouched.
         bool keep_params = false;
+        // Set once this swap has been held back and said so, so a swap that
+        // waits all afternoon reports the reason ONE time rather than every
+        // cycle. See apply_swaps: a swap deferred in silence is exactly what
+        // made the 2026-08-27 orphan invisible.
+        bool announced_wait = false;
     };
     std::mutex swap_mu_;
     std::vector<PendingSwap> pending_swaps_;
