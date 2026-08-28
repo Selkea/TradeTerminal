@@ -263,6 +263,10 @@ inline AlertCategory classify_alert_category(const std::string& l) {
     // line that is both a fill and a forced flatten is about the flatten.
     if (has("KILL SWITCH") || has("RISK HALT") || has("EOD BACKSTOP") ||
         has("PROTECTIVE STOP REJECTED") || has(kUnreachableStopTag) ||
+        // Carried by BOTH the naked-position alarm and its all-clear, so the
+        // two cannot land in different categories again — the alarm used to
+        // fall through to System (silenceable) while its recovery filed here.
+        has(kNakedPositionTag) ||
         has("unprotected") || has("orphaned position") ||
         // A refused EXIT is Risk, NOT Orders. "Orders" is the switch someone
         // flips to stop hearing about routine refusals, and this tag nests

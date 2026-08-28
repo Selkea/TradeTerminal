@@ -5183,35 +5183,58 @@ void App::pump_orphan_watchdog() {
         return;
     }
     const LiveSnapshot s = engine_.live_snapshot();
-    auto has_working_stop = [&](uint32_t sid) {
+    // Side and size, not just "some Stop exists for this symbol" — see
+    // stop_covers. orb_breakout rests BUY stops as its ENTRIES, so the old test
+    // would have read a long as protected by the order that opened it.
+    auto covered = [&](uint32_t sid, double pos_qty) {
         for (const OrderRecord& o : s.orders)
             if (o.symbol_id == sid && o.status == OrderStatus::Working &&
-                o.type == static_cast<uint8_t>(OrdType::Stop))
+                o.type == static_cast<uint8_t>(OrdType::Stop) &&
+                stop_covers(pos_qty, o.side == static_cast<uint8_t>(Side::Sell),
+                            o.qty))
                 return true;
         return false;
+    };
+    auto strat_key_of = [&](const std::string& sym) -> std::string {
+        for (const auto& ts : cfg_.trade_symbols)
+            if (ts.symbol == sym) return ts.strat_key;
+        return {};
     };
     std::string orphans;
     for (size_t i = 0; i < s.symbols.size(); ++i) {
         const SymbolState& ss = s.symbols[i];
-        if (!ss.adopted || ss.position.qty == 0.0) continue;
-        if (has_working_stop(static_cast<uint32_t>(i + 1))) continue;
+        if (ss.position.qty == 0.0) continue;
+        // ADOPTED, or a strategy that was SUPPOSED to place a stop and has not.
+        // The second half is 0.40.0: the comment above is right that a blanket
+        // alert cries wolf, and wrong that `adopted` is the only always-wrong
+        // state. orb_breakout holding 555 unbracketed shares is just as wrong,
+        // and on 2026-08-27 nothing looked for 5h22m.
+        if (!ss.adopted && !strategy_places_price_stop(strat_key_of(ss.symbol)))
+            continue;
+        if (covered(static_cast<uint32_t>(i + 1), ss.position.qty)) continue;
         if (!orphans.empty()) orphans += ", ";
         orphans += ss.symbol + " " +
-                   std::to_string(static_cast<long long>(ss.position.qty));
+                   std::to_string(static_cast<long long>(ss.position.qty)) +
+                   (ss.adopted ? " (adopted)" : "");
     }
     switch (orphan_wd_.update(!orphans.empty(), mono_s(), kOrphanAlertSec,
                               kOrphanReAlertSec)) {
     case WatchdogTimer::Action::None:
         return;
     case WatchdogTimer::Action::Recovered:
-        alerts_.notify(AlertNotifier::Warning, "positions: no orphaned positions left");
+        // Same tag as the alarm, so both file under Risk. It used to be the
+        // ONLY one of the pair that did.
+        alerts_.notify(AlertNotifier::Warning,
+                       std::string(kNakedPositionTag) + " cleared - every open "
+                       "position has something that will close it again");
         return;
     case WatchdogTimer::Action::Page:
         break;
     }
     const std::string msg =
-        "WATCHDOG adopted position(s) with NO protective stop and a paused "
-        "strategy - nothing will close them: " + orphans;
+        std::string("WATCHDOG ") + kNakedPositionTag +
+        ": position(s) with NO protective stop and nothing that will close "
+        "them: " + orphans;
     alerts_.notify(AlertNotifier::Critical, msg);
     route("alert: " + msg);
 }

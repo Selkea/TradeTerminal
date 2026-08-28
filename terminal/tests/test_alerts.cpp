@@ -1377,3 +1377,37 @@ TEST_CASE("the quiet variants nest inside the loud tag, and order decides") {
     REQUIRE(cat_risk != std::string::npos);
     CHECK(cat_quiet < cat_risk);
 }
+
+// The naked-position alarm and its all-clear must land in the SAME category,
+// and that category must be one the operator cannot silence by accident.
+//
+// Before 0.40.0 they did not. The Critical alarm read "WATCHDOG adopted
+// position(s) with NO protective stop..." — which matches none of the Risk
+// substrings, so it fell through to System and was droppable by notify_system,
+// before the enqueue and before the Critical beep. Its recovery said "no
+// orphaned positions left", which DOES match, so the all-clear was
+// unsilenceable and the alarm was not. Exactly backwards.
+TEST_CASE("naked position: alarm and all-clear share an unsilenceable category") {
+    using tt::ui::kNakedPositionTag;
+    const std::string alarm =
+        std::string("WATCHDOG ") + kNakedPositionTag +
+        ": position(s) with NO protective stop and nothing that will close "
+        "them: SPCH 555";
+    const std::string clear =
+        std::string(kNakedPositionTag) +
+        " cleared - every open position has something that will close it again";
+
+    CHECK(classify_alert_category(alarm) == AlertCategory::Risk);
+    CHECK(classify_alert_category(clear) == AlertCategory::Risk);
+    CHECK(classify_alert_category(alarm) == classify_alert_category(clear));
+    // Risk is the category the UI marks and refuses to let go quiet.
+    CHECK(tt::ui::alert_category_is_safety(AlertCategory::Risk));
+    // The alarm is still Critical on severity (the WATCHDOG prefix).
+    CHECK(tt::ui::classify_alert(alarm) == tt::ui::AlertClass::Critical);
+    // The exact text that USED to fall through, pinned so the old wording
+    // cannot come back without this failing.
+    CHECK(classify_alert_category(
+              "WATCHDOG adopted position(s) with NO protective stop and a "
+              "paused strategy - nothing will close them: SPCH 555") ==
+          AlertCategory::System);
+}

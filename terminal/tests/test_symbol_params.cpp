@@ -592,3 +592,57 @@ TEST_CASE("the two quiet verdicts are the ones where nothing is exposed") {
     // success path, which is the whole defect.
     CHECK(src.find("champion REJECTED - \" +") == std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Naked-position detection (0.40.0). pump_orphan_watchdog was gated on `adopted`
+// alone; on 2026-08-27 orb_breakout held 555 unbracketed SPCH shares for 5h22m
+// and nothing looked, because the position was not adopted. These are the two
+// free predicates that widen it without reintroducing the cry-wolf the old gate
+// was avoiding.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("naked position: only strategies that PLACE a stop are watched") {
+    using tt::ui::strategy_places_price_stop;
+    // Watched: these three place a real resting protective stop, so a position
+    // of theirs with no stop is always wrong.
+    CHECK(strategy_places_price_stop("orb_breakout.cpp"));
+    CHECK(strategy_places_price_stop("donchian_trend.cpp"));
+    CHECK(strategy_places_price_stop("scalper_burst.cpp"));
+    // Not watched: stopless BY DESIGN, each documented in its own file header.
+    // A blanket alert would fire on these every session, which is exactly the
+    // cry-wolf the old adopted-only gate was protecting against.
+    CHECK_FALSE(strategy_places_price_stop("bollinger_reversion.cpp"));
+    CHECK_FALSE(strategy_places_price_stop("rsi2_pullback.cpp"));
+    CHECK_FALSE(strategy_places_price_stop("sma_crossover.cpp"));
+    // An empty key is the BUILT-IN (kBuiltinStrategyKey -> sma_crossover), not
+    // "no strategy" — the distinction that cost a day in the journal work.
+    CHECK_FALSE(strategy_places_price_stop(""));
+    // UNKNOWN KEYS ARE WATCHED. Forgetting to update this list when a strategy
+    // is added must produce noise, never silence.
+    CHECK(strategy_places_price_stop("some_future_strategy.cpp"));
+}
+
+TEST_CASE("naked position: a stop only covers the right side, at the right size") {
+    using tt::ui::stop_covers;
+    constexpr uint8_t kSell = 1, kBuy = 0;
+    // A long is covered by a SELL stop of at least its size.
+    CHECK(stop_covers(555, kSell, 555));
+    CHECK(stop_covers(555, kSell, 600));
+    // ...and NOT by a BUY stop. orb_breakout rests buy-stops as its ENTRIES, so
+    // a symbol-and-type-only test read a long as protected by the very order
+    // that opened it.
+    CHECK_FALSE(stop_covers(555, kBuy, 555));
+    // 2026-08-06, SNXX: 526 shares behind a stop sized off ONE partial left 426
+    // naked. A short stop is not cover.
+    CHECK_FALSE(stop_covers(526, kSell, 100));
+    // A short is the mirror.
+    CHECK(stop_covers(-300, kBuy, 300));
+    CHECK_FALSE(stop_covers(-300, kSell, 300));
+    CHECK_FALSE(stop_covers(-300, kBuy, 100));
+    // Flat needs nothing.
+    CHECK(stop_covers(0, kBuy, 0));
+    // One share of slack, because a re-armed bracket can trail a partial fill
+    // for one publish cycle. Two shares is not slack.
+    CHECK(stop_covers(555, kSell, 554));
+    CHECK_FALSE(stop_covers(555, kSell, 553));
+}
