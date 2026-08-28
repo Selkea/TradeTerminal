@@ -29,20 +29,68 @@ public:
         slow_ = static_cast<int>(ctx.param("slow", 30));
         qty_ = ctx.param("qty", 100);
         if (fast_ < 1) fast_ = 1;
-        if (slow_ <= fast_) slow_ = fast_ + 1;
+        // REFUSE, DO NOT REPAIR. This line used to read
+        //
+        //     if (slow_ <= fast_) slow_ = fast_ + 1;
+        //
+        // and that repair MANUFACTURED the pathology it looks like it prevents.
+        // The optimizer sweeps one parameter at a time, holding the others at
+        // the incumbent (App::start_sweep_cell), so while it walks `fast` across
+        // its declared [1,500] with `slow` frozen at the default 30, every grid
+        // point above 30 silently became (fast, fast+1). Eleven of the twelve
+        // cells on that pass ran as adjacent moving averages, were scored as if
+        // they were distinct, and one of them got crowned: MRNA went live on
+        // 2026-08-27 with fast=273 slow=274 and lost $110 in a single round trip
+        // (in 142.73, out 139.58, back in 139.80 ten minutes later).
+        //
+        // Adjacent SMAs are not a slow signal, they are a noise generator. With
+        // slow = fast+1 the difference of the two sums is a single close, so
+        // `diff` reduces to (SMA_fast - close[n-slow]) / slow: a smooth mean
+        // measured against one old bar, which crosses zero on tick noise no
+        // matter how long the lookback. That is why nothing downstream caught
+        // it — the 0.35.0 minimum-trade floor is one-sided, and a whipsaw fails
+        // no test that only asks for ENOUGH trades.
+        //
+        // Refusing costs nothing and is scored: a disabled strategy takes zero
+        // trades, lands under sweep_min_trades, and the sweep marks the whole
+        // infeasible region rejected instead of ranking eleven copies of the
+        // same physics. Same doctrine as symbol_params.h's unreachable time
+        // stop: "it would leave the symbol trading a number no backtest ever
+        // scored." A quarter's separation, floor of two bars, so a legitimately
+        // tight pair like (10, 13) still trades.
+        const int min_slow = std::max(fast_ + 2, static_cast<int>(fast_ * 1.25));
+        disabled_ = slow_ < min_slow;
         closes_.clear();
         closes_.reserve(1 << 20);
         sum_fast_ = sum_slow_ = prev_diff_ = 0.0;
         prev_valid_ = false;
         sym_ = 0;
         entry_id_ = exit_id_ = 0;
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "SMA(dll): fast=%d slow=%d qty=%.0f",
-                      fast_, slow_, qty_);
-        ctx.log(1, buf);
+        char buf[160];
+        if (disabled_)
+            std::snprintf(buf, sizeof(buf),
+                          "SMA(dll): DISABLED - slow=%d is not clear of fast=%d "
+                          "(needs >= %d); adjacent averages cross on noise",
+                          slow_, fast_, min_slow);
+        else
+            std::snprintf(buf, sizeof(buf), "SMA(dll): fast=%d slow=%d qty=%.0f",
+                          fast_, slow_, qty_);
+        // Level 2, not 3: level 3 renders as [strategy error] and pages
+        // Critical (alert_rules.h). A set that simply is not trading is
+        // worth saying loudly in the log and not worth waking anyone.
+        ctx.log(disabled_ ? 2 : 1, buf);
     }
 
     void on_bar(IStrategyContext& ctx, uint32_t symbol_id, const Bar& bar) noexcept override {
+        // Refused in on_init; place nothing, ever.
+        //
+        // Safe to return before the exit branch below because a disabled
+        // instance can never be holding its own position: on_init runs either at
+        // session start (before anything trades) or on a hot swap, and since
+        // 0.39.0 a swap requires the symbol to be flat AND have nothing working.
+        // An ADOPTED position is not this strategy's to close — its strategy is
+        // paused and the broker-side stop exits it.
+        if (disabled_) return;
         if (sym_ == 0) sym_ = symbol_id;
         if (symbol_id != sym_) return;
 
@@ -100,6 +148,10 @@ public:
 
 private:
     int fast_ = 10, slow_ = 30;
+    // Set in on_init when slow is not clear enough of fast. A disabled
+    // instance places nothing, so the optimizer scores the region as
+    // zero-trade and rejects it instead of crowning a whipsaw.
+    bool disabled_ = false;
     double qty_ = 100;
     std::vector<double> closes_;
     double sum_fast_ = 0, sum_slow_ = 0, prev_diff_ = 0;

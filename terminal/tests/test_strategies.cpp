@@ -1101,3 +1101,87 @@ TEST_CASE("acceptance: the live caps size it the way production would") {
     const BacktestResult uncapped = boll_replay(233, 15.95);
     CHECK(r.fills.size() == uncapped.fills.size());
 }
+
+// ---------------------------------------------------------------------------
+// sma_crossover: an under-separated pair is REFUSED, not repaired (0.40.0).
+//
+// on_init used to read `if (slow_ <= fast_) slow_ = fast_ + 1;`, and that repair
+// manufactured the pathology. The optimizer sweeps one parameter at a time with
+// the others held at the incumbent, so walking `fast` across [1,500] with `slow`
+// frozen at 30 turned every grid point above 30 into (fast, fast+1) — eleven of
+// twelve cells running identical physics, scored as if distinct. MRNA went live
+// on 2026-08-27 with the crowned fast=273 slow=274 and lost $110 in one round
+// trip. sma_crossover had NO direct test of its own before this.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Bars that oscillate by a hair around a slow drift: nothing a real trend
+// strategy should touch, and exactly what adjacent averages chop up.
+size_t sma_orders(double fast, double slow, int bars = 400) {
+    IStrategy* s = make("sma_crossover.cpp");
+    FakeCtx ctx;
+    ctx.params["fast"] = fast;
+    ctx.params["slow"] = slow;
+    ctx.params["qty"] = 10;
+    ctx.budget_ = 1'000'000.0;   // never the binding constraint here
+    s->on_init(ctx);
+    int64_t ts = local_ts(2026, 8, 5, 9, 30);
+    for (int i = 0; i < bars; ++i) {
+        // Two slow cycles, STARTING AT THE PEAK so the warmup ends while price
+        // is still falling — a monotonic ramp leaves diff positive from the
+        // first valid bar and never crosses UP, which is a property of the
+        // fixture, not of the strategy. Small alternating jitter on top so the
+        // series is not perfectly smooth.
+        const double px = 100.0 + 10.0 * std::cos(i * 2.0 * 3.14159265 / 200.0) +
+                          ((i % 2) ? 0.10 : -0.10);
+        s->on_bar(ctx, 1, mk_bar(ts, px));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    const size_t n = ctx.sent.size();
+    s->destroy();
+    return n;
+}
+} // namespace
+
+TEST_CASE("sma_crossover: the crowned 273/274 pair places nothing at all") {
+    // The exact set that went live on MRNA. Adjacent averages: refused.
+    CHECK(sma_orders(273, 274) == 0);
+    // And the whole family the old clamp produced, at every scale.
+    CHECK(sma_orders(30, 31) == 0);
+    CHECK(sma_orders(91, 92) == 0);
+    CHECK(sma_orders(1, 2) == 0);
+}
+
+TEST_CASE("sma_crossover: slow <= fast is refused rather than repaired") {
+    // The literal input the old clamp existed to fix. Repairing it to
+    // (fast, fast+1) left the symbol trading a pair no backtest ever scored;
+    // refusing leaves it scored as zero-trade and therefore rejectable.
+    CHECK(sma_orders(50, 50) == 0);
+    CHECK(sma_orders(50, 10) == 0);
+}
+
+TEST_CASE("sma_crossover: the separation is PROPORTIONAL, not a fixed gap") {
+    // Mutation testing caught this hole: every case above is also refused by a
+    // bare `slow >= fast + 2`, so nothing proved the 1.25x term did any work.
+    // It is the term that matters at scale — two bars of separation on a 273-bar
+    // average is 0.7%, which is still a smooth mean measured against one old
+    // bar, i.e. still a noise generator. A fixed floor cannot express that.
+    CHECK(sma_orders(100, 105, 900) == 0);   // 5% apart: refused by the ratio
+    CHECK(sma_orders(200, 210, 900) == 0);
+    // ...and the floor is what the ratio cannot express at the small end:
+    // 1.25 x 2 is 2, so the ratio alone would admit (2, 3).
+    CHECK(sma_orders(2, 3) == 0);
+    CHECK(sma_orders(3, 4) == 0);
+}
+
+TEST_CASE("sma_crossover: a properly separated pair still trades") {
+    // The guard must not have disabled the strategy outright. The shipped
+    // default is 10/30, and a 25% separation with a two-bar floor keeps
+    // legitimately tight pairs alive.
+    CHECK(sma_orders(10, 30) > 0);
+    CHECK(sma_orders(8, 10) > 0);    // floor: fast+2 clears when 1.25x does not
+    CHECK(sma_orders(20, 25) > 0);   // exactly 1.25x
+    // A long lookback is fine as long as it is genuinely separated — the rule
+    // rejects adjacency, not slowness.
+    CHECK(sma_orders(100, 200, 900) > 0);
+}

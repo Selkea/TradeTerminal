@@ -165,6 +165,7 @@ set(TT_TESTED_STRATEGIES
     ${CMAKE_SOURCE_DIR}/strategies/bollinger_reversion.cpp
     ${CMAKE_SOURCE_DIR}/strategies/donchian_trend.cpp
     ${CMAKE_SOURCE_DIR}/strategies/scalper_burst.cpp
+    ${CMAKE_SOURCE_DIR}/strategies/sma_crossover.cpp
 )
 target_sources(tt_terminal_tests PRIVATE ${TT_TESTED_STRATEGIES})
 foreach(_src ${TT_TESTED_STRATEGIES})

@@ -78,6 +78,70 @@ namespace tt::ui {
 // ordinary prose about time stops cannot page anybody.
 inline constexpr const char* kUnreachableStopTag = "UNREACHABLE TIME STOP";
 
+// The tag every "this position has nothing that will close it" line carries —
+// the ALARM and its all-clear both, which is the point.
+//
+// 0.40.0. pump_orphan_watchdog's Critical read "WATCHDOG adopted position(s)
+// with NO protective stop..." and its recovery read "no orphaned positions
+// left". classify_alert_category matches "unprotected" and "orphaned position",
+// so the RECOVERY landed in Risk (unsilenceable, correctly) and the ALARM
+// matched nothing and fell through to System — silenceable by notify_system,
+// and dropped before the enqueue and before the Critical beep. The loudest
+// thing this app can say about a naked position was the half an operator could
+// turn off by accident, and its all-clear was the half they could not.
+//
+// Both lines carry this now, so they cannot drift apart again: the category
+// follows the FACT, not a phrase someone may reword.
+inline constexpr const char* kNakedPositionTag = "NAKED POSITION";
+
+// Does this strategy place a price stop for the positions it opens?
+//
+// WHY A CLASSIFIER AND NOT A BLANKET TEST. pump_orphan_watchdog was gated on
+// `adopted` alone, and the comment there gives the honest reason: bollinger_
+// reversion and rsi2_pullback hold their own positions with NO price stop BY
+// DESIGN (a time stop is their risk control), so `unprotected_positions >= 1`
+// is a normal, permanent reading and a blanket alert would cry wolf every
+// session. That reasoning is right. What it got wrong is the conclusion: the
+// state that is "always wrong" is not only an ADOPTED position with no stop,
+// it is any position whose strategy was SUPPOSED to place one and did not.
+//
+// 2026-08-27, SPCH: orb_breakout — which does place a bracket — held 555 shares
+// with no stop for 5h22m because a hot-swap had wiped its order ids (see
+// [[tt-swap-gate-flat-vs-quiet]]). Not adopted, so nothing looked. The cause is
+// fixed; a dropped fill callback or an adapter id-map fault reproduces the same
+// silence, so the DETECTION has to stand on its own.
+//
+// Keyed by strat_key (the .cpp filename, as TradeSymbol carries it). UNKNOWN
+// KEYS RETURN TRUE — a new strategy is watched until someone says otherwise,
+// so the failure mode of forgetting to update this list is noise, not silence.
+// Same conservative-default shape as net/feed_order.h's fidelity rank.
+inline bool strategy_places_price_stop(const std::string& strat_key) {
+    // The stopless-by-design set, each documented in its own file header.
+    // An empty key is the built-in sma_crossover (see kBuiltinStrategyKey),
+    // which submits Market orders only.
+    return !(strat_key.empty() || strat_key == "bollinger_reversion.cpp" ||
+             strat_key == "rsi2_pullback.cpp" || strat_key == "sma_crossover.cpp");
+}
+
+// Is `pos` actually covered by a resting stop?
+//
+// Side and size, not merely "a Stop exists for this symbol". A long is only
+// protected by a SELL stop, and orb_breakout rests BUY stops as its entries —
+// so the old symbol-and-type-only test would read a long as protected by the
+// very order that opened it. Size matters for the same reason the 2026-08-06
+// SNXX bracket did: 526 shares behind a 100-share stop leaves 426 naked, and
+// that is the failure the bracket resizing in orb_breakout exists to prevent.
+//
+// Tolerance on the quantity because partial fills and re-armed brackets can
+// leave the stop a share or two behind for one publish cycle; a whole share is
+// well inside that and far below anything that matters.
+inline bool stop_covers(double pos_qty, uint8_t stop_side_is_sell, double stop_qty) {
+    if (pos_qty == 0.0) return true;
+    const bool need_sell = pos_qty > 0.0;
+    if (need_sell != (stop_side_is_sell != 0)) return false;
+    return stop_qty + 1.0 >= (pos_qty > 0.0 ? pos_qty : -pos_qty);
+}
+
 // ...and the two variants that mean THE GUARD ALREADY ACTED.
 //
 // 0.34.1. The tag above paged Critical on the tag alone, with no regard for the
