@@ -990,6 +990,11 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
 
     std::vector<OrderRecord> orders;   // engine-thread master copy
     bool orders_dirty = true;          // snapshot copies the vector only on change
+    // Outstanding broker-side flattens (LiveSnapshot::PendingFlatten). An
+    // entry is added when broker->flatten() is ASKED for and removed when
+    // that symbol actually reaches flat, so a liquidation that never
+    // happened is a row that never clears rather than silence.
+    std::vector<LiveSnapshot::PendingFlatten> flatten_pending;
     bool params_dirty = true;          // same, for the per-symbol param maps
     bool next_is_manual = false;
     auto symbol_name = [&](uint32_t symbol_id) -> std::string {
@@ -1329,6 +1334,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             params_dirty = false;
         }
         if (fresh) snap_orders_ = std::move(fresh);
+        snap_.flatten_pending = flatten_pending;   // normally empty
         snap_.ticks = ticks;
         snap_.last_tick_ts_ms = last_ts_ms;
         snap_.lat_p50 = lat_p50;
@@ -1365,13 +1371,57 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     // Shared by the sim fill path and the broker event drain.
     auto apply_fill = [&](const Fill& f) {
         pf.apply(f);
+        bool matched = false;
         for (auto& o : orders)
             if (o.id == f.order_id) {
                 o.status = OrderStatus::Filled;
                 o.fill_price = f.price;
                 o.fee = f.fee;
                 orders_dirty = true;
+                matched = true;
             }
+        // A FILL FOR AN ORDER THIS ENGINE NEVER SUBMITTED. Until 0.41.0 the
+        // loop above simply found nothing and the fill vanished from the order
+        // book — the position moved, the P&L booked, and the blotter showed an
+        // entry with no exit.
+        //
+        // The reachable source is broker->flatten(): it returns void and the
+        // adapter's I/O thread submits the closes under its own ids, so the
+        // kill switch and the EOD backstop produce fills for ids `orders` has
+        // never heard of. A foreign order on the same account would land here
+        // too, which is the other reason to reconstruct rather than discard.
+        //
+        // Type is recorded as Market because that is what both liquidation
+        // paths actually send; a limit price is not knowable from a fill and
+        // guessing one would be worse than leaving it at 0.
+        if (!matched) {
+            const OrderRequest r{f.symbol_id, f.side, OrdType::Market, {},
+                                 f.qty, 0.0, 0.0, 0.0, 0.0};
+            record_order(r, f.order_id);
+            for (auto& o : orders)
+                if (o.id == f.order_id) {
+                    o.status = OrderStatus::Filled;
+                    o.fill_price = f.price;
+                    o.fee = f.fee;
+                    o.broker_originated = true;
+                    orders_dirty = true;
+                }
+        }
+        // Whatever this fill closed, the flatten no longer has to. Cleared on
+        // the POSITION going flat rather than on quantity, because a flatten
+        // can fill in pieces and a partial must keep the expectation open.
+        if (!flatten_pending.empty() && f.symbol_id >= 1 && f.symbol_id <= n_sym &&
+            pf.position(f.symbol_id).qty == 0.0) {
+            const std::string& fname = cfg.symbols[f.symbol_id - 1];
+            const size_t before = flatten_pending.size();
+            flatten_pending.erase(
+                std::remove_if(flatten_pending.begin(), flatten_pending.end(),
+                               [&](const LiveSnapshot::PendingFlatten& p) {
+                                   return p.symbol == fname;
+                               }),
+                flatten_pending.end());
+            if (flatten_pending.size() != before) orders_dirty = true;
+        }
         // Lead with the SYMBOL: without it a fill line cannot be attributed at
         // all, and journal.db was the only place that carried it. The order id
         // stays so a fill still pairs with its "tws: order #N acked" line.
@@ -1441,13 +1491,47 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         }
     };
 
+    // Record what a broker-side flatten is expected to close, BEFORE asking for
+    // it. broker->flatten() returns void and yields no order id, so without
+    // this a liquidation that never reached the exchange is indistinguishable
+    // from one that filled — both leave no order rows and the position either
+    // moves or does not. 2026-08-06: the backstop's flatten did not fill, the
+    // position sat overnight, $846, and nothing anywhere said a flatten was
+    // outstanding. Entries clear in apply_fill when the symbol reaches flat.
+    // The ENTIRE broker-side liquidation sequence, in one place, because it
+    // has two call sites (the kill switch and the EOD backstop) and the
+    // expectation is only worth anything if it can never be forgotten at one
+    // of them. Mutation testing made the point: deleting the bookkeeping from
+    // the backstop alone left every test green, since the backstop's
+    // minute-resolution edge trigger (prev_h < flat_h <= hod, both sampled
+    // from the same minute) cannot be driven from a test at all. One helper
+    // means the covered path and the uncovered path are the same code.
+    auto broker_flatten = [&](const char* why) {
+        for (size_t i = 0; i < n_sym; ++i) {
+            const double q = pf.position(static_cast<uint32_t>(i + 1)).qty;
+            if (q == 0.0) continue;
+            // Re-requesting replaces rather than duplicates: the kill switch
+            // and the EOD backstop can both fire on the same afternoon.
+            const std::string& nm = cfg.symbols[i];
+            flatten_pending.erase(
+                std::remove_if(flatten_pending.begin(), flatten_pending.end(),
+                               [&](const LiveSnapshot::PendingFlatten& p) {
+                                   return p.symbol == nm;
+                               }),
+                flatten_pending.end());
+            flatten_pending.push_back({nm, q, rt.now_ns(), why});
+        }
+        orders_dirty = true;
+        broker->cancel_all();
+        broker->flatten();
+    };
+
     // Kill-switch behavior, shared by the manual command and automated risk
     // halts: cancel everything, flatten, halt the strategy.
     auto kill_all = [&](const std::string& why) {
         halted = true;
         if (broker) {
-            broker->cancel_all();
-            broker->flatten();
+            broker_flatten("KILL SWITCH");
             push_log("live: " + why +
                      " — broker cancel-all + flatten requested, strategy halted");
             return;
@@ -1537,8 +1621,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         const int flat_mm = static_cast<int>((flat_h - flat_hh) * 60.0 + 0.5);
 
         if (broker) {
-            broker->cancel_all();
-            broker->flatten();
+            broker_flatten("EOD BACKSTOP");
             std::snprintf(eod_msg, sizeof(eod_msg),
                           "live: EOD BACKSTOP — open position(s) past %02d:%02d with "
                           "no strategy closing them; broker cancel-all + flatten "

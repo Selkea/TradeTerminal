@@ -1807,3 +1807,205 @@ TEST_CASE("live swap: a re-init waits for resting orders, not just a flat book")
     CHECK(s.inits.load() == 2);
     eng.stop_live();
 }
+
+// ---------------------------------------------------------------------------
+// A broker-side flatten leaves no order id (0.41.0).
+//
+// IBrokerAdapter::flatten() returns void and yields nothing the engine can
+// record; the adapter's own I/O thread submits the closes under its OWN
+// numbering. So on the live route the kill switch and the EOD backstop produced
+// fills for ids that `orders` had never heard of — and the loop in apply_fill
+// simply matched nothing. The position moved, the P&L booked, and the blotter
+// showed an entry with no exit.
+//
+// 2026-09-08, SNXX: bought 276 @ 18.07, backstop flattened at 17.39 for -$190,
+// and the operator saw a buy, a vanished position, realized P&L, and no sell
+// order anywhere. The SIM path records properly, which is why nothing in a
+// backtest or a replay could ever surface this.
+// ---------------------------------------------------------------------------
+namespace {
+// Models the real adapter: flatten() acknowledges nothing, and the close comes
+// back later as a fill under an id the engine never issued.
+struct FlatteningBroker : IBrokerAdapter {
+    std::mutex mu;
+    std::deque<EngineEvent> q;
+    std::atomic<int> flatten_calls{0};
+    std::atomic<bool> answer_flatten{true};   // false = the flatten never lands
+    uint64_t next_id = 1;
+
+    void emit(const EngineEvent& e) {
+        std::lock_guard l(mu);
+        q.push_back(e);
+    }
+    uint64_t submit(const OrderRequest&, int64_t) override {
+        std::lock_guard l(mu);
+        return next_id++;
+    }
+    bool cancel(uint64_t) override { return true; }
+    void cancel_all() override {}
+    void flatten() override {
+        ++flatten_calls;
+        if (!answer_flatten.load()) return;   // requested, never executed
+        // Id 9000: emphatically NOT one the engine handed out.
+        emit(ev_fill(1, 9000, Side::Sell, 276.0, 17.39));
+    }
+    bool poll_event(EngineEvent& out) override {
+        std::lock_guard l(mu);
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool ready() const override { return true; }
+};
+
+// Opens one long on its first tick and then does nothing, so the position is
+// still there when the kill switch runs.
+struct BuyOnceStrat : IStrategy {
+    std::atomic<bool> done{false};
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        if (done.exchange(true)) return;
+        OrderRequest r{};
+        r.symbol_id = sid;
+        r.side = Side::Buy;
+        r.type = OrdType::Market;
+        r.qty = 276.0;
+        ctx.submit_order(r);
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+// Buy 276 @ 18.07 the engine's way, then kill-switch. Returns the snapshot
+// after the flatten has had time to come back (or not).
+LiveSnapshot flatten_scenario(bool answer_flatten) {
+    Engine eng;
+    FlatteningBroker broker;
+    broker.answer_flatten = answer_flatten;
+    BuyOnceStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;   // no bars; drive on_tick
+    cfg.broker = &broker;
+    cfg.risk.disable_auto_halt = false;
+    eng.start_live(cfg, {&strat});
+    // Entry, then its fill under the id the engine DID issue.
+    pump_until(eng, [&] { return eng.live_snapshot().orders.size() >= 1; });
+    broker.emit(ev_fill(1, 1, Side::Buy, 276.0, 18.07));
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 276.0; });
+
+    eng.kill_switch();
+    pump_until(eng, [&] {
+        const LiveSnapshot s = eng.live_snapshot();
+        return broker.flatten_calls.load() > 0 &&
+               (!answer_flatten || s.symbols[0].position.qty == 0.0);
+    });
+    // Let a few more publishes go by so a pending row that WOULD clear has.
+    pump_until(eng, [] { return false; }, 120);
+    const LiveSnapshot s = eng.live_snapshot();
+    eng.stop_live();
+    return s;
+}
+} // namespace
+
+TEST_CASE("flatten: a broker-side close appears in the order book") {
+    const LiveSnapshot s = flatten_scenario(/*answer_flatten=*/true);
+    CHECK(s.symbols[0].position.qty == 0.0);   // it really did close
+
+    // THE BUG: before 0.41.0 this vector held only the BUY. A fill for an id
+    // the engine never submitted matched nothing and was dropped on the floor.
+    const OrderRecord* sell = nullptr;
+    for (const OrderRecord& o : s.orders)
+        if (o.side == static_cast<uint8_t>(Side::Sell)) sell = &o;
+    REQUIRE(sell != nullptr);
+    CHECK(sell->id == 9000);                       // the BROKER's id, preserved
+    CHECK(sell->qty == 276.0);
+    CHECK(sell->fill_price == doctest::Approx(17.39));
+    CHECK(sell->status == OrderStatus::Filled);
+    // Marked, not silently blended in: "the engine placed this" and "something
+    // else placed this and we inferred it" are different facts.
+    CHECK(sell->broker_originated);
+
+    // The engine's own order is untouched and NOT marked.
+    const OrderRecord* buy = nullptr;
+    for (const OrderRecord& o : s.orders)
+        if (o.side == static_cast<uint8_t>(Side::Buy)) buy = &o;
+    REQUIRE(buy != nullptr);
+    CHECK_FALSE(buy->broker_originated);
+    CHECK(buy->fill_price == doctest::Approx(18.07));
+}
+
+TEST_CASE("flatten: a completed flatten leaves nothing outstanding") {
+    const LiveSnapshot s = flatten_scenario(/*answer_flatten=*/true);
+    CHECK(s.flatten_pending.empty());
+}
+
+TEST_CASE("flatten: one that never executes stays outstanding and says so") {
+    // The half that matters. A flatten yields no order id, so a request that
+    // never reaches the exchange used to be indistinguishable from one that
+    // filled — no rows either way. 2026-08-06: the backstop's flatten did not
+    // fill, the position sat overnight, $846.
+    const LiveSnapshot s = flatten_scenario(/*answer_flatten=*/false);
+    CHECK(s.symbols[0].position.qty == 276.0);   // still open, as the bug requires
+    REQUIRE(s.flatten_pending.size() == 1);
+    CHECK(s.flatten_pending[0].symbol == "AAA");
+    CHECK(s.flatten_pending[0].qty == 276.0);
+    CHECK(std::string(s.flatten_pending[0].why) == "KILL SWITCH");
+    CHECK(s.flatten_pending[0].requested_ns > 0);
+    // And no phantom sell row was invented for a close that did not happen.
+    for (const OrderRecord& o : s.orders)
+        CHECK(o.side != static_cast<uint8_t>(Side::Sell));
+}
+
+TEST_CASE("flatten: a PARTIAL close keeps the expectation open") {
+    // A flatten can fill in pieces. The expectation clears on the POSITION
+    // reaching flat, never on "a fill arrived" — 100 of 276 closed still leaves
+    // 176 shares that nobody has closed, which is the state the whole
+    // outstanding-flatten row exists to make visible.
+    Engine eng;
+    FlatteningBroker broker;
+    broker.answer_flatten = false;   // drive the fills by hand instead
+    BuyOnceStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.broker = &broker;
+    eng.start_live(cfg, {&strat});
+    pump_until(eng, [&] { return eng.live_snapshot().orders.size() >= 1; });
+    broker.emit(ev_fill(1, 1, Side::Buy, 276.0, 18.07));
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 276.0; });
+
+    eng.kill_switch();
+    pump_until(eng, [&] { return !eng.live_snapshot().flatten_pending.empty(); });
+    CHECK(eng.live_snapshot().flatten_pending.size() == 1);
+
+    // 100 of 276 comes back. Still 176 open, so the flatten is NOT done.
+    broker.emit(ev_fill(1, 9000, Side::Sell, 100.0, 17.39));
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 176.0; });
+    pump_until(eng, [] { return false; }, 80);
+    {
+        const LiveSnapshot s = eng.live_snapshot();
+        CHECK(s.symbols[0].position.qty == 176.0);
+        CHECK(s.flatten_pending.size() == 1);        // still outstanding
+        CHECK(s.flatten_pending[0].qty == 276.0);    // what was ASKED for
+    }
+
+    // The remainder closes it out; only now does the expectation clear.
+    broker.emit(ev_fill(1, 9001, Side::Sell, 176.0, 17.35));
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 0.0; });
+    pump_until(eng, [] { return false; }, 80);
+    {
+        const LiveSnapshot s = eng.live_snapshot();
+        CHECK(s.flatten_pending.empty());
+        // Both partials are reconstructed, each under the broker's own id.
+        int broker_sells = 0;
+        for (const OrderRecord& o : s.orders)
+            if (o.side == static_cast<uint8_t>(Side::Sell) && o.broker_originated)
+                ++broker_sells;
+        CHECK(broker_sells == 2);
+    }
+    eng.stop_live();
+}

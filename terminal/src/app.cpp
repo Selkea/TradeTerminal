@@ -3332,6 +3332,28 @@ std::string App::build_diag_json() {
         j["entry_gate"] = std::move(g);
     }
 
+    // OUTSTANDING BROKER-SIDE FLATTENS. Absent on a healthy session; anything
+    // here is a liquidation that was requested and has not completed.
+    //
+    // broker->flatten() returns void and yields no order id, so this is the
+    // ONLY remote signal that separates "the flatten filled" from "the flatten
+    // never reached the exchange" — the 2026-08-06 state, $846 held overnight,
+    // which produced no order rows and no alert of any kind. A count that stays
+    // nonzero across polls is the alarm.
+    j["flatten_pending"] = s.flatten_pending.size();
+    if (!s.flatten_pending.empty()) {
+        json fp = json::array();
+        for (const LiveSnapshot::PendingFlatten& p : s.flatten_pending) {
+            json e;
+            e["symbol"] = p.symbol;
+            e["qty"] = p.qty;
+            e["why"] = p.why;
+            e["requested_ts_ms"] = p.requested_ns / 1'000'000;
+            fp.push_back(std::move(e));
+        }
+        j["flatten_pending_rows"] = std::move(fp);
+    }
+
     // ---- risk-halt headroom (how close the session is to an automated halt) ----
     // nearest_halt_frac is 0 (safe) .. 1 (at the halt), the max proximity across
     // the armed equity limits — one at-a-glance "distance to halt" number.
