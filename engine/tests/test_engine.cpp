@@ -2009,3 +2009,126 @@ TEST_CASE("flatten: a PARTIAL close keeps the expectation open") {
     }
     eng.stop_live();
 }
+
+// ---------------------------------------------------------------------------
+// EngineCtx::bars_to_eod (0.42.0) — the session horizon a stopless strategy
+// plans against. Read from the engine, never from the strategy, because a
+// strategy that hardcoded 15.95 would recreate the 0.27.0 defect exactly: an
+// entry gate reading the calendar against a backstop comparing to a literal,
+// 2h57m apart on a 13:00 early close.
+// ---------------------------------------------------------------------------
+namespace {
+// Asks the question at a FIXED timestamp on its first tick, so the answer does
+// not depend on when the suite happens to run.
+struct HorizonProbe : IStrategy {
+    int64_t ask_ts = 0;
+    std::atomic<int> answer{-1};
+    void on_init(IStrategyContext&) noexcept override {}
+    void on_bar(IStrategyContext&, uint32_t, const Bar&) noexcept override {}
+    void on_tick(IStrategyContext& ctx, uint32_t sid, const Tick&) noexcept override {
+        if (answer.load() < 0) answer = ctx.bars_to_eod(sid, ask_ts);
+    }
+    void on_fill(IStrategyContext&, const Fill&) noexcept override {}
+    void on_stop(IStrategyContext&) noexcept override {}
+    void destroy() noexcept override {}
+};
+
+int64_t local_ns(int y, int mon, int day, int hour, int min) {
+    std::tm tm{};
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_isdst = -1;
+    return static_cast<int64_t>(std::mktime(&tm)) * 1'000'000'000LL;
+}
+
+// Run a live session whose forced-flatten hour is `flat_h` and ask the horizon
+// at `ask` local time, on `bar_sec` bars.
+int horizon(double flat_h, int hour, int min, int bar_sec = 300) {
+    Engine eng;
+    StubBroker broker;
+    HorizonProbe probe;
+    probe.ask_ts = local_ns(2026, 9, 8, hour, min);
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = bar_sec;
+    cfg.broker = &broker;
+    if (flat_h != 0.0)
+        cfg.eod_flatten_h_for_day = [flat_h](const std::tm&) { return flat_h; };
+    eng.start_live(cfg, {&probe});
+    pump_until(eng, [&] { return probe.answer.load() >= 0; });
+    const int a = probe.answer.load();
+    eng.stop_live();
+    return a;
+}
+} // namespace
+
+TEST_CASE("bars_to_eod: counts the bars actually left before the flatten") {
+    // 15:57 cutoff, asked at 15:20 on 5-minute bars: 37 minutes = 7.4 bars.
+    // FLOOR, because a partial bar is not one the time stop can count — and
+    // rounding up hands back the single bar that makes an unexitable trade look
+    // exitable. This is the SNXX shape: 7 left, time_stop 12.
+    CHECK(horizon(15.95, 15, 20) == 7);
+    // Mid-morning, plenty of room.
+    CHECK(horizon(15.95, 10, 0) == 71);
+    // Bar size is respected, not assumed: the same instant on 1-minute bars.
+    CHECK(horizon(15.95, 15, 20, 60) == 37);
+}
+
+TEST_CASE("bars_to_eod: an EARLY CLOSE shortens the horizon") {
+    // The 0.27.0 defect, from the other side. On a 13:00 close the flatten is
+    // 12:57, so a 12:30 entry has 5 bars — not the 65 a hardcoded 15:57 would
+    // report. Three hours of difference on the one question a stopless strategy
+    // uses to decide whether it can close what it opens.
+    CHECK(horizon(12.95, 12, 30) == 5);
+    CHECK(horizon(15.95, 12, 30) == 41);   // the same instant on a full day
+}
+
+TEST_CASE("bars_to_eod: past the cutoff there is no room at all") {
+    CHECK(horizon(15.95, 15, 57) == 0);
+    CHECK(horizon(15.95, 16, 30) == 0);
+}
+
+TEST_CASE("bars_to_eod: a live session ALWAYS has a horizon") {
+    // No calendar hook installed still answers 15:57, because the engine's
+    // backstop is not optional — it fires on every live session whether or not
+    // anyone supplied a calendar. A strategy must never be told it has all the
+    // room in the world on a route that will liquidate it at 15:57.
+    CHECK(horizon(0.0, 15, 20) == 7);
+    // kNoEodLimit is reserved for "there is genuinely no cutoff": a day the
+    // calendar says never opens (the hook returns <= 0), and the manual
+    // backtest path where BacktestConfig::eod_flatten_h is left at 0 — see the
+    // acceptance cases in test_strategies.cpp, where an unreachable time stop
+    // trades freely without the boundary and is refused with it.
+    CHECK(horizon(-1.0, 10, 0) == IStrategyContext::kNoEodLimit);
+}
+
+TEST_CASE("bars_to_eod: each symbol is measured in ITS OWN bar size") {
+    // The lineup runs symbols at different intervals, and the horizon is
+    // consumed as a BAR count against that symbol's `time_stop`. Measuring a
+    // 1-minute symbol in 5-minute bars understates its room fivefold and
+    // refuses entries that had plenty; the reverse lets through the trades this
+    // whole gate exists to stop.
+    Engine eng;
+    StubBroker broker;
+    HorizonProbe slow, fast;
+    slow.ask_ts = fast.ask_ts = local_ns(2026, 9, 8, 15, 20);   // 37 min left
+    LiveConfig cfg;
+    cfg.symbols = {"SLOW", "FAST"};
+    cfg.bar_seconds = 300;
+    cfg.symbol_bar_seconds = {300, 60};
+    cfg.broker = &broker;
+    cfg.eod_flatten_h_for_day = [](const std::tm&) { return 15.95; };
+    eng.start_live(cfg, {&slow, &fast});
+    const bool got = pump_until(eng, [&] {
+        eng.push_live_tick("SLOW", 1, 10.0, 0.0);
+        eng.push_live_tick("FAST", 2, 10.0, 0.0);
+        return slow.answer.load() >= 0 && fast.answer.load() >= 0;
+    });
+    CHECK(got);
+    CHECK(slow.answer.load() == 7);     // 37 min / 5 min
+    CHECK(fast.answer.load() == 37);    // 37 min / 1 min
+    eng.stop_live();
+}
