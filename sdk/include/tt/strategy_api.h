@@ -14,6 +14,9 @@
 
 #include <ctime>
 
+// v6: IStrategyContext gained bars_to_eod() — how many bars are left before
+//     the session force-flattens, so a strategy whose only exit is a time
+//     stop can refuse an entry it could never close (see below).
 // v5: IStrategyContext gained risk_budget() — dollars of LOSS a single trade may
 //     take, for strategies that know their own stop (see below).
 // v4: IStrategy gained on_order_end() — an order dying without filling is now
@@ -22,7 +25,7 @@
 //     use instead of cash() (see below).
 // v2: OrderRequest grew stop_price + bracket legs (take_profit/stop_loss),
 // OrdType gained Stop. Old DLLs are rejected by the version check.
-#define TT_SDK_VERSION 5u
+#define TT_SDK_VERSION 6u
 
 namespace tt {
 
@@ -88,6 +91,37 @@ public:
     // same thing, so the knob is inert. See the ParamDesc note in
     // strategies/orb_breakout.cpp.
     virtual double   risk_budget(uint32_t symbol_id) const noexcept = 0;
+    // NO SESSION LIMIT: the caller has no forced flatten to plan around (a
+    // manual backtest, or a day the market never opens). Deliberately huge so
+    // the natural test — `bars_to_eod(...) >= time_stop` — simply passes.
+    static constexpr int kNoEodLimit = 1 << 30;
+
+    // Bars of `symbol_id`'s OWN size left, from `ts_ns`, before this session
+    // force-flattens everything it holds. 0 = the cutoff has already passed;
+    // kNoEodLimit = there is no cutoff.
+    //
+    // WHY A STRATEGY NEEDS THIS. bollinger_reversion and rsi2_pullback place no
+    // price stop by design: their `time_stop` is the ONLY thing that closes a
+    // LOSING position, because the other exit is gated on price recovering past
+    // the entry and so cannot fire while the trade is underwater. Open such a
+    // position with fewer bars remaining than `time_stop` needs and there is
+    // nothing in the system that can close it — the engine's 15:57 backstop
+    // liquidates it at market for whatever the interval happened to hand you.
+    //
+    // 2026-09-08, SNXX: entered 15:20 with time_stop 12 bars (60 minutes) and
+    // 37 minutes of session left. -$190.59, the whole of that day's loss, and
+    // the trade was unexitable from the instant it filled.
+    //
+    // NOT the same question as tt::ui::time_stop_reachable, which asks whether
+    // a time stop fits inside a WHOLE session (12 <= 77: it passes, correctly).
+    // This asks whether it fits from HERE.
+    //
+    // Answered by the engine so it is right in both regimes and on early
+    // closes: live reads the day's real cutoff (13:00 closes included), the
+    // backtest reads BacktestConfig::eod_flatten_h. Hardcoding 15.95 in a
+    // strategy would re-introduce the 0.27.0 bug exactly — an entry gate that
+    // read the calendar against a backstop that did not, 2h57m apart.
+    virtual int      bars_to_eod(uint32_t symbol_id, int64_t ts_ns) const noexcept = 0;
     // Engine time (backtest or real): epoch nanoseconds.
     virtual int64_t  now_ns() const noexcept = 0;
     // Interns a symbol string to the id used in events.

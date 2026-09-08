@@ -63,6 +63,13 @@ struct FakeCtx final : IStrategyContext {
     double cash() const noexcept override { return cash_; }
     double budget(uint32_t) const noexcept override { return budget_; }
     double risk_budget(uint32_t) const noexcept override { return risk_budget_; }
+    // Default kNoEodLimit: "no forced flatten to plan around", which is what a
+    // plain backtest has and what every pre-0.42.0 expectation in this file was
+    // written against. Tests that exercise the end-of-session gate set it.
+    int bars_to_eod_ = IStrategyContext::kNoEodLimit;
+    int bars_to_eod(uint32_t, int64_t) const noexcept override {
+        return bars_to_eod_;
+    }
     int64_t now_ns() const noexcept override { return now; }
     uint32_t symbol_id(const char*) noexcept override { return 1; }
     double param(const char* n, double fallback) const noexcept override {
@@ -1030,29 +1037,36 @@ TEST_CASE("acceptance: without the day boundary a 233-bar time stop is worth som
     CHECK(reachable.fills.size() != never.fills.size());
 }
 
-TEST_CASE("acceptance: with the day boundary it is worth exactly nothing") {
-    // The same two fits under production's physics. The boundary closes the
-    // position every afternoon, so neither time stop ever gets to fire and the
-    // parameter has no effect whatsoever — identical fills, identical equity.
+TEST_CASE("acceptance: with the day boundary an unreachable time stop is REFUSED") {
+    // The same two fits under production's physics. Until 0.42.0 this case
+    // asserted something weaker — that the boundary made 233 and 1000 produce
+    // IDENTICAL fills, because neither time stop could ever fire, so the
+    // parameter was inert. True, and not good enough: the strategy still OPENED
+    // the positions and the boundary still had to liquidate them at market.
+    // That is the 2026-08-14 STKH trade exactly — -$506 in the 2h16m before the
+    // backstop reached it.
+    //
+    // The time stop is this strategy's only exit for a loser. If it cannot fire
+    // before the session ends, nothing can close the position, so the entry is
+    // declined rather than taken and cleaned up after. Same doctrine as
+    // symbol_params.h's REFUSE, NEVER CLAMP, applied per entry instead of per fit.
     const BacktestResult a = boll_replay(233, 15.95);
     const BacktestResult b = boll_replay(1000, 15.95);
+    CHECK(a.fills.empty());
+    CHECK(b.fills.empty());
+    CHECK(a.final_equity == doctest::Approx(100'000.0));   // nothing was risked
+}
 
-    REQUIRE(a.fills.size() >= 2);                  // still trading, not silenced
-    REQUIRE(a.fills.size() == b.fills.size());
-    for (size_t i = 0; i < a.fills.size(); ++i) {
-        CHECK(a.fills[i].ts_ns == b.fills[i].ts_ns);
-        CHECK(a.fills[i].side == b.fills[i].side);
-        CHECK(a.fills[i].qty == doctest::Approx(b.fills[i].qty));
-        CHECK(a.fills[i].price == doctest::Approx(b.fills[i].price));
-    }
-    CHECK(a.final_equity == doctest::Approx(b.final_equity));
-
-    // And the reason they agree is the one that matters: the position does not
-    // survive the afternoon it was opened in. Entry at 10:36 on day one, exit at
-    // 16:00:00 on day one — so a hold cannot span a session and 78 bars is the
-    // hard ceiling, which is what makes every value above it identical.
-    CHECK(a.fills.back().side == static_cast<uint8_t>(Side::Sell));
-    CHECK(a.fills.back().ts_ns < local_ts(2026, 8, 18, 9, 30));
+TEST_CASE("acceptance: the day boundary still caps a REACHABLE hold") {
+    // The other half, and what stops the case above from being satisfied by a
+    // gate that refuses everything. 12 bars is one hour: it fits in a session,
+    // so it trades — and the boundary still ends the position inside the
+    // afternoon it was opened in, which was the original finding.
+    const BacktestResult r = boll_replay(12, 15.95);
+    REQUIRE(r.fills.size() >= 2);                  // trading, not silenced
+    CHECK(r.fills[0].side == static_cast<uint8_t>(Side::Buy));
+    CHECK(r.fills.back().side == static_cast<uint8_t>(Side::Sell));
+    CHECK(r.fills.back().ts_ns < local_ts(2026, 8, 18, 9, 30));
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1084,7 @@ TEST_CASE("acceptance: with no risk the replay buys the whole account") {
     // spends essentially all of it in one position. Live, the same symbol is
     // capped at $5,000. Recorded as a case so the number that justified the fix
     // stays visible and is not just an anecdote in a commit message.
-    const BacktestResult r = boll_replay(233, 15.95);
+    const BacktestResult r = boll_replay(12, 15.95);
     REQUIRE(r.fills.size() >= 1);
     const double notional = r.fills[0].qty * r.fills[0].price;
     CHECK(r.fills[0].qty == doctest::Approx(989));
@@ -1088,7 +1102,7 @@ TEST_CASE("acceptance: the live caps size it the way production would") {
     const RiskLimits swept = tt::ui::sweep_risk_limits(live, 100'000.0);
     REQUIRE(swept.max_position_notional == doctest::Approx(5'000.0));
 
-    const BacktestResult r = boll_replay(233, 15.95, swept);
+    const BacktestResult r = boll_replay(12, 15.95, swept);
     REQUIRE(r.fills.size() >= 1);
     const double notional = r.fills[0].qty * r.fills[0].price;
     CHECK(r.fills[0].qty == doctest::Approx(52));
@@ -1098,7 +1112,7 @@ TEST_CASE("acceptance: the live caps size it the way production would") {
     // Still TRADING, not just trading smaller. A cap that shrank the strategy
     // into inactivity would "fix" the score the same way a cutoff that refused
     // every entry would — by removing the evidence rather than the error.
-    const BacktestResult uncapped = boll_replay(233, 15.95);
+    const BacktestResult uncapped = boll_replay(12, 15.95);
     CHECK(r.fills.size() == uncapped.fills.size());
 }
 
@@ -1184,4 +1198,108 @@ TEST_CASE("sma_crossover: a properly separated pair still trades") {
     // A long lookback is fine as long as it is genuinely separated — the rule
     // rejects adjacency, not slowness.
     CHECK(sma_orders(100, 200, 900) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// The end-of-session entry gate (0.42.0).
+//
+// bollinger_reversion and rsi2_pullback place NO price stop by design, so
+// `time_stop` is the only thing that closes a LOSING position — the other exits
+// are all gated on price recovering. Opening a position with fewer bars left
+// than time_stop needs means nothing in the system can close it, and the
+// engine's 15:57 backstop liquidates it at market for whatever the interval
+// hands you.
+//
+// 2026-09-08, SNXX: entered 15:20 with time_stop 12 bars (60 minutes) and 37
+// minutes of session left. -$190.59, the whole of that day's loss, unexitable
+// from the instant it filled.
+//
+// The remaining-bars figure comes from the ENGINE (ctx.bars_to_eod) precisely so
+// a strategy never hardcodes the cutoff: 0.27.0 was an entry gate reading the
+// calendar against a backstop comparing to a literal 15.95, 2h57m apart on a
+// half day. FakeCtx lets these cases set it directly.
+// ---------------------------------------------------------------------------
+namespace {
+// Drive bollinger_reversion into a z-dip with `room` bars left before the close
+// and `time_stop` bars needed. Returns the orders it submitted.
+size_t boll_orders_with_room(int room, int time_stop) {
+    IStrategy* s = make("bollinger_reversion.cpp");
+    FakeCtx ctx;
+    ctx.params["length"] = 5;
+    ctx.params["entry_z"] = 1.0;
+    ctx.params["exit_z"] = 0.25;
+    ctx.params["time_stop"] = time_stop;
+    ctx.params["trend_len"] = 0;    // no regime filter: isolate the horizon test
+    ctx.bars_to_eod_ = room;
+    s->on_init(ctx);
+    int64_t ts = local_ts(2026, 9, 8, 10, 0);
+    // Flat, then a sharp drop: a clean z-dip well past -1.0.
+    for (int i = 0; i < 12; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, 100.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    s->on_bar(ctx, 1, mk_bar(ts, 96.0));
+    const size_t n = ctx.sent.size();
+    s->destroy();
+    return n;
+}
+} // namespace
+
+TEST_CASE("boll: refuses an entry whose time stop cannot fire before the close") {
+    // The SNXX shape: 60 minutes of time stop, 37 minutes of session.
+    CHECK(boll_orders_with_room(/*room=*/7, /*time_stop=*/12) == 0);
+    // One bar short is still short: the position would reach the backstop with
+    // the time stop one bar from firing, and the backstop does not care.
+    CHECK(boll_orders_with_room(11, 12) == 0);
+    // Nothing left at all.
+    CHECK(boll_orders_with_room(0, 12) == 0);
+}
+
+TEST_CASE("boll: takes the same entry when there IS room") {
+    // The control. Without this, a gate that refused everything would pass the
+    // case above — which is exactly how a "fix" removes the evidence instead of
+    // the error.
+    CHECK(boll_orders_with_room(12, 12) == 1);   // exactly enough
+    CHECK(boll_orders_with_room(65, 12) == 1);   // a normal mid-morning entry
+    // No forced flatten at all (a manual backtest) means no constraint.
+    CHECK(boll_orders_with_room(IStrategyContext::kNoEodLimit, 233) == 1);
+}
+
+TEST_CASE("boll: the horizon gate is about ROOM, not the hour") {
+    // enter_until_h is a wall-clock window and knows nothing about how long a
+    // position needs to live; these are independent gates and both must hold.
+    // Same clock, same series, opposite outcomes on room alone.
+    CHECK(boll_orders_with_room(4, 12) == 0);
+    CHECK(boll_orders_with_room(40, 12) == 1);
+}
+
+namespace {
+size_t rsi2_orders_with_room(int room, int time_stop) {
+    IStrategy* s = make("rsi2_pullback.cpp");
+    FakeCtx ctx;
+    ctx.params["rsi_len"] = 2;
+    ctx.params["buy_below"] = 40;
+    ctx.params["exit_ma"] = 2;
+    ctx.params["trend_ma"] = 20;
+    ctx.params["time_stop"] = time_stop;
+    ctx.bars_to_eod_ = room;
+    s->on_init(ctx);
+    int64_t ts = local_ts(2026, 9, 8, 9, 35);
+    for (double p : pullback_series()) {
+        s->on_bar(ctx, 1, mk_bar(ts, p));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    const size_t n = ctx.sent.size();
+    s->destroy();
+    return n;
+}
+} // namespace
+
+TEST_CASE("rsi2: the same horizon gate, for the same reason") {
+    // rsi2_pullback is stopless too — its exit_ma and min_gain_cps exits both
+    // need the price to come back, so time_stop is again the only exit a loser
+    // has. It carries the gate for exactly the same reason.
+    CHECK(rsi2_orders_with_room(5, 24) == 0);
+    CHECK(rsi2_orders_with_room(24, 24) == 1);    // exactly enough
+    CHECK(rsi2_orders_with_room(70, 24) == 1);
 }

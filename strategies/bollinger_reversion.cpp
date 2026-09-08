@@ -79,6 +79,7 @@ public:
         entry_id_ = exit_id_ = 0;
         bars_held_ = 0;
         entry_px_ = 0.0;
+        said_no_room_ = false;
 
         char buf[128];
         std::snprintf(buf, sizeof(buf),
@@ -147,7 +148,35 @@ public:
             trend_len_ == 0 || bar.close > trend_sum_ / trend_len_;
         const double hod = hour_of_day_local(bar.ts_ns);
         const bool time_ok = hod >= enter_from_h_ && hod < enter_until_h_;
-        if (z <= -entry_z_ && trend_ok && time_ok) {
+        // CAN THIS TRADE STILL BE CLOSED BY ITS OWN EXIT? `time_stop` is the
+        // only thing that closes a LOSING position here — there is no price
+        // stop by design, and the z-recovery exit is gated on the close getting
+        // back above entry_px_, so it cannot fire while the trade is underwater.
+        // Enter with fewer bars left than time_stop needs and nothing in the
+        // system can close the position: the engine's forced flatten does it, at
+        // market, for whatever the interval hands you.
+        //
+        // 2026-09-08, SNXX: entered 15:20 with time_stop 12 bars (60 minutes)
+        // and 37 minutes of session left. -$190.59 — the whole of that day's
+        // loss — and it was unexitable from the instant it filled.
+        //
+        // Distinct from the enter_until_h window above, which the fits set to
+        // 16.0 and which knows nothing about how long a position needs to live.
+        // Distinct too from tt::ui::time_stop_reachable, which asks whether the
+        // time stop fits in a WHOLE session (12 <= 77: it passes, correctly).
+        // This asks whether it fits from HERE, and only the engine can say —
+        // hardcoding the cutoff would re-create the 0.27.0 half-day bug.
+        const bool exitable = ctx.bars_to_eod(sym_, bar.ts_ns) >= time_stop_;
+        if (!exitable && !said_no_room_) {
+            said_no_room_ = true;   // once a session: this repeats every bar
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "no entry: %d bars left before the close, time_stop "
+                          "needs %d and it is the only exit a loser has",
+                          ctx.bars_to_eod(sym_, bar.ts_ns), time_stop_);
+            ctx.log(1, buf);
+        }
+        if (z <= -entry_z_ && trend_ok && time_ok && exitable) {
             // Size off the risk budget, not cash: the engine caps the position
             // notional anyway, so a % of the account is a number it discards.
             const double budget = ctx.budget(sym_);
@@ -201,6 +230,9 @@ private:
     uint64_t entry_id_ = 0, exit_id_ = 0;
     double entry_px_ = 0.0;   // fill price of the open position (0 = none/adopted)
     int bars_held_ = 0;
+    // The "no room left to close it" notice is once per session, not once
+    // per bar: the condition holds for every bar from the cutoff onward.
+    bool said_no_room_ = false;
 };
 
 TT_STRATEGY(BollingerReversionStrategy, "Bollinger Reversion", kParams)

@@ -162,6 +162,7 @@ public:
         entry_id_ = exit_id_ = 0;
         entry_px_ = 0.0;
         bars_held_ = 0;
+        said_no_room_ = false;
 
         char buf[192];
         std::snprintf(buf, sizeof(buf),
@@ -257,6 +258,31 @@ public:
             const double hod = hour_of_day_local(bar.ts_ns);
             if (hod < enter_from_h_ || hod >= enter_until_h_) return;
         }
+        // CAN THIS TRADE STILL BE CLOSED BY ITS OWN EXIT? Like
+        // bollinger_reversion, this places no price stop by design, so
+        // `time_stop` is the only thing that closes a LOSING position — the
+        // exit_ma and min_gain_cps exits both need the price to come back.
+        // Enter with fewer bars left than time_stop needs and nothing here can
+        // close it; the engine's forced flatten does, at market.
+        //
+        // Only asked of an intraday series, for the same reason the window
+        // above is: a daily bar is stamped at the session date, so the
+        // remaining-bars question is meaningless and would refuse everything.
+        if (intraday()) {
+            const int left = ctx.bars_to_eod(sym_, bar.ts_ns);
+            if (left < time_stop_) {
+                if (!said_no_room_) {
+                    said_no_room_ = true;   // once a session, not once a bar
+                    char nb[128];
+                    std::snprintf(nb, sizeof(nb),
+                                  "no entry: %d bars left before the close, "
+                                  "time_stop needs %d and it is the only exit "
+                                  "a loser has", left, time_stop_);
+                    ctx.log(1, nb);
+                }
+                return;
+            }
+        }
         if (bar.close > trend_sum_ / trend_ma_ && rsi <= buy_below_) {
             // Size off the risk budget, not cash: the engine caps the position
             // notional anyway, so a % of the account is a number it discards.
@@ -342,6 +368,9 @@ private:
     uint64_t entry_id_ = 0, exit_id_ = 0;
     double entry_px_ = 0.0;   // our average fill on the open position (0 = none/adopted)
     int bars_held_ = 0;
+    // The "no room left to close it" notice is once per session: the
+    // condition holds for every bar from the cutoff onward.
+    bool said_no_room_ = false;
 };
 
 TT_STRATEGY(Rsi2PullbackStrategy, "RSI-2 Pullback", kParams)

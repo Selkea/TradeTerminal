@@ -21,6 +21,17 @@ namespace tt {
 static thread_local bool tt_on_live_thread = false;
 
 namespace {
+// The engine's own forced-flatten hour, 15:57 local. tt::kEodBackstopH in
+// terminal/src/market_calendar.h mirrors it: the entry gate stops OPENING
+// positions at the same instant this starts closing them, because the
+// backstop is edge-triggered and marks the day done when it fires - anything
+// opened after it has nothing left to close it.
+//
+// FILE SCOPE since 0.42.0 because it now has two readers: the backstop, and
+// the session horizon EngineCtx::bars_to_eod hands to strategies. Two copies
+// of this number drifting apart is precisely the 0.27.0 defect.
+constexpr double kEodBackstopH = 15.95;
+
 int64_t median_gap_ns(const std::vector<Bar>& bars) {
     if (bars.size() < 2) return 60'000'000'000;  // default 1 minute
     std::vector<int64_t> gaps;
@@ -281,6 +292,53 @@ public:
     void set_manual(bool m) { manual_ = m; }
     // Wall-clock entry gate (LiveConfig::entry_gate); empty = disarmed.
     void set_entry_gate(std::function<bool(int64_t)> g) { entry_gate_ = std::move(g); }
+    // The day's forced-flatten hour, and the bar sizes to measure it in — the
+    // two things bars_to_eod needs and a strategy must never assume. `f` is
+    // handed the DAY so early closes answer 13:00 rather than 15:57; returning
+    // <= 0 means "no flatten configured", which reads as no limit.
+    void set_eod_flatten(std::function<double(const std::tm&)> f,
+                         const std::vector<int>* per_symbol_bar_sec,
+                         int fallback_bar_sec) {
+        eod_flatten_ = std::move(f);
+        symbol_bar_sec_ = per_symbol_bar_sec;
+        bar_sec_ = fallback_bar_sec;
+    }
+
+    int bars_to_eod(uint32_t symbol_id, int64_t ts_ns) const noexcept override {
+        if (!eod_flatten_) return kNoEodLimit;
+        const std::time_t secs = static_cast<std::time_t>(ts_ns / 1'000'000'000);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &secs);
+#else
+        localtime_r(&secs, &tm);
+#endif
+        // Judged against the same std::tm the hour is read from, so the cutoff
+        // and the clock can never come from two different reads — the shape
+        // LiveConfig::eod_flatten_h_for_day was given for the same reason.
+        const double cutoff = eod_flatten_(tm);
+        if (cutoff <= 0.0) return kNoEodLimit;   // not a trading day / not armed
+        // INTEGER SECONDS, not floating hours. 15.95 - (15 + 20/60.0) is
+        // 0.6166666...; times 3600 that is 2219.999... rather than 2220, so a
+        // 15:20 entry against a 15:57 cutoff measured 36 minutes instead of 37
+        // and the gate refused an entry that had exactly enough room. Rounding
+        // the cutoff to whole seconds the way market_calendar.h already does
+        // (`static_cast<int>(h * 3600.0 + 0.5)`) makes the boundary exact.
+        const int cutoff_sod = static_cast<int>(cutoff * 3600.0 + 0.5);
+        const int sod = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+        if (sod >= cutoff_sod) return 0;
+        int bs = bar_sec_;
+        if (symbol_bar_sec_ && symbol_id >= 1 &&
+            symbol_id <= symbol_bar_sec_->size() &&
+            (*symbol_bar_sec_)[symbol_id - 1] > 0)
+            bs = (*symbol_bar_sec_)[symbol_id - 1];
+        if (bs <= 0) return kNoEodLimit;   // unknown bar size: not ours to judge
+        // FLOOR, deliberately. A partial bar is not a bar the time stop can
+        // count, and rounding up would hand back the one bar that makes an
+        // unexitable trade look exitable.
+        const int64_t bars = static_cast<int64_t>(cutoff_sod - sod) / bs;
+        return bars >= kNoEodLimit ? kNoEodLimit : static_cast<int>(bars);
+    }
     bool entry_gate_armed() const { return static_cast<bool>(entry_gate_); }
     bool entry_gate_open() const { return !entry_gate_ || entry_gate_(now_()); }
     // Views onto run_live's halt state (both declared after this object).
@@ -432,6 +490,11 @@ private:
     bool warming_ = false;
     bool manual_ = false;
     std::function<bool(int64_t)> entry_gate_;
+    // bars_to_eod's inputs. Unset = kNoEodLimit, which is the honest answer for
+    // a manual backtest: it has no forced flatten to plan around.
+    std::function<double(const std::tm&)> eod_flatten_;
+    const std::vector<int>* symbol_bar_sec_ = nullptr;
+    int bar_sec_ = 0;
     const std::vector<char>* strat_halted_ = nullptr;
     IBrokerAdapter* broker_;
     std::vector<std::string> symbols_;
@@ -520,6 +583,24 @@ void Engine::run(BacktestConfig cfg, IStrategy* strategy) {
         ctx.set_entry_gate([cutoff](int64_t now_ns) {
             return hour_of_day_local(now_ns) < cutoff;
         });
+    }
+    // ...and the same session horizon the live engine has, so a strategy that
+    // declines an entry it could not close declines it in the REPLAY too.
+    // Without this the optimizer keeps scoring the trades production refuses,
+    // which is the physics mismatch BacktestConfig::eod_flatten_h exists to
+    // close. A manual backtest leaves eod_flatten_h at 0 and gets kNoEodLimit,
+    // i.e. exactly today's behaviour.
+    if (cfg.eod_flatten_h > 0.0) {
+        const double flat_h = cfg.eod_flatten_h;
+        // BacktestConfig carries no bar size — it is a property of the series,
+        // so measure it the way the rest of this function already does. A
+        // single-bar run has no gap to measure and median_gap_ns falls back to
+        // a minute; bars_to_eod then reads kNoEodLimit for bs <= 0 only, which
+        // cannot happen here, and a one-bar backtest has nothing to gate anyway.
+        const int bt_bar_sec =
+            static_cast<int>(median_gap_ns(cfg.bars) / 1'000'000'000);
+        ctx.set_eod_flatten([flat_h](const std::tm&) { return flat_h; }, nullptr,
+                            bt_bar_sec);
     }
 
     BacktestResult res;
@@ -1225,6 +1306,20 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                   exec, pf, lat, &cfg.risk, on_order, broker, &cfg.symbol_risk,
                   &cfg.symbol_params, &cfg.symbol_hold_only);
     ctx.set_entry_gate(cfg.entry_gate);
+    // The day's REAL flatten hour — 15:57 normally, 12:57 on the three 13:00
+    // early closes — read through the same hook the EOD backstop itself uses,
+    // so the horizon a strategy plans against and the deadline that actually
+    // liquidates it can never disagree. 0.27.0 is why that matters: an entry
+    // gate that read the calendar against a backstop comparing to a literal
+    // 15.95 was 2h57m apart on a half day.
+    {
+        auto for_day = cfg.eod_flatten_h_for_day;
+        ctx.set_eod_flatten(
+            [for_day](const std::tm& tm) {
+                return for_day ? for_day(tm) : kEodBackstopH;
+            },
+            &cfg.symbol_bar_seconds, cfg.bar_seconds);
+    }
     // The gate cannot fail silently. An app that forgot to install one gets one
     // line at session start saying so, and /diag carries entry_gate.armed for
     // the rest of the session — an unarmed live session is the 2026-08-13
@@ -1573,11 +1668,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
     //
     // Hold mode (disable_auto_halt) opts out: that setting exists to ride a
     // position through rather than realise it, and this must not fight it.
-    // 15:57 local. tt::kEodBackstopH in terminal/src/market_calendar.h mirrors
-    // this: the entry gate stops OPENING positions at the same instant this
-    // starts closing them, because this is edge-triggered and marks the day done
-    // when it fires — anything opened after it has nothing left to close it.
-    constexpr double kEodBackstopH = 15.95;
+    // The cutoff itself is kEodBackstopH at file scope (see there).
     int64_t eod_day = -1;
     double eod_prev_h = -1.0;   // last hour-of-day seen; -1 = first observation
     auto eod_backstop = [&] {
