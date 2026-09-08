@@ -327,6 +327,25 @@ struct OrderRecord {
     OrderStatus status = OrderStatus::Working;
     double qty = 0, limit_price = 0, fill_price = 0, fee = 0;
     bool manual = false;
+    // THE ENGINE NEVER SUBMITTED THIS ORDER; it was reconstructed from a fill
+    // (or an adopted-order event) whose id nothing in `orders` matched.
+    //
+    // 0.41.0. On the live broker route the kill switch and the EOD backstop
+    // both delegate to broker->cancel_all() + broker->flatten() (engine.cpp),
+    // and IBrokerAdapter::flatten() returns void: the adapter's own I/O thread
+    // builds the closing orders under its own ids, so record_submit is never
+    // called and no row is ever created. The fill still arrives, the position
+    // still goes to zero and the P&L is still booked — but the blotter, which
+    // renders this vector verbatim, showed the entry with no exit. On
+    // 2026-09-08 that read as "SNXX bought 276, position gone, -$190 realized,
+    // no sell order anywhere". The SIM path records properly, so no backtest
+    // or replay could ever surface it.
+    //
+    // Marked rather than silently blended in, because "the engine placed this"
+    // and "something else placed this and we inferred it" are different facts:
+    // the second is also how a genuinely FOREIGN order (another API client on
+    // the same account) would first become visible.
+    bool broker_originated = false;
     // WHY, when status == Rejected. The invariant, enforced at every write site
     // and asserted by engine/tests/test_reject.cpp:
     //
@@ -456,6 +475,30 @@ struct LiveSnapshot {
     bool entry_gate_armed = false;
     bool entry_gate_open = false;
     uint64_t entry_gate_blocked = 0;
+    // ---- outstanding broker-side flatten ------------------------------------
+    // What a broker->flatten() was asked to close and has not been seen to
+    // close yet. Empty on a healthy session, and empty again seconds after a
+    // flatten fills.
+    //
+    // WHY THIS EXISTS AT ALL. broker->flatten() is fire-and-forget: it returns
+    // void, it yields no order id, and until 0.41.0 nothing anywhere recorded
+    // that it had been asked for. So a flatten that FILLED and a flatten that
+    // WAS NEVER PLACED produced identical state — a position that is either
+    // gone or still there, and no order rows either way. That is not
+    // hypothetical: on 2026-08-06 the EOD backstop's flatten did not fill and
+    // the position sat overnight for $846.
+    //
+    // A synthesized OrderRecord (see OrderRecord::broker_originated) makes the
+    // SUCCESS visible. This makes the FAILURE visible, which is the half that
+    // matters: it is an expectation, recorded before the fill can arrive, and
+    // an entry that lingers here is a liquidation that did not happen.
+    struct PendingFlatten {
+        std::string symbol;
+        double qty = 0;          // signed position at the moment of the request
+        int64_t requested_ns = 0;
+        const char* why = "";    // "KILL SWITCH" / "EOD BACKSTOP"
+    };
+    std::vector<PendingFlatten> flatten_pending;
     RiskState risk;
     uint64_t ticks = 0, dropped_ticks = 0;
     int64_t last_tick_ts_ms = 0;       // most recent tick across any symbol
