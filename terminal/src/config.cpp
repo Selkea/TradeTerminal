@@ -46,6 +46,7 @@ AppConfig AppConfig::load(const std::string& path) {
     c.lineup_min_dollar_vol = j.value("lineup_min_dollar_vol", c.lineup_min_dollar_vol);
     c.lineup_top_n = j.value("lineup_top_n", c.lineup_top_n);
     c.lineup_atr_len = j.value("lineup_atr_len", c.lineup_atr_len);
+    c.tourn_max_sharpe = j.value("tourn_max_sharpe", c.tourn_max_sharpe);
     c.alert_webhook = j.value("alert_webhook", c.alert_webhook);
     c.notify_trades = j.value("notify_trades", c.notify_trades);
     c.notify_orders = j.value("notify_orders", c.notify_orders);
@@ -158,6 +159,7 @@ void AppConfig::save(const std::string& path) const {
         {"lineup_min_dollar_vol", lineup_min_dollar_vol},
         {"lineup_top_n", lineup_top_n},
         {"lineup_atr_len", lineup_atr_len},
+        {"tourn_max_sharpe", tourn_max_sharpe},
         {"alert_webhook", alert_webhook},
         {"notify_trades", notify_trades},
         {"notify_orders", notify_orders},

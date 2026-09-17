@@ -75,8 +75,20 @@ struct AppConfig {
     std::string lineup_scan_code = "MOST_ACTIVE";
     std::string lineup_location = "STK.US.MAJOR";
     int lineup_rows = 30;                     // scan candidate pool size
-    double lineup_min_price = 5.0;            // price gate (last close)
+    // Price gate (last close). Commissions are billed per SHARE, so a cheap
+    // name costs far more to trade for the same exposure: $5,000 of a $45 ETF
+    // is 111 shares, the same $5,000 of a $5.65 stock is 885 shares and ~8x the
+    // commission. 2026-09-14..17 ran on sub-$8 names (FTFT, VEEA, BIAF, CONL)
+    // at 27-46 fills/day and gave back $886 with ~$158 of it in fees.
+    double lineup_min_price = 15.0;           // price gate (last close)
     double lineup_min_dollar_vol = 20e6;      // liquidity gate ($/day)
+    // A champion can be too good to believe. On 5-minute bars a holdout Sharpe
+    // much above 3 is a fit to noise, not an edge — and the autopilot re-fits
+    // every ~30 min, so it gets many chances to find one. Over 2026-09-09..17 it
+    // crowned 307 champions, 78 of them above 3.0 (max 5.82); the symbols
+    // carrying those fits signalled constantly and lost money. Above this,
+    // keep the incumbent. 0 disables the gate.
+    double tourn_max_sharpe = 3.0;
     int lineup_top_n = 6;                     // how many symbols to trade
     int lineup_atr_len = 14;                  // ATR window for the vol ranking
     // (The daily TWS refresh / tws_refresh_time setting was removed after it
