@@ -383,6 +383,23 @@ constexpr double kTournDeadlineS = 180.0;
 constexpr const char* kSweepMetrics[] = {"Sharpe", "Return", "Max drawdown", "Win rate"};
 inline bool sweep_metric_minimize(int m) { return m == 2; }
 
+// Winning the field says the champion beat its rivals; it does not say the
+// number is believable. On 5-minute bars a holdout Sharpe much above 3 is a
+// curve fitted to noise, and the autopilot re-fits every ~30 minutes, so it
+// gets dozens of chances a day to find one. Over 2026-09-09..17 it crowned 307
+// champions, 78 of them above 3.0 and topping out at 5.82; those fits are what
+// put FTFT and VEEA in the book at 16-24 fills a day for a -$886 week, because
+// noise fits FAST and a fast fit trades constantly.
+//
+// Only Sharpe (metric 0) has a meaningful ceiling: "Return" is scale-dependent,
+// "Max drawdown" is minimised, and a win rate is already bounded by 1. A
+// ceiling of 0 disables the test, which is how an operator turns it off.
+// Both the tournament and the autopilot ask through here so the two paths can
+// never drift apart — the autopilot is the one that runs all session.
+inline bool sweep_fit_implausible(int metric, double score, double ceiling) {
+    return metric == 0 && ceiling > 0.0 && score > ceiling;
+}
+
 // A parameter set that barely trades is not a good parameter set — it is an
 // unmeasured one. Every metric here degenerates on a thin sample: Sharpe and
 // win rate are computed from a handful of returns, and "Max drawdown" is

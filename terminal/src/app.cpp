@@ -1689,6 +1689,37 @@ void App::finish_tournament() {
         tourn_.for_lineup = false;
         return;
     }
+    // ...and winning it too convincingly is its own kind of failure. The gate
+    // above only asks whether the champion made money on unseen data; nothing
+    // asked whether the number was BELIEVABLE. On 5-minute bars a holdout
+    // Sharpe much above 3 is a curve fitted to noise, and the autopilot re-runs
+    // this tournament every ~30 minutes, so it gets dozens of chances a day to
+    // find one. Over 2026-09-09..17 it crowned 307 champions — 78 above 3.0,
+    // topping out at 5.82 — and those fits are what put FTFT and VEEA in the
+    // book at 16-24 fills a day for a $886 week. Noise fits fast: the shorter
+    // the lookback, the better it scores and the more it trades (VEEA, band
+    // length 11.7, 16 fills; SNXX, same strategy, length 51.9, none).
+    // Sharpe is metric 0; the ceiling is meaningless for the others.
+    if (!minimize &&
+        sweep_fit_implausible(tourn_.base.metric, c.score, cfg_.tourn_max_sharpe)) {
+        char rej[256];
+        std::snprintf(rej, sizeof rej,
+                      "tournament: best candidate %s scored %s %.4g on %s — too "
+                      "good to be true (over %.4g), treating it as a fit to "
+                      "noise and keeping the incumbent (%s keeps whatever set it "
+                      "already had)",
+                      strat_mgr_.display_name(c.key).c_str(),
+                      kSweepMetrics[tourn_.base.metric], c.score,
+                      tourn_.base.symbol.c_str(), cfg_.tourn_max_sharpe,
+                      tourn_.target_symbol.empty() ? "the symbol"
+                                                   : tourn_.target_symbol.c_str());
+        route(rej);
+        // Same reasoning as the non-positive path: NOT recorded as fitted, so a
+        // lineup symbol left with nothing here is excluded rather than admitted
+        // on a set that was never installed.
+        tourn_.for_lineup = false;
+        return;
+    }
     // The champion was fitted to ONE instrument, so it belongs to that symbol.
     // Writing it to the shared per-strategy map as well is how a symbol with no
     // set of its own ended up trading another symbol's fit (2026-08-10), so a
@@ -2688,6 +2719,28 @@ void App::autopilot_evaluate() {
     // point beats it (sweep_param_max bounds the search grid, not the champion)
     // — so this gate re-proposed and re-rejected that same legal value every
     // cycle, forever, and the condition could never clear.
+    // ASK THE PLAUSIBILITY QUESTION HERE TOO. The tournament's own gate covers
+    // the 09:35 lineup build, but THIS is the path that runs every ~30 minutes
+    // all session, and until now it only asked whether the challenger scored
+    // BETTER — never whether the number was believable. That is how a holdout
+    // Sharpe of 3.1-5.8 got installed on FTFT and VEEA over 2026-09-09..17:
+    // each cycle re-fits, noise fits fast, and a fast fit trades constantly
+    // (16-24 fills/day against 2-4 before). Routine, so it is logged, not paged
+    // — a gate that fires several times a day must never page.
+    if (!sweep_metric_minimize(ap_.metric) &&
+        sweep_fit_implausible(ap_.metric, champ->score, cfg_.tourn_max_sharpe)) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf,
+                      "autopilot: %s challenger %s scored %s %.4g — over %.4g, "
+                      "treating it as a fit to noise and keeping the incumbent",
+                      S.symbol.c_str(), strat_mgr_.display_name(champ->key).c_str(),
+                      kSweepMetrics[ap_.metric], champ->score, cfg_.tourn_max_sharpe);
+        route(buf);
+        S.challenger.clear();
+        S.streak = 0;
+        return;
+    }
+
     const TradePanel::TabParams tp = trade_.tab_params(S.symbol, param_specs_fn());
     const int bar_sec = tp.found && tp.bar_seconds > 0 ? tp.bar_seconds : cfg_.trade_bar_sec;
     if (!time_stop_reachable(champ->params, bar_sec, tp.found && tp.hold_dont_halt)) {

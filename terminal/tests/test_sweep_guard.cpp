@@ -551,3 +551,40 @@ TEST_CASE("verdict: too few points to judge is never a verdict") {
     CHECK(tt::ui::sweep_param_verdict({1.5, nan, 1.5}) ==
           tt::ui::SweepParamVerdict::Inert);
 }
+
+// ---- fit plausibility ceiling ---------------------------------------------
+// The gate that says a champion can be TOO good. Both the 09:35 tournament and
+// the every-30-minute autopilot ask through this one function, so these cases
+// cover both paths at once.
+
+TEST_CASE("plausibility: an implausible Sharpe is rejected") {
+    // The real crownings that motivated the gate: 2026-09-09..17 accepted 78
+    // champions above 3.0, topping out at 5.82, and the symbols carrying them
+    // traded 16-24 times a day at a loss.
+    CHECK(tt::ui::sweep_fit_implausible(0, 5.82, 3.0));
+    CHECK(tt::ui::sweep_fit_implausible(0, 3.507, 3.0));   // VEEA
+    CHECK(tt::ui::sweep_fit_implausible(0, 3.0001, 3.0));
+}
+
+TEST_CASE("plausibility: a believable Sharpe is left alone") {
+    // Exactly at the ceiling is still allowed - the gate rejects "above".
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, 3.0, 3.0));
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, 1.84, 3.0));    // CONL
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, 0.1001, 3.0));  // SNXX
+    // A losing champion is the OTHER gate's business, not this one.
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, -2.268, 3.0));
+}
+
+TEST_CASE("plausibility: only Sharpe has a meaningful ceiling") {
+    // Return is scale-dependent, max drawdown is minimised, win rate is already
+    // bounded by 1. Applying a Sharpe ceiling to them would reject good fits.
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(1, 500.0, 3.0));  // Return %
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(2, 500.0, 3.0));  // Max drawdown
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(3, 0.99, 3.0));   // Win rate
+}
+
+TEST_CASE("plausibility: a zero ceiling disables the gate") {
+    // How an operator turns it off: nothing is ever implausible.
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, 99.0, 0.0));
+    CHECK_FALSE(tt::ui::sweep_fit_implausible(0, 5.82, 0.0));
+}
