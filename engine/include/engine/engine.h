@@ -325,7 +325,25 @@ struct OrderRecord {
     std::string symbol;
     uint8_t side = 0, type = 0;
     OrderStatus status = OrderStatus::Working;
+    // qty is what was ORDERED. fill_price is the VOLUME-WEIGHTED average of the
+    // fills seen so far, and fee is their SUM — both used to be overwritten by
+    // each partial, so a row showed the last slice's numbers against the whole
+    // order's quantity and the figures on it did not multiply out.
+    //
+    // 0.44.0. 47% of this account's orders (352 of 750) fill in more than one
+    // print. IBKR bills the commission on the FIRST execution, so the last
+    // partial's fee is usually 0.00 — and the blotter was showing exactly that:
+    // $852.01 of real commission on multi-fill orders displayed as $142.58,
+    // with 83% of it invisible and 8 orders reading "fee 0.00" on orders that
+    // cost money. On an account where commission on cheap, heavily-traded names
+    // was the documented cause of a $886 drawdown, that is the one number that
+    // must not be able to hide.
     double qty = 0, limit_price = 0, fill_price = 0, fee = 0;
+    // How much of `qty` has actually filled. Less than qty = still working,
+    // however the status reads: an order is marked Filled on its FIRST partial,
+    // so this is the only field that distinguishes "31 of 131 done" from "131
+    // done" — which is what made the blotter's arithmetic look wrong.
+    double filled_qty = 0;
     bool manual = false;
     // THE ENGINE NEVER SUBMITTED THIS ORDER; it was reconstructed from a fill
     // (or an adopted-order event) whose id nothing in `orders` matched.
