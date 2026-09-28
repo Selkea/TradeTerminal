@@ -1470,8 +1470,19 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
         for (auto& o : orders)
             if (o.id == f.order_id) {
                 o.status = OrderStatus::Filled;
-                o.fill_price = f.price;
-                o.fee = f.fee;
+                // ACCUMULATE, never overwrite. Both of these used to take
+                // the latest partial's value, so a 2-print order showed the
+                // last slice's price and fee against the FULL ordered
+                // quantity. IBKR bills commission on the first execution,
+                // which made the fee column read 0.00 on orders that cost a
+                // dollar. See OrderRecord::fill_price.
+                o.fill_price = o.filled_qty + f.qty > 0.0
+                                   ? (o.fill_price * o.filled_qty +
+                                      f.price * f.qty) /
+                                         (o.filled_qty + f.qty)
+                                   : f.price;
+                o.filled_qty += f.qty;
+                o.fee += f.fee;
                 orders_dirty = true;
                 matched = true;
             }
@@ -1497,6 +1508,7 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
                 if (o.id == f.order_id) {
                     o.status = OrderStatus::Filled;
                     o.fill_price = f.price;
+                    o.filled_qty = f.qty;
                     o.fee = f.fee;
                     o.broker_originated = true;
                     orders_dirty = true;

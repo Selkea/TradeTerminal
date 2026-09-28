@@ -60,7 +60,7 @@ void BlotterPanel::draw(bool* open) {
         return;
     }
 
-    if (ImGui::BeginTable("##orders", 9,
+    if (ImGui::BeginTable("##orders", 10,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -72,6 +72,13 @@ void BlotterPanel::draw(bool* open) {
         ImGui::TableSetupColumn("Type");
         ImGui::TableSetupColumn("Status");
         ImGui::TableSetupColumn("Fill");
+        // COMMISSION, which this table has never shown. It is billed on the
+        // FIRST execution of an order, so it was also the number the old
+        // overwrite-per-partial hid most completely: $852.01 of real commission
+        // on multi-fill orders displayed as $142.58. Commission on cheap,
+        // heavily-traded names is the documented cause of a $886 drawdown over
+        // 2026-09-14..17, so it belongs on the row that earns it.
+        ImGui::TableSetupColumn("Fee");
         ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 56);
         ImGui::TableHeadersRow();
 
@@ -93,7 +100,20 @@ void BlotterPanel::draw(bool* open) {
                                    : ImVec4(0.9f, 0.35f, 0.3f, 1),
                                buy ? "BUY" : "SELL");
             ImGui::TableNextColumn();
-            ImGui::Text("%.0f", o.qty);
+            // "31/131" while an order is still working through its prints.
+            // Showing the ordered quantity alone next to the last partial's
+            // price and fee is what made the blotter's arithmetic look wrong:
+            // 47% of this account's orders fill in more than one print.
+            if (o.filled_qty > 0.0 && o.filled_qty < o.qty) {
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.2f, 1), "%.0f/%.0f",
+                                   o.filled_qty, o.qty);
+                ImGui::SetItemTooltip(
+                    "Partially filled. The price and fee beside this are the\n"
+                    "average and the total OF WHAT HAS FILLED, not of the whole\n"
+                    "order.");
+            } else {
+                ImGui::Text("%.0f", o.qty);
+            }
             ImGui::TableNextColumn();
             if (o.type == static_cast<uint8_t>(OrdType::Limit))
                 ImGui::Text("lim %.2f", o.limit_price);
@@ -115,6 +135,11 @@ void BlotterPanel::draw(bool* open) {
             ImGui::TableNextColumn();
             if (o.status == OrderStatus::Filled)
                 ImGui::Text("%.2f", o.fill_price);
+            else
+                ImGui::TextUnformatted("--");
+            ImGui::TableNextColumn();
+            if (o.fee > 0.0)
+                ImGui::Text("%.2f", o.fee);
             else
                 ImGui::TextUnformatted("--");
             ImGui::TableNextColumn();

@@ -2132,3 +2132,83 @@ TEST_CASE("bars_to_eod: each symbol is measured in ITS OWN bar size") {
     CHECK(fast.answer.load() == 37);    // 37 min / 1 min
     eng.stop_live();
 }
+
+// ---------------------------------------------------------------------------
+// A partially-filled order must report the AVERAGE price and the TOTAL fee
+// (0.44.0). apply_fill used to assign both from each partial, so a multi-print
+// order carried the last slice's numbers against the whole ordered quantity and
+// the row's figures did not multiply out.
+//
+// 2026-09-28, MUU order #9: BUY 31 @ 35.92 (fee 1.00) then BUY 100 @ 35.91
+// (fee 0.00). The blotter showed "131 @ 35.91, fee 0.00" — an order that cost a
+// dollar, reading free. IBKR bills commission on the FIRST execution, so the
+// last partial's fee is routinely 0 and this hid it every time: across the
+// journal, $852.01 of commission on multi-fill orders displayed as $142.58.
+// 47% of this account's orders (352 of 750) fill in more than one print.
+// ---------------------------------------------------------------------------
+TEST_CASE("partial fills: the row shows the average price and the total fee") {
+    Engine eng;
+    FlatteningBroker broker;
+    broker.answer_flatten = false;   // no liquidation here; drive fills by hand
+    BuyOnceStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.broker = &broker;
+    eng.start_live(cfg, {&strat});
+    pump_until(eng, [&] { return eng.live_snapshot().orders.size() >= 1; });
+
+    // MUU's shape, in reverse (this strategy buys): two prints, the fee on the
+    // first, as IBKR actually bills it.
+    EngineEvent a = ev_fill(1, 1, Side::Buy, 31.0, 35.92);
+    a.u.fill.fee = 1.00;
+    EngineEvent b = ev_fill(1, 1, Side::Buy, 100.0, 35.91);
+    b.u.fill.fee = 0.00;
+    broker.emit(a);
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 31.0; });
+    {
+        const OrderRecord& o = eng.live_snapshot().orders[0];
+        CHECK(o.filled_qty == 31.0);        // 31 of 276 done...
+        CHECK(o.qty == 276.0);              // ...against what was ORDERED
+        CHECK(o.fill_price == doctest::Approx(35.92));
+        CHECK(o.fee == doctest::Approx(1.00));
+    }
+
+    broker.emit(b);
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 131.0; });
+    {
+        const OrderRecord& o = eng.live_snapshot().orders[0];
+        CHECK(o.filled_qty == 131.0);
+        // VOLUME-WEIGHTED, not the last print: (31*35.92 + 100*35.91)/131.
+        CHECK(o.fill_price == doctest::Approx(35.912366).epsilon(1e-6));
+        CHECK(o.fill_price != doctest::Approx(35.91));
+        // SUMMED, not the last print. This is the one that read 0.00.
+        CHECK(o.fee == doctest::Approx(1.00));
+    }
+    eng.stop_live();
+}
+
+TEST_CASE("partial fills: a single-print order is unchanged") {
+    // The common case must not have moved: one fill, one price, one fee, and
+    // the qty column shows the plain number rather than "131/131".
+    Engine eng;
+    FlatteningBroker broker;
+    broker.answer_flatten = false;
+    BuyOnceStrat strat;
+    LiveConfig cfg;
+    cfg.symbols = {"AAA"};
+    cfg.bar_seconds = 100'000;
+    cfg.broker = &broker;
+    eng.start_live(cfg, {&strat});
+    pump_until(eng, [&] { return eng.live_snapshot().orders.size() >= 1; });
+    EngineEvent a = ev_fill(1, 1, Side::Buy, 276.0, 18.07);
+    a.u.fill.fee = 1.38;
+    broker.emit(a);
+    pump_until(eng, [&] { return eng.live_snapshot().symbols[0].position.qty == 276.0; });
+    const OrderRecord& o = eng.live_snapshot().orders[0];
+    CHECK(o.filled_qty == 276.0);
+    CHECK(o.filled_qty == o.qty);          // not a partial: renders as "276"
+    CHECK(o.fill_price == doctest::Approx(18.07));
+    CHECK(o.fee == doctest::Approx(1.38));
+    eng.stop_live();
+}
