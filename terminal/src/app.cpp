@@ -1,4 +1,6 @@
 #include "app.h"
+
+#include "bar_archive.h"
 #include "alert_rules.h"   // classify_alert: what pages the phone
 #include "block_wait.h"    // wait_off_core: sub-ms sleep_for does not sleep here
 #include "build_info.h"   // TT_GIT_COMMIT / TT_GIT_DIRTY, stamped at build time
@@ -278,6 +280,7 @@ std::filesystem::path data_dir() {
 }
 std::string strategies_out_dir() { return (data_dir() / "strategies").string(); }
 std::string sessions_dir() { return (data_dir() / "sessions").string(); }
+std::string bars_dir() { return (data_dir() / "bars").string(); }
 std::string gxx_path() {
     const char* env = std::getenv("TT_GXX");
     return env ? env : TT_GXX_DEFAULT;
@@ -670,6 +673,17 @@ App::App(std::string gateway_url)
 
     if (!journal_.open((data_dir() / "journal.db").string()))
         route("journal: could not open journal.db — history disabled");
+
+    // Prune the bar archive ONCE, at startup. Symbols churn daily, so without
+    // this the directory grows for the life of the box and a full disk stops
+    // trading. Once per process rather than on a timer: it deletes files, and a
+    // delete that runs repeatedly unattended deserves a narrower window than one
+    // that runs at launch and says what it did.
+    if (cfg_.bar_archive && cfg_.bar_archive_days > 0) {
+        const int gone = bar_archive_prune(bars_dir(), cfg_.bar_archive_days);
+        if (gone > 0)
+            route("bars: pruned " + std::to_string(gone) + " archive file(s) older than " + std::to_string(cfg_.bar_archive_days) + " days");
+    }
 
 #ifdef TT_DEBUG
     sim_ticks_ = std::getenv("TT_SIM_TICKS") != nullptr;
@@ -3857,6 +3871,7 @@ int App::tick() {
     pump_orphan_watchdog();   // alert if an adopted position has nothing closing it
     pump_book_audit();        // alert if the app's book and the broker's disagree
     pump_history_watchdog();  // alert if traded symbols' candles stop refreshing
+    pump_bar_archive();       // persist delivered bars for offline analysis
     pump_preopen_gateway_check();   // 08:45 window: is the gateway actually LOGGED IN?
     // BEFORE the guard, on the same crossing: the guard stops the session, and
     // the per-symbol realized/open split only exists while one is live.
@@ -5741,6 +5756,34 @@ void App::pump_eod_report() {
         if (i != body.size() && body[i] != '\n') continue;
         if (i > start) route(body.substr(start, i - start));
         start = i + 1;
+    }
+}
+
+// Persist every delivered bar series, so a parameter study can be run offline
+// against the data the tournament actually scored on. See bar_archive.h for why
+// this exists and why the app never reads it back.
+//
+// ON THE UI THREAD, ONE FILE PER FRAME. on_candles runs on the I/O THREAD - the
+// same thread servicing IB's socket, where this project has already paid for
+// stalls more than once - so nothing is written there. The series is already in
+// series_, so the archive reads it back out here instead of copying half a
+// megabyte on the delivery path. One file per frame bounds the work: deliveries
+// arrive seconds apart at best and the UI runs at ~60 Hz, so the queue is never
+// more than a frame or two deep in practice.
+void App::pump_bar_archive() {
+    if (!cfg_.bar_archive) return;
+    // keys() is strings only; the candles are copied one series at a time below,
+    // and only when that series has actually advanced.
+    for (const auto& [sym, ivl] : series_.keys()) {
+        const std::string k = sym + "|" + ivl;
+        uint64_t& seen = bar_archive_rev_[k];
+        SeriesStore::Series ser;
+        if (!series_.copy_if_newer(sym, ivl, seen, ser)) continue;
+        if (ser.candles.empty()) continue;   // nothing to archive, and see below
+        const std::string name = bar_archive_name(sym, ivl);
+        if (!bar_archive_write(bars_dir(), name, bar_series_csv(ser.candles)))
+            route("bars: could not archive " + name);
+        return;   // one per frame
     }
 }
 

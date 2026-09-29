@@ -114,6 +114,20 @@ struct AppConfig {
     // nothing traded, which is the case it is most worth reading.
     bool notify_eod = true;
     bool notify_system = true;
+
+    // WRITE-ONLY archive of every historical bar series delivered, as CSV under
+    // %LOCALAPPDATA%/TradeTerminal/bars. net/bar_cache.h is memory-only by
+    // design, so six months of 5-minute bars evaporate with the process — and on
+    // 2026-09-28 that made "where does tp_r's floor actually belong"
+    // unanswerable without a TWS connection the live app was holding.
+    //
+    // THE APP NEVER READS IT BACK (see bar_archive.h). Turning a persisted
+    // cache into a read path would serve stale bars to a tournament that then
+    // fits and trades on them.
+    bool bar_archive = true;
+    // Archive files untouched for this long are deleted at startup. Symbols
+    // churn daily, and a disk that fills stops trading. 0 = never prune.
+    int bar_archive_days = 45;
     // Command that starts the IBKR Client Portal Gateway (e.g. its run.bat
     // with the conf path); enables the Launch button in Sign In. Empty = off.
     std::string ibkr_gateway_cmd;
