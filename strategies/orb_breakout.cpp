@@ -26,9 +26,30 @@
 using namespace tt;
 
 namespace {
+// The lowest reward:risk this strategy will ARM. Pure arithmetic, not a view
+// on markets: the stop sits at the far side of the range and the target is
+// tp_r times that distance, so tp_r IS the reward:risk ratio. Below 1.0 the
+// trade risks more than it is trying to make, which needs a win rate above 50%
+// to break even before commission -- and nobody claims that for an opening-range
+// breakout, where most breaks fail and the edge is in the size of the winners.
+//
+// 2026-09-28: MUU was fitted to tp_r 0.5 (the DECLARED MINIMUM of the parameter,
+// the signature of the optimizer's index-0 tie-break on a flat scoring line) and
+// traded 0.45:1 after slippage. It was the day's only loss, -$158.32.
+//
+// 1.0 and not 1.5 deliberately. 1.0 is indefensible regardless of win rate, so
+// it needs no evidence. 1.5 is where this probably belongs -- break-even at a 40%
+// win rate -- but that is a claim about THIS account's fills and has not been
+// measured yet, so it is not baked in here.
+constexpr double kMinTpR = 1.0;
+
 constexpr ParamDesc kParams[] = {
     {"range_min", 15, 1, 120},     // opening range length (minutes)
-    {"tp_r", 2.0, 0.5, 10},        // take-profit in range-heights
+    // Take-profit as a multiple of the RISK (the distance to the far-range
+    // stop), which is what the name and the "tp=2.0R" log line have always
+    // said. The floor is kMinTpR: the sweep may not propose a ratio that
+    // loses money by construction.
+    {"tp_r", 2.0, 1.0, 10},
     // % of CASH risked (stop = far range side). INERT on any account big enough
     // for the caps to bind, and kept only for the ones where it still moves:
     // against a per-symbol notional cap and a per-trade risk budget, cash is the
@@ -55,6 +76,18 @@ public:
         session_min_ = ctx.param("session_min", 390);
         eod_min_ = ctx.param("eod_min", 5);
         allow_short_ = ctx.param("allow_short", 0) >= 0.5;
+        // REFUSE, DO NOT CLAMP, a ratio that loses by construction.
+        //
+        // The ParamDesc minimum above bounds the sweep grid and the UI
+        // editor; it does NOT bound this. StrategyManagerPanel::
+        // set_param_values clamps its own editor copy, but the live path
+        // reads config.json straight through ctx.param, so a tp_r saved
+        // before the floor existed would still trade. Clamping it here
+        // would park the symbol on a number no backtest ever scored --
+        // the argument symbol_params.h makes at length for the unreachable
+        // time stop. Sitting the symbol out instead scores the region as
+        // zero-trade, so the next tournament fits its way off it.
+        disabled_ = tp_r_ < kMinTpR;
         max_qty_ = ctx.param("max_qty", 5000);
         // Risk overlay injected by the app in "hold — don't halt" mode: don't let
         // the EOD / new-day housekeeping flatten an underwater position.
@@ -68,9 +101,12 @@ public:
 
         char buf[128];
         std::snprintf(buf, sizeof(buf),
-                      "ORB: range=%.0fm tp=%.1fR risk=%.2f%% eod=%.0fm short=%d",
-                      range_min_, tp_r_, risk_pct_, eod_min_, allow_short_ ? 1 : 0);
-        ctx.log(1, buf);
+                      "ORB: range=%.0fm tp=%.1fR risk=%.2f%% eod=%.0fm short=%d%s",
+                      range_min_, tp_r_, risk_pct_, eod_min_, allow_short_ ? 1 : 0,
+                      disabled_ ? " - DISABLED, tp_r below 1.0 risks more than it targets" : "");
+        // Level 2 when refused: worth saying loudly, not worth a Critical
+        // page (level 3 renders as [strategy error]).
+        ctx.log(disabled_ ? 2 : 1, buf);
     }
 
     void on_bar(IStrategyContext& ctx, uint32_t symbol_id, const Bar& bar) noexcept override {
@@ -191,7 +227,11 @@ public:
         }
 
         // Range complete: arm the breakout stops, once per session.
-        if (!armed_ && !entered_ && long_stop_id_ == 0 && short_stop_id_ == 0) {
+        // Gates the ARMING only. Deliberately not an early return at the top
+        // of on_bar: a disabled instance must still manage and flatten any
+        // position it somehow holds.
+        if (!disabled_ && !armed_ && !entered_ && long_stop_id_ == 0 &&
+            short_stop_id_ == 0) {
             // NOT latched yet. armed_ used to be set here, above every check
             // below it, so a range that was not usable YET disabled the
             // breakout for the rest of the day — and the range can become
@@ -380,8 +420,26 @@ private:
         // TP keys off the position's AVERAGE entry, not the first print, so a
         // bracket rebuilt mid-fill targets the same edge the whole way up.
         prot_px_ = went_long ? range_lo_ : range_hi_;
-        tp_px_ = went_long ? p.avg_price + tp_r_ * range_h_
-                           : p.avg_price - tp_r_ * range_h_;
+        // TP AT tp_r TIMES THE RISK ACTUALLY TAKEN, not times the range height.
+        //
+        // The stop is a FIXED price — the far side of the range — so every cent
+        // of entry slippage widens the risk and leaves it there. Scaling the
+        // target by range_h_ instead left the reward untouched, so the realized
+        // ratio was tp_r * H / (H + slippage): always worse than tp_r, and worst
+        // exactly when the break is fastest, which is when this strategy trades.
+        //
+        // 2026-09-28, MUU: range 35.07-38.00 (H = 2.93), short filled at 34.72 —
+        // 35c past the trigger. Risk 3.28, reward 0.5 * 2.93 = 1.47, so a tp_r of
+        // 0.50 delivered 0.45. The parameter is NAMED tp_r and logged as "tp=0.5R",
+        // and R means risk-multiple everywhere in trading; only the ParamDesc
+        // comment said range-heights. The name promised one thing and the
+        // arithmetic did another.
+        //
+        // Now tp_r is a true R-multiple: a slipped entry moves the target out in
+        // proportion, so the ratio the fit was scored on is the ratio it trades.
+        const double risk_px = std::abs(p.avg_price - prot_px_);
+        tp_px_ = went_long ? p.avg_price + tp_r_ * risk_px
+                           : p.avg_price - tp_r_ * risk_px;
         const Side exit_side = went_long ? Side::Sell : Side::Buy;
 
         if (prot_id_) ctx.cancel_order(prot_id_);
@@ -413,6 +471,9 @@ private:
     }
 
     double range_min_ = 15, tp_r_ = 2.0, risk_pct_ = 1.0;
+    // Set in on_init when tp_r is below kMinTpR. Blocks arming only; a
+    // disabled instance still manages whatever it holds.
+    bool disabled_ = false;
     double session_min_ = 390, eod_min_ = 5, max_qty_ = 5000;
     bool allow_short_ = false;
     bool hold_losers_ = false;   // hold-mode overlay: keep underwater positions
