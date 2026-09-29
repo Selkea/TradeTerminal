@@ -1303,3 +1303,182 @@ TEST_CASE("rsi2: the same horizon gate, for the same reason") {
     CHECK(rsi2_orders_with_room(24, 24) == 1);    // exactly enough
     CHECK(rsi2_orders_with_room(70, 24) == 1);
 }
+
+// ---------------------------------------------------------------------------
+// tp_r is a RISK multiple, and below 1.0 it is refused (0.45.0).
+//
+// The protective stop is a FIXED price — the far side of the range — so every
+// cent of entry slippage widens the risk and leaves it there. The target used to
+// be scaled by the range HEIGHT, which knows nothing about slippage, so the
+// realized ratio was tp_r * H / (H + slip): always worse than tp_r, and worst
+// exactly when the break is fastest.
+//
+// 2026-09-28, MUU: range 35.07-38.00 (H 2.93), short filled 34.72 — 35c past the
+// trigger. Risk 3.28, reward 0.5 * 2.93 = 1.47, so tp_r 0.50 traded 0.45. And
+// 0.5 was the parameter's DECLARED MINIMUM, which is the signature of the
+// optimizer's index-0 tie-break on a flat scoring line. It was the day's only
+// loss, -$158.32.
+// ---------------------------------------------------------------------------
+namespace {
+// Build a 99/101 opening range, arm, then fill the LONG breakout at `fill_px`
+// (above 101 = slippage past the trigger). Returns the bracket legs.
+std::vector<OrderRequest> orb_bracket_at(double tp_r, double fill_px) {
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.params["tp_r"] = tp_r;
+    ctx.budget_ = 1'000'000.0;   // never the binding constraint here
+    s->on_init(ctx);
+
+    int64_t ts = local_ts(2026, 9, 28, 9, 30);
+    for (int i = 0; i < 4; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 101.0 : 99.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    uint64_t entry_id = 0;
+    double qty = 0;
+    for (size_t i = 0; i < ctx.sent.size(); ++i)
+        if (ctx.sent[i].side == Side::Buy && ctx.sent[i].type == OrdType::Stop) {
+            entry_id = static_cast<uint64_t>(i + 1);
+            qty = ctx.sent[i].qty;
+        }
+    if (entry_id == 0) { s->destroy(); return {}; }   // never armed
+    ctx.sent.clear();
+    // The engine applies the fill before calling on_fill, so the position is
+    // already live and carries the (slipped) average price.
+    ctx.pos = Position{1, qty, fill_px, 0.0, 0.0};
+    s->on_fill(ctx, Fill{entry_id, 1, Side::Buy, {}, ts, fill_px, qty, 0.0});
+    const std::vector<OrderRequest> out = ctx.sent;
+    s->destroy();
+    return out;
+}
+
+double leg_px(const std::vector<OrderRequest>& v, OrdType t) {
+    for (const OrderRequest& r : v)
+        if (r.type == t) return t == OrdType::Limit ? r.limit_price : r.stop_price;
+    return -1.0;
+}
+} // namespace
+
+TEST_CASE("orb: the take-profit scales with the RISK TAKEN, not the range height") {
+    // Range 99-101 (H 2.00), long slipped 50c to 101.50.
+    //   stop  = 99.00 (the far range side, a fixed price)
+    //   risk  = 101.50 - 99.00 = 2.50   <- slippage lives here
+    //   tp_r 2.0 -> target 101.50 + 5.00 = 106.50
+    const std::vector<OrderRequest> v = orb_bracket_at(2.0, 101.50);
+    REQUIRE(!v.empty());
+    CHECK(leg_px(v, OrdType::Stop) == doctest::Approx(99.00));
+    CHECK(leg_px(v, OrdType::Limit) == doctest::Approx(106.50));
+    // The OLD arithmetic scaled by the range height and would have targeted
+    // 101.50 + 2.0*2.00 = 105.50 — a 2.0R fit trading 1.6R.
+    CHECK(leg_px(v, OrdType::Limit) != doctest::Approx(105.50));
+}
+
+TEST_CASE("orb: the realized ratio now equals tp_r no matter how far it slipped") {
+    // The property that matters: reward/risk == tp_r for ANY entry price. The
+    // old anchoring made this false by construction, and the more violent the
+    // break the more it lied.
+    for (const double slip : {0.0, 0.25, 1.00, 3.00}) {
+        for (const double tp_r : {1.0, 2.0, 4.5}) {
+            const std::vector<OrderRequest> v = orb_bracket_at(tp_r, 101.0 + slip);
+            REQUIRE(!v.empty());
+            const double entry = 101.0 + slip;
+            const double risk = entry - leg_px(v, OrdType::Stop);
+            const double reward = leg_px(v, OrdType::Limit) - entry;
+            CHECK(reward / risk == doctest::Approx(tp_r).epsilon(1e-9));
+        }
+    }
+}
+
+TEST_CASE("orb: a no-slippage entry is unchanged") {
+    // The common case must not have moved: filled at the trigger, risk IS the
+    // range height, so old and new agree exactly.
+    const std::vector<OrderRequest> v = orb_bracket_at(2.0, 101.00);
+    REQUIRE(!v.empty());
+    CHECK(leg_px(v, OrdType::Stop) == doctest::Approx(99.00));
+    CHECK(leg_px(v, OrdType::Limit) == doctest::Approx(105.00));
+}
+
+TEST_CASE("orb: a reward:risk below 1.0 never arms") {
+    // MUU's 0.5 came straight from config.json, and the live path reads
+    // ctx.param unclamped — the ParamDesc minimum only bounds the sweep grid and
+    // the UI editor. So the refusal has to live in the strategy.
+    CHECK(orb_bracket_at(0.5, 101.0).empty());
+    CHECK(orb_bracket_at(0.9, 101.0).empty());
+    CHECK(orb_bracket_at(0.0, 101.0).empty());
+}
+
+TEST_CASE("orb: 1.0 and above still arm") {
+    // The control. A floor that refused everything would satisfy the case above
+    // by removing the evidence rather than the error.
+    CHECK_FALSE(orb_bracket_at(1.0, 101.0).empty());   // exactly at the floor
+    CHECK_FALSE(orb_bracket_at(1.5, 101.0).empty());
+    CHECK_FALSE(orb_bracket_at(2.0, 101.0).empty());
+}
+
+namespace {
+// The SHORT side, which is the side MUU actually traded. For a short the stop is
+// ABOVE the fill, so the risk distance is negative before abs() — a detail the
+// long-only cases above cannot see.
+std::vector<OrderRequest> orb_short_bracket_at(double tp_r, double fill_px) {
+    IStrategy* s = make("orb_breakout.cpp");
+    FakeCtx ctx;
+    ctx.params["range_min"] = 15;
+    ctx.params["session_min"] = 390;
+    ctx.params["eod_min"] = 5;
+    ctx.params["tp_r"] = tp_r;
+    ctx.params["allow_short"] = 1;
+    ctx.budget_ = 1'000'000.0;
+    s->on_init(ctx);
+    int64_t ts = local_ts(2026, 9, 28, 9, 30);
+    for (int i = 0; i < 4; ++i) {
+        s->on_bar(ctx, 1, mk_bar(ts, i % 2 ? 101.0 : 99.0));
+        ts += 300LL * 1'000'000'000LL;
+    }
+    uint64_t entry_id = 0;
+    double qty = 0;
+    for (size_t i = 0; i < ctx.sent.size(); ++i)
+        if (ctx.sent[i].side == Side::Sell && ctx.sent[i].type == OrdType::Stop) {
+            entry_id = static_cast<uint64_t>(i + 1);
+            qty = ctx.sent[i].qty;
+        }
+    if (entry_id == 0) { s->destroy(); return {}; }
+    ctx.sent.clear();
+    ctx.pos = Position{1, -qty, fill_px, 0.0, 0.0};   // NEGATIVE: short
+    s->on_fill(ctx, Fill{entry_id, 1, Side::Sell, {}, ts, fill_px, qty, 0.0});
+    const std::vector<OrderRequest> out = ctx.sent;
+    s->destroy();
+    return out;
+}
+} // namespace
+
+TEST_CASE("orb: the short side scales off risk too, and in the right direction") {
+    // Range 99-101, short slipped 50c below the trigger to 98.50.
+    //   stop  = 101.00 (the far range side — ABOVE a short)
+    //   risk  = |98.50 - 101.00| = 2.50
+    //   tp_r 2.0 -> target 98.50 - 5.00 = 93.50   (BELOW, for a short)
+    const std::vector<OrderRequest> v = orb_short_bracket_at(2.0, 98.50);
+    REQUIRE(!v.empty());
+    CHECK(leg_px(v, OrdType::Stop) == doctest::Approx(101.00));
+    CHECK(leg_px(v, OrdType::Limit) == doctest::Approx(93.50));
+    // The old range-height anchoring: 98.50 - 2.0*2.00 = 94.50.
+    CHECK(leg_px(v, OrdType::Limit) != doctest::Approx(94.50));
+    // And the target must be BELOW the entry — a sign error here would place a
+    // take-profit a short can only reach by losing.
+    CHECK(leg_px(v, OrdType::Limit) < 98.50);
+}
+
+TEST_CASE("orb: MUU's actual trade, under the new arithmetic") {
+    // 2026-09-28 as it happened, with tp_r at the floor instead of 0.5. The
+    // short filled 35c past its trigger; risk was 3.28/share against a 2.93
+    // range, which is why the old anchoring delivered 0.45R on a 0.5R fit.
+    const std::vector<OrderRequest> v = orb_short_bracket_at(1.0, 98.50);
+    REQUIRE(!v.empty());
+    const double risk = leg_px(v, OrdType::Stop) - 98.50;
+    const double reward = 98.50 - leg_px(v, OrdType::Limit);
+    CHECK(risk == doctest::Approx(2.50));
+    CHECK(reward == doctest::Approx(2.50));     // 1.0R means 1.0R now
+    CHECK(reward / risk == doctest::Approx(1.0));
+}
