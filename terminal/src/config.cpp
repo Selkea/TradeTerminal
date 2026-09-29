@@ -56,6 +56,8 @@ AppConfig AppConfig::load(const std::string& path) {
     c.notify_lineup = j.value("notify_lineup", c.notify_lineup);
     c.notify_eod = j.value("notify_eod", c.notify_eod);
     c.notify_system = j.value("notify_system", c.notify_system);
+    c.bar_archive = j.value("bar_archive", c.bar_archive);
+    c.bar_archive_days = j.value("bar_archive_days", c.bar_archive_days);
     c.ibkr_gateway_cmd = j.value("ibkr_gateway_cmd", c.ibkr_gateway_cmd);
     c.risk_max_order_qty = j.value("risk_max_order_qty", c.risk_max_order_qty);
     c.risk_max_position_qty = j.value("risk_max_position_qty", c.risk_max_position_qty);
@@ -169,6 +171,8 @@ void AppConfig::save(const std::string& path) const {
         {"notify_lineup", notify_lineup},
         {"notify_eod", notify_eod},
         {"notify_system", notify_system},
+        {"bar_archive", bar_archive},
+        {"bar_archive_days", bar_archive_days},
         {"ibkr_gateway_cmd", ibkr_gateway_cmd},
         {"risk_max_order_qty", risk_max_order_qty},
         {"risk_max_position_qty", risk_max_position_qty},

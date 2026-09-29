@@ -532,6 +532,11 @@ private:
     // this measures the SUCCESSES instead of the in-flight requests. Diagnostic
     // only — it never halts, cancels or flattens.
     void pump_history_watchdog();
+    // Write-only bar archive (bar_archive.h). UI thread, one file per frame.
+    // The revision each series was last archived at, so an unchanged series is
+    // not rewritten every frame.
+    void pump_bar_archive();
+    std::map<std::string, uint64_t> bar_archive_rev_;
     net::HistoryFreshness hist_fresh_;       // fed from the on_candles success path
     // The "since" of the since/last-alert pair is the SESSION clock, not the
     // start of the stale episode: staleness is already measured in absolute bar

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tt {
@@ -52,6 +53,21 @@ public:
         out = it->second;
         seen = it->second.revision;
         return true;
+    }
+
+    // Every (symbol, interval) held, so a caller that wants to sweep ALL of
+    // them can. copy_if_newer needs the pair up front, and nothing else could
+    // enumerate what had arrived. Strings only: no candles are copied.
+    std::vector<std::pair<std::string, std::string>> keys() const {
+        std::lock_guard lock(mu_);
+        std::vector<std::pair<std::string, std::string>> out;
+        out.reserve(series_.size());
+        for (const auto& [k, _] : series_) {
+            const size_t bar = k.rfind('|');
+            if (bar == std::string::npos) continue;
+            out.emplace_back(k.substr(0, bar), k.substr(bar + 1));
+        }
+        return out;
     }
 
 private:
