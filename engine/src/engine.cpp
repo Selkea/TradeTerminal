@@ -1420,6 +1420,21 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             snap_.symbols[i].position = pf.position(static_cast<uint32_t>(i + 1));
             snap_.symbols[i].fees = pf.fees(static_cast<uint32_t>(i + 1));
             snap_.symbols[i].adopted = adopt_hold[i] != 0;
+            // HIGH-WATER MARK of capital actually at work (SymbolState::
+            // peak_notional). Sampled here rather than in Portfolio::apply so
+            // the backtest path is untouched, and marked-to-market rather than
+            // to the entry price so it reflects what was really exposed.
+            //
+            // Only ever rises within a session, which is the point: the book is
+            // flat by the close, so anything read from the closing snapshot
+            // would report zero capital deployed on every day that traded.
+            const double px = last_price[i] > 0.0
+                                  ? last_price[i]
+                                  : snap_.symbols[i].position.avg_price;
+            const double qty = snap_.symbols[i].position.qty;
+            const double notional = (qty < 0.0 ? -qty : qty) * px;
+            if (notional > snap_.symbols[i].peak_notional)
+                snap_.symbols[i].peak_notional = notional;
         }
         // Params change only at session start and on a swap, so copy the maps
         // then rather than on every publish.

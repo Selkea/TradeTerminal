@@ -440,6 +440,19 @@ struct SymbolState {
     // accepted it — so the two disagree exactly when a proposal was rejected,
     // and reading the terminal's copy reports a set that is not trading.
     std::map<std::string, double> params;
+    // The most capital this symbol has had at work in THIS session:
+    // max(|qty| * last_price) sampled as the position moves.
+    //
+    // It is the only honest denominator for "what did the day return". The
+    // account is a ~$1M paper balance against a $5,000 per-symbol notional cap,
+    // so a day that makes $200 is +0.02% of the account and roughly +0.7% of the
+    // capital that was actually committed. The first number says the strategy is
+    // noise; the second says what it did. Both get reported, and this is what
+    // makes the second one a measurement rather than an estimate.
+    //
+    // PEAK, not the end-of-day figure: the session is flat by the close, so the
+    // closing snapshot would report zero deployed on every profitable day.
+    double peak_notional = 0.0;
     // This position came from the broker on connect (hot restart / lineup
     // swap), not from a fill of ours, and its strategy is PAUSED until it goes
     // flat. The adopted broker-side stop/TP is what exits it — so an adopted

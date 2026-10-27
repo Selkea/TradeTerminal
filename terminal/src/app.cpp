@@ -5712,7 +5712,8 @@ void App::pump_eod_report() {
                 eod_pending_.symbols.push_back(
                     eod_row_from(ss.symbol, ss.position.realized_pnl, ss.fees,
                                  ss.position.qty, ss.position.avg_price,
-                                 ss.position.unrealized_pnl));
+                                 ss.position.unrealized_pnl,
+                                 ss.peak_notional));
         }
         eod_report_pending_ = true;
         eod_report_armed_at_ = mono_s();
@@ -5746,6 +5747,23 @@ void App::pump_eod_report() {
             if (row.started.rfind(eod_pending_.date, 0) != 0) continue;
             if (row.halted) eod_pending_.halted = true;
         }
+    }
+    // Capital actually deployed today, and the equity basis for the return
+    // lines. Both read here rather than at the crossing: deployed_peak sums
+    // rows already captured, and the equity basis needs the journal to have
+    // CLOSED this day's session - which is the same condition the emit was
+    // already waiting on.
+    eod_pending_.deployed_peak = eod_deployed_peak(eod_pending_.symbols);
+    if (journal_.ok()) {
+        const RoiBasis rb = journal_.roi_basis();
+        eod_pending_.roi_ok = rb.ok;
+        eod_pending_.roi_from = rb.from_date;
+        eod_pending_.roi_baseline = rb.baseline_equity;
+        eod_pending_.roi_equity = rb.latest_equity;
+        eod_pending_.roi_sessions = rb.sessions;
+        eod_pending_.mtd_ok = rb.mtd_ok;
+        eod_pending_.mtd_from = rb.mtd_from_date;
+        eod_pending_.mtd_baseline = rb.mtd_baseline_equity;
     }
     const std::string body = format_eod_report(eod_pending_);
     alerts_.notify(AlertNotifier::Info, body);
