@@ -43,6 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'IbGatewayJava.ps1')
 $failures = New-Object System.Collections.ArrayList
 $warnings = New-Object System.Collections.ArrayList
 
@@ -89,6 +90,20 @@ if (-not $gwDirs) {
     }
     if ($gwDirs.Count -gt 1) {
         Warn "multiple builds present" "launcher takes $chosen; the others are inert but still on disk"
+    }
+
+    # Can IBC resolve a JVM for the build above? A build NUMBER says nothing
+    # about whether the thing can be started, and this check's absence is what
+    # let 2026-10-27 happen: 10.50.1f installed cleanly, passed every test this
+    # script had, and then IBC died with "Can't find suitable Java installation"
+    # because 10.50 bundles its JRE and writes no pref_jre.cfg for IBC to read.
+    # Asked of Resolve-IbcJava, which mirrors StartIBC.bat's own search order, so
+    # a pass here is the launcher's answer and not a second opinion.
+    $java = Resolve-IbcJava $gwDirs[0].FullName
+    if ($java.Path) {
+        Pass "JVM resolvable" "$($java.Path) [$($java.Source)]"
+    } else {
+        Fail "JVM resolvable" "IBC would fail with 'Can't find suitable Java installation' for build $chosen - no jre\bin, no usable pref_jre.cfg/inst_jre.cfg, no Oracle javapath"
     }
 }
 

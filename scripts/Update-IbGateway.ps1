@@ -64,6 +64,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+. (Join-Path $PSScriptRoot 'IbGatewayJava.ps1')
 
 $jts = 'C:\Jts\ibgateway'
 $stage = Join-Path $jts '_upgrade'
@@ -147,7 +148,10 @@ if ($diagToken) {
 # an earlier cut of this died at the first problem - telling the operator "I will
 # change nothing" and then hiding the rest of what it knew.
 $blocked = $null
-if ($liveRunning -eq $null) {
+# $null on the LEFT: `$x -eq $null` with an array on the left FILTERS it and
+# returns an empty array, which is falsy - so this gate would skip the "cannot
+# confirm" branch and proceed. Wrong failure direction for a safety gate.
+if ($null -eq $liveRunning) {
     Warn "could not reach /diag - cannot confirm the app is idle"
     if (-not $Force) { $blocked = "cannot confirm the app is idle (/diag unreachable). Stop the app, or use -Force if you know it is." }
     else { Warn "-Force given: would proceed without proof" }
@@ -242,6 +246,27 @@ $target = Join-Path $jts "$newVer"
 if (Test-Path $target) { Die "$target already exists but the launcher chose $current - resolve that by hand before re-running" }
 Rename-Item $stage "$newVer"
 Ok "installed as $target (build $current left in place for rollback)"
+
+# ---- can IBC actually LAUNCH it? -------------------------------------------
+# BEFORE the restart, and this ordering is the whole point. The 2026-10-27
+# outage was not caused by a bad download or a bad install - both were fine. It
+# was caused by VERIFYING AFTER RESTARTING: Start-IbGateway.ps1 killed a working
+# 10.45 gateway, IBC then failed to find a JVM for 10.50, and the verify step
+# 45 seconds later could only report the damage. A build whose JVM cannot be
+# resolved must never cost us the gateway we already have.
+Step "Launchability"
+$java = Resolve-IbcJava $target
+if (-not $java.Path) {
+    Warn "IBC cannot resolve a JVM for build $newVer."
+    Info "checked, in IBC's own order: <install>\jre\bin, .install4j\pref_jre.cfg,"
+    Info ".install4j\inst_jre.cfg, %PROGRAMDATA%\Oracle\Java\javapath"
+    Info "the running gateway (build $current) has NOT been touched."
+    Write-Host ""
+    Write-Host "  Leave it staged and disabled, so the launcher keeps choosing $current :" -ForegroundColor Yellow
+    Write-Host "    Rename-Item '$target' '$newVer.disabled'"
+    Die "build $newVer is installed but not launchable - refusing to restart onto it"
+}
+Ok "JVM for $newVer : $($java.Path) [$($java.Source)]"
 
 if ($StageOnly) {
     Step "Staged"

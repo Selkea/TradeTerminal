@@ -46,6 +46,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Security
+. (Join-Path $PSScriptRoot 'IbGatewayJava.ps1')
 
 function Stop-Gateway {
     Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" |
@@ -255,7 +256,17 @@ MinimizeMainWindow=no
     $env:TWSPASSWORD = Unprotect-Str $acc.pass
     $env:FIXUSERID = ''
     $env:FIXPASSWORD = ''
-    $env:JAVA_PATH = ''
+    # JAVA_PATH is set ONLY when this build ships its own JRE; otherwise it stays
+    # empty and IBC resolves the JVM itself exactly as it always has.
+    #
+    # 10.50 bundles its JRE in <install>\jre and writes no pref_jre.cfg, so IBC's
+    # own search finds nothing and dies with "Can't find suitable Java
+    # installation" - which on 2026-10-27 cost a full session, because the
+    # gateway it replaced had already been killed. 10.45 has no bundled JRE and
+    # a working pref_jre.cfg, so it takes the empty branch and is untouched by
+    # this: the fix can only ADD a JVM where IBC would have found none.
+    $bundledJava = Get-IbcBundledJava $gwVer.FullName
+    $env:JAVA_PATH = if ($bundledJava) { $bundledJava } else { '' }
     $env:APP = 'GATEWAY'
 
     # Hidden: this is only IBC's console (banner + log mirror; the real logs land
@@ -267,7 +278,9 @@ MinimizeMainWindow=no
     $env:TWSUSERID = $null
     $env:TWSPASSWORD = $null
 
-    "IB Gateway launching as '$name' ($mode, api port $port)."
+    "IB Gateway launching as '$name' ($mode, api port $port), build $($gwVer.Name)."
+    if ($bundledJava) { "  JVM: $bundledJava (bundled with the build)" }
+    else { "  JVM: left to IBC to resolve (this build ships no jre\bin\java.exe)" }
     "If the security-code dialog appears, type the authenticator code (RDP)."
     # The mutex is held across this wait ON PURPOSE: until the port is up, a
     # second caller launching IBC would be the login fight described at the top.
