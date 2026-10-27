@@ -112,3 +112,64 @@ Not "it started". Run on the VPS, in this order:
 4. Confirm the AM/PM landmine: the successor's log must say the restart is
    scheduled for **23:55**, not 11:55.
 5. Keep the previous IBC jar on disk. Rollback is restoring it.
+
+---
+
+## 2026-10-27: the 10.50 upgrade failed, and IBC was not the reason
+
+The upgrade to 10.50.1f ran on 2026-10-27 at 02:26 and took the box out of the
+market for the whole session. **The predicted risk materialised, but not in the
+predicted form.** This document said the unknown was whether IBC 3.24.1 could
+drive 10.50's *dialogs*. It never reached a dialog:
+
+```
+Error: Can't find suitable Java installation
+```
+
+**Java discovery, not dialog handling.** `IBC\scripts\StartIBC.bat` (lines
+404-423) looks for a JVM in this order, and nothing else:
+
+1. `$env:JAVA_PATH`, if it contains `java.exe`
+2. `<install>\.install4j\pref_jre.cfg` + `\bin`
+3. `<install>\.install4j\inst_jre.cfg` + `\bin`
+4. `%PROGRAMDATA%\Oracle\Java\javapath`
+
+10.45 passes at step 2: its installer registered a **shared** JRE and wrote
+`pref_jre.cfg` pointing at `C:\Program Files\Common Files\i4j_jres\...zulu`.
+
+10.50 **bundles its JRE inside the install directory** and writes **no
+`pref_jre.cfg` at all**. Its `inst_jre.cfg` points at the installer's own temp
+directory, which is deleted when the installer exits. So steps 2-4 all miss
+while a working `java.exe` sits in `<install>\jre\bin`. The gateway's own
+`ibgateway.exe` finds it — install4j resolves it relative to the launcher — so
+launching the exe by hand "works", which makes this look like an IBC/10.50
+incompatibility. **It is not.** IBC has to be told, and 0.51.0 tells it.
+
+### What actually cost the session
+
+Not the Java problem — that is one line of config. The cost came from
+**ordering**: `Update-IbGateway.ps1` restarted onto the new build and verified
+*afterwards*. `Start-IbGateway.ps1` killed a healthy 10.45 gateway, 10.50 failed
+to launch, and the verify step 45 s later could only report the damage. A
+`-Check` run beforehand would not have helped either: it checked preconditions
+on the *old* build, because the new one did not exist yet.
+
+**0.51.0 adds a launchability gate between the install and the restart**, so a
+build whose JVM cannot be resolved can no longer cost us the gateway we already
+have. `Verify-IbGateway.ps1` gained the same check, because its "gateway build
+1050" PASS was a claim about a *directory name* and said nothing about whether
+the thing could start.
+
+### Generalisable, and the same lesson as six previous entries
+
+A check narrower than the invariant it claims. "Is the build new enough?" was
+standing in for "will the gateway come up?", and the gap between those two
+questions was a trading day. **An upgrade verifier must test the artefact, not
+its version number.**
+
+### Still open
+
+Whether IBC 3.24.1 can drive 10.50's **login dialogs** — the original question —
+is *still unanswered*, because the 02:26 attempt never got far enough to find
+out. The acceptance test above stands unchanged, and step 3 (one real 23:55 cold
+restart) remains the one whose failure costs a trading day.
