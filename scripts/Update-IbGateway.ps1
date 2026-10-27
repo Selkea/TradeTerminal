@@ -131,9 +131,14 @@ if ($diagToken) {
         $body = (Invoke-WebRequest -Uri "http://127.0.0.1:$diagPort/diag?token=$diagToken" `
                     -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop).Content
         $liveRunning = ($body -match '"live_running"\s*:\s*true')
-        # Any non-zero "position" field at all. Crude on purpose: a false
-        # positive refuses the upgrade, which is the safe direction.
-        $openPositions = ($body -match '"position"\s*:\s*-?[1-9]')
+        # Compared NUMERICALLY, not by a leading-digit regex. The obvious
+        # '"position"\s*:\s*-?[1-9]' looks right and silently misses a
+        # fractional holding like 0.5, whose failure direction is the wrong one:
+        # it would ALLOW the upgrade over an open position.
+        $openPositions = $false
+        foreach ($m in [regex]::Matches($body, '"position"\s*:\s*(-?[0-9.]+)')) {
+            if ([double]$m.Groups[1].Value -ne 0) { $openPositions = $true; break }
+        }
     } catch { }
 }
 
@@ -153,7 +158,19 @@ if ($liveRunning -eq $null) {
     $blocked = "the book is NOT FLAT. Taking the gateway down over an open position is how 2026-08-06 cost `$846."
     Warn $blocked
 } else {
-    Ok "no live session, book flat"
+    # NOT "book flat". With no live session /diag carries no position rows at
+    # all - the symbols array is session-scoped - so their absence is not
+    # evidence of a flat book. And this box ends every day on the 16:15 guard,
+    # which KEEPS positions for the next session to re-adopt, so overnight is
+    # precisely when something can be held that the app cannot see.
+    #
+    # Not treated as blocking: nothing is managing those positions while the app
+    # is idle anyway, the broker-side stops stay live at IBKR across a gateway
+    # restart, and the gateway is back in minutes. But it is said plainly
+    # instead of printing a reassurance that was never checked.
+    Ok "no live session running"
+    Info "the app is idle, so /diag cannot see the broker's book - if the 16:15"
+    Info "guard kept positions overnight they are held at IBKR and invisible here"
 }
 
 $free = (Get-PSDrive C).Free / 1GB
