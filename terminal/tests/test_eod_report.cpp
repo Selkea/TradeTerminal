@@ -20,6 +20,7 @@ using tt::ui::AlertCategory;
 using tt::ui::classify_alert_category;
 using tt::ui::EodReport;
 using tt::ui::EodSymbolRow;
+using tt::ui::eod_allocated;
 using tt::ui::eod_deployed_peak;   // an empty {} arg has no type for ADL to find
 using tt::ui::EquityPoint;
 using tt::ui::format_eod_report;
@@ -292,10 +293,15 @@ EodReport roi_day() {
     r.net = 273.97;
     r.daily_loss_limit = 2000.0;
     r.symbols = {
-        {"SNXX", 180.20, 3.10, 0, 0.0, 0.0, 14900.0},
-        {"KORU", 93.77, 2.05, 0, 0.0, 0.0, 14887.0},
+        {"SNXX", 180.20, 3.10, 0, 0.0, 0.0, 14900.0, 5000.0},
+        {"KORU", 93.77, 2.05, 0, 0.0, 0.0, 14887.0, 5000.0},
+        {"MUU", 0.0, 0.0, 0, 0.0, 0.0, 0.0, 5000.0},
+        {"SOXL", 0.0, 0.0, 0, 0.0, 0.0, 0.0, 5000.0},
+        {"IREN", 0.0, 0.0, 0, 0.0, 0.0, 0.0, 5000.0},
+        {"CRWV", 0.0, 0.0, 0, 0.0, 0.0, 0.0, 5000.0},
     };
     r.deployed_peak = eod_deployed_peak(r.symbols);
+    r.allocated = eod_allocated(r.symbols);
     r.roi_ok = true;
     r.roi_from = "2026-08-03";
     r.roi_baseline = 994910.74;
@@ -310,23 +316,35 @@ EodReport roi_day() {
 
 TEST_CASE("roi: today is measured against capital actually deployed") {
     const std::string s = format_eod_report(roi_day());
-    // 14900 + 14887 = 29,787 at work; 273.97 / 29787 = 0.92%.
-    CHECK(has(s, "today       +273.97  on 29,787 deployed  = +0.92%"));
-    // NOT the account denominator for the daily line: 273.97/1,002,794 is
-    // +0.03%, which is the number that makes a real day look like noise.
-    CHECK_FALSE(has(s, "+0.03%"));
+    // 6 x $5,000 allocated; 273.97 / 30,000 = 0.91%.
+    CHECK(has(s, "return on the 30,000 allocated"));
+    CHECK(has(s, "today       +273.97  = +0.91%"));
+    // NOT the account base for the daily line: 273.97/1,002,794 is +0.03%, the
+    // number that makes a real day look like noise.
+    CHECK_FALSE(has(s, "today       +273.97  = +0.03%"));
+    // And NOT the day's own deployment either. 273.97/29,787 = 0.92% - close
+    // here by coincidence, but that denominator moves with how many signals
+    // fired, which is not a fact about performance.
+    CHECK_FALSE(has(s, "today       +273.97  = +0.92%"));
+    // Deployment is reported as UTILISATION instead: 29,787/30,000 = 99%.
+    CHECK(has(s, "used         29,787 at peak = 99% of it"));
 }
 
-TEST_CASE("roi: the cumulative lines are account-relative and name their base") {
+TEST_CASE("roi: the cumulative lines use ALLOCATED and name their base") {
     const std::string s = format_eod_report(roi_day());
-    // 1,002,794.09 - 994,910.74 = 7,883.35 on a 994,910.74 base = +0.79%.
-    CHECK(has(s, "overall    +7883.35  = +0.79% of account  (from 2026-08-03, 67 sessions)"));
-    // 1,002,794.09 - 1,002,084.00 = 710.09 on 1,002,084 = +0.07%.
-    CHECK(has(s, "month       +710.09  = +0.07% of account  (from 2026-10-01)"));
+    // 7,883.35 on the 30,000 allocated = +26.28%. THIS is the figure that
+    // answers "is this worth the capital it ties up".
+    CHECK(has(s, "overall    +7883.35  = +26.28%  (from 2026-08-03, 67 sessions)"));
+    CHECK(has(s, "month       +710.09  = +2.37%  (from 2026-10-01)"));
+    // The account view is kept alongside, precisely so the page cannot be
+    // accused of quoting only the flattering base: the same money is +0.79% of
+    // a ~$1M balance that is 97% idle.
+    CHECK(has(s, "account    +7883.35  = +0.79% of 1,002,794 equity"));
     // THE BASELINE DATE IS PRINTED. It is chosen by a rule (roi_from_sessions
     // skips the 100,000 placeholder era), and a rule whose choice is invisible
     // is a rule that can inflate a percentage unnoticed.
-    CHECK(has(s, "equity   1,002,794"));
+    CHECK(has(s, "from 2026-08-03, 67 sessions"));
+    CHECK(has(s, "of 1,002,794 equity"));
 }
 
 TEST_CASE("roi: a missing baseline says so instead of printing nothing") {
@@ -336,9 +354,12 @@ TEST_CASE("roi: a missing baseline says so instead of printing nothing") {
     const std::string s = format_eod_report(r);
     CHECK(has(s, "overall  not available - no believable equity baseline yet"));
     // An omitted line reads as zero to anyone skimming. Today still reports,
-    // because it needs no equity history at all.
-    CHECK(has(s, "today       +273.97"));
-    CHECK_FALSE(has(s, "of account"));
+    // because the allocated base needs no equity history at all.
+    CHECK(has(s, "today       +273.97  = +0.91%"));
+    // No account line at all - "equity" itself still appears, in the
+    // not-available message, so the assertion has to name the line.
+    CHECK_FALSE(has(s, "account "));
+    CHECK_FALSE(has(s, "overall  +"));
 }
 
 TEST_CASE("roi: nothing deployed is NOT a zero denominator") {
@@ -348,32 +369,42 @@ TEST_CASE("roi: nothing deployed is NOT a zero denominator") {
     EodReport r = roi_day();
     r.symbols.clear();
     r.deployed_peak = 0.0;
+    r.allocated = 0.0;
     const std::string s = format_eod_report(r);
-    CHECK_FALSE(has(s, "deployed"));
+    CHECK_FALSE(has(s, "at peak"));
     CHECK_FALSE(has(s, "inf"));
     CHECK_FALSE(has(s, "nan"));
-    CHECK(has(s, "overall    +7883.35"));
+    // The ACCOUNT line needs no daily denominator, so it still reports.
+    CHECK(has(s, "account    +7883.35  = +0.79%"));
 }
 
 TEST_CASE("roi: a losing day reports a negative return, not an absolute one") {
     EodReport r = roi_day();
     r.net = -150.37;
-    r.symbols = {{"MUU", -158.32, 2.12, 0, 0.0, 0.0, 4548.0}};
+    r.symbols = {{"MUU", -158.32, 2.12, 0, 0.0, 0.0, 4548.0, 5000.0}};
     r.deployed_peak = eod_deployed_peak(r.symbols);
+    r.allocated = eod_allocated(r.symbols);
     const std::string s = format_eod_report(r);
-    // -150.37 / 4548 = -3.31%. The sign has to survive: on 2026-09-28 this was
-    // the whole day's loss, on one unexitable MUU short.
-    CHECK(has(s, "on 4,548 deployed  = -3.31%"));
+    // A ONE-SYMBOL lineup allocates 5,000, so -150.37 / 5,000 = -3.01%. The
+    // sign has to survive: on 2026-09-28 this was the whole day's loss, on one
+    // unexitable MUU short.
+    CHECK(has(s, "today       -150.37  = -3.01%"));
+    CHECK(has(s, "used          4,548 at peak = 91% of it"));
 }
 
-TEST_CASE("roi: deployed peak sums the per-symbol high-water marks") {
+TEST_CASE("roi: deployed sums high-water marks, allocated sums the ceilings") {
     const std::vector<EodSymbolRow> rows = {
-        {"A", 0, 0, 0, 0, 0, 5000.0},
-        {"B", 0, 0, 0, 0, 0, 4900.0},
-        {"C", 0, 0, 0, 0, 0, 0.0},      // never took a position
+        {"A", 0, 0, 0, 0, 0, 5000.0, 5000.0},
+        {"B", 0, 0, 0, 0, 0, 4900.0, 5000.0},
+        {"C", 0, 0, 0, 0, 0, 0.0, 5000.0},   // in the lineup, never took a position
     };
     CHECK(eod_deployed_peak(rows) == doctest::Approx(9900.0));
+    // ALLOCATED counts C's ceiling even though it never traded: the capital was
+    // reserved for it and unavailable elsewhere, which is what makes this a
+    // denominator that does not move with how many signals fired.
+    CHECK(eod_allocated(rows) == doctest::Approx(15000.0));
     CHECK(eod_deployed_peak({}) == doctest::Approx(0.0));
+    CHECK(eod_allocated({}) == doctest::Approx(0.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +471,7 @@ TEST_CASE("roi: with nothing deployed AND no baseline the block is absent") {
     EodReport r = roi_day();
     r.symbols.clear();
     r.deployed_peak = 0.0;
+    r.allocated = 0.0;
     r.roi_ok = false;
     r.mtd_ok = false;
     const std::string s = format_eod_report(r);
@@ -457,7 +489,7 @@ TEST_CASE("roi: a negative equity still prints its sign") {
     r.roi_equity = -1500.0;
     r.roi_baseline = 1000.0;
     const std::string s = format_eod_report(r);
-    CHECK(has(s, "equity   -1,500"));
+    CHECK(has(s, "of -1,500 equity"));
 }
 
 TEST_CASE("roi basis: a baseline far ABOVE the latest equity is refused too") {

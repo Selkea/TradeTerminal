@@ -5713,7 +5713,8 @@ void App::pump_eod_report() {
                     eod_row_from(ss.symbol, ss.position.realized_pnl, ss.fees,
                                  ss.position.qty, ss.position.avg_price,
                                  ss.position.unrealized_pnl,
-                                 ss.peak_notional));
+                                 ss.peak_notional,
+                                 ss.max_position_notional));
         }
         eod_report_pending_ = true;
         eod_report_armed_at_ = mono_s();
@@ -5754,6 +5755,10 @@ void App::pump_eod_report() {
     // CLOSED this day's session - which is the same condition the emit was
     // already waiting on.
     eod_pending_.deployed_peak = eod_deployed_peak(eod_pending_.symbols);
+    // ALLOCATED, which is the return denominator - see EodReport::allocated.
+    // Summed from the ceilings the ENGINE published rather than recomputed,
+    // so the figure cannot drift from the one actually enforced.
+    eod_pending_.allocated = eod_allocated(eod_pending_.symbols);
     if (journal_.ok()) {
         const RoiBasis rb = journal_.roi_basis();
         eod_pending_.roi_ok = rb.ok;

@@ -1435,6 +1435,12 @@ void Engine::run_live(LiveConfig cfg, std::vector<IStrategy*> strategies) {
             const double notional = (qty < 0.0 ? -qty : qty) * px;
             if (notional > snap_.symbols[i].peak_notional)
                 snap_.symbols[i].peak_notional = notional;
+            // The ceiling in force, so a report states ALLOCATED capital
+            // rather than recomputing the derivation and drifting from it.
+            snap_.symbols[i].max_position_notional =
+                i < cfg.symbol_risk.size()
+                    ? cfg.symbol_risk[i].max_position_notional
+                    : cfg.risk.max_position_notional;
         }
         // Params change only at session start and on a swap, so copy the maps
         // then rather than on every publish.
