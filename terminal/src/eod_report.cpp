@@ -126,29 +126,44 @@ std::string format_eod_report(const EodReport& r) {
     // figure is +0.79% of this account or ~+26% of what the strategy commits,
     // and a page that printed only one of those would be either dispiriting or
     // flattering rather than informative.
-    if (r.deployed_peak > 0.0 || r.roi_ok) {
-        addf(out, "\n\nreturn");
-        if (r.deployed_peak > 0.0) {
-            // Today, against capital that was actually at work. The guard is
-            // deployed_peak > 0 and not >= 0: a zero denominator means NOT
-            // MEASURED, and dividing by it would print an infinity.
-            addf(out, "\n  today    %+10.2f  on %s deployed  = %+.2f%%",
-                 r.net, money(r.deployed_peak).c_str(),
-                 100.0 * r.net / r.deployed_peak);
+    if (r.allocated > 0.0 || r.roi_ok) {
+        addf(out, "\n\nreturn on the %s allocated", money(r.allocated).c_str());
+        if (r.allocated > 0.0) {
+            // Against ALLOCATED capital, not against the day's deployment. The
+            // guard is > 0 and not >= 0: a zero denominator means NOT MEASURED,
+            // and dividing by it would print an infinity.
+            // Shortest period to longest, then context. A reader scanning this
+            // on a phone wants today first and the verdict last.
+            addf(out, "\n  today    %+10.2f  = %+.2f%%", r.net,
+                 100.0 * r.net / r.allocated);
+            if (r.mtd_ok && r.mtd_baseline > 0.0) {
+                const double chg = r.roi_equity - r.mtd_baseline;
+                addf(out, "\n  month    %+10.2f  = %+.2f%%  (from %s)", chg,
+                     100.0 * chg / r.allocated, r.mtd_from.c_str());
+            }
+            if (r.roi_ok && r.roi_baseline > 0.0) {
+                const double chg = r.roi_equity - r.roi_baseline;
+                addf(out, "\n  overall  %+10.2f  = %+.2f%%  (from %s, %d session%s)",
+                     chg, 100.0 * chg / r.allocated, r.roi_from.c_str(),
+                     r.roi_sessions, plural(r.roi_sessions));
+            }
+            // UTILISATION, not a return. How much of the allocation the day
+            // actually used - useful on its own ("is the capital sized right?")
+            // and deliberately NOT a denominator.
+            if (r.deployed_peak > 0.0)
+                addf(out, "\n  used     %10s at peak = %.0f%% of it",
+                     money(r.deployed_peak).c_str(),
+                     100.0 * r.deployed_peak / r.allocated);
         }
-        if (r.mtd_ok && r.mtd_baseline > 0.0) {
-            const double chg = r.roi_equity - r.mtd_baseline;
-            addf(out, "\n  month    %+10.2f  = %+.2f%% of account  (from %s)", chg,
-                 100.0 * chg / r.mtd_baseline, r.mtd_from.c_str());
-        }
+        // The account view, which answers a different and also-real question:
+        // what the brokerage balance did, including the choice to leave most of
+        // it idle. Small by construction, and kept precisely so the page cannot
+        // be accused of quoting only the flattering base.
         if (r.roi_ok && r.roi_baseline > 0.0) {
             const double chg = r.roi_equity - r.roi_baseline;
-            addf(out,
-                 "\n  overall  %+10.2f  = %+.2f%% of account  (from %s, %d session%s)",
-                 chg, 100.0 * chg / r.roi_baseline, r.roi_from.c_str(),
-                 r.roi_sessions, plural(r.roi_sessions));
-            addf(out, "\n  equity   %s", money(r.roi_equity).c_str());
-        } else if (r.deployed_peak > 0.0) {
+            addf(out, "\n  account  %+10.2f  = %+.2f%% of %s equity", chg,
+                 100.0 * chg / r.roi_baseline, money(r.roi_equity).c_str());
+        } else if (r.allocated > 0.0) {
             // Said out loud rather than omitted: a missing line reads as zero.
             addf(out, "\n  overall  not available - no believable equity baseline yet");
         }

@@ -453,6 +453,18 @@ struct SymbolState {
     // PEAK, not the end-of-day figure: the session is flat by the close, so the
     // closing snapshot would report zero deployed on every profitable day.
     double peak_notional = 0.0;
+    // The notional ceiling the ENGINE is enforcing for this symbol
+    // (RiskLimits::max_position_notional), published so a report can state
+    // the capital ALLOCATED to the strategy rather than recomputing it and
+    // risking a figure that drifts from the one actually in force.
+    //
+    // This is the honest RoI denominator. The account is ~$1M and the
+    // strategy can never commit more than the sum of these - 6 x $5,000 on
+    // the current config - so the rest of the balance is not invested in it.
+    // And unlike the capital actually DEPLOYED on a given day, it does not
+    // move with how many signals happened to fire, so returns stay
+    // comparable across days.
+    double max_position_notional = 0.0;
     // This position came from the broker on connect (hot restart / lineup
     // swap), not from a fill of ours, and its strategy is PAUSED until it goes
     // flat. The adopted broker-side stop/TP is what exits it — so an adopted

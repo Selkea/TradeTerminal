@@ -58,6 +58,9 @@ struct EodSymbolRow {
     // say and defaults this to 0, which is also the honest value for a row
     // built before the measurement existed.
     double peak_notional = 0;
+    // The notional ceiling in force for this symbol. Summed across the
+    // lineup this is the capital ALLOCATED to the strategy.
+    double max_notional = 0;
 };
 
 struct EodReport {
@@ -99,6 +102,35 @@ struct EodReport {
     // crossing), which must read as "not measured", never as "nothing
     // deployed" - that would make today's return look infinite.
     double deployed_peak = 0;
+    // Capital ALLOCATED: the sum of the live symbols' notional ceilings.
+    //
+    // THIS IS THE RETURN DENOMINATOR, and the reasoning is worth keeping.
+    // Three candidates were on the table:
+    //
+    //   account balance (~$1,002,794) - what the brokerage balance did, but
+    //       the strategy never commits more than ~$30k of it. Move the rest
+    //       to a money-market fund and it trades identically, so that
+    //       capital is not invested in this. A $274 day reads +0.03%.
+    //   deployed THAT DAY ($23k-45k, varies) - the first cut used this and
+    //       it is the wrong base for a RETURN. A day deploying $4,548 and
+    //       losing $158 reads -3.5%; six symbols deploying $45k and losing
+    //       the same $158 reads -0.35%. Same strategy, same loss, 10x the
+    //       number - driven by how many signals happened to fire, which is
+    //       not a fact about performance. A denominator that moves for
+    //       reasons unrelated to the numerator makes the series
+    //       incomparable, which is the one thing a return series is for.
+    //   ALLOCATED (sum of the caps) - stable day to day, derived from the
+    //       operator's own risk config rather than from the balance, and
+    //       conservative: allocated >= deployed, so it never flatters.
+    //
+    // Summed per live symbol rather than top_n x cap, so a day the lineup
+    // admitted two symbols instead of six is measured against the two.
+    //
+    // CAVEAT, stated because the figure invites extrapolation: the strategy
+    // does NOT compound. Each cap comes from the daily-loss limit, not from
+    // the balance, so profits do not grow position size. This is a
+    // capital-efficiency ratio, not a growth rate.
+    double allocated = 0;
     // Account-level equity, from TradeJournal::roi_basis. `from` is printed
     // because the baseline is chosen by a rule (see roi_from_sessions) and a
     // rule whose choice is invisible is a rule that can lie.
@@ -124,7 +156,8 @@ struct EodReport {
 // to catch it if it does.
 inline EodSymbolRow eod_row_from(std::string symbol, double realized_gross,
                                  double fees, double qty, double avg_price,
-                                 double unrealized, double peak_notional = 0) {
+                                 double unrealized, double peak_notional = 0,
+                                 double max_notional = 0) {
     EodSymbolRow r;
     r.symbol = std::move(symbol);
     r.realized_net = realized_gross - fees;
@@ -133,6 +166,7 @@ inline EodSymbolRow eod_row_from(std::string symbol, double realized_gross,
     r.avg_price = avg_price;
     r.unrealized = unrealized;
     r.peak_notional = peak_notional;
+    r.max_notional = max_notional;
     return r;
 }
 
@@ -164,6 +198,14 @@ inline int eod_held_count(const std::vector<EodSymbolRow>& rows) {
 inline double eod_deployed_peak(const std::vector<EodSymbolRow>& rows) {
     double t = 0;
     for (const EodSymbolRow& r : rows) t += r.peak_notional;
+    return t;
+}
+
+// Capital allocated: the sum of the live symbols' notional ceilings. See
+// EodReport::allocated for why this and not the balance or the daily figure.
+inline double eod_allocated(const std::vector<EodSymbolRow>& rows) {
+    double t = 0;
+    for (const EodSymbolRow& r : rows) t += r.max_notional;
     return t;
 }
 
