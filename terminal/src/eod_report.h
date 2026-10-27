@@ -48,6 +48,16 @@ struct EodSymbolRow {
     double qty = 0;            // position carried into the next session
     double avg_price = 0;
     double unrealized = 0;     // mark on that carried position
+    // This symbol's high-water capital for the session (SymbolState::
+    // peak_notional). Not the closing position - the book is flat by the close,
+    // so that would be zero on every day that traded.
+    //
+    // LAST, deliberately. Every case in test_eod_report.cpp brace-initialises
+    // this struct positionally, so a field added anywhere above here silently
+    // reassigns six existing columns. Appending leaves them reading what they
+    // say and defaults this to 0, which is also the honest value for a row
+    // built before the measurement existed.
+    double peak_notional = 0;
 };
 
 struct EodReport {
@@ -73,6 +83,33 @@ struct EodReport {
     // the session did not stop within the grace window, so `net` is missing that
     // session's contribution. Said out loud rather than quietly under-reported.
     bool session_still_open = false;
+
+    // ---- return on capital -------------------------------------------
+    //
+    // THE DENOMINATOR IS THE WHOLE QUESTION, so two are reported and both
+    // are labelled. This is a ~$1M paper balance against a $5,000 per-symbol
+    // notional cap, so on 2026-10-26 the SAME +$7,883 since 2026-08-03 is
+    // +0.79% of the account and roughly +26% of the ~$30k the strategy
+    // actually commits. Report only the first and a working system reads as
+    // rounding error; report only the second and it hides that 97% of the
+    // account is idle. Neither is wrong. Either alone misleads.
+
+    // Peak concurrent notional across every symbol today, summed from
+    // SymbolState::peak_notional. 0 = unknown (no session was live at the
+    // crossing), which must read as "not measured", never as "nothing
+    // deployed" - that would make today's return look infinite.
+    double deployed_peak = 0;
+    // Account-level equity, from TradeJournal::roi_basis. `from` is printed
+    // because the baseline is chosen by a rule (see roi_from_sessions) and a
+    // rule whose choice is invisible is a rule that can lie.
+    bool roi_ok = false;
+    std::string roi_from;
+    double roi_baseline = 0;
+    double roi_equity = 0;
+    int roi_sessions = 0;
+    bool mtd_ok = false;
+    std::string mtd_from;
+    double mtd_baseline = 0;
 };
 
 // Build a row from the engine's per-symbol live snapshot.
@@ -87,7 +124,7 @@ struct EodReport {
 // to catch it if it does.
 inline EodSymbolRow eod_row_from(std::string symbol, double realized_gross,
                                  double fees, double qty, double avg_price,
-                                 double unrealized) {
+                                 double unrealized, double peak_notional = 0) {
     EodSymbolRow r;
     r.symbol = std::move(symbol);
     r.realized_net = realized_gross - fees;
@@ -95,6 +132,7 @@ inline EodSymbolRow eod_row_from(std::string symbol, double realized_gross,
     r.qty = qty;
     r.avg_price = avg_price;
     r.unrealized = unrealized;
+    r.peak_notional = peak_notional;
     return r;
 }
 
@@ -119,6 +157,14 @@ inline int eod_held_count(const std::vector<EodSymbolRow>& rows) {
     for (const EodSymbolRow& r : rows)
         if (r.qty != 0.0) ++n;
     return n;
+}
+
+// Peak capital deployed, summed across symbols. Exposed so the caller and the
+// tests agree on the arithmetic, like the other eod_* helpers.
+inline double eod_deployed_peak(const std::vector<EodSymbolRow>& rows) {
+    double t = 0;
+    for (const EodSymbolRow& r : rows) t += r.peak_notional;
+    return t;
 }
 
 // The page body. Plain text, newline-separated, no trailing newline — ntfy

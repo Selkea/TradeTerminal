@@ -41,6 +41,45 @@ inline const char* live_broker_mode(bool has_tws, bool has_ibkr) {
     return "sim";                   // no broker: the internal simulator
 }
 
+// One closed session's equity, oldest first - the input to roi_from_sessions.
+struct EquityPoint {
+    std::string date;          // local YYYY-MM-DD the session STARTED
+    double initial_cash = 0;   // baseline equity, after set_baseline re-anchored
+    double final_equity = 0;
+};
+
+// What a return figure is measured against.
+struct RoiBasis {
+    bool ok = false;                 // false = not enough usable history to say
+    std::string from_date;           // the baseline session's date
+    double baseline_equity = 0;
+    double latest_equity = 0;
+    int sessions = 0;                // closed sessions in the window
+    // Month-to-date, taken from the month of the LATEST session rather than
+    // from today's clock, so the figure and the period it names cannot disagree
+    // when a report is emitted either side of midnight.
+    bool mtd_ok = false;
+    std::string mtd_from_date;
+    double mtd_baseline_equity = 0;
+};
+
+// Pick the inception baseline and the month-to-date baseline from the closed
+// session history (oldest first).
+//
+// THE TRAP THIS EXISTS TO AVOID. begin_session can only record a PLACEHOLDER
+// baseline - on the TWS route the real account equity has not been replayed
+// yet - and set_baseline re-anchors it once reconciliation finishes. Sessions
+// recorded before that worked carry initial_cash = 100,000 against a real ~$1M
+// account: 48 of this journal's 115 closed sessions, every one up to
+// 2026-07-28. Measuring "return since inception" from one of those would report
+// roughly +900%.
+//
+// So a baseline is only believed if it is within a factor of two of the latest
+// equity. One rule, applied in one place - and RoiBasis::from_date is REPORTED,
+// so a wrong pick is visible on the page rather than silently inflating a
+// percentage. A heuristic that cannot be seen is the one that lies.
+RoiBasis roi_from_sessions(const std::vector<EquityPoint>& closed);
+
 class TradeJournal {
 public:
     ~TradeJournal();
@@ -86,6 +125,11 @@ public:
     };
     std::vector<DayRow> days(int limit = 60) const;
     std::vector<SessionRow> sessions(int limit = 100) const;
+    // Equity basis for the return figures on the daily summary. Reads every
+    // CLOSED session (an open one has no final_equity) and hands them to
+    // roi_from_sessions. Empty/unusable history comes back with ok = false,
+    // never as a zero that would read as a flat account.
+    RoiBasis roi_basis() const;
     std::vector<FillRow> fills(int64_t session_id) const;
 
 private:

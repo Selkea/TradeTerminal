@@ -28,6 +28,26 @@ void addf(std::string& out, const char* fmt, ...) {
 
 const char* plural(int n) { return n == 1 ? "" : "s"; }
 
+// Thousands separators, because the capital figures are five and seven digits
+// and "1002794.09" against "27917.00" is two numbers nobody can compare at a
+// glance on a phone. Hand-rolled: std::locale on MinGW does not reliably carry
+// a grouping facet, and a page that silently stopped grouping would be worse
+// than one that never did.
+std::string money(double v) {
+    char raw[48];
+    const int n = std::snprintf(raw, sizeof raw, "%.0f", v < 0 ? -v : v);
+    if (n <= 0) return "0";
+    std::string digits(raw, static_cast<size_t>(n));
+    std::string out;
+    out.reserve(digits.size() + digits.size() / 3 + 1);
+    if (v < 0) out.push_back('-');
+    for (size_t i = 0; i < digits.size(); ++i) {
+        if (i > 0 && (digits.size() - i) % 3 == 0) out.push_back(',');
+        out.push_back(digits[i]);
+    }
+    return out;
+}
+
 } // namespace
 
 std::string format_eod_report(const EodReport& r) {
@@ -99,6 +119,39 @@ std::string format_eod_report(const EodReport& r) {
                 addf(out, " | flat");
         }
         if (!flat.empty()) addf(out, "\n  no trades: %s", flat.c_str());
+    }
+
+    // ---- return on capital ------------------------------------------------
+    // Both denominators, both labelled. See the note on EodReport: the same
+    // figure is +0.79% of this account or ~+26% of what the strategy commits,
+    // and a page that printed only one of those would be either dispiriting or
+    // flattering rather than informative.
+    if (r.deployed_peak > 0.0 || r.roi_ok) {
+        addf(out, "\n\nreturn");
+        if (r.deployed_peak > 0.0) {
+            // Today, against capital that was actually at work. The guard is
+            // deployed_peak > 0 and not >= 0: a zero denominator means NOT
+            // MEASURED, and dividing by it would print an infinity.
+            addf(out, "\n  today    %+10.2f  on %s deployed  = %+.2f%%",
+                 r.net, money(r.deployed_peak).c_str(),
+                 100.0 * r.net / r.deployed_peak);
+        }
+        if (r.mtd_ok && r.mtd_baseline > 0.0) {
+            const double chg = r.roi_equity - r.mtd_baseline;
+            addf(out, "\n  month    %+10.2f  = %+.2f%% of account  (from %s)", chg,
+                 100.0 * chg / r.mtd_baseline, r.mtd_from.c_str());
+        }
+        if (r.roi_ok && r.roi_baseline > 0.0) {
+            const double chg = r.roi_equity - r.roi_baseline;
+            addf(out,
+                 "\n  overall  %+10.2f  = %+.2f%% of account  (from %s, %d session%s)",
+                 chg, 100.0 * chg / r.roi_baseline, r.roi_from.c_str(),
+                 r.roi_sessions, plural(r.roi_sessions));
+            addf(out, "\n  equity   %s", money(r.roi_equity).c_str());
+        } else if (r.deployed_peak > 0.0) {
+            // Said out loud rather than omitted: a missing line reads as zero.
+            addf(out, "\n  overall  not available - no believable equity baseline yet");
+        }
     }
 
     if (r.daily_loss_limit > 0.0) {

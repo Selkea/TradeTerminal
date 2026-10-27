@@ -11,14 +11,20 @@
 
 #include "alert_rules.h"
 #include "eod_report.h"
+#include "journal.h"   // EquityPoint, RoiBasis, roi_from_sessions
 
 #include <string>
+#include <vector>
 
 using tt::ui::AlertCategory;
 using tt::ui::classify_alert_category;
 using tt::ui::EodReport;
 using tt::ui::EodSymbolRow;
+using tt::ui::eod_deployed_peak;   // an empty {} arg has no type for ADL to find
+using tt::ui::EquityPoint;
 using tt::ui::format_eod_report;
+using tt::ui::RoiBasis;
+using tt::ui::roi_from_sessions;
 
 namespace {
 
@@ -263,4 +269,243 @@ TEST_CASE("eod report: the category has a name of its own in /diag") {
           "EndOfDay");
     CHECK(std::string(tt::ui::alert_category_name(AlertCategory::System)) ==
           "System");
+}
+
+// ---------------------------------------------------------------------------
+// RETURN ON CAPITAL (0.48.0).
+//
+// The denominator is the whole question. This is a ~$1M paper balance against a
+// $5,000 per-symbol notional cap, so on 2026-10-26 the same +$7,883.35 since
+// 2026-08-03 is +0.79% of the account and roughly +26% of the ~$30k the strategy
+// actually commits. Report only the first and a working system reads as rounding
+// error; report only the second and it hides that 97% of the account is idle.
+// Both are reported, both labelled.
+// ---------------------------------------------------------------------------
+namespace {
+// 2026-10-26 as it actually stood: equity 1,002,794.09, inception baseline
+// 994,910.74 from 2026-08-03 over 67 closed sessions.
+EodReport roi_day() {
+    EodReport r;
+    r.date = "2026-10-26";
+    r.sessions = 1;
+    r.fills = 4;
+    r.net = 273.97;
+    r.daily_loss_limit = 2000.0;
+    r.symbols = {
+        {"SNXX", 180.20, 3.10, 0, 0.0, 0.0, 14900.0},
+        {"KORU", 93.77, 2.05, 0, 0.0, 0.0, 14887.0},
+    };
+    r.deployed_peak = eod_deployed_peak(r.symbols);
+    r.roi_ok = true;
+    r.roi_from = "2026-08-03";
+    r.roi_baseline = 994910.74;
+    r.roi_equity = 1002794.09;
+    r.roi_sessions = 67;
+    r.mtd_ok = true;
+    r.mtd_from = "2026-10-01";
+    r.mtd_baseline = 1002084.00;
+    return r;
+}
+} // namespace
+
+TEST_CASE("roi: today is measured against capital actually deployed") {
+    const std::string s = format_eod_report(roi_day());
+    // 14900 + 14887 = 29,787 at work; 273.97 / 29787 = 0.92%.
+    CHECK(has(s, "today       +273.97  on 29,787 deployed  = +0.92%"));
+    // NOT the account denominator for the daily line: 273.97/1,002,794 is
+    // +0.03%, which is the number that makes a real day look like noise.
+    CHECK_FALSE(has(s, "+0.03%"));
+}
+
+TEST_CASE("roi: the cumulative lines are account-relative and name their base") {
+    const std::string s = format_eod_report(roi_day());
+    // 1,002,794.09 - 994,910.74 = 7,883.35 on a 994,910.74 base = +0.79%.
+    CHECK(has(s, "overall    +7883.35  = +0.79% of account  (from 2026-08-03, 67 sessions)"));
+    // 1,002,794.09 - 1,002,084.00 = 710.09 on 1,002,084 = +0.07%.
+    CHECK(has(s, "month       +710.09  = +0.07% of account  (from 2026-10-01)"));
+    // THE BASELINE DATE IS PRINTED. It is chosen by a rule (roi_from_sessions
+    // skips the 100,000 placeholder era), and a rule whose choice is invisible
+    // is a rule that can inflate a percentage unnoticed.
+    CHECK(has(s, "equity   1,002,794"));
+}
+
+TEST_CASE("roi: a missing baseline says so instead of printing nothing") {
+    EodReport r = roi_day();
+    r.roi_ok = false;
+    r.mtd_ok = false;
+    const std::string s = format_eod_report(r);
+    CHECK(has(s, "overall  not available - no believable equity baseline yet"));
+    // An omitted line reads as zero to anyone skimming. Today still reports,
+    // because it needs no equity history at all.
+    CHECK(has(s, "today       +273.97"));
+    CHECK_FALSE(has(s, "of account"));
+}
+
+TEST_CASE("roi: nothing deployed is NOT a zero denominator") {
+    // A day with no live session at the crossing has deployed_peak 0. Dividing
+    // by it would print inf% or nan%; the line must simply be absent while the
+    // cumulative ones, which need no daily denominator, still report.
+    EodReport r = roi_day();
+    r.symbols.clear();
+    r.deployed_peak = 0.0;
+    const std::string s = format_eod_report(r);
+    CHECK_FALSE(has(s, "deployed"));
+    CHECK_FALSE(has(s, "inf"));
+    CHECK_FALSE(has(s, "nan"));
+    CHECK(has(s, "overall    +7883.35"));
+}
+
+TEST_CASE("roi: a losing day reports a negative return, not an absolute one") {
+    EodReport r = roi_day();
+    r.net = -150.37;
+    r.symbols = {{"MUU", -158.32, 2.12, 0, 0.0, 0.0, 4548.0}};
+    r.deployed_peak = eod_deployed_peak(r.symbols);
+    const std::string s = format_eod_report(r);
+    // -150.37 / 4548 = -3.31%. The sign has to survive: on 2026-09-28 this was
+    // the whole day's loss, on one unexitable MUU short.
+    CHECK(has(s, "on 4,548 deployed  = -3.31%"));
+}
+
+TEST_CASE("roi: deployed peak sums the per-symbol high-water marks") {
+    const std::vector<EodSymbolRow> rows = {
+        {"A", 0, 0, 0, 0, 0, 5000.0},
+        {"B", 0, 0, 0, 0, 0, 4900.0},
+        {"C", 0, 0, 0, 0, 0, 0.0},      // never took a position
+    };
+    CHECK(eod_deployed_peak(rows) == doctest::Approx(9900.0));
+    CHECK(eod_deployed_peak({}) == doctest::Approx(0.0));
+}
+
+// ---------------------------------------------------------------------------
+// The equity baseline rule. roi_from_sessions is where the 100,000 placeholder
+// era gets skipped, and getting it wrong reports roughly +900%.
+// ---------------------------------------------------------------------------
+TEST_CASE("roi basis: the 100k placeholder era is skipped") {
+    // This journal's real shape: 48 closed sessions carrying a 100,000
+    // placeholder (begin_session can only record one on the TWS route; a later
+    // set_baseline re-anchors it), then the real ~$1M era from 2026-08-03.
+    std::vector<EquityPoint> closed;
+    for (int i = 0; i < 48; ++i)
+        closed.push_back({"2026-07-28", 100000.0, 100000.0});
+    closed.push_back({"2026-08-03", 994910.74, 995200.0});
+    closed.push_back({"2026-10-26", 1002520.12, 1002794.09});
+
+    const RoiBasis b = roi_from_sessions(closed);
+    REQUIRE(b.ok);
+    CHECK(b.from_date == "2026-08-03");
+    CHECK(b.baseline_equity == doctest::Approx(994910.74));
+    CHECK(b.latest_equity == doctest::Approx(1002794.09));
+    CHECK(b.sessions == 2);                    // the placeholders are not counted
+    // The bug this prevents: measuring from 100,000 to 1,002,794 is +902%.
+    const double wrong = (b.latest_equity - 100000.0) / 100000.0 * 100.0;
+    CHECK(wrong > 900.0);
+    const double right = (b.latest_equity - b.baseline_equity) / b.baseline_equity * 100.0;
+    CHECK(right == doctest::Approx(0.79).epsilon(0.02));
+}
+
+TEST_CASE("roi basis: month-to-date comes from the LATEST session's month") {
+    std::vector<EquityPoint> closed = {
+        {"2026-08-03", 994910.74, 995200.0},
+        {"2026-09-30", 1001900.00, 1002000.0},
+        {"2026-10-01", 1002084.00, 1002200.0},
+        {"2026-10-26", 1002520.12, 1002794.09},
+    };
+    const RoiBasis b = roi_from_sessions(closed);
+    REQUIRE(b.mtd_ok);
+    // The first OCTOBER session, because the latest session is in October -
+    // taken from the data rather than from today's clock, so a report emitted
+    // either side of midnight cannot name a period it did not measure.
+    CHECK(b.mtd_from_date == "2026-10-01");
+    CHECK(b.mtd_baseline_equity == doctest::Approx(1002084.00));
+    CHECK(b.from_date == "2026-08-03");        // inception is unaffected
+    CHECK(b.sessions == 4);
+}
+
+TEST_CASE("roi basis: no usable history says so rather than guessing") {
+    CHECK_FALSE(roi_from_sessions({}).ok);
+    // Every baseline implausible against the latest equity: refuse.
+    const RoiBasis all_ph = roi_from_sessions({
+        {"2026-07-08", 100000.0, 100000.0},
+        {"2026-07-28", 100000.0, 1002794.09},
+    });
+    CHECK_FALSE(all_ph.ok);
+    // A zero/absent latest equity cannot anchor anything either.
+    CHECK_FALSE(roi_from_sessions({{"2026-08-03", 994910.74, 0.0}}).ok);
+}
+
+TEST_CASE("roi: with nothing deployed AND no baseline the block is absent") {
+    // Not an empty "return" heading with nothing under it. The earlier
+    // nothing-deployed case still had a baseline, so it never exercised the
+    // outer guard - mutation testing found it surviving.
+    EodReport r = roi_day();
+    r.symbols.clear();
+    r.deployed_peak = 0.0;
+    r.roi_ok = false;
+    r.mtd_ok = false;
+    const std::string s = format_eod_report(r);
+    CHECK_FALSE(has(s, "return"));
+    CHECK_FALSE(has(s, "deployed"));
+    CHECK_FALSE(has(s, "not available"));
+    CHECK(has(s, "net "));            // the rest of the page is untouched
+}
+
+TEST_CASE("roi: a negative equity still prints its sign") {
+    // Unlikely, and precisely why it is worth pinning: money() formats the
+    // magnitude, and a blown account printing as a positive balance would be a
+    // silently wrong number on the one line showing the account total.
+    EodReport r = roi_day();
+    r.roi_equity = -1500.0;
+    r.roi_baseline = 1000.0;
+    const std::string s = format_eod_report(r);
+    CHECK(has(s, "equity   -1,500"));
+}
+
+TEST_CASE("roi basis: a baseline far ABOVE the latest equity is refused too") {
+    // Only checking the low side would accept a stale or mis-scaled figure and
+    // report a catastrophic loss that never happened.
+    const RoiBasis b = roi_from_sessions({
+        {"2026-08-03", 10000000.0, 1002794.09},   // 10x too HIGH
+        {"2026-10-26", 1002520.12, 1002794.09},
+    });
+    REQUIRE(b.ok);
+    CHECK(b.from_date == "2026-10-26");           // the 10M row is skipped
+    CHECK(b.baseline_equity == doctest::Approx(1002520.12));
+    CHECK(b.sessions == 1);
+}
+
+TEST_CASE("roi basis: a zero baseline is refused, not divided by") {
+    const RoiBasis b = roi_from_sessions({
+        {"2026-08-03", 0.0, 1002794.09},
+        {"2026-10-26", 1002520.12, 1002794.09},
+    });
+    REQUIRE(b.ok);
+    CHECK(b.from_date == "2026-10-26");
+    CHECK(b.baseline_equity == doctest::Approx(1002520.12));
+}
+
+TEST_CASE("roi basis: a placeholder inside the CURRENT month is skipped too") {
+    // The placeholder era is historical, but the same rule has to hold for the
+    // month-to-date baseline - otherwise one bad row in the latest month
+    // reports a ~+900% month.
+    const RoiBasis b = roi_from_sessions({
+        {"2026-08-03", 994910.74, 995200.0},
+        {"2026-10-01", 100000.0, 1002200.0},      // a placeholder, this month
+        {"2026-10-05", 1002084.00, 1002300.0},
+        {"2026-10-26", 1002520.12, 1002794.09},
+    });
+    REQUIRE(b.mtd_ok);
+    CHECK(b.mtd_from_date == "2026-10-05");       // NOT 2026-10-01
+    CHECK(b.mtd_baseline_equity == doctest::Approx(1002084.00));
+    const double mtd = (b.latest_equity - b.mtd_baseline_equity) /
+                       b.mtd_baseline_equity * 100.0;
+    CHECK(mtd == doctest::Approx(0.07).epsilon(0.1));
+}
+
+TEST_CASE("roi basis: a single session is enough, and is its own baseline") {
+    const RoiBasis b = roi_from_sessions({{"2026-08-03", 994910.74, 995200.0}});
+    REQUIRE(b.ok);
+    CHECK(b.from_date == "2026-08-03");
+    CHECK(b.sessions == 1);
+    CHECK(b.latest_equity == doctest::Approx(995200.0));
+    CHECK(b.mtd_ok);                           // August, same month as itself
 }

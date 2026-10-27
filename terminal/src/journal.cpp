@@ -211,4 +211,103 @@ std::vector<TradeJournal::FillRow> TradeJournal::fills(int64_t session_id) const
     return out;
 }
 
+
+// The believability bar for a baseline: within a factor of two of the latest
+// equity. Named so the number is arguable rather than buried in a comparison.
+// A $100,000 placeholder against a ~$1M account fails it by 10x, which is the
+// whole point; a genuine drawdown or run-up of 2x on a paper account that has
+// moved 0.8% in three months is not a thing that happens.
+namespace {
+constexpr double kBaselineTolerance = 2.0;
+
+bool plausible(double baseline, double latest) {
+    // Only the BASELINE is checked for zero here. `latest` is already refused by
+    // roi_from_sessions before this is reached, and a second guard on it would be
+    // dead code - the 0.34.3 lesson, where a 25-line comment described protection
+    // that provably could not fire.
+    //
+    // The zero-baseline check is NOT redundant though, and the difference is
+    // worth stating: with baseline 0 the ratio below is +inf, which does fail
+    // `<= kBaselineTolerance` and would return false anyway. It is kept because
+    // relying on infinity arithmetic to reject a divide-by-zero is a correct
+    // answer reached by accident, and the next person to touch the comparison
+    // would not know they were depending on it.
+    if (!(baseline > 0.0)) return false;
+    // BOTH DIRECTIONS. A baseline far ABOVE the latest equity is just as
+    // unbelievable as one far below, and only checking one side would accept a
+    // stale or mis-scaled figure that reports a catastrophic loss.
+    if (baseline > latest) return baseline / latest <= kBaselineTolerance;
+    return latest / baseline <= kBaselineTolerance;
+}
+
+// "2026-08-03" -> "2026-08". Empty for anything that is not long enough to be
+// a date, so a malformed row cannot match every month.
+std::string year_month(const std::string& date) {
+    if (date.size() < 7) return std::string();
+    return date.substr(0, 7);
+}
+} // namespace
+
+RoiBasis roi_from_sessions(const std::vector<EquityPoint>& closed) {
+    RoiBasis out;
+    if (closed.empty()) return out;          // ok stays false
+    out.latest_equity = closed.back().final_equity;
+    if (!(out.latest_equity > 0.0)) return out;
+
+    // Inception = the OLDEST session whose recorded baseline is believable.
+    // Scanning forward rather than taking closed.front() is what skips the
+    // placeholder era instead of reporting +900%.
+    size_t first = closed.size();
+    for (size_t i = 0; i < closed.size(); ++i) {
+        if (plausible(closed[i].initial_cash, out.latest_equity)) { first = i; break; }
+    }
+    if (first == closed.size()) return out;  // nothing believable: say so
+
+    out.ok = true;
+    out.from_date = closed[first].date;
+    out.baseline_equity = closed[first].initial_cash;
+    out.sessions = static_cast<int>(closed.size() - first);
+
+    // Month to date, from the month of the LATEST session. Using today's clock
+    // instead would let a report emitted either side of midnight name a period
+    // it did not measure.
+    const std::string ym = year_month(closed.back().date);
+    if (ym.empty()) return out;
+    for (size_t i = first; i < closed.size(); ++i) {
+        if (year_month(closed[i].date) != ym) continue;
+        if (!plausible(closed[i].initial_cash, out.latest_equity)) continue;
+        out.mtd_ok = true;
+        out.mtd_from_date = closed[i].date;
+        out.mtd_baseline_equity = closed[i].initial_cash;
+        break;
+    }
+    return out;
+}
+
+RoiBasis TradeJournal::roi_basis() const {
+    std::vector<EquityPoint> closed;
+    if (!db_) return roi_from_sessions(closed);
+    sqlite3_stmt* st = nullptr;
+    // CLOSED sessions only: an open one has no final_equity, and COALESCEing it
+    // to 0 would drag the latest figure to zero on any day a session is still
+    // running. Oldest first, which is the order roi_from_sessions expects.
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT date(started_utc,'unixepoch','localtime'), initial_cash, final_equity "
+            "FROM sessions WHERE ended_utc IS NOT NULL AND final_equity IS NOT NULL "
+            "ORDER BY id",
+            -1, &st, nullptr) != SQLITE_OK)
+        return roi_from_sessions(closed);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        EquityPoint p;
+        const unsigned char* d = sqlite3_column_text(st, 0);
+        if (d) p.date = reinterpret_cast<const char*>(d);
+        p.initial_cash = sqlite3_column_double(st, 1);
+        p.final_equity = sqlite3_column_double(st, 2);
+        closed.push_back(std::move(p));
+    }
+    sqlite3_finalize(st);
+    return roi_from_sessions(closed);
+}
+
 } // namespace tt::ui
