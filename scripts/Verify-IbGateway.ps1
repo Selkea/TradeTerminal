@@ -105,6 +105,21 @@ if (-not $gwDirs) {
     } else {
         Fail "JVM resolvable" "IBC would fail with 'Can't find suitable Java installation' for build $chosen - no jre\bin, no usable pref_jre.cfg/inst_jre.cfg, no Oracle javapath"
     }
+
+    # Did the gateway LOAD ITS SETTINGS at its last start? 10.50 under IBC 3.24.1
+    # failed to on every start for two days (Java 25 XML limits - see
+    # IbGatewayJava.ps1) and every check above passed throughout, because the API
+    # still came up. A gateway on factory defaults is not a verified gateway.
+    #
+    # Read from IBC's log, so it costs nothing and touches nothing. A FAIL here
+    # must only ever be REPORTED: nothing may restart on it, or a dialog that
+    # keeps coming back would become a nightly governed password login.
+    $load = Get-IbcSettingsLoadState $chosen
+    switch ($load.State) {
+        'loaded'   { Pass "settings loaded" $load.Detail }
+        'defaults' { Fail "settings loaded" ($load.Detail + ". Start-IbGateway.ps1 must forward the build's jdk.xml limits; see IbGatewayJava.ps1") }
+        default    { Warn "settings loaded" $load.Detail }
+    }
 }
 
 # ---- 2. which IBC is live? -------------------------------------------------

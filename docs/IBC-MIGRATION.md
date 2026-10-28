@@ -2,7 +2,15 @@
 
 IbcAlpha/IBC was **retired on 2026-09-01**. The maintainer: *"I'll continue to
 support it until 1 September 2026, and after that I will let it die."* The VPS
-runs **IBC 3.24.1** (jar dated 2026-07-02), so it will never be updated again.
+runs **IBC 3.24.1** (jar dated 2026-07-02).
+
+> **CORRECTED 2026-10-28.** 3.24.1 was *not* the last release. **IBC 3.24.2**
+> shipped 2026-08-21 and is the real final IbcAlpha release (the 09-01 commit only
+> revised the README). It exists *specifically* for TWS/Gateway 10.48+: it
+> forwards the build's own `javaOptions` from `i4jparams.conf`, falls back to
+> `<install>\jre\bin` for Java, and restores the auto-restart confirmation handler
+> 3.24.1 lacks (IbcAlpha/IBC #377). Both 10.50 problems hit on 2026-10-27/28 are
+> ones it fixes. See the end of this file.
 
 This file is the checklist a replacement has to satisfy. It exists because the
 knowledge is currently spread across `Start-IbGateway.ps1`'s comments, a memory
@@ -21,7 +29,8 @@ The gateway upgrade is forced and cheap. The IBC migration is neither.
 **The gateway upgrade is also the experiment that tells us whether the IBC
 migration is urgent.** If IBC 3.24.1 drives 10.50's dialogs, there is no fire and
 the successor can be adopted whenever one has matured. Do the gateway first,
-alone, and watch one nightly cold restart before touching IBC.
+alone, and watch the overnight restarts before touching IBC (weeknights are the
+gateway's own soft restart; the IBC cold restart is Sundays only — see item 6).
 
 Rollback for the gateway is genuinely cheap: `Start-IbGateway.ps1` selects the
 **highest numeric** version directory under `C:\Jts\ibgateway`, so reverting is
@@ -46,12 +55,23 @@ the rest is load-bearing here.
 5. **Auto-accept the API connection prompt**
    (`AcceptIncomingConnectionAction=accept`). Left at `manual` the app cannot
    connect at all.
-6. **A nightly COLD restart at 23:55** — kill and re-login, not the gateway's own
-   soft `AutoRestartTime`. This is not a preference. The soft restart reuses the
-   session and that session comes back **stale** on this box: port open, API
-   accepting, and unable to reach IBKR, rejecting clients with "Client
-   disconnected before version was sent" until a full cold relaunch. That is the
-   failure 0.2.14 fixed by switching paper to `ColdRestartTime`.
+6. **A weekly cold restart, and a backstop for the nightly soft one.**
+
+   > **CORRECTED 2026-10-28.** This item used to say IBC gives us "a nightly COLD
+   > restart at 23:55". It does not. IBC 3.24.1's own `config.ini` documents
+   > `ColdRestartTime` as **Sundays only** ("When this time is reached on Sundays,
+   > IBC tidily closes TWS ... initiating the usual full logon"), and its log
+   > agrees: *"Gateway will be cold restarted at 2026/11/01 23:55"*, a Sunday.
+
+   On weeknights the gateway does its **own soft auto-restart** at the Lock and
+   Exit time in its settings. That reuses the session, and on this box the reused
+   session can come back **stale**: port open, API accepting, unable to reach
+   IBKR, rejecting clients with "Client disconnected before version was sent".
+   What actually rescues those nights is `Watch-IbGateway.ps1`'s broker-down
+   relaunch — the ~00:58 cold logins scattered through the launcher logs. 0.2.14
+   believed `ColdRestartTime` had removed this failure; it only made it weekly
+   on Sundays. A replacement must keep both: the weekly full re-authentication,
+   and a backstop for a stale weeknight session.
 
    **The retiring maintainer's own reason for dropping IBC was "the auto-restart
    mechanism in Gateway and TWS" — i.e. precisely the mechanism that fails here.**
@@ -106,9 +126,11 @@ Not "it started". Run on the VPS, in this order:
    client-id conflict).
 2. `scripts\Start-IbGateway.ps1 -Restart` then `Verify-IbGateway.ps1` → PASS.
    This is the cold-login path, on demand, with the governor still armed.
-3. **Let one real 23:55 cold restart happen**, then verify the next morning
-   before the open. This is the only check that exercises the *scheduled* path,
-   and it is the one whose failure costs a trading day.
+3. **Let the scheduled restarts happen**, then verify the next morning before the
+   open: at least one weeknight soft auto-restart, and one **Sunday** 23:55 cold
+   restart (`ColdRestartTime` fires on Sundays only). These are the only checks
+   that exercise the *scheduled* paths, and their failure costs a trading day.
+   `Verify-IbGateway.ps1`'s "settings loaded" line must PASS after each.
 4. Confirm the AM/PM landmine: the successor's log must say the restart is
    scheduled for **23:55**, not 11:55.
 5. Keep the previous IBC jar on disk. Rollback is restoring it.
@@ -167,9 +189,91 @@ standing in for "will the gateway come up?", and the gap between those two
 questions was a trading day. **An upgrade verifier must test the artefact, not
 its version number.**
 
-### Still open
+### Still open — ANSWERED 2026-10-27
 
-Whether IBC 3.24.1 can drive 10.50's **login dialogs** — the original question —
-is *still unanswered*, because the 02:26 attempt never got far enough to find
-out. The acceptance test above stands unchanged, and step 3 (one real 23:55 cold
-restart) remains the one whose failure costs a trading day.
+Whether IBC 3.24.1 can drive 10.50's **login dialogs**: **yes.** Four password
+logins and one soft auto-restart on 2026-10-27/28 all completed. The problem
+turned out to be one layer down, below.
+
+---
+
+## 2026-10-28: 10.50 could not read its own settings — Java 25's XML limits
+
+With the JVM found, 10.50 came up and authenticated — and then, on **every**
+start, showed:
+
+```
+We are having trouble loading your settings, they may be corrupted.
+File does not exist C:\Jts\<userdir>\ibg.xml
+```
+
+The file existed. At the nightly soft restart the exiting instance wrote it at
+00:45:01 and the new one rejected it at 00:45:12 — **its own build's output,
+eleven seconds old.** 10.45 never showed it once in months, under the same IBC
+and directories.
+
+**Cause.** 10.50 bundles **Java 25**, and JDK 24 tightened the XML parser's
+limits (JDK-8343006): `elementAttributeLimit` 10000 → 200, `totalEntitySizeLimit`
+50,000,000 → 100000, `maxGeneralEntitySizeLimit` unlimited → 100000. The
+settings file exceeds them. IB's own launcher raises all three again through the
+`javaOptions` variable in `<install>\.install4j\i4jparams.conf`; IBC 3.24.1
+builds its own java command line and forwards none of it (only `-DjxBrowserKey`).
+So the parser rejects every settings file and the gateway runs on **factory
+defaults** after every start. 10.45 ran on a shared Zulu 17 with the old limits.
+0.51.0's `JAVA_PATH` — required, 10.50 cannot run without its JRE — is what put
+the gateway on Java 25 under IBC.
+
+All four local facts were checked on the VPS, read-only: `i4jparams.conf` carries
+`10000 / 0 / 0`; the bundled `jre\conf\jaxp.properties` carries `200 / 100000 /
+100000`; IBC's launch line for `1050\jre\bin\java.exe` has zero `jdk.xml` options;
+`StartIBC.bat` blanks `JAVA_TOOL_OPTIONS` (line 446) and leaves
+`JDK_JAVA_OPTIONS` alone. Publicly reproduced with a one-variable A/B on the same
+10.50.1f build: extrange/ibkr-docker #158.
+
+**Why it looked cosmetic and was not.** IBC re-applies the API port and the
+Read-Only flag on every start, so trading worked throughout. But every setting
+IBC does not manage was reset on every launch, and IBC's log said so: *"Read-Only
+API checkbox is **now** set to: false"*, where 10.45 had always logged *"already
+set"*. The nightly restart also slid from 00:55 to 00:45 ET — the default Lock and
+Exit time showing through.
+
+**Do not answer the dialog.** Per the IBC maintainer's 3.24.2 notes, "Yes"
+(recover from backup) strips the API Trusted IPs, and "No" leaves the settings
+"in some indeterminate state". Neither can help: the parse has already failed.
+
+**0.52.0 fix.** `Start-IbGateway.ps1` reads the selected build's own `-Djdk.xml.*`
+tokens from its `i4jparams.conf` and passes them through `JDK_JAVA_OPTIONS`, set
+or cleared on every launch (10.45 has none, so a rollback launches exactly as
+before). It reaches every JVM that IBC instance starts — `StartIBC.bat` builds
+its environment once and loops back to `:startIBC` for the soft and cold restarts
+alike — so it takes effect at the next **fresh** launch and stays. Proven on the
+VPS's own Java 25: with the variable, `java -XshowSettings:properties` reports
+all three limits; without it, none. System properties outrank `jaxp.properties`,
+so nothing inside the install is edited. `Verify-IbGateway.ps1` now FAILS when
+the last start showed the dialog — report only, never a restart trigger.
+
+### The next IBC step: 3.24.2, side by side
+
+3.24.2 forwards the whole `javaOptions` value (including the `--enable-native-access`
+and `--add-exports` entries 3.24.1 also omits for 10.50), so it would make the
+`JDK_JAVA_OPTIONS` forwarding redundant and harmless. Plan it as its own change,
+on a weekend, with the acceptance test above:
+
+1. Unzip `IBCWin-3.24.2.zip` to `C:\IBC-3.24.2` while everything runs. Never
+   rename `C:\IBC` with the keepalive active: if it fires while the folder is
+   missing, `Start-IbGateway.ps1` spends a governor slot before its `IBC.jar`
+   check fails.
+2. Point `IBC_PATH` (and the `IBC.jar` checks in `Start-IbGateway.ps1` and
+   `Verify-IbGateway.ps1`) at the new folder. Rollback is a one-line change.
+3. Confirm first that `DisplayBannerAndLaunch.bat` and its environment-variable
+   interface are unchanged in 3.24.2 — `Start-IbGateway.ps1` calls it directly.
+4. Its `getExtraJavaOptions.ps1` pastes the `javaOptions` value unquoted into a
+   cmd line; check the IBC log's java command after the first launch.
+
+**Live-account hazard until then.** For a live account `Start-IbGateway.ps1`
+writes `AutoRestartTime`, which makes IBC change the restart time in the config
+dialog — and 3.24.1 has no handler for the confirmation that raises (#377), so the
+change, and the API port applied with it, may silently not commit. With settings
+resetting on every launch it would have happened on every launch. Do not run a
+live account through this launcher before settings load reliably and IBC is on
+3.24.2.

@@ -267,6 +267,13 @@ if (-not $java.Path) {
     Die "build $newVer is installed but not launchable - refusing to restart onto it"
 }
 Ok "JVM for $newVer : $($java.Path) [$($java.Source)]"
+# Reported, not gated: these are what Start-IbGateway.ps1 will forward through
+# JDK_JAVA_OPTIONS. On a Java 25 build their absence is how the gateway ends up
+# unable to read its own settings file (see IbGatewayJava.ps1) - and the
+# verifier's "settings loaded" check is what catches it after the restart.
+$xmlOpts = Get-IbcJdkXmlOptions $target
+if ($xmlOpts) { Info "XML limits the build's own launcher sets (forwarded): $xmlOpts" }
+else { Info "XML limits: none set by this build's launcher" }
 
 if ($StageOnly) {
     Step "Staged"

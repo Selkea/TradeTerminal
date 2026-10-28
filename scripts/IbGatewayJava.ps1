@@ -100,3 +100,106 @@ function Resolve-IbcJava {
 
     return [pscustomobject]@{ Path = $null; Source = 'none' }
 }
+
+<#
+    THE SECOND 10.50 PROBLEM, found 2026-10-28: once IBC could find Java, the
+    gateway came up - and then failed to load its own settings on EVERY start:
+
+        We are having trouble loading your settings, they may be corrupted.
+        File does not exist C:\Jts\<userdir>\ibg.xml
+
+    The file existed. It had been written 11 seconds earlier, by the same build,
+    on the way down into its nightly auto-restart. The message is false; the
+    cause is the JRE. 10.50 bundles JAVA 25, and JDK 24 tightened the XML
+    parser's limits (JDK-8343006): elementAttributeLimit 10000 -> 200,
+    totalEntitySizeLimit 50,000,000 -> 100000, maxGeneralEntitySizeLimit
+    unlimited -> 100000. The gateway's settings file is bigger than that.
+
+    IB knows. Its own install4j launcher raises all three again through the
+    javaOptions variable in <install>\.install4j\i4jparams.conf:
+
+        -Djdk.xml.elementAttributeLimit=10000
+        -Djdk.xml.maxGeneralEntitySizeLimit=0
+        -Djdk.xml.totalEntitySizeLimit=0
+
+    IBC 3.24.1 never uses that launcher. It builds its own java command line and
+    takes exactly one option from i4jparams.conf (-DjxBrowserKey), so the parser
+    runs on Java 25's strict defaults and rejects every settings file - and the
+    gateway runs on FACTORY DEFAULTS after every start. IBC quietly re-applies
+    the API port and Read-Only flag, so trading kept working, which is precisely
+    why this looked cosmetic. It was not: every setting IBC does not manage was
+    reset on every launch, and IBC's log said so - "Read-Only API checkbox is
+    NOW set to: false", where 10.45 had always said "already set".
+
+    10.45 never showed it because it ran on a shared Zulu 17, whose limits are
+    the old loose ones. 0.51.0 pointed IBC at 10.50's bundled JRE, which was
+    necessary - 10.50 cannot run without it - and is what exposed this.
+
+    The fix forwards the build's OWN values, read from its own i4jparams.conf,
+    through JDK_JAVA_OPTIONS: the one variable StartIBC.bat leaves alone (it
+    blanks JAVA_TOOL_OPTIONS at line 446) and the route publicly A/B-tested on
+    this exact build (extrange/ibkr-docker #158). Verified on the VPS's own
+    Java 25: with the variable set, java -XshowSettings:properties reports all
+    three; without it, none. System properties outrank the JRE's
+    conf\jaxp.properties, so nothing inside the install has to be edited.
+
+    IBC 3.24.2 (2026-08-21, the real final IbcAlpha release - not 3.24.1, as
+    these notes long assumed) forwards the whole javaOptions value itself. When
+    the box moves to it this becomes redundant, and harmless.
+#>
+
+# The -Djdk.xml.* options a build's OWN launcher passes, as one string, or $null.
+#
+# Only tokens of the exact shape -Djdk.xml.<name>=<word> are taken, and only when
+# the token ENDS cleanly (whitespace, closing quote or end of line). A value
+# carrying an XML escape such as &amp; therefore fails to match at all instead of
+# being silently truncated into a different value. This also guarantees nothing
+# else on that line - it carries a licence key - can leak into the environment.
+function Get-IbcJdkXmlOptions {
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+    $conf = Join-Path $InstallDir '.install4j\i4jparams.conf'
+    if (-not (Test-Path $conf)) { return $null }
+    $line = Select-String -Path $conf -Pattern 'name="javaOptions"' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    if (-not $line) { return $null }
+    $toks = @([regex]::Matches($line.Line, '-Djdk\.xml\.[A-Za-z]+=[A-Za-z0-9.]+(?=[\s"]|$)') |
+              ForEach-Object { $_.Value })
+    if ($toks.Count -eq 0) { return $null }
+    return ($toks -join ' ')
+}
+
+# The gateway's own verdict on the LAST start, read from IBC's log: did it fail
+# to load its settings? Returns a PSCustomObject with State = loaded |
+# defaults | unknown, and Detail.
+#
+# Scoped to the segment after the last "IBC: Starting Gateway", which IBC logs
+# once per JVM start - including the nightly soft auto-restart, which appends to
+# the same file rather than starting a new one. A segment with no
+# "Login has completed" yet is UNKNOWN, not loaded: the dialog appears just
+# before that line, so an absent dialog proves nothing until the login is past it.
+function Get-IbcSettingsLoadState {
+    param([Parameter(Mandatory = $true)][string]$Build)
+    $logDir = Join-Path $env:LOCALAPPDATA 'TradeTerminal\ibc\logs'
+    $log = Get-ChildItem $logDir -Filter "IBC-*_GATEWAY-${Build}_*.txt" -ErrorAction SilentlyContinue |
+           Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $log) {
+        return [pscustomobject]@{ State = 'unknown'; Detail = "no IBC log for build $Build under $logDir" }
+    }
+    $lines = @(Get-Content $log.FullName -ErrorAction SilentlyContinue)
+    $start = -1
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match 'IBC: Starting Gateway') { $start = $i; break }
+    }
+    if ($start -lt 0) {
+        return [pscustomobject]@{ State = 'unknown'; Detail = "$($log.Name) has no 'Starting Gateway' line" }
+    }
+    $seg = $lines[$start..($lines.Count - 1)]
+    $when = if ($lines[$start] -match '^(\S+ \S+)') { $Matches[1] } else { '?' }
+    if ($seg -match 'trouble loading your settings') {
+        return [pscustomobject]@{ State = 'defaults'; Detail = "start at $when (IBC clock) showed the settings-load dialog - running on FACTORY DEFAULTS" }
+    }
+    if (-not ($seg -match 'Login has completed')) {
+        return [pscustomobject]@{ State = 'unknown'; Detail = "start at $when has not completed login yet" }
+    }
+    return [pscustomobject]@{ State = 'loaded'; Detail = "start at $when (IBC clock) loaded its settings - no dialog" }
+}
