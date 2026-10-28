@@ -206,19 +206,32 @@ try {
     $ibcCfgDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'IBC'
     New-Item -ItemType Directory -Force -Path $ibcCfgDir | Out-Null
     $ini = Join-Path $ibcCfgDir 'config.ini'
-    # Nightly restart mode. AutoRestartTime = the gateway's OWN soft restart: it
-    # reuses the session (no re-auth) and survives ~a week - but that reused
-    # session can come back STALE, leaving the gateway up (API port open) yet
-    # unable to reconnect to IBKR, rejecting API clients ("Client disconnected
-    # before version was sent") until a full COLD relaunch. ColdRestartTime =
-    # IBC kills + relaunches with a fresh login, which never lands in that stale
-    # state. Paper never prompts 2FA, so cold is safe + strictly better here. A
-    # LIVE account MAY require a TOTP on the cold re-login (IBC can't type it)
-    # and would wedge on the 2FA dialog nightly, so keep the soft restart there.
-    # See [[tt-gateway-overnight-reauth]]. That asymmetry is also why the app's
-    # 08:45 pre-open check only ever issues -Restart for a PAPER account: a cold
-    # re-login it cannot complete would leave no login at all, 40 minutes before
-    # the open, fixable only by RDP.
+    # Restart schedule. CORRECTED 2026-10-28 - this comment used to call
+    # ColdRestartTime a NIGHTLY cold restart, and it is not one. IBC 3.24.1's own
+    # config.ini documents it as SUNDAYS ONLY: "When this time is reached on
+    # Sundays, IBC tidily closes TWS ... initiating the usual full logon." Its
+    # log agrees ("Gateway will be cold restarted at 2026/11/01 23:55", a Sunday).
+    #
+    # So on WEEKNIGHTS a paper box gets the gateway's OWN soft auto-restart, at
+    # the Lock and Exit time held in the gateway's settings. That reuses the
+    # session (no re-auth) and can come back STALE - API port open, unable to
+    # reach IBKR, rejecting clients ("Client disconnected before version was
+    # sent") - and the backstop for that is Watch-IbGateway.ps1's broker-down
+    # relaunch, which is what the ~00:58 cold logins in the launcher logs are.
+    # ColdRestartTime still earns its place: the weekly full re-authentication
+    # IBKR requires, done by IBC at a time we choose.
+    #
+    # A LIVE account MAY require a TOTP on a cold re-login (IBC can't type it)
+    # and would wedge on the 2FA dialog, so it keeps AutoRestartTime. HAZARD,
+    # live only, until settings load reliably and IBC is 3.24.2: AutoRestartTime
+    # makes IBC change the restart time in the config dialog, and 3.24.1 has no
+    # handler for the confirmation that raises (IbcAlpha/IBC #377), so the
+    # change - and the API port applied with it - may silently not commit. While
+    # 10.50's settings reset on every launch (fixed below by JDK_JAVA_OPTIONS),
+    # that happened on EVERY launch. See [[tt-gateway-overnight-reauth]]. The
+    # paper/live asymmetry is also why the app's 08:45 pre-open check only ever
+    # issues -Restart for a PAPER account: a cold re-login it cannot complete
+    # would leave no login at all, 40 minutes before the open, fixable only by RDP.
     # 24-HOUR FORMAT, NOT '11:55 PM'. IBC 3.24.1 silently drops the AM/PM suffix:
     # with 'ColdRestartTime=11:55 PM' its own log said "Gateway will be cold
     # restarted at 2026/08/02 11:55" and it duly restarted at 11:55 *AM* on
@@ -267,6 +280,17 @@ MinimizeMainWindow=no
     # this: the fix can only ADD a JVM where IBC would have found none.
     $bundledJava = Get-IbcBundledJava $gwVer.FullName
     $env:JAVA_PATH = if ($bundledJava) { $bundledJava } else { '' }
+    # The build's OWN -Djdk.xml.* limits, which IB's launcher passes and IBC
+    # 3.24.1 does not - without them 10.50's Java 25 cannot parse the gateway's
+    # settings file and it runs on factory defaults after every start. See the
+    # note in IbGatewayJava.ps1. Set, or CLEARED, on every launch: 10.45 has
+    # none, so a rollback to it launches exactly as it always did.
+    #
+    # It reaches every JVM this IBC instance starts, not just the first: StartIBC.bat
+    # builds its environment once and loops back to :startIBC for the nightly
+    # soft restart and the Sunday cold restart alike.
+    $jdkXml = Get-IbcJdkXmlOptions $gwVer.FullName
+    $env:JDK_JAVA_OPTIONS = if ($jdkXml) { $jdkXml } else { '' }
     $env:APP = 'GATEWAY'
 
     # Hidden: this is only IBC's console (banner + log mirror; the real logs land
@@ -281,6 +305,8 @@ MinimizeMainWindow=no
     "IB Gateway launching as '$name' ($mode, api port $port), build $($gwVer.Name)."
     if ($bundledJava) { "  JVM: $bundledJava (bundled with the build)" }
     else { "  JVM: left to IBC to resolve (this build ships no jre\bin\java.exe)" }
+    if ($jdkXml) { "  XML limits: $jdkXml (the build's own, via JDK_JAVA_OPTIONS)" }
+    else { "  XML limits: none - this build's launcher sets none" }
     "If the security-code dialog appears, type the authenticator code (RDP)."
     # The mutex is held across this wait ON PURPOSE: until the port is up, a
     # second caller launching IBC would be the login fight described at the top.
