@@ -16,6 +16,7 @@
 #include "eod_report.h"      // EodReport, held between the crossing and the send
 #include "journal.h"
 #include "lineup_dryrun.h"
+#include "lineup_schedule.h" // LineupLatch: when the scheduled build really began
 #include "market_data.h"
 #include "net/book_divergence.h"
 #include "net/diag_server.h"
@@ -334,7 +335,9 @@ private:
     // when requests are merely being PACED, and the two are indistinguishable
     // from the UI thread. See pump_daily_lineup.
     std::vector<std::string> lineup_dropped_;
-    void start_daily_lineup(bool autostart_when_done = false);  // Trade menu / schedule
+    // Trade menu / schedule. True when a build actually BEGAN; false when it
+    // refused (and said why). The schedule marks its day only on true.
+    bool start_daily_lineup(bool autostart_when_done = false);
     void pump_daily_lineup();                      // UI thread, per frame
     void collect_lineup_bars(net::CandleBatch& b); // on_candles tap during FetchingBars
     // Newest cached candles for a live symbol, oldest first, as engine bars.
@@ -396,7 +399,9 @@ private:
     // Fire start_daily_lineup on the configured pre-market clock (weekday,
     // once/day); on Done, auto-start unless lineup_propose_only.
     void pump_lineup_schedule();
-    int lineup_last_build_day_ = -1;         // tm_yday guard: one scheduled build/day
+    // Was lineup_last_build_day_, set when the window was ENTERED - so one
+    // refused attempt cost the whole day. See lineup_schedule.h.
+    LineupLatch lineup_latch_;
     bool lineup_autostart_pending_ = false;  // Done -> start_live_session next frame
     char lineup_build_buf_[8] = "09:35";     // Trade-menu edit buffer for build time
 

@@ -149,6 +149,7 @@ add_executable(tt_terminal_tests
     tests/test_ui_tooltips.cpp
     tests/test_eod_report.cpp
     tests/test_bar_archive.cpp
+    tests/test_lineup_schedule.cpp
     src/panels/log_console.cpp
     src/journal.cpp
     src/eod_report.cpp

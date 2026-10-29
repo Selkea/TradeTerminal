@@ -1790,8 +1790,6 @@ void App::pump_lineup_schedule() {
     // for the whole run, regardless of what config.json says.
     if (dry_.active) return;
     if (!cfg_.lineup_enabled) return;
-    // Never interrupt a running session or an in-flight build/optimize.
-    if (lineup_active() || engine_.running() || tourn_.active || sweep_.running) return;
     int bh = -1, bm = -1;
     if (std::sscanf(cfg_.lineup_build_time.c_str(), "%d:%d", &bh, &bm) != 2) return;
     if (bh < 0 || bh > 23 || bm < 0 || bm > 59) return;
@@ -1807,14 +1805,42 @@ void App::pump_lineup_schedule() {
     // this and was only ever wired into the pre-open check; this is the second
     // of its call sites. Doing nothing on a holiday is free — yesterday's
     // lineup simply stands until the next real open.
-    if (!is_us_trading_day(tm)) return;
-    if (tm.tm_yday == lineup_last_build_day_) return;   // one build per day
+    const bool trading_day = is_us_trading_day(tm);
     const int now_min = tm.tm_hour * 60 + tm.tm_min;
-    if (now_min < build_min || now_min > build_min + 30) return;   // in the window
-    lineup_last_build_day_ = tm.tm_yday;
-    route("lineup: scheduled build (" + cfg_.lineup_build_time +
-             (cfg_.lineup_propose_only ? ", propose-only)" : ", auto-start)"));
-    start_daily_lineup(!cfg_.lineup_propose_only);
+    // Why a build could not start this tick - the same refusals, in the same
+    // order, as the top of start_daily_lineup, so a Build decision is one that
+    // call will honour. Never interrupt a running session or an in-flight
+    // build (AlreadyTrading: skip, and never call it a missed day); an
+    // optimizer run or a down data session are worth WAITING out within the
+    // window, and worth a page if the window closes on them.
+    LineupBlock block = LineupBlock::None;
+    if (lineup_active() || engine_.running()) block = LineupBlock::AlreadyTrading;
+    else if (tourn_.active || sweep_.running) block = LineupBlock::OptimizerBusy;
+    else if (use_tws_data_ && !data_.connected()) block = LineupBlock::DataDown;
+    const LineupTick tick = lineup_schedule_decide(trading_day, tm.tm_yday, now_min,
+                                                   build_min, lineup_latch_, block);
+    if (tick == LineupTick::Skip) return;
+    if (tick == LineupTick::Build) {
+        route("lineup: scheduled build (" + cfg_.lineup_build_time +
+              (cfg_.lineup_propose_only ? ", propose-only)" : ", auto-start)"));
+        // The day is marked only when a build BEGAN. The one refusal `block`
+        // cannot foresee is the data session dropping in the instant since it
+        // was read; that leaves the day unmarked, and the next tick re-derives
+        // DataDown and waits. The web route can never build - it is marked so
+        // its one refusal line is said once a day, as before.
+        const bool began = start_daily_lineup(!cfg_.lineup_propose_only);
+        lineup_schedule_record(lineup_latch_, tick, tm.tm_yday, block,
+                               began || !use_tws_data_);
+        return;
+    }
+    // Wait (said once per day) or Missed (said once, and it pages - see
+    // lineup_missed_line). route_operator, not route: route() files every
+    // "lineup:" line into optimizer.log, which neither /logs nor the alert scan
+    // ever sees.
+    if (!lineup_schedule_record(lineup_latch_, tick, tm.tm_yday, block, false)) return;
+    route_operator(tick == LineupTick::Wait
+                       ? lineup_wait_line(build_min, block)
+                       : lineup_missed_line(build_min, lineup_latch_.waited_why));
 }
 
 // The scheduled daily TWS refresh (force broker+feed to drop & reconnect at a
@@ -2029,26 +2055,28 @@ static constexpr double kLineupFetchQuietS = 60.0;
 // whatever turned up.
 static constexpr double kLineupFetchDeadlineS = 150.0;
 
-void App::start_daily_lineup(bool autostart_when_done) {
+bool App::start_daily_lineup(bool autostart_when_done) {
+    // Each refusal returns false, and pump_lineup_schedule mirrors all five in
+    // LineupBlock (lineup_schedule.h) - keep the two lists in step.
     if (lineup_.phase != DailyLineup::Phase::Idle) {
         route("lineup: already building");
-        return;
+        return false;
     }
     if (!use_tws_data_) {
         route("lineup: requires the IBKR (TWS) data route");
-        return;
+        return false;
     }
     if (!data_.connected()) {
         route("lineup: data session not connected");
-        return;
+        return false;
     }
     if (engine_.running()) {
         route("lineup: stop the live session first");
-        return;
+        return false;
     }
     if (tourn_.active || sweep_.running) {
         route("lineup: optimizer busy, try again");
-        return;
+        return false;
     }
     lineup_ = DailyLineup{};
     lineup_.autostart = autostart_when_done;
@@ -2078,6 +2106,7 @@ void App::start_daily_lineup(bool autostart_when_done) {
     lineup_.phase = DailyLineup::Phase::Scanning;
     lineup_.stamp_s = mono_s();
     route("lineup: scanning IBKR for high-volatility movers...");
+    return true;
 }
 
 // I/O thread (on_candles): stage a pool symbol's daily bars for the UI thread.

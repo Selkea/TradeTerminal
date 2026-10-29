@@ -281,6 +281,17 @@ inline AlertCategory classify_alert_category(const std::string& l) {
         has("OFF-LINEUP BROKER POSITION") || has(kTwsForeignOrderTag) ||
         has("half-open order"))
         return AlertCategory::Integrity;
+    // A REFUSED TRADING DAY IS NOT LINEUP NEWS. classify_alert rates
+    // "lineup: ABORTED" Critical because "no session today" is the one lineup
+    // outcome an operator away from the machine has to hear - and until 0.53.0
+    // the generic "lineup:" rule below filed it under Lineup, the category an
+    // operator switches off to stop hearing which symbols were picked. The VPS
+    // has exactly that off, so every ABORTED page there was counted in /diag and
+    // discarded. Filed under System instead: the switch for routine lineup chatter
+    // must not also be the switch for "the system will not trade today".
+    // Answered BEFORE Connection too, so a verdict that happens to mention the
+    // gateway still lands here.
+    if (has("lineup: ABORTED")) return AlertCategory::System;
     // A duplicate order id paralyses the ORDER path — it is a broker-session
     // fault, not a decision about one order.
     if (has(kTwsClientIdConflictTag) || has(kTwsClientIdClearedTag) ||
