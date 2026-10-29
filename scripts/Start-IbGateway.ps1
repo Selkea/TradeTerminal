@@ -216,8 +216,11 @@ try {
     # the Lock and Exit time held in the gateway's settings. That reuses the
     # session (no re-auth) and can come back STALE - API port open, unable to
     # reach IBKR, rejecting clients ("Client disconnected before version was
-    # sent") - and the backstop for that is Watch-IbGateway.ps1's broker-down
-    # relaunch, which is what the ~00:58 cold logins in the launcher logs are.
+    # sent"). NOTHING catches that overnight: Watch-IbGateway.ps1's broker-down
+    # relaunch only acts while a live session runs, and the port is open. The
+    # ~00:58 cold logins in the launcher logs are its PORT-DOWN relaunch, a soft
+    # restart that did not bring the port back within 180 s. A stale session is
+    # first seen by the app's 08:45 pre-open check (corrected 2026-10-29).
     # ColdRestartTime still earns its place: the weekly full re-authentication
     # IBKR requires, done by IBC at a time we choose.
     #

@@ -67,11 +67,24 @@ the rest is load-bearing here.
    Exit time in its settings. That reuses the session, and on this box the reused
    session can come back **stale**: port open, API accepting, unable to reach
    IBKR, rejecting clients with "Client disconnected before version was sent".
-   What actually rescues those nights is `Watch-IbGateway.ps1`'s broker-down
-   relaunch — the ~00:58 cold logins scattered through the launcher logs. 0.2.14
-   believed `ColdRestartTime` had removed this failure; it only made it weekly
-   on Sundays. A replacement must keep both: the weekly full re-authentication,
-   and a backstop for a stale weeknight session.
+   0.2.14 believed `ColdRestartTime` had removed this failure; it only made it
+   weekly on Sundays.
+
+   > **CORRECTED AGAIN 2026-10-29.** The first correction (10-28) said the
+   > backstop was `Watch-IbGateway.ps1`'s *broker-down* relaunch and that the
+   > ~00:58 cold logins were it. Wrong mechanism: the broker-down check returns
+   > "ok" whenever no live session is running (`Watch-IbGateway.ps1:120-122`),
+   > and overnight none is. The ~00:58 logins were its **port-down** relaunch —
+   > the 00:55 soft restart failing to bring the API port back within the 180 s
+   > grace. The keepalive's own log shows the shape: `gateway API port down -
+   > watching` at every nightly restart, and the only forced relaunch it has ever
+   > logged is `gateway port down > 180s - forcing re-login`.
+
+   So a weeknight soft restart that comes back **stale** — port open, IBKR
+   unreachable — is caught by **nothing overnight**. The first thing that sees it
+   is the app's 08:45 pre-open check, which relaunches once on paper. A
+   replacement must keep both: the weekly full re-authentication, and a check
+   before the open for a stale weeknight session.
 
    **The retiring maintainer's own reason for dropping IBC was "the auto-restart
    mechanism in Gateway and TWS" — i.e. precisely the mechanism that fails here.**
